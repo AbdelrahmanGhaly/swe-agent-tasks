@@ -1,0 +1,680 @@
+diff --git a/archunit/src/main/java/com/tngtech/archunit/core/domain/Dependency.java b/archunit/src/main/java/com/tngtech/archunit/core/domain/Dependency.java
+index 91f5cd44..9cf0ff60 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/core/domain/Dependency.java
++++ b/archunit/src/main/java/com/tngtech/archunit/core/domain/Dependency.java
+@@ -111,6 +111,10 @@ public class Dependency implements HasDescription, Comparable<Dependency>, HasSo
+         return result.get();
+     }
+ 
++    static Dependency fromStaticInitializationTrigger(JavaClass initializedClass, JavaClass triggeredClass, JavaAccess<?> access) {
++        return new Dependency(initializedClass, triggeredClass, access.getSourceCodeLocation(), access.getDescription());
++    }
++
+     static Set<Dependency> tryCreateFromField(JavaField field) {
+         return tryCreateDependency(field, "has type", field.getRawType());
+     }
+diff --git a/archunit/src/main/java/com/tngtech/archunit/core/domain/JavaClass.java b/archunit/src/main/java/com/tngtech/archunit/core/domain/JavaClass.java
+index eee80dc1..8af7bc47 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/core/domain/JavaClass.java
++++ b/archunit/src/main/java/com/tngtech/archunit/core/domain/JavaClass.java
+@@ -22,6 +22,7 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.SortedSet;
+ import java.util.function.Function;
+ import java.util.function.Supplier;
+ 
+@@ -1225,6 +1226,16 @@ public final class JavaClass
+         return JavaClassTransitiveDependencies.findTransitiveDependenciesFrom(this);
+     }
+ 
++    /**
++     * @return The dependencies on all classes whose initialization is triggered by initializing this class,
++     *         i.e. by its supertypes and by the code that runs within its static initializer.
++     *         For further details refer to {@link com.tngtech.archunit.library.GeneralCodingRules#beFreeOfStaticInitializationCycles()}.
++     */
++    @PublicAPI(usage = ACCESS)
++    public SortedSet<Dependency> getStaticInitializationDependenciesFromSelf() {
++        return JavaClassStaticInitialization.findStaticInitializationDependenciesFrom(this);
++    }
++
+     /**
+      * Like {@link #getDirectDependenciesFromSelf()}, but instead returns all dependencies where this class
+      * is target.
+diff --git a/archunit/src/main/java/com/tngtech/archunit/core/domain/JavaClassStaticInitialization.java b/archunit/src/main/java/com/tngtech/archunit/core/domain/JavaClassStaticInitialization.java
+new file mode 100644
+index 00000000..8d018371
+--- /dev/null
++++ b/archunit/src/main/java/com/tngtech/archunit/core/domain/JavaClassStaticInitialization.java
+@@ -0,0 +1,171 @@
++/*
++ * Copyright 2014-2026 TNG Technology Consulting GmbH
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.tngtech.archunit.core.domain;
++
++import java.util.ArrayDeque;
++import java.util.Deque;
++import java.util.HashSet;
++import java.util.Optional;
++import java.util.Set;
++import java.util.SortedSet;
++import java.util.TreeSet;
++
++import com.tngtech.archunit.core.domain.AccessTarget.MethodCallTarget;
++
++import static com.tngtech.archunit.core.domain.JavaModifier.ABSTRACT;
++import static com.tngtech.archunit.core.domain.JavaModifier.PRIVATE;
++import static com.tngtech.archunit.core.domain.JavaModifier.PROTECTED;
++import static com.tngtech.archunit.core.domain.JavaModifier.PUBLIC;
++import static com.tngtech.archunit.core.domain.JavaModifier.STATIC;
++
++class JavaClassStaticInitialization {
++    private final JavaClass initializedClass;
++    private final SortedSet<Dependency> dependencies = new TreeSet<>();
++    private final Set<JavaCodeUnit> visitedCodeUnits = new HashSet<>();
++    private final Deque<JavaCodeUnit> codeUnitsToVisit = new ArrayDeque<>();
++
++    private JavaClassStaticInitialization(JavaClass initializedClass) {
++        this.initializedClass = initializedClass;
++    }
++
++    static SortedSet<Dependency> findStaticInitializationDependenciesFrom(JavaClass javaClass) {
++        JavaClassStaticInitialization initialization = new JavaClassStaticInitialization(javaClass);
++        initialization.addSupertypesInitializedBefore();
++        initialization.addClassesInitializedByExecutedCode();
++        return initialization.dependencies;
++    }
++
++    private void addSupertypesInitializedBefore() {
++        if (initializedClass.isInterface()) {
++            return;
++        }
++        initializedClass.getRawSuperclass().ifPresent(this::addInheritanceDependency);
++        Set<JavaClass> visitedInterfaces = new HashSet<>();
++        initializedClass.getRawInterfaces().forEach(anInterface -> addInterfacesDeclaringDefaultMethods(anInterface, visitedInterfaces));
++    }
++
++    private void addInterfacesDeclaringDefaultMethods(JavaClass anInterface, Set<JavaClass> visitedInterfaces) {
++        if (!visitedInterfaces.add(anInterface)) {
++            return;
++        }
++        if (declaresDefaultMethod(anInterface)) {
++            addInheritanceDependency(anInterface);
++        }
++        anInterface.getRawInterfaces().forEach(superInterface -> addInterfacesDeclaringDefaultMethods(superInterface, visitedInterfaces));
++    }
++
++    private static boolean declaresDefaultMethod(JavaClass anInterface) {
++        return anInterface.getMethods().stream()
++                .map(JavaMethod::getModifiers)
++                .anyMatch(modifiers -> !modifiers.contains(ABSTRACT) && !modifiers.contains(STATIC) && !modifiers.contains(PRIVATE));
++    }
++
++    private void addInheritanceDependency(JavaClass supertype) {
++        if (isRelevantTarget(supertype)) {
++            dependencies.add(Dependency.fromInheritance(initializedClass, supertype));
++        }
++    }
++
++    private void addClassesInitializedByExecutedCode() {
++        initializedClass.getStaticInitializer().ifPresent(this::scheduleVisit);
++        while (!codeUnitsToVisit.isEmpty()) {
++            JavaCodeUnit codeUnit = codeUnitsToVisit.pop();
++            codeUnit.getFieldAccesses().stream()
++                    .filter(access -> !access.isDeclaredInLambda())
++                    .forEach(this::handleFieldAccess);
++            codeUnit.getMethodCallsFromSelf().stream()
++                    .filter(call -> !call.isDeclaredInLambda())
++                    .forEach(this::handleMethodCall);
++            codeUnit.getConstructorCallsFromSelf().stream()
++                    .filter(call -> !call.isDeclaredInLambda())
++                    .forEach(this::handleConstructorCall);
++        }
++    }
++
++    private void handleFieldAccess(JavaFieldAccess access) {
++        access.getTarget().resolveMember()
++                .filter(field -> field.getModifiers().contains(STATIC))
++                .ifPresent(field -> addInitializationTrigger(access, field.getOwner()));
++    }
++
++    private void handleMethodCall(JavaMethodCall call) {
++        Optional<JavaMethod> method = call.getTarget().resolveMember();
++        method.filter(it -> it.getModifiers().contains(STATIC))
++                .ifPresent(it -> addInitializationTrigger(call, it.getOwner()));
++        method.ifPresent(this::scheduleVisit);
++        if (call.isDynamicallyDispatched() && !method.filter(JavaClassStaticInitialization::cannotBeOverridden).isPresent()) {
++            scheduleVisitOfOverridingMethods(call.getTarget(), method);
++        }
++    }
++
++    private static boolean cannotBeOverridden(JavaMethod method) {
++        return method.getModifiers().contains(STATIC) || method.getModifiers().contains(PRIVATE);
++    }
++
++    private void scheduleVisitOfOverridingMethods(MethodCallTarget target, Optional<JavaMethod> calledMethod) {
++        String[] parameterTypeNames = target.getRawParameterTypes().stream().map(JavaClass::getName).toArray(String[]::new);
++        for (JavaClass subclass : target.getOwner().getAllSubclasses()) {
++            subclass.tryGetMethod(target.getName(), parameterTypeNames)
++                    .filter(candidate -> overrides(candidate, calledMethod))
++                    .ifPresent(this::scheduleVisit);
++        }
++    }
++
++    private static boolean overrides(JavaMethod candidate, Optional<JavaMethod> calledMethod) {
++        if (cannotBeOverridden(candidate)) {
++            return false;
++        }
++        return !calledMethod.filter(JavaClassStaticInitialization::isPackagePrivate).isPresent()
++                || calledMethod.get().getOwner().getPackageName().equals(candidate.getOwner().getPackageName());
++    }
++
++    private static boolean isPackagePrivate(JavaMethod method) {
++        Set<JavaModifier> modifiers = method.getModifiers();
++        return !modifiers.contains(PUBLIC) && !modifiers.contains(PROTECTED) && !modifiers.contains(PRIVATE);
++    }
++
++    private void handleConstructorCall(JavaConstructorCall call) {
++        if (!isConstructorDelegation(call)) {
++            addInitializationTrigger(call, call.getTargetOwner());
++        }
++        call.getTarget().resolveMember().ifPresent(this::scheduleVisit);
++    }
++
++    private static boolean isConstructorDelegation(JavaConstructorCall call) {
++        if (!(call.getOrigin() instanceof JavaConstructor)) {
++            return false;
++        }
++        JavaClass callingClass = call.getOriginOwner();
++        JavaClass targetClass = call.getTargetOwner();
++        return targetClass.equals(callingClass) || callingClass.getRawSuperclass().map(targetClass::equals).orElse(false);
++    }
++
++    private void addInitializationTrigger(JavaAccess<?> access, JavaClass triggeredClass) {
++        if (isRelevantTarget(triggeredClass)) {
++            dependencies.add(Dependency.fromStaticInitializationTrigger(initializedClass, triggeredClass, access));
++        }
++    }
++
++    private boolean isRelevantTarget(JavaClass targetClass) {
++        return !targetClass.equals(initializedClass);
++    }
++
++    private void scheduleVisit(JavaCodeUnit codeUnit) {
++        if (visitedCodeUnits.add(codeUnit)) {
++            codeUnitsToVisit.push(codeUnit);
++        }
++    }
++}
+diff --git a/archunit/src/main/java/com/tngtech/archunit/core/domain/JavaMethodCall.java b/archunit/src/main/java/com/tngtech/archunit/core/domain/JavaMethodCall.java
+index 90de3bcd..52b598c3 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/core/domain/JavaMethodCall.java
++++ b/archunit/src/main/java/com/tngtech/archunit/core/domain/JavaMethodCall.java
+@@ -23,8 +23,15 @@ import static com.tngtech.archunit.PublicAPI.Usage.ACCESS;
+ 
+ @PublicAPI(usage = ACCESS)
+ public final class JavaMethodCall extends JavaCall<MethodCallTarget> {
++    private final boolean dynamicallyDispatched;
++
+     JavaMethodCall(JavaMethodCallBuilder builder) {
+         super(builder);
++        dynamicallyDispatched = builder.isDynamicallyDispatched();
++    }
++
++    boolean isDynamicallyDispatched() {
++        return dynamicallyDispatched;
+     }
+ 
+     @Override
+diff --git a/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassFileImportRecord.java b/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassFileImportRecord.java
+index fc677062..b50e8d93 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassFileImportRecord.java
++++ b/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassFileImportRecord.java
+@@ -329,7 +329,8 @@ class ClassFileImportRecord {
+     }
+ 
+     private static final Function<RawAccessRecord, RawAccessRecord.Builder> COPY_RAW_ACCESS_RECORD =
+-            access -> copyInto(new RawAccessRecord.Builder(), access);
++            access -> copyInto(new RawAccessRecord.Builder(), access)
++                    .withDynamicallyDispatched(access.isDynamicallyDispatched());
+ 
+     private static final Function<RawAccessRecord.ForField, RawAccessRecord.ForField.Builder> COPY_RAW_FIELD_ACCESS_RECORD =
+             access -> copyInto(new RawAccessRecord.ForField.Builder(), access)
+diff --git a/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassFileProcessor.java b/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassFileProcessor.java
+index b708ebad..5abff94c 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassFileProcessor.java
++++ b/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassFileProcessor.java
+@@ -250,10 +250,12 @@ class ClassFileProcessor {
+         }
+ 
+         @Override
+-        public void handleMethodInstruction(String owner, String name, String desc) {
++        public void handleMethodInstruction(String owner, String name, String desc, boolean dynamicallyDispatched) {
+             LOG.trace("Found call of method {}.{}:{} in line {}", owner, name, desc, lineNumber);
+             TargetInfo target = new TargetInfo(owner, name, desc);
+-            RawAccessRecord accessRecord = filled(new RawAccessRecord.Builder(), target).build();
++            RawAccessRecord accessRecord = filled(new RawAccessRecord.Builder(), target)
++                    .withDynamicallyDispatched(dynamicallyDispatched)
++                    .build();
+             if (CONSTRUCTOR_NAME.equals(name)) {
+                 importRecord.registerConstructorCall(accessRecord);
+             } else {
+diff --git a/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassGraphCreator.java b/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassGraphCreator.java
+index cc46b64a..b4253427 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassGraphCreator.java
++++ b/archunit/src/main/java/com/tngtech/archunit/core/importer/ClassGraphCreator.java
+@@ -200,7 +200,9 @@ class ClassGraphCreator implements ImportContext {
+     public Set<JavaMethodCall> createMethodCallsFor(JavaCodeUnit codeUnit, Set<TryCatchBlockBuilder> tryCatchBlockBuilders) {
+         ImmutableSet.Builder<JavaMethodCall> result = ImmutableSet.builder();
+         for (AccessRecord<MethodCallTarget> record : processedMethodCallRecords.get(codeUnit)) {
+-            JavaMethodCall call = accessBuilderFrom(new JavaMethodCallBuilder(), record).build();
++            JavaMethodCall call = accessBuilderFrom(new JavaMethodCallBuilder(), record)
++                    .withDynamicallyDispatched(record.getRaw().isDynamicallyDispatched())
++                    .build();
+             result.add(call);
+             handlePossibleTryBlockAccess(tryCatchBlockBuilders, record, call);
+         }
+diff --git a/archunit/src/main/java/com/tngtech/archunit/core/importer/DomainBuilders.java b/archunit/src/main/java/com/tngtech/archunit/core/importer/DomainBuilders.java
+index 156061a8..52b2dc58 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/core/importer/DomainBuilders.java
++++ b/archunit/src/main/java/com/tngtech/archunit/core/importer/DomainBuilders.java
+@@ -1033,9 +1033,20 @@ public final class DomainBuilders {
+ 
+     @Internal
+     public static final class JavaMethodCallBuilder extends JavaAccessBuilder<MethodCallTarget, JavaMethodCallBuilder> {
++        private boolean dynamicallyDispatched;
++
+         JavaMethodCallBuilder() {
+         }
+ 
++        JavaMethodCallBuilder withDynamicallyDispatched(boolean dynamicallyDispatched) {
++            this.dynamicallyDispatched = dynamicallyDispatched;
++            return this;
++        }
++
++        public boolean isDynamicallyDispatched() {
++            return dynamicallyDispatched;
++        }
++
+         JavaMethodCall build() {
+             return DomainObjectCreationContext.createJavaMethodCall(this);
+         }
+diff --git a/archunit/src/main/java/com/tngtech/archunit/core/importer/JavaClassProcessor.java b/archunit/src/main/java/com/tngtech/archunit/core/importer/JavaClassProcessor.java
+index f0cc8324..d50cf126 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/core/importer/JavaClassProcessor.java
++++ b/archunit/src/main/java/com/tngtech/archunit/core/importer/JavaClassProcessor.java
+@@ -389,7 +389,7 @@ class JavaClassProcessor extends ClassVisitor {
+ 
+         @Override
+         public void visitMethodInsn(int opcode, String owner, String name, String desc, boolean itf) {
+-            accessHandler.handleMethodInstruction(owner, name, desc);
++            accessHandler.handleMethodInstruction(owner, name, desc, opcode == Opcodes.INVOKEVIRTUAL || opcode == Opcodes.INVOKEINTERFACE);
+         }
+ 
+         @Override
+@@ -524,7 +524,7 @@ class JavaClassProcessor extends ClassVisitor {
+ 
+         void onLabel(Label label);
+ 
+-        void handleMethodInstruction(String owner, String name, String desc);
++        void handleMethodInstruction(String owner, String name, String desc, boolean dynamicallyDispatched);
+ 
+         void handleMethodReferenceInstruction(String owner, String name, String desc);
+ 
+@@ -559,7 +559,7 @@ class JavaClassProcessor extends ClassVisitor {
+             }
+ 
+             @Override
+-            public void handleMethodInstruction(String owner, String name, String desc) {
++            public void handleMethodInstruction(String owner, String name, String desc, boolean dynamicallyDispatched) {
+             }
+ 
+             @Override
+diff --git a/archunit/src/main/java/com/tngtech/archunit/core/importer/RawAccessRecord.java b/archunit/src/main/java/com/tngtech/archunit/core/importer/RawAccessRecord.java
+index f036dd45..eec142ca 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/core/importer/RawAccessRecord.java
++++ b/archunit/src/main/java/com/tngtech/archunit/core/importer/RawAccessRecord.java
+@@ -30,12 +30,14 @@ class RawAccessRecord implements RawCodeUnitDependency<RawAccessRecord.TargetInf
+     private final TargetInfo target;
+     private final int lineNumber;
+     private final boolean declaredInLambda;
++    private final boolean dynamicallyDispatched;
+ 
+-    RawAccessRecord(CodeUnit origin, TargetInfo target, int lineNumber, boolean declaredInLambda) {
++    RawAccessRecord(CodeUnit origin, TargetInfo target, int lineNumber, boolean declaredInLambda, boolean dynamicallyDispatched) {
+         this.origin = checkNotNull(origin);
+         this.target = checkNotNull(target);
+         this.lineNumber = lineNumber;
+         this.declaredInLambda = declaredInLambda;
++        this.dynamicallyDispatched = dynamicallyDispatched;
+     }
+ 
+     @Override
+@@ -58,6 +60,10 @@ class RawAccessRecord implements RawCodeUnitDependency<RawAccessRecord.TargetInf
+         return declaredInLambda;
+     }
+ 
++    boolean isDynamicallyDispatched() {
++        return dynamicallyDispatched;
++    }
++
+     @Override
+     public String toString() {
+         return getClass().getSimpleName() + "{" + fieldsAsString() + '}';
+@@ -226,7 +232,7 @@ class RawAccessRecord implements RawCodeUnitDependency<RawAccessRecord.TargetInf
+     static class Builder extends BaseBuilder<RawAccessRecord, Builder> {
+         @Override
+         public RawAccessRecord build() {
+-            return new RawAccessRecord(origin, target, lineNumber, declaredInLambda);
++            return new RawAccessRecord(origin, target, lineNumber, declaredInLambda, dynamicallyDispatched);
+         }
+     }
+ 
+@@ -235,6 +241,7 @@ class RawAccessRecord implements RawCodeUnitDependency<RawAccessRecord.TargetInf
+         TargetInfo target;
+         int lineNumber = -1;
+         boolean declaredInLambda = false;
++        boolean dynamicallyDispatched = false;
+ 
+         @Override
+         public SELF withOrigin(CodeUnit origin) {
+@@ -260,6 +267,11 @@ class RawAccessRecord implements RawCodeUnitDependency<RawAccessRecord.TargetInf
+             return self();
+         }
+ 
++        SELF withDynamicallyDispatched(boolean dynamicallyDispatched) {
++            this.dynamicallyDispatched = dynamicallyDispatched;
++            return self();
++        }
++
+         @SuppressWarnings("unchecked")
+         SELF self() {
+             return (SELF) this;
+@@ -270,7 +282,7 @@ class RawAccessRecord implements RawCodeUnitDependency<RawAccessRecord.TargetInf
+         final AccessType accessType;
+ 
+         private ForField(CodeUnit origin, TargetInfo target, int lineNumber, AccessType accessType, boolean declaredInLambda) {
+-            super(origin, target, lineNumber, declaredInLambda);
++            super(origin, target, lineNumber, declaredInLambda, false);
+             this.accessType = accessType;
+         }
+ 
+diff --git a/archunit/src/main/java/com/tngtech/archunit/library/GeneralCodingRules.java b/archunit/src/main/java/com/tngtech/archunit/library/GeneralCodingRules.java
+index 80ca3c71..d5fa030e 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/library/GeneralCodingRules.java
++++ b/archunit/src/main/java/com/tngtech/archunit/library/GeneralCodingRules.java
+@@ -15,13 +15,23 @@
+  */
+ package com.tngtech.archunit.library;
+ 
++import java.util.ArrayDeque;
++import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.Collections;
++import java.util.Deque;
+ import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ 
++import com.google.common.collect.ImmutableSet;
+ import com.tngtech.archunit.PublicAPI;
++import com.tngtech.archunit.base.DescribedPredicate;
+ import com.tngtech.archunit.core.domain.AccessTarget.FieldAccessTarget;
++import com.tngtech.archunit.core.domain.Dependency;
+ import com.tngtech.archunit.core.domain.JavaAccess;
+ import com.tngtech.archunit.core.domain.JavaAccess.Functions.Get;
+ import com.tngtech.archunit.core.domain.JavaClass;
+@@ -32,6 +42,7 @@ import com.tngtech.archunit.lang.ArchCondition;
+ import com.tngtech.archunit.lang.ArchRule;
+ import com.tngtech.archunit.lang.ConditionEvents;
+ import com.tngtech.archunit.lang.conditions.ArchConditions;
++import com.tngtech.archunit.library.cycle_detection.rules.CycleArchCondition;
+ 
+ import static com.tngtech.archunit.PublicAPI.Usage.ACCESS;
+ import static com.tngtech.archunit.base.DescribedPredicate.not;
+@@ -47,6 +58,7 @@ import static com.tngtech.archunit.core.domain.properties.HasOwner.Predicates.Wi
+ import static com.tngtech.archunit.core.domain.properties.HasParameterTypes.Predicates.rawParameterTypes;
+ import static com.tngtech.archunit.core.domain.properties.HasType.Functions.GET_RAW_TYPE;
+ import static com.tngtech.archunit.lang.ConditionEvent.createMessage;
++import static com.tngtech.archunit.lang.SimpleConditionEvent.satisfied;
+ import static com.tngtech.archunit.lang.SimpleConditionEvent.violated;
+ import static com.tngtech.archunit.lang.conditions.ArchConditions.accessField;
+ import static com.tngtech.archunit.lang.conditions.ArchConditions.accessTargetWhere;
+@@ -60,7 +72,9 @@ import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
+ import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
+ import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noFields;
+ import static java.util.Collections.emptyList;
++import static java.util.Collections.singleton;
+ import static java.util.stream.Collectors.groupingBy;
++import static java.util.stream.Collectors.joining;
+ 
+ /**
+  * GeneralCodingRules provides a set of very general {@link ArchCondition ArchConditions}
+@@ -548,4 +562,121 @@ public final class GeneralCodingRules {
+                     .orShould().dependOnClassesThat().haveFullyQualifiedName("java.util.Date")
+                     .as("java.time API should be used")
+                     .because("legacy date/time APIs have been replaced since Java 8 (JSR 310)");
++
++    /**
++     * A condition that detects cycles in the static initialization of the checked classes, i.e. classes whose
++     * initialization triggers the initialization of each other. Such a cycle can make one of the classes observe
++     * the other one only partially initialized.<br>
++     * The initialization of a class triggers the initialization of the classes described by
++     * {@link JavaClass#getStaticInitializationDependenciesFromSelf()}. Initialization that runs through classes
++     * that are not checked still connects the checked classes it leads to.
++     *
++     * @return A condition that is violated for every static initialization cycle between the checked classes
++     */
++    @PublicAPI(usage = ACCESS)
++    public static ArchCondition<JavaClass> beFreeOfStaticInitializationCycles() {
++        return new StaticInitializationCycleCondition();
++    }
++
++    /**
++     * A condition that matches classes whose static initialization triggers the initialization of a class
++     * matching the given predicate, either directly or through the initialization of further classes
++     * (compare {@link JavaClass#getStaticInitializationDependenciesFromSelf()}).
++     * Every matching class is reported once, together with a shortest chain of initializations leading to it.
++     *
++     * @param predicate Selects the classes whose initialization should be reported
++     * @return A condition matching classes that trigger the static initialization of classes matching the predicate
++     */
++    @PublicAPI(usage = ACCESS)
++    public static ArchCondition<JavaClass> triggerStaticInitializationOfClassesThat(DescribedPredicate<? super JavaClass> predicate) {
++        return new ArchCondition<JavaClass>("trigger static initialization of classes that " + predicate.getDescription()) {
++            @Override
++            public void check(JavaClass javaClass, ConditionEvents events) {
++                List<List<JavaClass>> chains = findStaticInitializationChains(javaClass, predicate);
++                for (List<JavaClass> chain : chains) {
++                    String message = String.format("triggers static initialization of <%s> by [%s]",
++                            chain.get(chain.size() - 1).getName(), chain.stream().map(JavaClass::getName).collect(joining("->")));
++                    events.add(satisfied(javaClass, createMessage(javaClass, message)));
++                }
++                if (chains.isEmpty()) {
++                    events.add(violated(javaClass, createMessage(javaClass, "does not trigger static initialization of any matching class")));
++                }
++            }
++        };
++    }
++
++    private static List<List<JavaClass>> findStaticInitializationChains(JavaClass initializedClass, DescribedPredicate<? super JavaClass> predicate) {
++        Map<JavaClass, JavaClass> triggeringClasses = new HashMap<>();
++        Deque<JavaClass> classesToFollow = new ArrayDeque<>(singleton(initializedClass));
++        List<List<JavaClass>> chains = new ArrayList<>();
++        while (!classesToFollow.isEmpty()) {
++            JavaClass triggeringClass = classesToFollow.poll();
++            for (Dependency dependency : triggeringClass.getStaticInitializationDependenciesFromSelf()) {
++                JavaClass triggeredClass = dependency.getTargetClass();
++                if (!triggeredClass.equals(initializedClass) && !triggeringClasses.containsKey(triggeredClass)) {
++                    triggeringClasses.put(triggeredClass, triggeringClass);
++                    classesToFollow.add(triggeredClass);
++                    if (predicate.test(triggeredClass)) {
++                        chains.add(chainOfInitializations(triggeredClass, triggeringClasses));
++                    }
++                }
++            }
++        }
++        return chains;
++    }
++
++    private static List<JavaClass> chainOfInitializations(JavaClass triggeredClass, Map<JavaClass, JavaClass> triggeringClasses) {
++        LinkedList<JavaClass> chain = new LinkedList<>();
++        for (JavaClass current = triggeredClass; current != null; current = triggeringClasses.get(current)) {
++            chain.addFirst(current);
++        }
++        return chain;
++    }
++
++    private static class StaticInitializationCycleCondition extends ArchCondition<JavaClass> {
++        private ArchCondition<JavaClass> cycleCondition;
++
++        StaticInitializationCycleCondition() {
++            super("be free of static initialization cycles");
++        }
++
++        @Override
++        public void init(Collection<JavaClass> allObjectsToTest) {
++            Set<JavaClass> checkedClasses = ImmutableSet.copyOf(allObjectsToTest);
++            cycleCondition = CycleArchCondition.<JavaClass>builder()
++                    .retrieveClassesBy(Collections::singleton)
++                    .retrieveDescriptionBy(javaClass -> "Class <" + javaClass.getName() + ">")
++                    .retrieveOutgoingDependenciesBy(javaClass -> dependenciesOnCheckedClasses(javaClass, checkedClasses))
++                    .build();
++            cycleCondition.init(allObjectsToTest);
++        }
++
++        @Override
++        public void check(JavaClass javaClass, ConditionEvents events) {
++            cycleCondition.check(javaClass, events);
++        }
++
++        @Override
++        public void finish(ConditionEvents events) {
++            cycleCondition.finish(events);
++        }
++
++        private static Set<Dependency> dependenciesOnCheckedClasses(JavaClass initializedClass, Set<JavaClass> checkedClasses) {
++            Set<Dependency> result = new HashSet<>();
++            Set<JavaClass> visitedClasses = new HashSet<>(singleton(initializedClass));
++            Deque<Dependency> dependenciesToFollow = new ArrayDeque<>(initializedClass.getStaticInitializationDependenciesFromSelf());
++            while (!dependenciesToFollow.isEmpty()) {
++                Dependency dependency = dependenciesToFollow.pop();
++                JavaClass targetClass = dependency.getTargetClass();
++                if (checkedClasses.contains(targetClass)) {
++                    if (!targetClass.equals(initializedClass)) {
++                        result.add(dependency);
++                    }
++                } else if (visitedClasses.add(targetClass)) {
++                    dependenciesToFollow.addAll(targetClass.getStaticInitializationDependenciesFromSelf());
++                }
++            }
++            return result;
++        }
++    }
+ }
+diff --git a/archunit/src/main/java/com/tngtech/archunit/library/dependencies/GivenSlicesInternal.java b/archunit/src/main/java/com/tngtech/archunit/library/dependencies/GivenSlicesInternal.java
+index 0a048bc3..f4daad73 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/library/dependencies/GivenSlicesInternal.java
++++ b/archunit/src/main/java/com/tngtech/archunit/library/dependencies/GivenSlicesInternal.java
+@@ -96,6 +96,18 @@ class GivenSlicesInternal implements GivenSlices, SlicesShould, GivenSlicesConju
+         );
+     }
+ 
++    @Override
++    public SliceRule beFreeOfStaticInitializationCycles() {
++        return new SliceRule(classesTransformer, priority, (transformer, predicate) -> CycleArchCondition.<Slice>builder()
++                .retrieveClassesBy(Function.identity())
++                .retrieveDescriptionBy(HasDescription::getDescription)
++                .retrieveOutgoingDependenciesBy(Slice::getStaticInitializationDependenciesFromSelf)
++                .onlyConsiderDependencies(predicate)
++                .build()
++                .as("be free of static initialization cycles")
++        );
++    }
++
+     @Override
+     public SliceRule notDependOnEachOther() {
+         return new SliceRule(classesTransformer, priority, (transformer, predicate) -> new NotDependOnEachOtherCondition(predicate, transformer));
+diff --git a/archunit/src/main/java/com/tngtech/archunit/library/dependencies/Slice.java b/archunit/src/main/java/com/tngtech/archunit/library/dependencies/Slice.java
+index 0abbacba..1f8f716f 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/library/dependencies/Slice.java
++++ b/archunit/src/main/java/com/tngtech/archunit/library/dependencies/Slice.java
+@@ -15,6 +15,8 @@
+  */
+ package com.tngtech.archunit.library.dependencies;
+ 
++import java.util.ArrayDeque;
++import java.util.Deque;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Objects;
+@@ -125,6 +127,35 @@ public final class Slice extends ForwardingSet<JavaClass> implements HasDescript
+         return result.build();
+     }
+ 
++    /**
++     * @return All {@link JavaClass#getStaticInitializationDependenciesFromSelf() static initialization dependencies}
++     *         of the classes within this {@link Slice} on classes of other slices. Static initialization that runs
++     *         through classes not assigned to any slice is followed to the slices it leads to.
++     */
++    @PublicAPI(usage = ACCESS)
++    public Set<Dependency> getStaticInitializationDependenciesFromSelf() {
++        ImmutableSet.Builder<Dependency> result = ImmutableSet.builder();
++        Set<JavaClass> visitedClasses = new HashSet<>(this);
++        Deque<Dependency> dependenciesToFollow = new ArrayDeque<>();
++        forEach(javaClass -> dependenciesToFollow.addAll(javaClass.getStaticInitializationDependenciesFromSelf()));
++        while (!dependenciesToFollow.isEmpty()) {
++            Dependency dependency = dependenciesToFollow.pop();
++            JavaClass targetClass = dependency.getTargetClass();
++            if (!isAssignedToAnySlice(targetClass)) {
++                if (visitedClasses.add(targetClass)) {
++                    dependenciesToFollow.addAll(targetClass.getStaticInitializationDependenciesFromSelf());
++                }
++            } else if (isNotAssignedToOwnSlice(targetClass)) {
++                result.add(dependency);
++            }
++        }
++        return result.build();
++    }
++
++    private boolean isAssignedToAnySlice(JavaClass javaClass) {
++        return !sliceAssignment.getIdentifierOf(javaClass).getParts().isEmpty();
++    }
++
+     /**
+      * @return All dependencies that originate from outside of this {@link Slice} and target a class within this {@link Slice}
+      */
+diff --git a/archunit/src/main/java/com/tngtech/archunit/library/dependencies/syntax/SlicesShould.java b/archunit/src/main/java/com/tngtech/archunit/library/dependencies/syntax/SlicesShould.java
+index 58707214..408ce8a9 100644
+--- a/archunit/src/main/java/com/tngtech/archunit/library/dependencies/syntax/SlicesShould.java
++++ b/archunit/src/main/java/com/tngtech/archunit/library/dependencies/syntax/SlicesShould.java
+@@ -39,4 +39,13 @@ public interface SlicesShould {
+      */
+     @PublicAPI(usage = ACCESS)
+     SliceRule notDependOnEachOther();
++
++    /**
++     * @return a {@link SliceRule} asserting that the static initialization of the evaluated slices
++     * does not form any cycle, i.e. that no slice triggers the initialization of a slice whose initialization
++     * in turn triggers the initialization of the first slice again
++     * (compare {@link com.tngtech.archunit.library.dependencies.Slice#getStaticInitializationDependenciesFromSelf()})
++     */
++    @PublicAPI(usage = ACCESS)
++    SliceRule beFreeOfStaticInitializationCycles();
+ }

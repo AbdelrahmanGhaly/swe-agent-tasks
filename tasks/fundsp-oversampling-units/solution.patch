@@ -1,0 +1,711 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 4a968b4..7bed81e 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -5,6 +5,9 @@
+ - `Sequencer` now supports looping. Some fixes were also made.
+ - New `AudioNode` tree introspection system in the module `graph`.
+ - In order to take effect, `Sequencer` changes must now be committed to the backend.
++- `oversample` now works with block processing, passes settings to the enclosed node, and reports latency and frequency response at the outer sample rate.
++- New opcode `oversample_linear` for oversampling with linear phase filters.
++- New `OversampleUnit` for oversampling an `AudioUnit` by 2, 4, 8 or 16.
+ 
+ ### Version 0.23
+ 
+diff --git a/README.md b/README.md
+index 1d3bff7..0075f5d 100644
+--- a/README.md
++++ b/README.md
+@@ -1253,6 +1253,7 @@ The type parameters in the table refer to the `prelude32` and `prelude64` prelud
+ | `organ()`              | 1 (frequency) | 1 | Bandlimited organ wave oscillator. |
+ | `organ_hz(f)`          |    -    |    1    | Bandlimited organ wave oscillator at `f` Hz. |
+ | `oversample(node)`     |  `node` |  `node` | 2x oversample enclosed `node`. |
++| `oversample_linear(node)` | `node` | `node` | 2x oversample enclosed `node` using linear phase filters. Filter delay is reported as latency. |
+ | `pan(pan)`             |    1    |    2    | Fixed mono-to-stereo equal power panner with pan in -1...1. |
+ | `panner()`             | 2 (audio, pan) | 2 | Mono-to-stereo equal power panner with pan in -1...1. |
+ | `pass()`               |    1    |    1    | Pass signal through. |
+diff --git a/src/oversample.rs b/src/oversample.rs
+index c28380b..050f148 100644
+--- a/src/oversample.rs
++++ b/src/oversample.rs
+@@ -1,12 +1,20 @@
+ //! Oversampling.
+ 
+ use super::audionode::*;
++use super::audiounit::*;
+ use super::buffer::*;
+ use super::graph::*;
+ use super::math::*;
++use super::setting::*;
+ use super::signal::*;
+ use super::*;
++use core::marker::PhantomData;
++use num_complex::Complex64;
+ use numeric_array::typenum::*;
++extern crate alloc;
++use alloc::boxed::Box;
++use alloc::vec;
++use alloc::vec::Vec;
+ 
+ #[inline]
+ fn interpolating_filter(input_buffer: &[f32], new_sample_index: usize) -> (f32, f32) {
+@@ -61,20 +69,156 @@ fn decimating_filter(output_buffer: &[f32], last_sample_index: usize) -> f32 {
+     accumulator.reduce_add()
+ }
+ 
++#[inline]
++fn interpolating_filter_linear(input_buffer: &[f32], new_sample_index: usize) -> (f32, f32) {
++    let mut even = 0.0;
++    let mut odd = 0.0;
++    for i in 0..HALFBAND_LINEAR_LEN / 2 {
++        let sample = input_buffer[(new_sample_index + 0x80 - i) & 0x7f];
++        even += HALFBAND_LINEAR[i * 2] * sample;
++        odd += HALFBAND_LINEAR[i * 2 + 1] * sample;
++    }
++    even += HALFBAND_LINEAR[HALFBAND_LINEAR_LEN - 1]
++        * input_buffer[(new_sample_index + 0x80 - HALFBAND_LINEAR_LEN / 2) & 0x7f];
++    (even * 2.0, odd * 2.0)
++}
++
++#[inline]
++fn decimating_filter_linear(output_buffer: &[f32], last_sample_index: usize) -> f32 {
++    let mut output = 0.0;
++    for (i, coefficient) in HALFBAND_LINEAR.iter().enumerate() {
++        output += coefficient * output_buffer[(last_sample_index + 0x80 - i) & 0x7f];
++    }
++    output
++}
++
++/// Resampling filter design of an oversampler.
++pub trait OversamplingPhase: Clone + Default + Sync + Send {
++    /// Unique ID of an oversampler using this design.
++    const ID: u64;
++    /// Delay of the resampling filters reported as latency, in samples at the outer rate.
++    const LATENCY: f64;
++    /// Interpolate an even and an odd inner sample from input history ending at `index`.
++    fn interpolate(history: &[f32], index: usize) -> (f32, f32);
++    /// Decimate inner output history ending at `index` into an outer sample.
++    fn decimate(history: &[f32], index: usize) -> f32;
++}
++
++/// Minimum phase resampling filters. They add no latency.
++#[derive(Clone, Default)]
++pub struct MinimumPhase;
++
++impl OversamplingPhase for MinimumPhase {
++    const ID: u64 = 51;
++    const LATENCY: f64 = 0.0;
++    #[inline]
++    fn interpolate(history: &[f32], index: usize) -> (f32, f32) {
++        interpolating_filter(history, index)
++    }
++    #[inline]
++    fn decimate(history: &[f32], index: usize) -> f32 {
++        decimating_filter(history, index)
++    }
++}
++
++/// Linear phase resampling filters. Their constant delay is reported as latency.
++#[derive(Clone, Default)]
++pub struct LinearPhase;
++
++impl OversamplingPhase for LinearPhase {
++    const ID: u64 = 101;
++    const LATENCY: f64 = (HALFBAND_LINEAR_LEN - 2) as f64 * 0.5;
++    #[inline]
++    fn interpolate(history: &[f32], index: usize) -> (f32, f32) {
++        interpolating_filter_linear(history, index)
++    }
++    #[inline]
++    fn decimate(history: &[f32], index: usize) -> f32 {
++        decimating_filter_linear(history, index)
++    }
++}
++
++/// Frequency response of the resampling filters of `P` at `frequency` Hz
++/// when the outer sample rate is `sample_rate`. The delay reported as latency is excluded.
++fn resampling_response<P: OversamplingPhase>(sample_rate: f64, frequency: f64) -> Complex64 {
++    let mut input = [0.0f32; 0x80];
++    let mut output = [0.0f32; 0x80];
++    let omega = f64::TAU * frequency / sample_rate;
++    let mut response = Complex64::new(0.0, 0.0);
++    for i in 0..0x80 {
++        input[i] = if i == 0 { 1.0 } else { 0.0 };
++        let (even, odd) = P::interpolate(&input, i);
++        output[(i * 2) & 0x7f] = even;
++        output[(i * 2 + 1) & 0x7f] = odd;
++        let sample = P::decimate(&output, (i * 2 + 1) & 0x7f) as f64;
++        response += Complex64::from_polar(sample, -omega * (i as f64 - P::LATENCY));
++    }
++    if P::LATENCY > 0.0 {
++        Complex64::new(response.re, 0.0)
++    } else {
++        response
++    }
++}
++
++/// Convert latencies of signals by `factor`.
++fn scale_latency(signal: Signal, factor: f64) -> Signal {
++    match signal {
++        Signal::Latency(l) => Signal::Latency(l * factor),
++        Signal::Response(r, l) => Signal::Response(r, l * factor),
++        s => s,
++    }
++}
++
++/// Route signals through an oversampler with phase `P` and outer `sample_rate`.
++/// The enclosed node is routed with `inner`.
++fn route_oversampled<P: OversamplingPhase>(
++    sample_rate: f64,
++    input: &SignalFrame,
++    frequency: f64,
++    outputs: usize,
++    inner: impl FnOnce(&SignalFrame) -> SignalFrame,
++) -> SignalFrame {
++    let mut inner_input = SignalFrame::new(input.len());
++    for i in 0..input.len() {
++        inner_input.set(i, scale_latency(input.at(i), 2.0));
++    }
++    let inner_output = inner(&inner_input);
++    let mut response = None;
++    let mut output = SignalFrame::new(outputs);
++    for i in 0..outputs {
++        let signal = match inner_output.at(i) {
++            Signal::Latency(l) => Signal::Latency(l * 0.5 + P::LATENCY),
++            Signal::Response(r, l) => {
++                let filters = *response
++                    .get_or_insert_with(|| resampling_response::<P>(sample_rate, frequency));
++                Signal::Response(r * filters, l * 0.5 + P::LATENCY)
++            }
++            s => s,
++        };
++        output.set(i, signal);
++    }
++    output
++}
++
++/// 2x oversampler. The enclosed node runs at twice the sample rate.
++/// The resampling filters are selected with `P`.
+ #[derive(Clone)]
+-pub struct Oversampler<X>
++pub struct Oversampler<X, P = MinimumPhase>
+ where
+     X: AudioNode,
+     X::Inputs: Size<f32>,
+     X::Outputs: Size<f32>,
+     X::Inputs: Size<Frame<f32, U128>>,
+     X::Outputs: Size<Frame<f32, U128>>,
++    P: OversamplingPhase,
+ {
+     x: X,
+     inv: Frame<Frame<f32, U128>, X::Inputs>,
+     outv: Frame<Frame<f32, U128>, X::Outputs>,
+     input_rb_index: usize,
+     output_rb_index: usize,
++    sample_rate: f64,
++    _marker: PhantomData<P>,
+ }
+ 
+ impl<X> Oversampler<X>
+@@ -85,11 +229,39 @@ where
+     X::Inputs: Size<Frame<f32, U128>>,
+     X::Outputs: Size<Frame<f32, U128>>,
+ {
+-    /// Create new oversampler. 2x oversamples enclosed node.
+-    pub fn new(sample_rate: f64, mut node: X) -> Self {
++    /// Create new oversampler with minimum phase filters. 2x oversamples enclosed node.
++    pub fn new(sample_rate: f64, node: X) -> Self {
++        Self::with_phase(sample_rate, node)
++    }
++}
++
++impl<X> Oversampler<X, LinearPhase>
++where
++    X: AudioNode,
++    X::Inputs: Size<f32>,
++    X::Outputs: Size<f32>,
++    X::Inputs: Size<Frame<f32, U128>>,
++    X::Outputs: Size<Frame<f32, U128>>,
++{
++    /// Create new oversampler with linear phase filters. 2x oversamples enclosed node.
++    pub fn linear(sample_rate: f64, node: X) -> Self {
++        Self::with_phase(sample_rate, node)
++    }
++}
++
++impl<X, P> Oversampler<X, P>
++where
++    X: AudioNode,
++    X::Inputs: Size<f32>,
++    X::Outputs: Size<f32>,
++    X::Inputs: Size<Frame<f32, U128>>,
++    X::Outputs: Size<Frame<f32, U128>>,
++    P: OversamplingPhase,
++{
++    fn with_phase(sample_rate: f64, mut node: X) -> Self {
+         let inner_sr = sample_rate * 2.0;
+         node.set_sample_rate(inner_sr);
+-        let hash = node.ping(true, AttoHash::new(Self::ID));
++        let hash = node.ping(true, AttoHash::new(P::ID));
+         node.ping(false, hash);
+         Self {
+             x: node,
+@@ -97,6 +269,8 @@ where
+             outv: Frame::default(),
+             input_rb_index: 0,
+             output_rb_index: 0,
++            sample_rate,
++            _marker: PhantomData,
+         }
+     }
+ 
+@@ -111,15 +285,16 @@ where
+     }
+ }
+ 
+-impl<X> AudioNode for Oversampler<X>
++impl<X, P> AudioNode for Oversampler<X, P>
+ where
+     X: AudioNode,
+     X::Inputs: Size<f32>,
+     X::Outputs: Size<f32>,
+     X::Inputs: Size<Frame<f32, U128>>,
+     X::Outputs: Size<Frame<f32, U128>>,
++    P: OversamplingPhase,
+ {
+-    const ID: u64 = 51;
++    const ID: u64 = P::ID;
+     type Inputs = X::Inputs;
+     type Outputs = X::Outputs;
+ 
+@@ -127,9 +302,12 @@ where
+         self.x.reset();
+         self.inv = Frame::default();
+         self.outv = Frame::default();
++        self.input_rb_index = 0;
++        self.output_rb_index = 0;
+     }
+ 
+     fn set_sample_rate(&mut self, sample_rate: f64) {
++        self.sample_rate = sample_rate;
+         let inner_sr = sample_rate * 2.0;
+         self.x.set_sample_rate(inner_sr);
+     }
+@@ -143,7 +321,7 @@ where
+         for channel in 0..Self::Inputs::USIZE {
+             self.inv[channel][self.input_rb_index] = input[channel];
+ 
+-            let (even, odd) = interpolating_filter(&self.inv[channel], self.input_rb_index);
++            let (even, odd) = P::interpolate(&self.inv[channel], self.input_rb_index);
+             over_input[channel] = even;
+             over_input2[channel] = odd;
+         }
+@@ -162,57 +340,65 @@ where
+         }
+ 
+         let output: Frame<f32, Self::Outputs> =
+-            Frame::generate(|channel| decimating_filter(&self.outv[channel], self.output_rb_index));
++            Frame::generate(|channel| P::decimate(&self.outv[channel], self.output_rb_index));
+ 
+         self.output_rb_index = (self.output_rb_index + 1) & 0x7f;
+ 
+         output
+     }
+ 
+-    #[inline]
+     fn process(&mut self, size: usize, input: &BufferRef, output: &mut BufferMut) {
+         let mut inner_input: BufferArray<Self::Inputs> = BufferArray::new();
+         let mut inner_output: BufferArray<Self::Outputs> = BufferArray::new();
+ 
+-        for offset in [0, size / 2] {
+-            // interpolate into input buffer (half of input)
+-            for i in 0..size / 2 {
++        let mut offset = 0;
++        while offset < size {
++            let length = min(size - offset, MAX_BUFFER_SIZE / 2);
++
++            // interpolate into input buffer
++            for i in 0..length {
+                 for channel in 0..Self::Inputs::USIZE {
+-                    self.inv[channel][self.input_rb_index] = input.at_f32(channel, i + offset);
++                    self.inv[channel][self.input_rb_index] = input.at_f32(channel, offset + i);
+ 
+-                    let (even, odd) = interpolating_filter(&self.inv[channel], self.input_rb_index);
++                    let (even, odd) = P::interpolate(&self.inv[channel], self.input_rb_index);
+                     inner_input.set_f32(channel, i * 2, even);
+                     inner_input.set_f32(channel, i * 2 + 1, odd);
+                 }
+-
+                 self.input_rb_index = (self.input_rb_index + 1) & 0x7f;
+             }
+ 
+-            // process
+             self.x.process(
+-                size,
+-                &(inner_input.buffer_ref()),
++                length * 2,
++                &inner_input.buffer_ref(),
+                 &mut inner_output.buffer_mut(),
+             );
+ 
+-            // decimate into output buffer (half of output)
+-            for i in 0..size / 2 {
+-                for channel in 0..Self::Inputs::USIZE {
++            // decimate into output buffer
++            for i in 0..length {
++                let next_output_index = (self.output_rb_index + 1) & 0x7f;
++                for channel in 0..Self::Outputs::USIZE {
+                     self.outv[channel][self.output_rb_index] = inner_output.at_f32(channel, i * 2);
+-                    let next_output_index = (self.output_rb_index + 1) & 0x7f;
+                     self.outv[channel][next_output_index] = inner_output.at_f32(channel, i * 2 + 1);
+-
+-                    let output_sample = decimating_filter(&self.outv[channel], next_output_index);
+-                    output.set_f32(channel, i + offset, output_sample);
++                    let output_sample = P::decimate(&self.outv[channel], next_output_index);
++                    output.set_f32(channel, offset + i, output_sample);
+                 }
+-
+                 self.output_rb_index = (self.output_rb_index + 2) & 0x7f;
+             }
++
++            offset += length;
+         }
+     }
+ 
++    fn set(&mut self, setting: Setting) {
++        self.x.set(setting);
++    }
++
+     fn route(&mut self, input: &SignalFrame, frequency: f64) -> SignalFrame {
+-        self.x.route(input, frequency)
++        let outputs = self.outputs();
++        let x = &mut self.x;
++        route_oversampled::<P>(self.sample_rate, input, frequency, outputs, |input| {
++            x.route(input, frequency)
++        })
+     }
+ 
+     fn ping(&mut self, probe: bool, hash: AttoHash) -> AttoHash {
+@@ -242,12 +428,227 @@ where
+     }
+ }
+ 
++/// Oversampler for an `AudioUnit`. The enclosed unit runs at
++/// 2, 4, 8 or 16 times the sample rate.
++/// Oversampling by 2^k is done like k nested 2x oversamplers.
++#[derive(Clone)]
++pub struct OversampleUnit {
++    unit: Box<dyn AudioUnit>,
++    linear: bool,
++    inputs: usize,
++    outputs: usize,
++    sample_rate: f64,
++    inv: Vec<[f32; 0x80]>,
++    outv: Vec<[f32; 0x80]>,
++    input_index: usize,
++    output_index: usize,
++    tick_input: Vec<f32>,
++    tick_output: Vec<f32>,
++    inner_input: BufferVec,
++    inner_output: BufferVec,
++}
++
++impl OversampleUnit {
++    /// Oversample `unit` by `factor` (2, 4, 8 or 16) using minimum phase filters.
++    pub fn new(factor: usize, unit: Box<dyn AudioUnit>) -> Self {
++        Self::build(factor, false, unit)
++    }
++
++    /// Oversample `unit` by `factor` (2, 4, 8 or 16) using linear phase filters.
++    pub fn linear(factor: usize, unit: Box<dyn AudioUnit>) -> Self {
++        Self::build(factor, true, unit)
++    }
++
++    fn build(factor: usize, linear: bool, unit: Box<dyn AudioUnit>) -> Self {
++        assert!(
++            (2..=16).contains(&factor) && factor.is_power_of_two(),
++            "OversampleUnit: factor must be 2, 4, 8 or 16"
++        );
++        let mut unit: Box<dyn AudioUnit> = if factor > 2 {
++            Box::new(Self::build(factor / 2, linear, unit))
++        } else {
++            unit
++        };
++        unit.set_sample_rate(DEFAULT_SR * 2.0);
++        let id = if linear {
++            LinearPhase::ID
++        } else {
++            MinimumPhase::ID
++        };
++        let hash = unit.ping(true, AttoHash::new(id));
++        unit.ping(false, hash);
++        let inputs = unit.inputs();
++        let outputs = unit.outputs();
++        Self {
++            unit,
++            linear,
++            inputs,
++            outputs,
++            sample_rate: DEFAULT_SR,
++            inv: vec![[0.0; 0x80]; inputs],
++            outv: vec![[0.0; 0x80]; outputs],
++            input_index: 0,
++            output_index: 0,
++            tick_input: vec![0.0; inputs * 2],
++            tick_output: vec![0.0; outputs],
++            inner_input: BufferVec::new(inputs),
++            inner_output: BufferVec::new(outputs),
++        }
++    }
++
++    #[inline]
++    fn interpolate(&self, channel: usize) -> (f32, f32) {
++        if self.linear {
++            LinearPhase::interpolate(&self.inv[channel], self.input_index)
++        } else {
++            MinimumPhase::interpolate(&self.inv[channel], self.input_index)
++        }
++    }
++
++    #[inline]
++    fn decimate(&self, channel: usize, index: usize) -> f32 {
++        if self.linear {
++            LinearPhase::decimate(&self.outv[channel], index)
++        } else {
++            MinimumPhase::decimate(&self.outv[channel], index)
++        }
++    }
++}
++
++impl AudioUnit for OversampleUnit {
++    fn reset(&mut self) {
++        self.unit.reset();
++        self.inv.fill([0.0; 0x80]);
++        self.outv.fill([0.0; 0x80]);
++        self.input_index = 0;
++        self.output_index = 0;
++    }
++
++    fn set_sample_rate(&mut self, sample_rate: f64) {
++        self.sample_rate = sample_rate;
++        self.unit.set_sample_rate(sample_rate * 2.0);
++    }
++
++    fn tick(&mut self, input: &[f32], output: &mut [f32]) {
++        for channel in 0..self.inputs {
++            self.inv[channel][self.input_index] = input[channel];
++            let (even, odd) = self.interpolate(channel);
++            self.tick_input[channel] = even;
++            self.tick_input[self.inputs + channel] = odd;
++        }
++        self.input_index = (self.input_index + 1) & 0x7f;
++
++        let (even, odd) = self.tick_input.split_at(self.inputs);
++        self.unit.tick(even, &mut self.tick_output);
++        for channel in 0..self.outputs {
++            self.outv[channel][self.output_index] = self.tick_output[channel];
++        }
++        self.output_index = (self.output_index + 1) & 0x7f;
++
++        self.unit.tick(odd, &mut self.tick_output);
++        for channel in 0..self.outputs {
++            self.outv[channel][self.output_index] = self.tick_output[channel];
++            output[channel] = self.decimate(channel, self.output_index);
++        }
++        self.output_index = (self.output_index + 1) & 0x7f;
++    }
++
++    fn process(&mut self, size: usize, input: &BufferRef, output: &mut BufferMut) {
++        let mut offset = 0;
++        while offset < size {
++            let length = min(size - offset, MAX_BUFFER_SIZE / 2);
++
++            for i in 0..length {
++                for channel in 0..self.inputs {
++                    self.inv[channel][self.input_index] = input.at_f32(channel, offset + i);
++                    let (even, odd) = self.interpolate(channel);
++                    self.inner_input.set_f32(channel, i * 2, even);
++                    self.inner_input.set_f32(channel, i * 2 + 1, odd);
++                }
++                self.input_index = (self.input_index + 1) & 0x7f;
++            }
++
++            self.unit.process(
++                length * 2,
++                &self.inner_input.buffer_ref(),
++                &mut self.inner_output.buffer_mut(),
++            );
++
++            for i in 0..length {
++                let next_index = (self.output_index + 1) & 0x7f;
++                for channel in 0..self.outputs {
++                    self.outv[channel][self.output_index] =
++                        self.inner_output.at_f32(channel, i * 2);
++                    self.outv[channel][next_index] = self.inner_output.at_f32(channel, i * 2 + 1);
++                    output.set_f32(channel, offset + i, self.decimate(channel, next_index));
++                }
++                self.output_index = (self.output_index + 2) & 0x7f;
++            }
++
++            offset += length;
++        }
++    }
++
++    fn set(&mut self, setting: Setting) {
++        self.unit.set(setting);
++    }
++
++    fn inputs(&self) -> usize {
++        self.inputs
++    }
++
++    fn outputs(&self) -> usize {
++        self.outputs
++    }
++
++    fn route(&mut self, input: &SignalFrame, frequency: f64) -> SignalFrame {
++        let unit = &mut self.unit;
++        if self.linear {
++            route_oversampled::<LinearPhase>(
++                self.sample_rate,
++                input,
++                frequency,
++                self.outputs,
++                |input| unit.route(input, frequency),
++            )
++        } else {
++            route_oversampled::<MinimumPhase>(
++                self.sample_rate,
++                input,
++                frequency,
++                self.outputs,
++                |input| unit.route(input, frequency),
++            )
++        }
++    }
++
++    fn get_id(&self) -> u64 {
++        if self.linear {
++            LinearPhase::ID
++        } else {
++            MinimumPhase::ID
++        }
++    }
++
++    fn ping(&mut self, probe: bool, hash: AttoHash) -> AttoHash {
++        self.unit.ping(probe, hash.hash(self.get_id()))
++    }
++
++    fn footprint(&self) -> usize {
++        core::mem::size_of::<Self>()
++    }
++
++    fn allocate(&mut self) {
++        self.unit.allocate();
++    }
++}
++
+ // Coefficients from https://fiiir.com/, a linear phase Kaiser windowed filter with
+ // normalized frequency cutoff 0.22, transition band 0.06 and 80 dB stopband attenuation.
+ // Gain is -1.5 dB at 0.21 (18522 Hz @ 88.2 kHz) and -79 dB at 0.25.
+-const _HALFBAND_LINEAR_LEN: usize = 85;
++const HALFBAND_LINEAR_LEN: usize = 85;
+ #[allow(clippy::excessive_precision)]
+-const _HALFBAND_LINEAR: [f32; _HALFBAND_LINEAR_LEN] = [
++const HALFBAND_LINEAR: [f32; HALFBAND_LINEAR_LEN] = [
+     0.000020220200441046,
+     0.000004861974285292,
+     -0.000061492255405391,
+diff --git a/src/prelude.rs b/src/prelude.rs
+index 9d9e58b..4c0a2e1 100644
+--- a/src/prelude.rs
++++ b/src/prelude.rs
+@@ -1004,6 +1004,26 @@ where
+     An(Oversampler::new(DEFAULT_SR, node.0))
+ }
+ 
++/// 2x oversample enclosed `node` using linear phase filters.
++/// The delay of the filters is reported as latency.
++/// - Inputs and outputs: from `node`.
++///
++/// ### Example: Oversampled Distortion
++/// ```
++/// use fundsp::prelude::*;
++/// oversample_linear(saw_hz(220.0) >> shape(Tanh(4.0)));
++/// ```
++pub fn oversample_linear<X>(node: An<X>) -> An<Oversampler<X, LinearPhase>>
++where
++    X: AudioNode,
++    X::Inputs: Size<f32>,
++    X::Outputs: Size<f32>,
++    X::Inputs: Size<Frame<f32, U128>>,
++    X::Outputs: Size<Frame<f32, U128>>,
++{
++    An(Oversampler::linear(DEFAULT_SR, node.0))
++}
++
+ /// Resample enclosed generator `node` using FIR based sinc interpolation.
+ /// It supports these input and output sample rates:
+ /// 16 kHz, 22.05 kHz, 32 kHz, 44.1 kHz, 48 kHz, 88.2 kHz, 96 kHz, 176.4 kHz, 192 kHz, 384 kHz.
+diff --git a/src/prelude32.rs b/src/prelude32.rs
+index 444546d..7c52455 100644
+--- a/src/prelude32.rs
++++ b/src/prelude32.rs
+@@ -991,6 +991,26 @@ where
+     An(Oversampler::new(DEFAULT_SR, node.0))
+ }
+ 
++/// 2x oversample enclosed `node` using linear phase filters.
++/// The delay of the filters is reported as latency.
++/// - Inputs and outputs: from `node`.
++///
++/// ### Example: Oversampled Distortion
++/// ```
++/// use fundsp::prelude32::*;
++/// oversample_linear(saw_hz(220.0) >> shape(Tanh(4.0)));
++/// ```
++pub fn oversample_linear<X>(node: An<X>) -> An<Oversampler<X, LinearPhase>>
++where
++    X: AudioNode,
++    X::Inputs: Size<f32>,
++    X::Outputs: Size<f32>,
++    X::Inputs: Size<Frame<f32, U128>>,
++    X::Outputs: Size<Frame<f32, U128>>,
++{
++    An(Oversampler::linear(DEFAULT_SR, node.0))
++}
++
+ /// Resample enclosed generator `node` using FIR based sinc interpolation.
+ /// It supports these input and output sample rates:
+ /// 16 kHz, 22.05 kHz, 32 kHz, 44.1 kHz, 48 kHz, 88.2 kHz, 96 kHz, 176.4 kHz, 192 kHz, 384 kHz.
+diff --git a/src/prelude64.rs b/src/prelude64.rs
+index 086c5c6..fd88e07 100644
+--- a/src/prelude64.rs
++++ b/src/prelude64.rs
+@@ -991,6 +991,26 @@ where
+     An(Oversampler::new(DEFAULT_SR, node.0))
+ }
+ 
++/// 2x oversample enclosed `node` using linear phase filters.
++/// The delay of the filters is reported as latency.
++/// - Inputs and outputs: from `node`.
++///
++/// ### Example: Oversampled Distortion
++/// ```
++/// use fundsp::prelude64::*;
++/// oversample_linear(saw_hz(220.0) >> shape(Tanh(4.0)));
++/// ```
++pub fn oversample_linear<X>(node: An<X>) -> An<Oversampler<X, LinearPhase>>
++where
++    X: AudioNode,
++    X::Inputs: Size<f32>,
++    X::Outputs: Size<f32>,
++    X::Inputs: Size<Frame<f32, U128>>,
++    X::Outputs: Size<Frame<f32, U128>>,
++{
++    An(Oversampler::linear(DEFAULT_SR, node.0))
++}
++
+ /// Resample enclosed generator `node` using FIR based sinc interpolation.
+ /// It supports these input and output sample rates:
+ /// 16 kHz, 22.05 kHz, 32 kHz, 44.1 kHz, 48 kHz, 88.2 kHz, 96 kHz, 176.4 kHz, 192 kHz, 384 kHz.

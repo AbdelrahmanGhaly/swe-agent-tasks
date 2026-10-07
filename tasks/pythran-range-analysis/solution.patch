@@ -1,0 +1,1082 @@
+diff --git a/pythran/analyses/range_values.py b/pythran/analyses/range_values.py
+index 8be9af633..641060c90 100644
+--- a/pythran/analyses/range_values.py
++++ b/pythran/analyses/range_values.py
+@@ -29,6 +29,73 @@ def combine(op, node0, node1):
+         return UNKNOWN_RANGE
+ 
+ 
++def without_zero(range_):
++    """ Drop zero from a range, or None when nothing else is left. """
++    if range_.low == 0 == range_.high:
++        return None
++    if range_.low == 0:
++        return Interval(1, range_.high)
++    if range_.high == 0:
++        return Interval(range_.low, -1)
++    return range_
++
++
++def holds_zero(range_):
++    """ Whether zero lies between the bounds of a range. """
++    return range_.low <= 0 <= range_.high
++
++
++def reaches_other(range_):
++    """ Whether a range holds anything besides zero. """
++    return not (range_.low == 0 == range_.high)
++
++
++def negation_of(range_):
++    """
++    The truth value `not' gives an operand, as narrow as the operand settles.
++
++    It is one exactly where the operand holds zero and nought exactly where
++    the operand holds something else, so an operand settled either way leaves
++    a single value rather than the pair.
++    """
++    return Interval(0 if reaches_other(range_) else 1,
++                    1 if holds_zero(range_) else 0)
++
++
++def bool_state(range_):
++    """ A range, whether it can be zero, and whether it can be else. """
++    return range_, holds_zero(range_), reaches_other(range_)
++
++
++def combine_bool(op, left, right):
++    """
++    Fold one step of a boolean chain, which yields one of its operands.
++
++    `or` gives its left operand unless that one is zero, `and` gives zero
++    when its left operand is zero and its right operand otherwise. Only the
++    left operand decides which of the two a step can reach, so the right side
++    arrives as a plain range and the step hands back one as well.
++    """
++    left_range, left_zero, left_other = left
++    parts = []
++    if isinstance(op, ast.Or):
++        if left_other:
++            parts.append(without_zero(left_range))
++        if left_zero:
++            parts.append(right)
++    else:
++        if left_zero:
++            parts.append(Interval(0, 0))
++        if left_other:
++            parts.append(right)
++    if not parts:
++        return UNKNOWN_RANGE
++    res = parts[0]
++    for part in parts[1:]:
++        res = res.union(part)
++    return res
++
++
+ def negate(node):
+     if isinstance(node, ast.Name):
+         # Not type info, could be anything :(
+@@ -94,6 +161,46 @@ def negate(node):
+     raise UnsupportedExpression()
+ 
+ 
++def narrow(mapping, node, target, modified):
++    """
++    Bound the identifiers `node' reaches through the sums, the differences and
++    the minus signs it applies to them, by undoing those steps on `target'.
++
++    `mapping' and `modified' are updated in place, and a bound that leaves an
++    identifier nothing to take is dropped rather than recorded.
++    """
++    if isinstance(node, ast.Name):
++        current = mapping[node.id]
++        low = max(current.low, target.low)
++        high = min(current.high, target.high)
++        if low <= high:
++            mapping[node.id] = Interval(low, high)
++            modified.add(node.id)
++        return
++
++    if isinstance(node, ast.UnaryOp):
++        if isinstance(node.op, ast.USub):
++            narrow(mapping, node.operand,
++                   Interval(-target.high, -target.low), modified)
++        elif isinstance(node.op, ast.UAdd):
++            narrow(mapping, node.operand, target, modified)
++        return
++
++    if not isinstance(node, ast.BinOp):
++        return
++
++    left, right = mapping[node.left], mapping[node.right]
++    if not isinstance(left, Interval) or not isinstance(right, Interval):
++        return
++
++    if isinstance(node.op, ast.Add):
++        narrow(mapping, node.left, target - right, modified)
++        narrow(mapping, node.right, target - left, modified)
++    elif isinstance(node.op, ast.Sub):
++        narrow(mapping, node.left, target + right, modified)
++        narrow(mapping, node.right, left - target, modified)
++
++
+ def bound_range(mapping, aliases, node, modified=None):
+     """
+     Bound the identifier in `mapping' with the expression in `node'.
+@@ -198,10 +305,16 @@ def bound_range(mapping, aliases, node, modified=None):
+                         else:
+                             l_i = l_i.union(alias.return_range(right))
+ 
+-            if l_i is not None and isinstance(left, ast.Name):
+-                mapping[left.id] = l_i
+-            if r_i is not None and isinstance(right, ast.Name):
+-                mapping[right.id] = r_i
++            if l_i is not None:
++                if isinstance(left, ast.Name):
++                    mapping[left.id] = l_i
++                else:
++                    narrow(mapping, left, l_i, modified)
++            if r_i is not None:
++                if isinstance(right, ast.Name):
++                    mapping[right.id] = r_i
++                else:
++                    narrow(mapping, right, r_i, modified)
+ 
+             left = right
+ 
+@@ -246,9 +359,7 @@ class RangeValuesBase(ModuleAnalysis[Aliases, CFG, UseOMP]):
+                 self.result[k] = w.widen(v)
+ 
+     def visit_BoolOp(self, node):
+-        """ Merge right and left operands ranges.
+-
+-        TODO : We could exclude some operand with this range information...
++        """ Report the operand a boolean operator actually yields.
+ 
+         >>> import gast as ast
+         >>> from pythran import passmanager, backend
+@@ -256,14 +367,27 @@ class RangeValuesBase(ModuleAnalysis[Aliases, CFG, UseOMP]):
+         ... def foo():
+         ...     a = 2
+         ...     c = 3
+-        ...     d = a or c''')
++        ...     d = a or c
++        ...     e = a and c
++        ...     f = (a - 2) or c''')
+         >>> pm = passmanager.PassManager("test")
+         >>> res = pm.gather(RangeValues, node)
+         >>> res['d']
+-        Interval(low=2, high=3)
++        Interval(low=2, high=2)
++        >>> res['e']
++        Interval(low=3, high=3)
++        >>> res['f']
++        Interval(low=3, high=3)
+         """
+-        res = list(zip(*[self.visit(elt).bounds() for elt in node.values]))
+-        return self.add(node, Interval(min(res[0]), max(res[1])))
++        return self.add(node, self.fold_bool(node)[0])
++
++    def fold_bool(self, node):
++        """ Walk a boolean chain left to right, one operand at a time. """
++        state = bool_state(self.visit(node.values[0]))
++        for value in node.values[1:]:
++            state = bool_state(combine_bool(node.op, state,
++                                            self.visit(value)))
++        return state
+ 
+     def visit_BinOp(self, node):
+         """ Combine operands ranges for given operator.
+@@ -304,15 +428,14 @@ class RangeValuesBase(ModuleAnalysis[Aliases, CFG, UseOMP]):
+         >>> res['d']
+         Interval(low=-3, high=-3)
+         >>> res['e']
+-        Interval(low=0, high=1)
++        Interval(low=0, high=0)
+         """
+         res = self.visit(node.operand)
+         if isinstance(node.op, ast.Not):
+-            res = Interval(0, 1)
+-        elif(isinstance(node.op, ast.Invert) and
+-             isinstance(res.high, int) and
+-             isinstance(res.low, int)):
+-            res = Interval(~res.high, ~res.low)
++            res = negation_of(res) if isinstance(res, Interval) \
++                else Interval(0, 1)
++        elif isinstance(node.op, ast.Invert) and isinstance(res, Interval):
++            res = ~res
+         elif isinstance(node.op, ast.UAdd):
+             pass
+         elif isinstance(node.op, ast.USub):
+@@ -334,7 +457,7 @@ class RangeValuesBase(ModuleAnalysis[Aliases, CFG, UseOMP]):
+         >>> pm = passmanager.PassManager("test")
+         >>> res = pm.gather(RangeValues, node)
+         >>> res['c']
+-        Interval(low=2, high=5)
++        Interval(low=2, high=4)
+         """
+         self.visit(node.test)
+         body_res = self.visit(node.body)
+@@ -360,7 +483,11 @@ class RangeValuesBase(ModuleAnalysis[Aliases, CFG, UseOMP]):
+         >>> res['d']
+         Interval(low=0, high=0)
+         >>> res['e']
+-        Interval(low=0, high=1)
++        Interval(low=1, high=1)
++        >>> node = ast.parse("def foo(): f = 1 < 2 < 2")
++        >>> res = pm.gather(RangeValues, node)
++        >>> res['f']
++        Interval(low=0, high=0)
+         """
+         if any(isinstance(op, (ast.In, ast.NotIn, ast.Is, ast.IsNot))
+                for op in node.ops):
+@@ -378,6 +505,7 @@ class RangeValuesBase(ModuleAnalysis[Aliases, CFG, UseOMP]):
+             ast.fix_missing_locations(fake)
+             expr = compile(ast.gast_to_ast(fake), '<range_values>', 'eval')
+             res.append(eval(expr, {'x': curr, 'y': comparator}))
++            curr = comparator
+         if all(res):
+             return self.add(node, Interval(1, 1))
+         elif any(r.low == r.high == 0 for r in res):
+diff --git a/pythran/interval.py b/pythran/interval.py
+index b8ef42e69..6fe45b6d2 100644
+--- a/pythran/interval.py
++++ b/pythran/interval.py
+@@ -1,9 +1,328 @@
+ """ Module with facilities to represent range values. """
+ 
+-from math import isinf, isnan
++from math import isinf as _float_isinf, isnan as _float_isnan
+ import itertools
+ 
+-import numpy
++
++def isinf(bound):
++    """
++    Whether a bound is one of the two infinities.
++
++    An integer bound is never one, however wide it is, and asking `math' about
++    a wide one raises rather than answering, so the type is checked first.
++    """
++    return isinstance(bound, float) and _float_isinf(bound)
++
++
++def isnan(bound):
++    """ Whether a bound is not a number, settled on the type first. """
++    return isinstance(bound, float) and _float_isnan(bound)
++
++
++def _bit_window(*bounds):
++    """ Two's complement width wide enough for every finite bound. """
++    width = 4
++    for bound in bounds:
++        if isinf(bound):
++            continue
++        width = max(width, int(bound).bit_length() + 1)
++    return width + 2
++
++
++def _min_or(a, b, c, d, mask):
++    """ Smallest `x | y` for x in [a, b] and y in [c, d], all unsigned. """
++    m = mask
++    while m:
++        if ~a & c & m:
++            temp = (a | m) & -m
++            if temp <= b:
++                a = temp
++                break
++        elif a & ~c & m:
++            temp = (c | m) & -m
++            if temp <= d:
++                c = temp
++                break
++        m >>= 1
++    return a | c
++
++
++def _max_or(a, b, c, d, mask):
++    """ Largest `x | y` for x in [a, b] and y in [c, d], all unsigned. """
++    m = mask
++    while m:
++        if b & d & m:
++            temp = (b - m) | (m - 1)
++            if temp >= a:
++                b = temp
++                break
++            temp = (d - m) | (m - 1)
++            if temp >= c:
++                d = temp
++                break
++        m >>= 1
++    return b | d
++
++
++def _min_and(a, b, c, d, mask):
++    """ Smallest `x & y` for x in [a, b] and y in [c, d], all unsigned. """
++    m = mask
++    while m:
++        if ~a & ~c & m:
++            temp = (a | m) & -m
++            if temp <= b:
++                a = temp
++                break
++            temp = (c | m) & -m
++            if temp <= d:
++                c = temp
++                break
++        m >>= 1
++    return a & c
++
++
++def _max_and(a, b, c, d, mask):
++    """ Largest `x & y` for x in [a, b] and y in [c, d], all unsigned. """
++    m = mask
++    while m:
++        if b & ~d & m:
++            temp = (b & ~m) | (m - 1)
++            if temp >= a:
++                b = temp
++                break
++        elif ~b & d & m:
++            temp = (d & ~m) | (m - 1)
++            if temp >= c:
++                d = temp
++                break
++        m >>= 1
++    return b & d
++
++
++def _min_xor(a, b, c, d, mask):
++    """ Smallest `x ^ y` for x in [a, b] and y in [c, d], all unsigned. """
++    m = mask
++    while m:
++        if ~a & c & m:
++            temp = (a | m) & -m
++            if temp <= b:
++                a = temp
++        elif a & ~c & m:
++            temp = (c | m) & -m
++            if temp <= d:
++                c = temp
++        m >>= 1
++    return a ^ c
++
++
++def _max_xor(a, b, c, d, mask):
++    """ Largest `x ^ y` for x in [a, b] and y in [c, d], all unsigned. """
++    m = mask
++    while m:
++        if b & d & m:
++            temp = (b - m) | (m - 1)
++            if temp >= a:
++                b = temp
++            else:
++                temp = (d - m) | (m - 1)
++                if temp >= c:
++                    d = temp
++        m >>= 1
++    return b ^ d
++
++
++BITWISE_BOUNDS = {'bitand': (_min_and, _max_and),
++                  'bitor': (_min_or, _max_or),
++                  'bitxor': (_min_xor, _max_xor)}
++
++
++def _sign_windows(interval, top, modulus):
++    """ Same-sign unsigned windows, each flagged negative and open ended. """
++    opens_low, opens_high = isinf(interval.low), isinf(interval.high)
++    low = -top if opens_low else max(int(interval.low), -top)
++    high = top - 1 if opens_high else min(int(interval.high), top - 1)
++    if low > high:
++        return []
++    windows = []
++    if low < 0:
++        windows.append((low + modulus, min(high, -1) + modulus,
++                        True, opens_low))
++    if high >= 0:
++        windows.append((max(low, 0), high, False, opens_high))
++    return windows
++
++
++def _bitwise_open(kind, left_neg, left_open, right_neg, right_open):
++    """
++    Whether one sign quadrant reaches past every finite bound.
++
++    A negative operand carries endless leading one bits, so an operand open
++    away from zero is what lets a result run away, and which side it runs to
++    follows from the sign the operation gives that quadrant.
++    """
++    if kind == 'bitand':
++        if left_neg and right_neg:
++            return left_open or right_open, False
++        if left_neg:
++            return False, right_open
++        if right_neg:
++            return False, left_open
++        return False, left_open and right_open
++    if kind == 'bitor':
++        if left_neg and right_neg:
++            return left_open and right_open, False
++        if left_neg:
++            return left_open, False
++        if right_neg:
++            return right_open, False
++        return False, left_open or right_open
++    if left_neg == right_neg:
++        return False, left_open or right_open
++    return left_open or right_open, False
++
++
++def _bitwise(left, right, kind):
++    """ Hull of a bitwise operation over unbounded two's complement. """
++    width = _bit_window(left.low, left.high, right.low, right.high)
++    top = 1 << (width - 1)
++    modulus = 1 << width
++    lefts = _sign_windows(left, top, modulus)
++    rights = _sign_windows(right, top, modulus)
++    if not lefts or not rights:
++        return UNKNOWN_RANGE
++    smallest, largest = BITWISE_BOUNDS[kind]
++    lows, highs = [], []
++    for a, b, left_neg, left_open in lefts:
++        for c, d, right_neg, right_open in rights:
++            opens_low, opens_high = _bitwise_open(kind, left_neg, left_open,
++                                                  right_neg, right_open)
++            if opens_low:
++                lows.append(-float("inf"))
++            else:
++                bound = smallest(a, b, c, d, top)
++                lows.append(bound - modulus if bound >= top else bound)
++            if opens_high:
++                highs.append(float("inf"))
++            else:
++                bound = largest(a, b, c, d, top)
++                highs.append(bound - modulus if bound >= top else bound)
++    return Interval(min(lows), max(highs))
++
++
++def _mod_side(dividend, low, high):
++    """
++    Remainders left by the divisors of one sign.
++
++    A divisor outgrowing every dividend in magnitude leaves a dividend of its
++    own sign alone and shifts one of the other sign by itself, which settles
++    that case outright. Everywhere else a remainder only has to be smaller
++    than its divisor in magnitude and to carry its sign, and a dividend of
++    that sign caps the window on its own side.
++    """
++    first, last = dividend.low, dividend.high
++    positive = high >= 1
++    closest = low if positive else high
++    if max(abs(first), abs(last)) < abs(closest):
++        parts = []
++        if positive:
++            if last >= 0:
++                parts.append(Interval(max(first, 0), last))
++            if first < 0:
++                parts.append(Interval(first + low, min(last, -1) + high))
++        else:
++            if first <= 0:
++                parts.append(Interval(first, min(last, 0)))
++            if last > 0:
++                parts.append(Interval(max(first, 1) + low, last + high))
++        res = parts[0]
++        for part in parts[1:]:
++            res = res.union(part)
++        return res
++
++    if positive:
++        top = float("inf") if isinf(high) else high - 1
++        if first >= 0:
++            top = min(top, last)
++        return Interval(0, top)
++
++    bottom = -float("inf") if isinf(low) else low + 1
++    if last <= 0:
++        bottom = max(bottom, first)
++    return Interval(bottom, 0)
++
++
++def _mul_bound(v1, v2):
++    """ Product of two bounds, a zero bound winning over an infinite one. """
++    if v1 == 0 or v2 == 0:
++        return 0
++    if isinf(v1) or isinf(v2):
++        return float("inf") if (v1 > 0) == (v2 > 0) else -float("inf")
++    return v1 * v2
++
++
++def _floordiv_bound(v1, v2):
++    """ Floor division of two bounds, either of them possibly infinite. """
++    if isinf(v1):
++        return v1 if v2 > 0 else -v1
++    if isinf(v2):
++        if v2 > 0:
++            return 0 if v1 >= 0 else -1
++        return 0 if v1 <= 0 else -1
++    return v1 // v2
++
++
++def _lshift_bound(v1, v2):
++    """ Left shift of two bounds, either of them possibly infinite. """
++    if isinf(v1):
++        return v1
++    if isinf(v2):
++        if v1 > 0:
++            return float("inf")
++        if v1 < 0:
++            return -float("inf")
++        return 0
++    return v1 << v2
++
++
++def _rshift_bound(v1, v2):
++    """ Right shift of two bounds, either of them possibly infinite. """
++    if isinf(v1):
++        return v1
++    if isinf(v2):
++        return 0 if v1 >= 0 else -1
++    return v1 >> v2
++
++
++def _pow_bound(v1, v2):
++    """ Power of two bounds, for a finite non negative exponent. """
++    if v2 == 0:
++        return 1
++    if isinf(v1):
++        return float("inf") if v1 > 0 or v2 % 2 == 0 else -float("inf")
++    return v1 ** v2
++
++
++def _exponents(low, high):
++    """ Exponents of both parities that reach the ends of [low, high]. """
++    candidates = {low, high}
++    for parity in (0, 1):
++        for bound in (low + (parity - low) % 2, high - (high - parity) % 2):
++            if low <= bound <= high:
++                candidates.add(bound)
++    return candidates
++
++
++def _unbounded_pow(base, low):
++    """ Values a power reaches when its exponent grows without bound. """
++    if base == float("inf"):
++        return [_pow_bound(base, low), float("inf")]
++    if isinf(base) or base < -1:
++        return [-float("inf"), float("inf")]
++    if base == -1:
++        return [-1, 1]
++    if base in (0, 1):
++        return [_pow_bound(base, low), base]
++    return [_pow_bound(base, low), float("inf")]
+ 
+ 
+ class Interval(object):
+@@ -72,13 +391,7 @@ class Interval(object):
+         Interval(low=3, high=40)
+         """
+ 
+-        def all_bounds():
+-            return itertools.chain(self.bounds(), other.bounds())
+-
+-        if any(map(isinf, all_bounds())) and any(x == 0 for x in all_bounds()):
+-            return UNKNOWN_RANGE
+-
+-        res = [v1 * v2 for v1, v2 in
++        res = [_mul_bound(v1, v2) for v1, v2 in
+                itertools.product(self.bounds(), other.bounds())]
+         return Interval(min(res), max(res))
+ 
+@@ -86,30 +399,12 @@ class Interval(object):
+ 
+     def __div__(self, other):
+         """
+-        Combiner for Divide operation.
++        Combiner for Divide operation, whose result need not be integral.
+ 
+         >>> Interval(-1, 5) / Interval(3, 8)
+-        Interval(low=-1, high=1)
+-        >>> Interval(-1, 5) / Interval(-5, -4)
+-        Interval(low=-2, high=0)
+-        >>> Interval(-1, 5) / Interval(-5, 3)
+         Interval(low=-inf, high=inf)
+         """
+-
+-        if other.low <= 0 and other.high >= 0:
+-            return UNKNOWN_RANGE
+-        if other.low == 0:
+-            return UNKNOWN_RANGE
+-
+-        def all_bounds():
+-            return itertools.chain(self.bounds(), other.bounds())
+-
+-        if any(isinf(x) for x in all_bounds()):
+-            return UNKNOWN_RANGE
+-
+-        res = [v1 // v2 for v1, v2 in
+-               itertools.product(self.bounds(), other.bounds())]
+-        return Interval(min(res), max(res))
++        return UNKNOWN_RANGE
+ 
+     __truediv__ = __div__
+ 
+@@ -141,12 +436,10 @@ class Interval(object):
+         """
+         sl, sh, ol, oh = self.low, self.high, other.low, other.high
+ 
+-        if isinf(sl) and isinf(oh):
+-            return UNKNOWN_RANGE
+-        if isinf(sh) and isinf(ol):
+-            return UNKNOWN_RANGE
++        low = -float("inf") if isinf(sl) or isinf(oh) else sl - oh
++        high = float("inf") if isinf(sh) or isinf(ol) else sh - ol
+ 
+-        return Interval(sl - oh, sh - ol)
++        return Interval(low, high)
+ 
+     def __rshift__(range1, range2):
+         """
+@@ -161,50 +454,70 @@ class Interval(object):
+         >>> Interval(-30, 10) >> Interval(3, float('inf'))
+         Interval(low=-4, high=1)
+         """
+-        if range1.low <= 0:
+-            if isinf(range1.low):
+-                min_ = range1.low
+-            else:
+-                min_ = range1.low >> range2.low
+-        elif isinf(range2.high):
+-            min_ = 0
+-        else:
+-            min_ = range1.low >> range2.high
+-        if isinf(range1.high):
+-            max_ = range1.high
+-        elif isinf(range2.low):
+-            max_ = 0
+-        else:
+-            max_ = range1.high >> range2.low
+-        return Interval(min_, max_)
++        if range2.high < 0:
++            return UNKNOWN_RANGE
++        counts = (max(range2.low, 0), range2.high)
++        res = [_rshift_bound(v1, v2) for v1, v2 in
++               itertools.product(range1.bounds(), counts)]
++        return Interval(min(res), max(res))
+ 
+     def __mod__(range1, range2):
+-        """ Combiner for Modulo operation.
++        """ Combiner for Modulo operation, a remainder taking the divisor sign.
+ 
+         >>> Interval(-1, 5) % Interval(1, 13)
+-        Interval(low=0, high=5)
+-        >>> Interval(-21, 5) % Interval(1, 13)
+-        Interval(low=0, high=13)
++        Interval(low=0, high=12)
++        >>> Interval(-5, 5) % Interval(-13, -1)
++        Interval(low=-12, high=0)
++        >>> Interval(0, 3) % Interval(8, 10)
++        Interval(low=0, high=3)
++        >>> Interval(0, 9) % Interval(2, float("inf"))
++        Interval(low=0, high=9)
++        >>> Interval(-5, -1) % Interval(8, float("inf"))
++        Interval(low=3, high=inf)
+         """
+-        return Interval(0, min(range2.high,
+-                               max(abs(range1.high), abs(range1.low))))
++        windows = []
++        if range2.high >= 1:
++            windows.append(_mod_side(range1, max(range2.low, 1), range2.high))
++        if range2.low <= -1:
++            windows.append(_mod_side(range1, range2.low, min(range2.high, -1)))
++        if not windows:
++            return UNKNOWN_RANGE
++        res = windows[0]
++        for window in windows[1:]:
++            res = res.union(window)
++        return res
+ 
+     def __pow__(range1, range2):
+         """
+-        Combiner for Power operation.
++        Combiner for Power operation, over non negative exponents only.
+ 
+         >>> Interval(1, 5) ** Interval(-5, -4)
+-        Interval(low=1.0, high=1.0)
+-        >>> Interval(-1, 5) ** Interval(-5, 3)
+-        Interval(low=-1.0, high=125)
++        Interval(low=-inf, high=inf)
++        >>> Interval(0, 0) ** Interval(-1, 0)
++        Interval(low=1, high=1)
++        >>> Interval(-2, 3) ** Interval(2, 2)
++        Interval(low=0, high=9)
+         >>> Interval(1, 5) ** Interval(3, 8)
+         Interval(low=1, high=390625)
+         """
+-        res = [v1 ** v2 for v1, v2 in
+-               itertools.product(range1.bounds(), range2.bounds())]
+-        minres, maxres = min(res), max(res)
+-        return Interval(type(minres)(numpy.ceil(minres)),
+-                        type(maxres)(numpy.floor(maxres)))
++        res = []
++        if range2.low < 0 and not range1.low == 0 == range1.high:
++            res.extend([-float("inf"), float("inf")])
++        if range2.high >= 0:
++            bases = list(range1.bounds())
++            if range1.low <= 0 <= range1.high:
++                bases.append(0)
++            low = max(range2.low, 0)
++            if isinf(range2.high):
++                for base in bases:
++                    res.extend(_unbounded_pow(base, low))
++            else:
++                for base, exponent in itertools.product(
++                        bases, _exponents(int(low), int(range2.high))):
++                    res.append(_pow_bound(base, exponent))
++        if not res:
++            return UNKNOWN_RANGE
++        return Interval(min(res), max(res))
+ 
+     def __lshift__(range1, range2):
+         """
+@@ -217,13 +530,14 @@ class Interval(object):
+         >>> Interval(-float("inf"), 0) << Interval(3, 8)
+         Interval(low=-inf, high=0)
+         >>> Interval(-3, 1) << Interval(3, float('inf'))
+-        Interval(low=-24, high=inf)
++        Interval(low=-inf, high=inf)
+         """
+-        min_inf = isinf(range1.low) or isinf(range2.low)
+-        max_inf = isinf(range1.high) or isinf(range2.high)
+-        min_ = -float("inf") if min_inf else (range1.low << range2.low)
+-        max_ = float("inf") if max_inf else (range1.high << range2.high)
+-        return Interval(min_, max_)
++        if range2.high < 0:
++            return UNKNOWN_RANGE
++        counts = (max(range2.low, 0), range2.high)
++        res = [_lshift_bound(v1, v2) for v1, v2 in
++               itertools.product(range1.bounds(), counts)]
++        return Interval(min(res), max(res))
+ 
+     def __floordiv__(range1, range2):
+         """
+@@ -233,17 +547,68 @@ class Interval(object):
+         Interval(low=-1, high=1)
+         >>> Interval(-1, 5) // Interval(-5, -4)
+         Interval(low=-2, high=0)
+-        >>> Interval(-1, 5) // Interval(-5, 3)
+-        Interval(low=-inf, high=inf)
++        >>> Interval(-4, 4) // Interval(-4, 4)
++        Interval(low=-4, high=4)
+         """
+-        if range2.low <= 0 and range2.high >= 0:
++        divisors = []
++        if range2.high >= 1:
++            divisors.append((max(range2.low, 1), range2.high))
++        if range2.low <= -1:
++            divisors.append((range2.low, min(range2.high, -1)))
++        if not divisors:
+             return UNKNOWN_RANGE
+-        if range2.low == 0:
+-            return UNKNOWN_RANGE
+-        res = [v1 if isinf(v1) else (v1 // v2) for v1, v2 in
+-               itertools.product(range1.bounds(), range2.bounds())]
++        res = []
++        for window in divisors:
++            res.extend(_floordiv_bound(v1, v2) for v1, v2 in
++                       itertools.product(range1.bounds(), window))
+         return Interval(min(res), max(res))
+ 
++    def __bitand__(self, other):
++        """
++        Combiner for bitwise and operation.
++
++        >>> Interval(4, 5) & Interval(2, 3)
++        Interval(low=0, high=1)
++        >>> Interval(0, float("inf")) & Interval(0, 7)
++        Interval(low=0, high=7)
++        """
++        return _bitwise(self, other, 'bitand')
++
++    def __bitor__(self, other):
++        """
++        Combiner for bitwise or operation.
++
++        >>> Interval(4, 5) | Interval(2, 3)
++        Interval(low=6, high=7)
++        >>> Interval(-8, -1) | Interval(-8, -1)
++        Interval(low=-8, high=-1)
++        """
++        return _bitwise(self, other, 'bitor')
++
++    def __bitxor__(self, other):
++        """
++        Combiner for bitwise xor operation.
++
++        >>> Interval(4, 5) ^ Interval(2, 3)
++        Interval(low=6, high=7)
++        >>> Interval(-8, -1) ^ Interval(-8, -1)
++        Interval(low=0, high=7)
++        """
++        return _bitwise(self, other, 'bitxor')
++
++    __and__ = __bitand__
++    __or__ = __bitor__
++    __xor__ = __bitxor__
++
++    def __invert__(self):
++        """
++        Combiner for bitwise complement, which negates and steps down by one.
++
++        >>> ~Interval(0, float("inf"))
++        Interval(low=-inf, high=-1)
++        """
++        return Interval(-self.high - 1, -self.low - 1)
++
+     def __lt__(self, other):
+         """
+         Combiner for lower than operation.
+@@ -342,13 +707,14 @@ class Interval(object):
+         Interval(low=0, high=1)
+         >>> Interval(-1, 5) == Interval(6, 7)
+         Interval(low=0, high=0)
++        >>> Interval(-float("inf"), -2) == Interval(3, 3)
++        Interval(low=0, high=0)
+         """
+-        if isinf(self.low):
+-            return Interval(0, 1)
+-        elif self.low == self.high == other.low == other.high:
+-            return Interval(1, 1)
+-        elif (self < other) or (self > other):
++        if (self < other) or (self > other):
+             return Interval(0, 0)
++        elif not isinf(self.low) and \
++                self.low == self.high == other.low == other.high:
++            return Interval(1, 1)
+         else:
+             return Interval(0, 1)
+ 
+@@ -362,13 +728,16 @@ class Interval(object):
+         Interval(low=0, high=1)
+         >>> Interval(-1, 5) != Interval(6, 7)
+         Interval(low=1, high=1)
++        >>> Interval(-float("inf"), -2) != Interval(3, 3)
++        Interval(low=1, high=1)
++        >>> Interval(4, 4) != Interval(4, 4)
++        Interval(low=0, high=0)
+         """
+-        if isinf(self.low):
+-            return Interval(0, 1)
+-        elif self.low == self.high == other.low == other.high:
+-            return Interval(1, 1)
+-        elif (self < other) or (self > other):
++        if (self < other) or (self > other):
+             return Interval(1, 1)
++        elif not isinf(self.low) and \
++                self.low == self.high == other.low == other.high:
++            return Interval(0, 0)
+         else:
+             return Interval(0, 1)
+ 
+@@ -408,8 +777,9 @@ class IntervalTuple(object):
+ 
+     def __getitem__(self, index):
+         out = None
+-        low = max(0, index.low)
+-        high = min(len(self.values) - 1, index.high)
++        extent = len(self.values)
++        low = int(max(-extent, index.low))
++        high = int(min(extent - 1, index.high))
+         for i in range(low, high + 1):
+             if out is None:
+                 out = self.values[i]
+@@ -450,6 +820,16 @@ def range_values(args):
+             return Interval(args[0].low, args[1].high - 1)
+ 
+ 
++def abs_values(args):
++    """ Return possible range for abs function. """
++    arg = args[0]
++    if arg.low >= 0:
++        return Interval(arg.low, arg.high)
++    if arg.high <= 0:
++        return Interval(-arg.high, -arg.low)
++    return Interval(0, max(-arg.low, arg.high))
++
++
+ def bool_values(_):
+     """ Return the range of a boolean value, i.e. [0, 1]. """
+     return Interval(0, 1)
+diff --git a/pythran/optimizations/range_based_simplify.py b/pythran/optimizations/range_based_simplify.py
+index f1995698e..3b037692d 100644
+--- a/pythran/optimizations/range_based_simplify.py
++++ b/pythran/optimizations/range_based_simplify.py
+@@ -1,14 +1,111 @@
+ ''' Simplify expressions based on range information when possible'''
+ 
+-from pythran.analyses import RangeValues
++from pythran.analyses import PureExpressions, RangeValues
++from pythran.interval import Interval, IntervalTuple, isinf
+ from pythran.passmanager import Transformation
+ 
+ import gast as ast
+-from math import isinf
+ from copy import deepcopy
+ 
+ 
+-class RangeBasedSimplify(Transformation[RangeValues]):
++TOTAL_BINARY = (ast.Add, ast.Sub, ast.Mult,
++                ast.BitAnd, ast.BitOr, ast.BitXor)
++
++
++def reachable_index(node, ranges):
++    """
++    Whether a subscript is bound to land inside the thing it reads.
++
++    The only container the analysis sizes is a tuple, so a subscript of
++    anything else is left alone. An index whose whole range falls within that
++    size cannot raise; any other index may, and an expression that may raise
++    is never replaced by its value.
++    """
++    container = ranges.get(node.value)
++    if not isinstance(container, IntervalTuple):
++        return False
++    extent = len(container.values)
++    index = ranges.get(node.slice)
++    if not isinstance(index, Interval):
++        return False
++    return -extent <= index.low and index.high < extent
++
++
++def foldable(node, ranges):
++    """
++    Whether an expression can be replaced by the single value it reports.
++
++    Replacing an expression deletes every evaluation inside it, so this
++    answers the opposite way round from a list of dangerous forms: a shape is
++    named here only once it is known not to raise, and anything unnamed, a
++    call or an attribute above all, keeps its place. The operators left out
++    of TOTAL_BINARY are exactly those refusing some operand pair.
++    """
++    if isinstance(node, ast.Constant):
++        return True
++    if isinstance(node, ast.Name):
++        return isinstance(node.ctx, ast.Load)
++    if isinstance(node, ast.UnaryOp):
++        return foldable(node.operand, ranges)
++    if isinstance(node, ast.BinOp):
++        return (isinstance(node.op, TOTAL_BINARY)
++                and foldable(node.left, ranges)
++                and foldable(node.right, ranges))
++    if isinstance(node, ast.BoolOp):
++        return all(foldable(value, ranges) for value in node.values)
++    if isinstance(node, ast.Compare):
++        return all(foldable(operand, ranges)
++                   for operand in [node.left] + node.comparators)
++    if isinstance(node, ast.IfExp):
++        return all(foldable(operand, ranges)
++                   for operand in (node.test, node.body, node.orelse))
++    if isinstance(node, ast.Subscript):
++        return (reachable_index(node, ranges)
++                and foldable(node.value, ranges)
++                and foldable(node.slice, ranges))
++    if isinstance(node, ast.Tuple):
++        return all(foldable(element, ranges) for element in node.elts)
++    return False
++
++
++def repeatable(node, pure):
++    """
++    Whether an expression may be evaluated a second time.
++
++    A shape is named here only once evaluating it again is known to change
++    nothing, so an unnamed one keeps its place. A call qualifies on the effect
++    analysis rather than on its shape, since that is what settles whether
++    running it twice is the same as running it once.
++    """
++    if isinstance(node, ast.Constant):
++        return True
++    if isinstance(node, ast.Name):
++        return isinstance(node.ctx, ast.Load)
++    if isinstance(node, ast.UnaryOp):
++        return repeatable(node.operand, pure)
++    if isinstance(node, ast.BinOp):
++        return repeatable(node.left, pure) and repeatable(node.right, pure)
++    if isinstance(node, ast.Subscript):
++        return repeatable(node.value, pure) and repeatable(node.slice, pure)
++    if isinstance(node, ast.Tuple):
++        return all(repeatable(elt, pure) for elt in node.elts)
++    if isinstance(node, ast.BoolOp):
++        return all(repeatable(value, pure) for value in node.values)
++    if isinstance(node, ast.Compare):
++        return all(repeatable(operand, pure)
++                   for operand in [node.left] + node.comparators)
++    if isinstance(node, ast.IfExp):
++        return all(repeatable(operand, pure)
++                   for operand in (node.test, node.body, node.orelse))
++    if isinstance(node, ast.Call):
++        return (node in pure
++                and all(repeatable(arg, pure) for arg in node.args)
++                and all(repeatable(keyword.value, pure)
++                        for keyword in node.keywords))
++    return False
++
++
++class RangeBasedSimplify(Transformation[PureExpressions, RangeValues]):
+     '''
+     Simplify expressions based on range analysis
+ 
+@@ -44,19 +141,27 @@ class RangeBasedSimplify(Transformation[RangeValues]):
+         return node
+ 
+     def visit_BinOp(self, node):
+-        node = self.generic_visit(node)
+         if not isinstance(node.op, ast.Mod):
+-            return node
++            return self.generic_visit(node)
+ 
+         right_range = self.range_values[node.right]
+         left_range = self.range_values[node.left]
++        pure_operands = (node.left in self.pure_expressions
++                         and node.right in self.pure_expressions)
++        node = self.generic_visit(node)
+ 
+-        if right_range.low < 0 or isinf(right_range.high):
++        if right_range.low < 1:
+             return node
+ 
+-        if left_range.low < -right_range.low:
++        if left_range.low < 0:
+             return node
+-        if left_range.high > right_range.high * 2:
++
++        if left_range.high >= right_range.low * 2:
++            return node
++        if not repeatable(node.left, self.pure_expressions) or \
++                not repeatable(node.right, self.pure_expressions):
++            return node
++        if not pure_operands:
+             return node
+ 
+         cleft0, cleft1 = deepcopy(node.left), deepcopy(node.left)
+@@ -70,6 +175,8 @@ class RangeBasedSimplify(Transformation[RangeValues]):
+         range_value = self.range_values[node]
+         if isinf(range_value.high):
+             return self.generic_visit(node)
++        elif not foldable(node, self.range_values):
++            return self.generic_visit(node)
+         elif range_value.low == range_value.high:
+             self.update = True
+             return ast.Constant(range_value.low, None)
+diff --git a/pythran/tables.py b/pythran/tables.py
+index 15723d809..5bc751ab9 100644
+--- a/pythran/tables.py
++++ b/pythran/tables.py
+@@ -2790,6 +2790,7 @@ MODULES = {
+             "StaticIfReturn": ConstFunctionIntr(),
+         },
+         "abs": ConstFunctionIntr(
++            return_range=interval.abs_values,
+             signature=Union[
+                 Fun[[int], int],
+                 Fun[[float], float],

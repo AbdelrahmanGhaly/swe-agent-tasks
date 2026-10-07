@@ -1,0 +1,1556 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..c6569ff
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,90 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() { echo "usage: $0 [--output_path <path>] base|new" >&2; exit 2; }
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new) MODE="$1"; MODE_COUNT=$((MODE_COUNT + 1)); shift ;;
++    --output_path) shift; [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }; OUTPUT_PATH="$1"; shift ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    *) echo "unknown argument: $1" >&2; usage ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")"
++ROOT="$(pwd)"
++[ -n "$OUTPUT_PATH" ] || OUTPUT_PATH="$ROOT/junit-$MODE.xml"
++case "$OUTPUT_PATH" in /*) ;; *) OUTPUT_PATH="$ROOT/$OUTPUT_PATH" ;; esac
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++rm -f "$OUTPUT_PATH"
++
++NEW_TESTS="tests/resume_3dfd94.test.mjs"
++JEST_JUNIT_REPORTER="$(npm root -g)/jest-junit"
++export JEST_JUNIT_OUTPUT_FILE="$OUTPUT_PATH"
++export JEST_JUNIT_REPORT_TEST_SUITE_ERRORS=true
++
++write_failure() {
++  cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites name="jest tests" tests="1" failures="1" errors="0" time="0">
++<testsuite name="$MODE" tests="1" failures="1" errors="0" time="0">
++<testcase classname="$MODE" name="$1" time="0">
++<failure message="$1">$2</failure>
++</testcase>
++</testsuite>
++</testsuites>
++XMLEOF
++}
++
++rm -rf lib
++if ! BUILD_LOG="$(./node_modules/.bin/babel src -d lib 2>&1)"; then
++  printf '%s\n' "$BUILD_LOG" >&2
++  write_failure "library build" "$(printf '%s' "$BUILD_LOG" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++  exit 1
++fi
++
++JEST_LOG="$(mktemp)"
++if [ "$MODE" = "base" ]; then
++  # The generated suite reuses identical test names within a describe block; the environment
++  # numbers repeated names so every result is reported under its own name.
++  # The two constant-operand arithmetic families (10,344 of the suite's 11,880 cases) are left
++  # out: they only cover the constant arithmetic cells and the constant-folding transform, which
++  # this change does not touch, and one of them draws its constants at random.
++  # Math.random is seeded, so the randomized logic table checks draw the same inputs on every run.
++  timeout 1500 ./node_modules/.bin/jest tests/index.test.mjs --ci --forceExit \
++    --testEnvironment "$ROOT/tests/unique_names_d7cd5a.js" \
++    --setupFiles "$ROOT/tests/seeded_random_03797d.js" \
++    -t '^(?!.*(with constant|bits constant)).*$' \
++    --reporters=default --reporters="$JEST_JUNIT_REPORTER" 2>&1 | tee "$JEST_LOG"
++  STATUS=${PIPESTATUS[0]}
++  # jest reports the cases left out by -t as skipped; keep only the cases that ran in the report.
++  if [ -f "$OUTPUT_PATH" ]; then
++    node -e '
++      const fs = require("fs");
++      const file = process.argv[1];
++      let dropped = 0;
++      const xml = fs.readFileSync(file, "utf8")
++        .replace(/\n\s*<testcase [^>]*>\s*<skipped\/>\s*<\/testcase>/g, () => { dropped++; return ""; });
++      fs.writeFileSync(file, xml
++        .replace(/ tests="(\d+)"/g, (m, n) => ` tests="${n - dropped}"`)
++        .replace(/ skipped="(\d+)"/g, (m, n) => ` skipped="${n - dropped}"`));
++    ' "$OUTPUT_PATH"
++  fi
++else
++  timeout 1500 ./node_modules/.bin/jest "$NEW_TESTS" --ci --forceExit \
++    --reporters=default --reporters="$JEST_JUNIT_REPORTER" 2>&1 | tee "$JEST_LOG"
++  STATUS=${PIPESTATUS[0]}
++fi
++
++if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  write_failure "jest run" "jest exited with status $STATUS without reporting any test. Last lines of its output:
++$(tail -n 60 "$JEST_LOG" | tr -d '\000-\010\013\014\016-\037' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++  [ "$STATUS" -ne 0 ] || STATUS=1
++fi
++rm -f "$JEST_LOG"
++exit "$STATUS"
+diff --git a/tests/resume_3dfd94.test.mjs b/tests/resume_3dfd94.test.mjs
+new file mode 100644
+index 0000000..7f2dfee
+--- /dev/null
++++ b/tests/resume_3dfd94.test.mjs
+@@ -0,0 +1,1412 @@
++"use strict";
++
++import fs from 'fs';
++import path from 'path';
++import { HeadlessCircuit } from '../lib/circuit.mjs';
++import { Circuit } from '../lib/index.mjs';
++import * as cells from '../lib/cells.mjs';
++import { Vector3vl } from '3vl';
++import { SynchEngine } from '../lib/engines/synch.mjs';
++import { BrowserSynchEngine } from '../lib/engines/browsersynch.mjs';
++import { WorkerEngine } from '../lib/engines/worker.mjs';
++
++jest.mock('jquery', () => { const $ = () => $; return $; });
++jest.mock('jquery-ui/ui/widgets/dialog.js', () => ({}));
++jest.mock('jquery-ui/themes/base/all.css', () => ({}));
++jest.mock('../lib/style.css.js', () => ({}), { virtual: true });
++
++console.assert = (stmt, msg) => { if (!stmt) throw new Error(msg); };
++
++jest.setTimeout(60000);
++
++const workerURL = new URL('../lib/engines/worker-worker.js', require('url').pathToFileURL(__filename).toString());
++const engineOptions = { workerURL };
++const engines = [["synch", SynchEngine], ["worker", WorkerEngine]];
++const enginePairs = [
++    ["synch", "synch", SynchEngine, SynchEngine],
++    ["synch", "worker", SynchEngine, WorkerEngine],
++    ["worker", "synch", WorkerEngine, SynchEngine],
++    ["worker", "worker", WorkerEngine, WorkerEngine]
++];
++
++const clone = x => JSON.parse(JSON.stringify(x));
++const example = name => JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'examples', name + '.json'), 'utf8'));
++const sig = bin => Vector3vl.fromBin(bin, bin.length);
++
++const live = [];
++afterEach(() => {
++    while (live.length) live.pop().shutdown();
++});
++
++function build(data, engine, extra = {}, Class = HeadlessCircuit) {
++    const circuit = new Class(clone(data), Object.assign({ engine, engineOptions }, extra));
++    live.push(circuit);
++    circuit.observeGraph();
++    return circuit;
++}
++
++function observeAll(circuit, where = []) {
++    if (where.length) circuit.observeGraph(where);
++    for (const label of Object.keys(circuit.getLabelIndex(where).subcircuits))
++        observeAll(circuit, where.concat([label]));
++}
++
++function outputs(circuit) {
++    return circuit.getOutputCells().map(cell => cell.id + '=' + cell.getOutput().toBin()).sort().join(' ');
++}
++
++function devicesAt(circuit, where = [], out = {}) {
++    const index = circuit.getLabelIndex(where);
++    for (const [label, cell] of Object.entries(index.devices)) {
++        const key = where.concat([label]).join(' / ');
++        out[key] = [cell.get('inputSignals'), cell.get('outputSignals')]
++            .map(sigs => Object.keys(sigs).sort().map(port => port + ':' + sigs[port].toBin()).join(','))
++            .join(' -> ');
++    }
++    for (const label of Object.keys(index.subcircuits))
++        devicesAt(circuit, where.concat([label]), out);
++    return out;
++}
++
++async function run(circuit, fixture, from, to, log = []) {
++    await circuit.synchronize();
++    for (let step = from; step < to; step++) {
++        for (const [at, id, bin] of fixture.script)
++            if (at == step) circuit.setInput(id, sig(bin));
++        await circuit.updateGates({ synchronous: true });
++        log.push(circuit.tick + ' ' + outputs(circuit));
++    }
++    return log;
++}
++
++function watch(circuit, targets, calls, options = {}) {
++    return targets.map(([label, where, port]) => {
++        const cell = circuit.findDeviceByLabel(label, where);
++        return circuit.monitor(cell, port, (tick, value) => {
++            calls.push([label, where.join('/'), port, tick, value.toBin()].join(' '));
++        }, options);
++    });
++}
++
++const settled = promise => Promise.race([promise, Promise.resolve('still waiting')]);
++
++const COUNTER = {
++    devices: {
++        clk: { type: 'Clock', label: 'clk', propagation: 3 },
++        en: { type: 'Input', label: 'en', net: 'en', bits: 1 },
++        ff: { type: 'Dff', label: 'ff', bits: 4, polarity: { clock: true, enable: true }, initial: '0000' },
++        one: { type: 'Constant', label: 'one', constant: '0001' },
++        add: { type: 'Addition', label: 'add', bits: { in1: 4, in2: 4, out: 4 }, propagation: 2 },
++        q: { type: 'Output', label: 'q', net: 'q', bits: 4 }
++    },
++    connectors: [
++        { from: { id: 'clk', port: 'out' }, to: { id: 'ff', port: 'clk' } },
++        { from: { id: 'en', port: 'out' }, to: { id: 'ff', port: 'en' } },
++        { from: { id: 'ff', port: 'out' }, to: { id: 'add', port: 'in1' } },
++        { from: { id: 'one', port: 'out' }, to: { id: 'add', port: 'in2' } },
++        { from: { id: 'add', port: 'out' }, to: { id: 'ff', port: 'in' } },
++        { from: { id: 'ff', port: 'out' }, to: { id: 'q', port: 'in' } }
++    ]
++};
++
++const PULSES = {
++    devices: {
++        a: { type: 'Input', label: 'a', net: 'a', bits: 1 },
++        b: { type: 'Input', label: 'b', net: 'b', bits: 2 },
++        slow: { type: 'Not', label: 'slow', bits: 1, propagation: 4 },
++        slower: { type: 'Not', label: 'slower', bits: 1, propagation: 3 },
++        glitch: { type: 'Xor', label: 'glitch', bits: 1, propagation: 1 },
++        wide: { type: 'Not', label: 'wide', bits: 2, propagation: 5 },
++        both: { type: 'And', label: 'both', bits: 2, propagation: 2 },
++        g: { type: 'Output', label: 'g', net: 'g', bits: 1 },
++        s: { type: 'Output', label: 's', net: 's', bits: 1 },
++        w: { type: 'Output', label: 'w', net: 'w', bits: 2 }
++    },
++    connectors: [
++        { from: { id: 'a', port: 'out' }, to: { id: 'slow', port: 'in' } },
++        { from: { id: 'slow', port: 'out' }, to: { id: 'slower', port: 'in' } },
++        { from: { id: 'a', port: 'out' }, to: { id: 'glitch', port: 'in1' } },
++        { from: { id: 'slower', port: 'out' }, to: { id: 'glitch', port: 'in2' } },
++        { from: { id: 'glitch', port: 'out' }, to: { id: 'g', port: 'in' } },
++        { from: { id: 'slower', port: 'out' }, to: { id: 's', port: 'in' } },
++        { from: { id: 'b', port: 'out' }, to: { id: 'wide', port: 'in' } },
++        { from: { id: 'wide', port: 'out' }, to: { id: 'both', port: 'in1' } },
++        { from: { id: 'b', port: 'out' }, to: { id: 'both', port: 'in2' } },
++        { from: { id: 'both', port: 'out' }, to: { id: 'w', port: 'in' } }
++    ]
++};
++
++const TWINS = {
++    devices: {
++        clk: { type: 'Input', label: 'clk', net: 'clk', bits: 1 },
++        d1: { type: 'Input', label: 'd1', net: 'd1', bits: 4 },
++        d2: { type: 'Input', label: 'd2', net: 'd2', bits: 4 },
++        r1: { type: 'Subcircuit', label: 'r1', celltype: 'reg' },
++        r2: { type: 'Subcircuit', label: 'r2', celltype: 'reg' },
++        q1: { type: 'Output', label: 'q1', net: 'q1', bits: 4 },
++        q2: { type: 'Output', label: 'q2', net: 'q2', bits: 4 }
++    },
++    connectors: [
++        { from: { id: 'clk', port: 'out' }, to: { id: 'r1', port: 'clk' } },
++        { from: { id: 'clk', port: 'out' }, to: { id: 'r2', port: 'clk' } },
++        { from: { id: 'd1', port: 'out' }, to: { id: 'r1', port: 'd' } },
++        { from: { id: 'd2', port: 'out' }, to: { id: 'r2', port: 'd' } },
++        { from: { id: 'r1', port: 'q' }, to: { id: 'q1', port: 'in' } },
++        { from: { id: 'r2', port: 'q' }, to: { id: 'q2', port: 'in' } }
++    ],
++    subcircuits: {
++        reg: {
++            devices: {
++                clk: { type: 'Input', label: 'clk', net: 'clk', bits: 1 },
++                d: { type: 'Input', label: 'd', net: 'd', bits: 4 },
++                ff: { type: 'Dff', label: 'ff', bits: 4, polarity: { clock: true } },
++                inv: { type: 'Subcircuit', label: 'inv', celltype: 'invert' },
++                q: { type: 'Output', label: 'q', net: 'q', bits: 4 }
++            },
++            connectors: [
++                { from: { id: 'clk', port: 'out' }, to: { id: 'ff', port: 'clk' } },
++                { from: { id: 'd', port: 'out' }, to: { id: 'inv', port: 'i' } },
++                { from: { id: 'inv', port: 'o' }, to: { id: 'ff', port: 'in' } },
++                { from: { id: 'ff', port: 'out' }, to: { id: 'q', port: 'in' } }
++            ]
++        },
++        invert: {
++            devices: {
++                i: { type: 'Input', label: 'i', net: 'i', bits: 4 },
++                n: { type: 'Not', label: 'n', bits: 4, propagation: 2 },
++                o: { type: 'Output', label: 'o', net: 'o', bits: 4 }
++            },
++            connectors: [
++                { from: { id: 'i', port: 'out' }, to: { id: 'n', port: 'in' } },
++                { from: { id: 'n', port: 'out' }, to: { id: 'o', port: 'in' } }
++            ]
++        }
++    }
++};
++
++const CHAIN = {
++    devices: {
++        a: { type: 'Input', label: 'a', net: 'a', bits: 1 },
++        n: { type: 'Not', label: 'n', bits: 1, propagation: 9 },
++        o: { type: 'Output', label: 'o', net: 'o', bits: 1 }
++    },
++    connectors: [
++        { from: { id: 'a', port: 'out' }, to: { id: 'n', port: 'in' } },
++        { from: { id: 'n', port: 'out' }, to: { id: 'o', port: 'in' } }
++    ]
++};
++
++function withChanges(data, change) {
++    const copy = clone(data);
++    change(copy);
++    return copy;
++}
++
++function renamed(data, from, to, celltype) {
++    return withChanges(data, copy => {
++        const circuit = celltype ? copy.subcircuits[celltype] : copy;
++        circuit.devices = Object.fromEntries(Object.entries(circuit.devices).map(([id, dev]) => [id == from ? to : id, dev]));
++        for (const conn of circuit.connectors)
++            for (const end of [conn.from, conn.to])
++                if (end.id == from) end.id = to;
++    });
++}
++
++let evaluations = 0;
++const countedCells = {};
++for (const kind of ['Not', 'And', 'Xor', 'Addition', 'Constant'])
++    countedCells['Counted' + kind] = class extends cells[kind] {
++        operation(...args) {
++            evaluations++;
++            return super.operation(...args);
++        }
++    };
++
++function counted(data) {
++    return withChanges(data, copy => {
++        for (const circuit of [copy].concat(Object.values(copy.subcircuits || {})))
++            for (const dev of Object.values(circuit.devices))
++                if (countedCells['Counted' + dev.type]) dev.type = 'Counted' + dev.type;
++    });
++}
++
++const reversedKeys = obj => Object.fromEntries(Object.entries(obj).reverse());
++
++function reordered(data) {
++    return withChanges(data, copy => {
++        for (const circuit of [copy].concat(Object.values(copy.subcircuits || {}))) {
++            circuit.devices = reversedKeys(circuit.devices);
++            circuit.connectors.reverse();
++        }
++        if (copy.subcircuits) copy.subcircuits = reversedKeys(copy.subcircuits);
++    });
++}
++
++function relabeled(data) {
++    return withChanges(data, copy => {
++        for (const circuit of [copy].concat(Object.values(copy.subcircuits || {})))
++            for (const [id, dev] of Object.entries(circuit.devices)) {
++                dev.label = 'renamed ' + id;
++                dev.position = { x: 40, y: 80 };
++            }
++    });
++}
++
++function rewired(data, first, second) {
++    return withChanges(data, copy => {
++        const one = copy.connectors.find(conn => conn.from.id == first);
++        const other = copy.connectors.find(conn => conn.from.id == second);
++        [one.to, other.to] = [other.to, one.to];
++    });
++}
++
++function everything(circuit) {
++    const automata = Object.values(circuit.getLabelIndex([]).devices).map(cell => cell.get('current_state'));
++    return [circuit.tick, circuit.hasPendingEvents, devicesAt(circuit), circuit.toJSON(), automata];
++}
++
++const fixtures = {
++    counter: {
++        data: COUNTER,
++        script: [[0, 'en', '1'], [40, 'en', '0'], [57, 'en', '1']],
++        save: 31, more: 70,
++        other: [[0, 'en', '0'], [9, 'en', '1']],
++        watch: [['ff', [], 'out'], ['clk', [], 'out']]
++    },
++    pulses: {
++        data: PULSES,
++        script: [[0, 'a', '0'], [0, 'b', '00'], [12, 'a', '1'], [13, 'a', '0'], [14, 'a', '1'], [15, 'b', '11'], [16, 'b', '01'], [23, 'a', '0'], [24, 'b', '10'], [25, 'a', '1']],
++        save: 16, more: 30,
++        other: [[0, 'a', '1'], [2, 'b', '11'], [5, 'a', '0']],
++        watch: [['glitch', [], 'out'], ['slower', [], 'out'], ['both', [], 'out']]
++    },
++    twins: {
++        data: TWINS,
++        script: [[0, 'clk', '0'], [0, 'd1', '0011'], [0, 'd2', '1100'], [6, 'clk', '1'], [9, 'clk', '0'], [10, 'd1', '1010'], [11, 'clk', '1'], [12, 'd2', '0110'], [15, 'clk', '0'], [19, 'clk', '1'], [23, 'd1', '1111'], [24, 'clk', '0'], [26, 'clk', '1']],
++        save: 12, more: 20,
++        other: [[0, 'clk', '1'], [0, 'd1', '0101'], [0, 'd2', '0101'], [3, 'clk', '0'], [5, 'clk', '1']],
++        watch: [['ff', ['r1'], 'out'], ['ff', ['r2'], 'out'], ['n', ['r2', 'inv'], 'out']]
++    },
++    cycleadder: {
++        data: example('cycleadder'),
++        script: [[0, 'dev1', '1'], [0, 'dev2', '1'], [0, 'dev3', '0011'], [230, 'dev1', '0'], [700, 'dev3', '0101'], [1400, 'dev2', '0']],
++        save: 777, more: 900,
++        other: [[0, 'dev1', '0'], [0, 'dev2', '1'], [0, 'dev3', '1111']],
++        watch: [['$procdff$9', [], 'out']]
++    },
++    lfsr: {
++        data: example('lfsr'),
++        script: [[0, 'dev2', '1'], [250, 'dev2', '0']],
++        save: 1234, more: 1000,
++        other: [[0, 'dev2', '0']],
++        watch: [['$procdff$4', [], 'out']]
++    },
++    ram: {
++        data: example('ram'),
++        script: [[0, 'dev1', '00011'], [0, 'dev3', '00011'], [0, 'dev4', '1010'], [330, 'dev4', '0110'], [520, 'dev3', '00101'], [610, 'dev1', '00101'], [900, 'dev4', '1111']],
++        save: 555, more: 800,
++        other: [[0, 'dev1', '00000'], [0, 'dev3', '00001'], [0, 'dev4', '0001']],
++        watch: [['mem', [], 'rd0data']]
++    },
++    fsm: {
++        data: example('fsm'),
++        script: [[0, 'dev1', '1'], [0, 'dev2', '0'], [120, 'dev1', '0'], [250, 'dev2', '1'], [470, 'dev2', '0'], [690, 'dev2', '1'], [1150, 'dev2', '0']],
++        save: 555, more: 900,
++        other: [[0, 'dev1', '0'], [0, 'dev2', '1']],
++        watch: [['$fsm$\\state$21', [], 'out']]
++    },
++    horner: {
++        data: example('horner'),
++        script: [[0, 'dev2', '000000000101'], [480, 'dev2', '000000000011']],
++        save: 333, more: 400,
++        other: [[0, 'dev2', '000000010001']],
++        watch: [['$procdff$393', [], 'out']]
++    }
++};
++
++async function savedCircuit(fixture, engine, observed = false) {
++    const circuit = build(fixture.data, engine);
++    if (observed) observeAll(circuit);
++    await run(circuit, fixture, 0, fixture.save);
++    const tick = circuit.tick;
++    const state = clone(await circuit.saveState());
++    return { circuit, state, tick };
++}
++
++describe.each(Object.keys(fixtures).filter(name => name != 'horner'))('%s', (name) => {
++    const fixture = fixtures[name];
++
++    describe.each(enginePairs)('saved with %s, loaded with %s', (_n1, _n2, saveEngine, loadEngine) => {
++        test('a fresh circuit continues exactly like the saved one', async () => {
++            const { circuit, state, tick } = await savedCircuit(fixture, saveEngine);
++            const expected = await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++            const target = build(fixture.data, loadEngine);
++            await target.loadState(state);
++            await target.synchronize();
++            expect(target.tick).toBe(tick);
++            expect(await run(target, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++        });
++    });
++
++    describe.each(engines)('%s', (_n, engine) => {
++        test('loading into the saved circuit rewinds it', async () => {
++            const { circuit, state, tick } = await savedCircuit(fixture, engine);
++            const first = await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++            await circuit.loadState(state);
++            await circuit.synchronize();
++            expect(circuit.tick).toBe(tick);
++            expect(await run(circuit, fixture, fixture.save, fixture.save + fixture.more)).toEqual(first);
++        });
++
++        test('a circuit that has simulated something else takes over the saved simulation', async () => {
++            const { circuit, state, tick } = await savedCircuit(fixture, engine);
++            const expected = await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++            const target = build(fixture.data, engine);
++            await run(target, { script: fixture.other }, 0, fixture.save + 17);
++            await target.loadState(state);
++            await target.synchronize();
++            expect(target.tick).toBe(tick);
++            expect(await run(target, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++        });
++
++        test('a circuit constructed with the state starts from it', async () => {
++            const { circuit, state, tick } = await savedCircuit(fixture, engine);
++            const expected = await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++            const target = build(fixture.data, engine, { state });
++            await target.synchronize();
++            expect(target.tick).toBe(tick);
++            expect(await run(target, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++        });
++
++        test('monitors report what happens after a load and nothing because of it', async () => {
++            const saved = [], resumed = [];
++            const circuit = build(fixture.data, engine);
++            watch(circuit, fixture.watch, saved);
++            await run(circuit, fixture, 0, fixture.save);
++            const state = clone(await circuit.saveState());
++            saved.length = 0;
++            await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++            const target = build(fixture.data, engine);
++            await run(target, { script: fixture.other }, 0, 11);
++            watch(target, fixture.watch, resumed);
++            await target.synchronize();
++            resumed.length = 0;
++            await target.loadState(state);
++            await target.synchronize();
++            expect(resumed).toEqual([]);
++            await run(target, fixture, fixture.save, fixture.save + fixture.more);
++            expect(resumed).toEqual(saved);
++        });
++
++        test('saving leaves the simulation untouched', async () => {
++            const circuit = build(fixture.data, engine);
++            const twin = build(fixture.data, engine);
++            const end = fixture.save + fixture.more;
++            const log = [], twinLog = [];
++            for (let from = 0; from < end; from += 37) {
++                await circuit.synchronize();
++                const tick = circuit.tick, pendingEvents = circuit.hasPendingEvents;
++                await circuit.saveState();
++                expect(circuit.tick).toBe(tick);
++                expect(circuit.hasPendingEvents).toBe(pendingEvents);
++                await run(circuit, fixture, from, Math.min(from + 37, end), log);
++                await run(twin, fixture, from, Math.min(from + 37, end), twinLog);
++            }
++            expect(log).toEqual(twinLog);
++        });
++    });
++});
++
++describe.each(enginePairs.filter(([a, b]) => a != b))('deeply nested circuit saved with %s, loaded with %s', (_n1, _n2, saveEngine, loadEngine) => {
++    test('continues exactly like the saved one', async () => {
++        const fixture = fixtures.horner;
++        const { circuit, state, tick } = await savedCircuit(fixture, saveEngine);
++        const expected = await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++        const target = build(fixture.data, loadEngine);
++        await target.loadState(state);
++        await target.synchronize();
++        expect(target.tick).toBe(tick);
++        expect(await run(target, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++    }, 300000);
++});
++
++describe.each(engines)('%s', (_n, engine) => {
++    test.each(['twins', 'ram', 'fsm'])('%s: a saved state is a plain object that still works after a trip through JSON', async (name) => {
++        const fixture = fixtures[name];
++        const circuit = build(fixture.data, engine);
++        await run(circuit, fixture, 0, fixture.save);
++        const state = await circuit.saveState();
++        expect(typeof state).toBe('object');
++        expect(state).not.toBeNull();
++        expect(Array.isArray(state)).toBe(false);
++        const proto = Object.getPrototypeOf(state);
++        expect(proto === null || Object.getPrototypeOf(proto) === null).toBe(true);
++        const parsed = JSON.parse(JSON.stringify(state));
++        const expected = await run(circuit, fixture, fixture.save, fixture.save + 30);
++        for (const loadEngine of [SynchEngine, WorkerEngine]) {
++            const target = build(fixture.data, loadEngine);
++            await target.loadState(parsed);
++            expect(await run(target, fixture, fixture.save, fixture.save + 30)).toEqual(expected);
++        }
++    });
++
++    test.each(['twins', 'ram', 'fsm'].flatMap(name => [[name, 'written in another order', reordered], [name, 'with other labels and positions', relabeled]]))('%s: a state still fits when the description is %s', async (name, _label, variant) => {
++        const fixture = fixtures[name];
++        const { circuit, state, tick } = await savedCircuit(fixture, engine);
++        const expected = await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++        const target = build(variant(fixture.data), engine);
++        await target.loadState(state);
++        await target.synchronize();
++        expect(target.tick).toBe(tick);
++        expect(await run(target, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++        const built = build(variant(fixture.data), engine, { state });
++        await built.synchronize();
++        expect(built.tick).toBe(tick);
++        expect(await run(built, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++    });
++
++    test.each([['twins', 'd1', 'd2'], ['ram', 'dev1', 'dev3']])('%s: a state still fits when the same devices are wired differently', async (name, first, second) => {
++        const fixture = fixtures[name];
++        const { state, tick } = await savedCircuit(fixture, engine);
++        const other = rewired(fixture.data, first, second);
++        const target = build(other, engine);
++        await target.loadState(state);
++        await target.synchronize();
++        expect(target.tick).toBe(tick);
++        const built = build(other, engine, { state });
++        await built.synchronize();
++        expect(built.tick).toBe(tick);
++    });
++
++    test.each(['twins', 'pulses', 'ram', 'fsm'])('%s: every device at every depth matches right after the load and at every step after it', async (name) => {
++        const fixture = fixtures[name];
++        const circuit = build(fixture.data, engine);
++        observeAll(circuit);
++        await run(circuit, fixture, 0, fixture.save);
++        await circuit.synchronize();
++        const expected = devicesAt(circuit);
++        const state = clone(await circuit.saveState());
++        const target = build(fixture.data, engine);
++        observeAll(target);
++        await run(target, { script: fixture.other }, 0, 5);
++        await target.loadState(state);
++        await target.synchronize();
++        expect(devicesAt(target)).toEqual(expected);
++        for (let step = fixture.save; step < fixture.save + 12; step++) {
++            await run(circuit, fixture, step, step + 1);
++            await run(target, fixture, step, step + 1);
++            await circuit.synchronize();
++            await target.synchronize();
++            expect(devicesAt(target)).toEqual(devicesAt(circuit));
++        }
++    });
++
++    test('saveState, loadState and switchEngine return promises', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, engine);
++        await run(circuit, fixture, 0, 20);
++        const saving = circuit.saveState();
++        expect(typeof (saving && saving.then)).toBe('function');
++        const state = clone(await saving);
++        await run(circuit, fixture, 20, 30);
++        const loading = circuit.loadState(state);
++        expect(typeof (loading && loading.then)).toBe('function');
++        await loading;
++        await circuit.synchronize();
++        expect(circuit.tick).toBe(20);
++        const switching = circuit.switchEngine(engine == SynchEngine ? WorkerEngine : SynchEngine, engineOptions);
++        expect(typeof (switching && switching.then)).toBe('function');
++        await switching;
++        expect(circuit.tick).toBe(20);
++    });
++
++    test('inner registers keep their own values when the subgraphs were never observed', async () => {
++        const fixture = fixtures.twins;
++        const { circuit, state } = await savedCircuit(fixture, engine);
++        const expected = [];
++        watch(circuit, fixture.watch, expected);
++        await circuit.synchronize();
++        expected.length = 0;
++        await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++        const target = build(fixture.data, SynchEngine);
++        await target.loadState(state);
++        const got = [];
++        watch(target, fixture.watch, got);
++        got.length = 0;
++        await run(target, fixture, fixture.save, fixture.save + fixture.more);
++        expect(got).toEqual(expected);
++        observeAll(target);
++        observeAll(circuit);
++        await circuit.synchronize();
++        expect(devicesAt(target)).toEqual(devicesAt(circuit));
++    });
++
++    test('memory contents are restored', async () => {
++        const fixture = fixtures.ram;
++        const { circuit, state } = await savedCircuit(fixture, engine);
++        await circuit.synchronize();
++        const saved = circuit.toJSON().devices.dev5.memdata;
++        await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++        expect(circuit.toJSON().devices.dev5.memdata).not.toEqual(saved);
++        await circuit.loadState(state);
++        await circuit.synchronize();
++        expect(circuit.toJSON().devices.dev5.memdata).toEqual(saved);
++        const target = build(fixture.data, engine);
++        await target.loadState(state);
++        await target.synchronize();
++        expect(target.toJSON().devices.dev5.memdata).toEqual(saved);
++    });
++
++    test('restoring memory contents calls no memory write listener', async () => {
++        const fixture = fixtures.ram;
++        const { circuit, state } = await savedCircuit(fixture, engine);
++        const writes = [];
++        circuit.findDeviceByLabel('mem').on('memChange', (addr) => { writes.push(addr); });
++        await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++        await circuit.synchronize();
++        expect(writes.length).toBeGreaterThan(0);
++        writes.length = 0;
++        await circuit.loadState(state);
++        await circuit.synchronize();
++        expect(writes).toEqual([]);
++        const target = build(fixture.data, engine);
++        await run(target, { script: fixture.other }, 0, fixture.save + 17);
++        await target.synchronize();
++        expect(target.toJSON().devices.dev5.memdata).not.toEqual(circuit.toJSON().devices.dev5.memdata);
++        const targetWrites = [];
++        target.findDeviceByLabel('mem').on('memChange', (addr) => { targetWrites.push(addr); });
++        await target.loadState(state);
++        await target.synchronize();
++        expect(targetWrites).toEqual([]);
++        expect(target.toJSON().devices.dev5.memdata).toEqual(circuit.toJSON().devices.dev5.memdata);
++    });
++
++    test('automaton states are restored', async () => {
++        const fixture = fixtures.fsm;
++        const label = '$fsm$\\state$21';
++        const circuit = build(fixture.data, engine);
++        const seen = new Set();
++        const states = [];
++        for (let step = 0; step < 1400; step += 50) {
++            await run(circuit, fixture, step, step + 50);
++            await circuit.synchronize();
++            const current = circuit.findDeviceByLabel(label).get('current_state');
++            if (!seen.has(current)) {
++                seen.add(current);
++                states.push([step + 50, current, clone(await circuit.saveState())]);
++            }
++        }
++        expect(states.length).toBeGreaterThan(2);
++        for (const [, current, state] of states) {
++            const target = build(fixture.data, engine);
++            await target.loadState(state);
++            await target.synchronize();
++            expect(target.findDeviceByLabel(label).get('current_state')).toBe(current);
++        }
++    });
++
++    test('a clocked register does not miss the first edge after a load', async () => {
++        const fixture = {
++            data: TWINS,
++            script: [[0, 'clk', '0'], [0, 'd1', '0011'], [0, 'd2', '1100'], [3, 'clk', '1'], [5, 'clk', '0'], [6, 'd1', '1010'], [11, 'clk', '1'], [14, 'clk', '0'], [16, 'clk', '1']]
++        };
++        const circuit = build(fixture.data, engine);
++        await run(circuit, fixture, 0, 10);
++        const state = clone(await circuit.saveState());
++        const expected = await run(circuit, fixture, 10, 20);
++        const target = build(fixture.data, engine);
++        await target.loadState(state);
++        const got = await run(target, fixture, 10, 20);
++        expect(got).toEqual(expected);
++        expect(got[0]).toContain('q1=1100');
++        expect(got[2]).toContain('q1=0101');
++    });
++
++    test('a clock keeps its pace after a load', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, engine);
++        await run(circuit, fixture, 0, 20);
++        const state = clone(await circuit.saveState());
++        const clockTicks = [];
++        const target = build(fixture.data, engine);
++        await target.loadState(state);
++        target.monitor(target.findDeviceByLabel('clk'), 'out', (tick) => { clockTicks.push(tick); }, { triggerValues: [Vector3vl.one] });
++        await run(target, fixture, 20, 45);
++        expect(clockTicks.length).toBeGreaterThan(2);
++        for (let i = 1; i < clockTicks.length; i++)
++            expect(clockTicks[i] - clockTicks[i - 1]).toBe(6);
++    });
++
++    test('a circuit constructed with a state is in it straight away', async () => {
++        const fixture = fixtures.twins;
++        const { circuit, state, tick } = await savedCircuit(fixture, engine, true);
++        await circuit.synchronize();
++        const target = new HeadlessCircuit(clone(fixture.data), { engine, engineOptions, state });
++        live.push(target);
++        expect(target.tick).toBe(tick);
++        expect(target.hasPendingEvents).toBe(circuit.hasPendingEvents);
++        expect(outputs(target)).toBe(outputs(circuit));
++        expect(devicesAt(target)).toEqual(devicesAt(circuit));
++    });
++
++    test.each(['ram', 'fsm'])('%s: a circuit constructed with a state has every port, memory word and automaton state straight away', async (name) => {
++        const fixture = fixtures[name];
++        const { circuit, state } = await savedCircuit(fixture, engine, true);
++        await circuit.synchronize();
++        const target = new HeadlessCircuit(clone(fixture.data), { engine, engineOptions, state });
++        live.push(target);
++        expect(everything(target)).toEqual(everything(circuit));
++    });
++
++    test('an alarm set before a rewind still goes off at its tick', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, engine);
++        await run(circuit, fixture, 0, 20);
++        const state = clone(await circuit.saveState());
++        await run(circuit, fixture, 20, 30);
++        let fired = 0;
++        circuit.alarm(45, () => { fired++; });
++        await circuit.loadState(state);
++        const seen = [];
++        for (let step = 0; step < 30; step++) {
++            await circuit.updateGatesNext({ synchronous: true });
++            await circuit.synchronize();
++            seen.push(circuit.tick + ':' + fired);
++        }
++        expect(seen.find(entry => entry.endsWith(':1'))).toBe('45:1');
++        expect(fired).toBe(1);
++    });
++
++    test('an alarm a load jumps past is not called, and still goes off once a rewind brings it back', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, engine);
++        await run(circuit, fixture, 0, 20);
++        const early = clone(await circuit.saveState());
++        await run(circuit, fixture, 20, 60);
++        const late = clone(await circuit.saveState());
++        const target = build(fixture.data, engine);
++        await target.loadState(early);
++        let fired = 0;
++        target.alarm(45, () => { fired++; });
++        await target.loadState(late);
++        await run(target, fixture, 60, 70);
++        await target.synchronize();
++        expect(fired).toBe(0);
++        await target.loadState(early);
++        const seen = [];
++        for (let step = 0; step < 30; step++) {
++            await target.updateGatesNext({ synchronous: true });
++            await target.synchronize();
++            seen.push(target.tick + ':' + fired);
++        }
++        expect(seen.find(entry => entry.endsWith(':1'))).toBe('45:1');
++        expect(fired).toBe(1);
++    });
++});
++
++describe.each(engines)('refusing states with %s', (_n, engine) => {
++    const counter = (change) => withChanges(COUNTER, change);
++    const spare = (bits) => withChanges(TWINS, d => { d.subcircuits.invert.devices.spare = { type: 'Not', label: 'spare', bits }; });
++    const cases = [
++        ['from another circuit', PULSES, fixtures.counter],
++        ['with a device missing', counter(d => { delete d.devices.q; d.connectors.pop(); }), fixtures.counter],
++        ['with an extra device', counter(d => { d.devices.extra = { type: 'Not', label: 'extra', bits: 1 }; }), fixtures.counter],
++        ['with a device of another kind', counter(d => { d.devices.add.type = 'Subtraction'; }), fixtures.counter],
++        ['with a different port width', counter(d => { d.devices.one.constant = '00001'; d.devices.add.bits.in2 = 5; }), fixtures.counter],
++        ['with a different subcircuit inside', withChanges(TWINS, d => { d.subcircuits.invert.devices.x = { type: 'Not', label: 'x', bits: 1 }; }), fixtures.twins],
++        ['with a device of another kind inside a subcircuit', withChanges(TWINS, d => { d.subcircuits.invert.devices.n.type = 'Repeater'; }), fixtures.twins],
++        ['with a different port width inside a subcircuit', spare(2), Object.assign({}, fixtures.twins, { data: spare(1) })],
++        ['with a device missing inside a subcircuit', withChanges(TWINS, d => {
++            delete d.subcircuits.invert.devices.n;
++            d.subcircuits.invert.connectors = d.subcircuits.invert.connectors.filter(conn => conn.from.id != 'n' && conn.to.id != 'n');
++        }), fixtures.twins],
++        ['with a device under another id', renamed(COUNTER, 'q', 'r'), fixtures.counter],
++        ['with a subcircuit under another id', renamed(TWINS, 'r1', 'r0'), fixtures.twins],
++        ['with a device under another id inside a subcircuit', renamed(TWINS, 'n', 'm', 'invert'), fixtures.twins]
++    ];
++
++    async function foreignState(data) {
++        const donor = build(data, engine);
++        for (let step = 0; step < 4; step++)
++            await donor.updateGates({ synchronous: true });
++        return clone(await donor.saveState());
++    }
++
++    test.each(cases)('rejects a state %s and leaves the circuit as it was', async (_label, data, fixture) => {
++        const foreign = await foreignState(data);
++        const circuit = build(fixture.data, engine);
++        const twin = build(fixture.data, engine);
++        await run(circuit, fixture, 0, 9);
++        await run(twin, fixture, 0, 9);
++        const tick = circuit.tick;
++        await expect(circuit.loadState(foreign)).rejects.toThrow();
++        expect(circuit.tick).toBe(tick);
++        expect(await run(circuit, fixture, 9, 40)).toEqual(await run(twin, fixture, 9, 40));
++    });
++
++    test.each(cases)('refuses to construct a circuit from a state %s', async (_label, data, fixture) => {
++        const foreign = await foreignState(data);
++        expect(() => new HeadlessCircuit(clone(fixture.data), { engine, engineOptions, state: foreign })).toThrow();
++    });
++
++    test.each(['ram', 'fsm', 'twins'])('%s: a refused state changes no port, memory or automaton state', async (name) => {
++        const fixture = fixtures[name];
++        const own = withChanges(fixture.data, d => { d.devices.z = { type: 'Not', label: 'z', bits: 1 }; });
++        const other = withChanges(fixture.data, d => { d.devices.z = { type: 'Repeater', label: 'z', bits: 1 }; });
++        const donor = build(other, engine);
++        await run(donor, { script: fixture.other }, 0, 60);
++        const foreign = clone(await donor.saveState());
++        const circuit = build(own, engine);
++        observeAll(circuit);
++        await run(circuit, fixture, 0, fixture.save);
++        await circuit.synchronize();
++        const before = everything(circuit);
++        await expect(circuit.loadState(foreign)).rejects.toThrow();
++        await circuit.synchronize();
++        expect(everything(circuit)).toEqual(before);
++    });
++
++    test.each(['twins', 'ram'])('%s: rejects an empty object and stays exactly as it was', async (name) => {
++        const fixture = fixtures[name];
++        const circuit = build(fixture.data, engine);
++        observeAll(circuit);
++        await run(circuit, fixture, 0, fixture.save + 13);
++        await circuit.synchronize();
++        const before = everything(circuit);
++        await expect(circuit.loadState({})).rejects.toThrow();
++        await circuit.synchronize();
++        expect(everything(circuit)).toEqual(before);
++        expect(() => new HeadlessCircuit(clone(fixture.data), { engine, engineOptions, state: {} })).toThrow();
++    });
++});
++
++describe.each(enginePairs.filter(([a, b]) => a != b))('switching from %s to %s', (_n1, _n2, fromEngine, toEngine) => {
++    test.each(['counter', 'pulses', 'twins', 'ram', 'fsm'])('%s carries on exactly where it was', async (name) => {
++        const fixture = fixtures[name];
++        const circuit = build(fixture.data, fromEngine);
++        const twin = build(fixture.data, fromEngine);
++        await run(circuit, fixture, 0, fixture.save);
++        await run(twin, fixture, 0, fixture.save);
++        const tick = circuit.tick;
++        await circuit.switchEngine(toEngine, engineOptions);
++        expect(circuit.tick).toBe(tick);
++        expect(await run(circuit, fixture, fixture.save, fixture.save + fixture.more))
++            .toEqual(await run(twin, fixture, fixture.save, fixture.save + fixture.more));
++    });
++
++    test('monitors keep reporting without a report from the switch itself', async () => {
++        const fixture = fixtures.twins;
++        const circuit = build(fixture.data, fromEngine);
++        const twin = build(fixture.data, fromEngine);
++        const calls = [], twinCalls = [];
++        const ids = watch(circuit, fixture.watch, calls);
++        watch(twin, fixture.watch, twinCalls);
++        const removedCalls = [];
++        const [removed] = watch(circuit, [['ff', ['r2'], 'out']], removedCalls);
++        await run(circuit, fixture, 0, fixture.save);
++        await run(twin, fixture, 0, fixture.save);
++        await circuit.synchronize();
++        await twin.synchronize();
++        expect(calls).toEqual(twinCalls);
++        circuit.unmonitor(removed);
++        removedCalls.length = 0;
++        const before = calls.length;
++        await circuit.switchEngine(toEngine, engineOptions);
++        await circuit.synchronize();
++        expect(calls.length).toBe(before);
++        await run(circuit, fixture, fixture.save, 20);
++        await run(twin, fixture, fixture.save, 20);
++        expect(calls).toEqual(twinCalls);
++        circuit.unmonitor(ids[0]);
++        const count = calls.length;
++        await run(circuit, fixture, 20, fixture.save + fixture.more);
++        await run(twin, fixture, 20, fixture.save + fixture.more);
++        expect(calls.slice(count).filter(call => call.startsWith('ff r1 '))).toEqual([]);
++        expect(calls.slice(count)).toEqual(twinCalls.slice(count).filter(call => !call.startsWith('ff r1 ')));
++        expect(removedCalls).toEqual([]);
++    });
++
++    test('a one-shot monitor that already fired stays gone, a pending one still fires once', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, fromEngine);
++        const fired = [], pending = [];
++        const ff = circuit.findDeviceByLabel('ff');
++        circuit.monitor(ff, 'out', (tick, value) => { fired.push(tick + ':' + value.toBin()); }, { oneShot: true, triggerValues: [sig('0010')] });
++        circuit.monitor(ff, 'out', (tick, value) => { pending.push(tick + ':' + value.toBin()); }, { oneShot: true, triggerValues: [sig('1001')] });
++        await run(circuit, fixture, 0, 18);
++        await circuit.synchronize();
++        expect(fired.length).toBe(1);
++        expect(pending.length).toBe(0);
++        await circuit.switchEngine(toEngine, engineOptions);
++        await run(circuit, fixture, 18, 160);
++        await circuit.synchronize();
++        expect(fired.length).toBe(1);
++        expect(pending.length).toBe(1);
++        const twin = build(fixture.data, fromEngine);
++        const twinPending = [];
++        twin.monitor(twin.findDeviceByLabel('ff'), 'out', (tick, value) => { twinPending.push(tick + ':' + value.toBin()); }, { oneShot: true, triggerValues: [sig('1001')] });
++        await run(twin, fixture, 0, 160);
++        await twin.synchronize();
++        expect(pending).toEqual(twinPending);
++    });
++
++    test('a one-shot monitor that has only reported the value its port had can still be removed by its id', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, fromEngine);
++        const calls = [];
++        const ff = circuit.findDeviceByLabel('ff');
++        const first = circuit.monitor(ff, 'out', (tick) => { calls.push('first ' + tick); }, { oneShot: true });
++        await circuit.synchronize();
++        circuit.unmonitor(first);
++        const reported = calls.slice();
++        await run(circuit, fixture, 0, 20);
++        await circuit.switchEngine(toEngine, engineOptions);
++        expect(calls).toEqual(reported);
++        const second = circuit.monitor(ff, 'out', (tick) => { calls.push('second ' + tick); }, { oneShot: true });
++        await circuit.synchronize();
++        circuit.unmonitor(second);
++        const reportedAgain = calls.slice();
++        await run(circuit, fixture, 20, 60);
++        await circuit.synchronize();
++        expect(calls).toEqual(reportedAgain);
++    });
++
++    test('a wait that started before the switch resolves at the right tick', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, fromEngine);
++        const twin = build(fixture.data, fromEngine);
++        const waited = circuit.waitFor(circuit.findDeviceByLabel('ff'), 'out', sig('0111'));
++        const twinWaited = twin.waitFor(twin.findDeviceByLabel('ff'), 'out', sig('0111'));
++        await run(circuit, fixture, 0, 12);
++        await circuit.switchEngine(toEngine, engineOptions);
++        await run(circuit, fixture, 12, 120);
++        await run(twin, fixture, 0, 120);
++        expect(await waited).toBe(await twinWaited);
++    });
++
++    test('observed subcircuits stay observed', async () => {
++        const fixture = fixtures.twins;
++        const circuit = build(fixture.data, fromEngine);
++        const twin = build(fixture.data, SynchEngine);
++        observeAll(circuit);
++        await run(circuit, fixture, 0, 8);
++        await run(twin, fixture, 0, 8);
++        await circuit.switchEngine(toEngine, engineOptions);
++        for (let step = 8; step < 30; step++) {
++            await run(circuit, fixture, step, step + 1);
++            await run(twin, fixture, step, step + 1);
++            await circuit.synchronize();
++            expect(devicesAt(circuit)).toEqual(devicesAt(twin));
++        }
++    });
++
++    test('update notifications keep coming after the switch', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, fromEngine);
++        const ticks = [];
++        circuit.on('postUpdateGates', (tick) => { ticks.push(tick); });
++        await run(circuit, fixture, 0, 5);
++        await circuit.switchEngine(toEngine, engineOptions);
++        ticks.length = 0;
++        await run(circuit, fixture, 5, 12);
++        await circuit.synchronize();
++        expect(ticks.length).toBeGreaterThanOrEqual(7);
++        expect(ticks.every(tick => tick >= 5 && tick <= 12)).toBe(true);
++        expect(ticks).toContain(11);
++    });
++
++    test('an alarm set before the switch goes off at its tick after it, and one removed before it never does', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, fromEngine);
++        await run(circuit, fixture, 0, 20);
++        let fired = 0, removed = 0;
++        circuit.alarm(35, () => { fired++; });
++        circuit.unalarm(circuit.alarm(38, () => { removed++; }));
++        await circuit.switchEngine(toEngine, engineOptions);
++        const seen = [];
++        for (let step = 0; step < 20; step++) {
++            await circuit.updateGatesNext({ synchronous: true });
++            await circuit.synchronize();
++            seen.push(circuit.tick + ':' + fired);
++        }
++        expect(seen.find(entry => entry.endsWith(':1'))).toBe('35:1');
++        expect(fired).toBe(1);
++        expect(removed).toBe(0);
++    });
++
++    test('an alarm a load jumped past still goes off once a rewind after the switch brings it back', async () => {
++        const fixture = fixtures.counter;
++        const donor = build(fixture.data, fromEngine);
++        await run(donor, fixture, 0, 20);
++        const early = clone(await donor.saveState());
++        await run(donor, fixture, 20, 60);
++        const late = clone(await donor.saveState());
++        const circuit = build(fixture.data, fromEngine);
++        await circuit.loadState(early);
++        let fired = 0;
++        circuit.alarm(45, () => { fired++; });
++        await circuit.loadState(late);
++        await circuit.switchEngine(toEngine, engineOptions);
++        await run(circuit, fixture, 60, 70);
++        await circuit.synchronize();
++        expect(fired).toBe(0);
++        await circuit.loadState(early);
++        const seen = [];
++        for (let step = 0; step < 30; step++) {
++            await circuit.updateGatesNext({ synchronous: true });
++            await circuit.synchronize();
++            seen.push(circuit.tick + ':' + fired);
++        }
++        expect(seen.find(entry => entry.endsWith(':1'))).toBe('45:1');
++        expect(fired).toBe(1);
++    });
++
++    test('an alarm due right after a pending evaluation still goes off, and the circuit keeps going', async () => {
++        async function prepared(calls) {
++            const circuit = build(CHAIN, fromEngine);
++            await run(circuit, { script: [[0, 'a', '0']] }, 0, 20);
++            circuit.alarm(30, () => { calls.push(circuit.tick); });
++            circuit.setInput('a', sig('1'));
++            await circuit.synchronize();
++            return circuit;
++        }
++        const fired = [], twinFired = [];
++        const circuit = await prepared(fired);
++        const twin = await prepared(twinFired);
++        await circuit.switchEngine(toEngine, engineOptions);
++        const script = { script: [[42, 'a', '0']] };
++        expect(await run(circuit, script, 20, 60)).toEqual(await run(twin, script, 20, 60));
++        expect(fired).toEqual(twinFired);
++        circuit.setInput('a', sig('1'));
++        twin.setInput('a', sig('1'));
++        await circuit.updateGatesNext({ synchronous: true });
++        await twin.updateGatesNext({ synchronous: true });
++        await circuit.synchronize();
++        await twin.synchronize();
++        expect([circuit.tick, outputs(circuit)]).toEqual([twin.tick, outputs(twin)]);
++    });
++
++    test('a wait for the value its port already has and an alarm for the next tick are not called by the switch', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, fromEngine);
++        const twin = build(fixture.data, fromEngine);
++        await run(circuit, fixture, 0, 20);
++        await run(twin, fixture, 0, 20);
++        await circuit.synchronize();
++        const value = circuit.findDeviceByLabel('ff').get('outputSignals').out;
++        const waited = circuit.waitFor(circuit.findDeviceByLabel('ff'), 'out', value);
++        const twinWaited = twin.waitFor(twin.findDeviceByLabel('ff'), 'out', value);
++        let fired = 0, twinFired = 0;
++        circuit.alarm(21, () => { fired++; });
++        twin.alarm(21, () => { twinFired++; });
++        await circuit.switchEngine(toEngine, engineOptions);
++        await circuit.synchronize();
++        expect(fired).toBe(0);
++        expect(await settled(waited)).toBe('still waiting');
++        await run(circuit, fixture, 20, 200);
++        await run(twin, fixture, 20, 200);
++        await circuit.synchronize();
++        await twin.synchronize();
++        expect([fired, twinFired]).toEqual([1, 1]);
++        expect(await settled(twinWaited)).not.toBe('still waiting');
++        expect(await settled(waited)).toBe(await settled(twinWaited));
++    });
++});
++
++async function until(check, what, tries = 2000) {
++    for (let i = 0; i < tries && !check(); i++)
++        await new Promise(resolve => setTimeout(resolve, 10));
++    if (!check()) throw new Error('gave up after 20 s waiting for ' + what);
++}
++
++describe('switching from the worker engine to the synch engine and back', () => {
++    test('a once shot monitor that has only reported its current value can be removed by its id without touching any other monitor', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, WorkerEngine);
++        const twin = build(fixture.data, WorkerEngine);
++        await run(circuit, fixture, 0, 12);
++        await run(twin, fixture, 0, 12);
++        const shots = [];
++        const once = circuit.monitor(circuit.findDeviceByLabel('ff'), 'out', (tick) => { shots.push(tick); }, { oneShot: true });
++        await circuit.synchronize();
++        const reported = shots.slice();
++        await circuit.switchEngine(SynchEngine, engineOptions);
++        await circuit.switchEngine(WorkerEngine, engineOptions);
++        const calls = [], twinCalls = [];
++        for (let k = 0; k < 40; k++) {
++            const mine = [], theirs = [];
++            calls.push(mine);
++            twinCalls.push(theirs);
++            circuit.monitor(circuit.findDeviceByLabel('ff'), 'out', (tick, value) => { mine.push(tick + ':' + value.toBin()); });
++            twin.monitor(twin.findDeviceByLabel('ff'), 'out', (tick, value) => { theirs.push(tick + ':' + value.toBin()); });
++        }
++        circuit.unmonitor(once);
++        await run(circuit, fixture, 12, 40);
++        await run(twin, fixture, 12, 40);
++        await circuit.synchronize();
++        await twin.synchronize();
++        expect(shots).toEqual(reported);
++        expect(calls).toEqual(twinCalls);
++    });
++
++    test('a once shot monitor that already went off can be removed by its id without touching any other monitor', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, WorkerEngine);
++        const twin = build(fixture.data, WorkerEngine);
++        await run(circuit, fixture, 0, 8);
++        await run(twin, fixture, 0, 8);
++        const shots = [];
++        const once = circuit.monitor(circuit.findDeviceByLabel('ff'), 'out', (tick, value) => { shots.push(tick + ':' + value.toBin()); }, { oneShot: true, triggerValues: [sig('0010')] });
++        await run(circuit, fixture, 8, 16);
++        await run(twin, fixture, 8, 16);
++        await circuit.synchronize();
++        const fired = shots.slice();
++        await circuit.switchEngine(SynchEngine, engineOptions);
++        await circuit.switchEngine(WorkerEngine, engineOptions);
++        const calls = [], twinCalls = [];
++        for (let k = 0; k < 40; k++) {
++            const mine = [], theirs = [];
++            calls.push(mine);
++            twinCalls.push(theirs);
++            circuit.monitor(circuit.findDeviceByLabel('ff'), 'out', (tick, value) => { mine.push(tick + ':' + value.toBin()); });
++            twin.monitor(twin.findDeviceByLabel('ff'), 'out', (tick, value) => { theirs.push(tick + ':' + value.toBin()); });
++        }
++        circuit.unmonitor(once);
++        await run(circuit, fixture, 16, 40);
++        await run(twin, fixture, 16, 40);
++        await circuit.synchronize();
++        await twin.synchronize();
++        expect(fired.length).toBe(1);
++        expect(shots).toEqual(fired);
++        expect(calls).toEqual(twinCalls);
++    });
++});
++
++describe('switching a running simulation', () => {
++    async function runningCounter(interval = 5) {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, WorkerEngine);
++        await run(circuit, fixture, 0, 10);
++        circuit.interval = interval;
++        circuit.start();
++        await until(() => circuit.tick >= 14, 'the running circuit to reach tick 14');
++        return { fixture, circuit };
++    }
++
++    async function runningOnTheMainThread(interval) {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, BrowserSynchEngine);
++        await run(circuit, fixture, 0, 10);
++        circuit.interval = interval;
++        await circuit.start();
++        await until(() => circuit.tick >= 14, 'the running circuit to reach tick 14');
++        return { fixture, circuit };
++    }
++
++    async function twinAt(fixture, tick) {
++        const twin = build(fixture.data, SynchEngine);
++        await run(twin, fixture, 0, 10);
++        await run(twin, { script: [] }, 10, tick);
++        return twin;
++    }
++
++    test('keeps running at the same pace when the new engine can run by itself', async () => {
++        const { fixture, circuit } = await runningOnTheMainThread(5);
++        await circuit.switchEngine(WorkerEngine, engineOptions);
++        expect(circuit.running).toBe(true);
++        expect(circuit.interval).toBe(5);
++        const switched = circuit.tick;
++        await until(() => circuit.tick >= switched + 8, 'eight more ticks after the switch');
++        await circuit.stop();
++        await circuit.synchronize();
++        expect(circuit.tick).toBeGreaterThanOrEqual(switched + 8);
++        const twin = await twinAt(fixture, circuit.tick);
++        expect(outputs(circuit)).toBe(outputs(twin));
++    });
++
++    test('keeps another interval just the same', async () => {
++        const { fixture, circuit } = await runningOnTheMainThread(17);
++        await circuit.switchEngine(WorkerEngine, engineOptions);
++        expect(circuit.running).toBe(true);
++        expect(circuit.interval).toBe(17);
++        const switched = circuit.tick;
++        await until(() => circuit.tick >= switched + 8, 'eight more ticks after the switch');
++        await circuit.stop();
++        await circuit.synchronize();
++        expect(circuit.tick).toBeGreaterThanOrEqual(switched + 8);
++        const twin = await twinAt(fixture, circuit.tick);
++        expect(outputs(circuit)).toBe(outputs(twin));
++    });
++
++    test('keeps the same interval on an engine that runs by itself on the main thread', async () => {
++        const { fixture, circuit } = await runningCounter(17);
++        jest.useFakeTimers({ doNotFake: ['Date', 'hrtime', 'nextTick', 'performance', 'queueMicrotask', 'requestAnimationFrame', 'cancelAnimationFrame', 'requestIdleCallback', 'cancelIdleCallback', 'setImmediate', 'clearImmediate', 'setTimeout', 'clearTimeout'] });
++        try {
++            await circuit.switchEngine(BrowserSynchEngine, engineOptions);
++            expect(circuit.running).toBe(true);
++            const switched = circuit.tick;
++            jest.advanceTimersByTime(170);
++            expect(circuit.tick).toBe(switched + 10);
++            await circuit.stop();
++            const twin = await twinAt(fixture, circuit.tick);
++            expect(outputs(circuit)).toBe(outputs(twin));
++        } finally {
++            jest.useRealTimers();
++        }
++    });
++
++    test('stops where it got to when it was running as fast as it can and the new engine cannot run by itself', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, WorkerEngine);
++        const seen = [];
++        circuit.monitor(circuit.findDeviceByLabel('clk'), 'out', (tick) => { seen.push(tick); });
++        await run(circuit, fixture, 0, 10);
++        for (let round = 0; round < 4; round++) {
++            if (round) await circuit.switchEngine(WorkerEngine, engineOptions);
++            const from = circuit.tick;
++            circuit.startFast();
++            await until(() => circuit.tick >= from + 1000, 'a thousand more ticks');
++            await circuit.switchEngine(SynchEngine, engineOptions);
++            expect(circuit.running).toBe(false);
++            expect(seen.reduce((latest, at) => Math.max(latest, at), 0)).toBeLessThanOrEqual(circuit.tick);
++        }
++        const tick = circuit.tick;
++        await run(circuit, { script: [] }, tick, tick + 30);
++        expect(new Set(seen).size).toBe(seen.length);
++    });
++
++    test('stops when the new engine cannot run by itself, and carries on from there', async () => {
++        const { fixture, circuit } = await runningCounter();
++        await circuit.switchEngine(SynchEngine, engineOptions);
++        expect(circuit.running).toBe(false);
++        const tick = circuit.tick;
++        const twin = await twinAt(fixture, tick);
++        expect(await run(circuit, { script: [] }, tick, tick + 20)).toEqual(await run(twin, { script: [] }, tick, tick + 20));
++    });
++});
++
++describe('a running simulation', () => {
++    test('keeps running at the same interval when it refuses a state that does not fit', async () => {
++        const fixture = fixtures.counter;
++        const donor = build(withChanges(COUNTER, d => { d.devices.extra = { type: 'Not', label: 'extra', bits: 1 }; }), SynchEngine);
++        await donor.updateGates({ synchronous: true });
++        const foreign = clone(await donor.saveState());
++        jest.useFakeTimers({ doNotFake: ['Date', 'hrtime', 'nextTick', 'performance', 'queueMicrotask', 'requestAnimationFrame', 'cancelAnimationFrame', 'requestIdleCallback', 'cancelIdleCallback', 'setImmediate', 'clearImmediate', 'setTimeout', 'clearTimeout'] });
++        try {
++            const circuit = build(fixture.data, BrowserSynchEngine);
++            await run(circuit, fixture, 0, 10);
++            circuit.interval = 23;
++            await circuit.start();
++            await new Promise(resolve => setTimeout(resolve, 0));
++            jest.advanceTimersByTime(23 * 4);
++            expect(circuit.tick).toBe(14);
++            await expect(circuit.loadState(foreign)).rejects.toThrow();
++            await new Promise(resolve => setTimeout(resolve, 0));
++            expect(circuit.running).toBe(true);
++            expect(circuit.interval).toBe(23);
++            jest.advanceTimersByTime(230);
++            expect(circuit.tick).toBe(24);
++            await circuit.stop();
++            const twin = build(fixture.data, SynchEngine);
++            await run(twin, fixture, 0, 10);
++            await run(twin, { script: [] }, 10, 24);
++            expect(outputs(circuit)).toBe(outputs(twin));
++        } finally {
++            jest.useRealTimers();
++        }
++    });
++});
++
++describe.each(engines.filter(([name]) => name != 'synch'))('switching from %s to the synch engine', (_n, fromEngine) => {
++    test('forwards every update notification of the new engine exactly once', async () => {
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, fromEngine);
++        const ticks = [];
++        circuit.on('postUpdateGates', (tick) => { ticks.push(tick); });
++        await run(circuit, fixture, 0, 5);
++        await circuit.switchEngine(SynchEngine, engineOptions);
++        ticks.length = 0;
++        await run(circuit, fixture, 5, 12);
++        expect(ticks).toEqual([5, 6, 7, 8, 9, 10, 11]);
++    });
++});
++
++describe.each(enginePairs.filter(([a, b]) => a != b))('a state saved with %s', (_n1, _n2, saveEngine, loadEngine) => {
++    test.each(['counter', 'twins', 'ram', 'fsm'])('%s: builds a circuit on the other engine straight into it', async (name) => {
++        const fixture = fixtures[name];
++        const { circuit, state, tick } = await savedCircuit(fixture, saveEngine);
++        const expected = await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++        const target = build(fixture.data, loadEngine, { state });
++        await target.synchronize();
++        expect(target.tick).toBe(tick);
++        expect(await run(target, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++    });
++});
++
++describe.each(engines)('switching from %s to a subclass of the synch engine', (_n, fromEngine) => {
++    test('builds exactly one new instance of the given class with the given options', async () => {
++        const created = [];
++        class RecordingEngine extends SynchEngine {
++            constructor(graph, options) {
++                super(graph, options);
++                created.push(options);
++            }
++        }
++        const fixture = fixtures.counter;
++        const circuit = build(fixture.data, fromEngine);
++        const twin = build(fixture.data, fromEngine);
++        await run(circuit, fixture, 0, 20);
++        await run(twin, fixture, 0, 20);
++        await circuit.switchEngine(RecordingEngine, { marker: 7 });
++        expect(created.some(options => options.marker === 7)).toBe(true);
++        expect(await run(circuit, fixture, 20, 50)).toEqual(await run(twin, fixture, 20, 50));
++    });
++});
++
++describe('loading on the synch engine', () => {
++    test('calls no postUpdateGates listener', async () => {
++        const fixture = fixtures.counter;
++        const { state } = await savedCircuit(fixture, SynchEngine);
++        const target = build(fixture.data, SynchEngine);
++        await run(target, { script: fixture.other }, 0, 7);
++        const ticks = [];
++        target.on('postUpdateGates', (tick) => { ticks.push(tick); });
++        await target.loadState(state);
++        expect(ticks).toEqual([]);
++        await run(target, fixture, fixture.save, fixture.save + 3);
++        expect(ticks.length).toBe(3);
++    });
++
++    test.each(['counter', 'pulses', 'twins'])('%s: evaluates no device', async (name) => {
++        const fixture = fixtures[name];
++        const data = counted(fixture.data);
++        const circuit = build(data, SynchEngine, { cellsNamespace: countedCells });
++        await run(circuit, fixture, 0, fixture.save);
++        const state = clone(await circuit.saveState());
++        const expected = await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++        const target = build(data, SynchEngine, { cellsNamespace: countedCells });
++        await run(target, { script: fixture.other }, 0, fixture.save + 17);
++        const before = evaluations;
++        await target.loadState(state);
++        expect(evaluations).toBe(before);
++        expect(await run(target, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++        expect(evaluations).toBeGreaterThan(before);
++    });
++});
++
++describe('loading on the worker engine', () => {
++    test('sends no update notification about the loaded state, and notifications resume afterwards', async () => {
++        const fixture = fixtures.counter;
++        const { state, tick } = await savedCircuit(fixture, WorkerEngine);
++        const target = build(fixture.data, WorkerEngine);
++        await run(target, { script: fixture.other }, 0, 7);
++        await target.synchronize();
++        const ticks = [];
++        target.on('postUpdateGates', (at) => { ticks.push(at); });
++        await target.loadState(state);
++        expect(ticks).toEqual([]);
++        await run(target, fixture, fixture.save, fixture.save + 3);
++        expect(ticks).toContain(tick + 3);
++    });
++});
++
++describe('Circuit on its default engine', () => {
++    test('saves, loads and is built straight into a saved state', async () => {
++        const fixture = fixtures.twins;
++        const circuit = new Circuit(clone(fixture.data));
++        live.push(circuit);
++        await run(circuit, fixture, 0, fixture.save);
++        const tick = circuit.tick;
++        const pending = circuit.hasPendingEvents;
++        const shown = outputs(circuit);
++        const ports = devicesAt(circuit);
++        const state = clone(await circuit.saveState());
++        const expected = await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++        await circuit.loadState(state);
++        await circuit.synchronize();
++        expect(circuit.tick).toBe(tick);
++        expect(await run(circuit, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++        const target = new Circuit(clone(fixture.data), { state });
++        live.push(target);
++        expect([target.tick, target.hasPendingEvents, outputs(target), devicesAt(target)]).toEqual([tick, pending, shown, ports]);
++        expect(await run(target, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++    });
++
++    test('takes a state from the worker engine and gives one the worker engine can use', async () => {
++        const fixture = fixtures.ram;
++        const circuit = new Circuit(clone(fixture.data));
++        live.push(circuit);
++        const worker = build(fixture.data, WorkerEngine);
++        await run(circuit, fixture, 0, fixture.save);
++        await run(worker, fixture, 0, fixture.save);
++        const tick = circuit.tick;
++        const fromDefault = clone(await circuit.saveState());
++        const fromWorker = clone(await worker.saveState());
++        const expected = await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++        const onWorker = build(fixture.data, WorkerEngine, { state: fromDefault });
++        await onWorker.synchronize();
++        expect(onWorker.tick).toBe(tick);
++        expect(await run(onWorker, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++        const onDefault = new Circuit(clone(fixture.data), { state: fromWorker });
++        live.push(onDefault);
++        expect(onDefault.tick).toBe(tick);
++        expect(await run(onDefault, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++    });
++});
++
++describe.each(engines)('Circuit on %s', (_n, engine) => {
++    test('saves, loads and is built straight into a saved state', async () => {
++        const fixture = fixtures.twins;
++        const circuit = build(fixture.data, engine, {}, Circuit);
++        await run(circuit, fixture, 0, fixture.save);
++        const tick = circuit.tick;
++        const state = clone(await circuit.saveState());
++        const expected = await run(circuit, fixture, fixture.save, fixture.save + fixture.more);
++        await circuit.loadState(state);
++        await circuit.synchronize();
++        expect(circuit.tick).toBe(tick);
++        expect(await run(circuit, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++        const target = build(fixture.data, engine, { state }, Circuit);
++        await target.synchronize();
++        expect(target.tick).toBe(tick);
++        expect(await run(target, fixture, fixture.save, fixture.save + fixture.more)).toEqual(expected);
++    });
++
++    test('refuses a state that does not fit and stays exactly as it was', async () => {
++        const fixture = fixtures.twins;
++        const other = withChanges(fixture.data, d => { d.subcircuits.invert.devices.n.type = 'Repeater'; });
++        const donor = build(other, engine);
++        await run(donor, { script: fixture.other }, 0, 20);
++        const foreign = clone(await donor.saveState());
++        const circuit = build(fixture.data, engine, {}, Circuit);
++        observeAll(circuit);
++        await run(circuit, fixture, 0, fixture.save);
++        await circuit.synchronize();
++        const before = everything(circuit);
++        await expect(circuit.loadState(foreign)).rejects.toThrow();
++        await circuit.synchronize();
++        expect(everything(circuit)).toEqual(before);
++        expect(() => new Circuit(clone(fixture.data), { engine, engineOptions, state: foreign })).toThrow();
++    });
++
++    test('switches engines and carries on exactly where it was', async () => {
++        const fixture = fixtures.twins;
++        const circuit = build(fixture.data, engine, {}, Circuit);
++        const twin = build(fixture.data, engine);
++        const calls = [], twinCalls = [];
++        watch(circuit, fixture.watch, calls);
++        watch(twin, fixture.watch, twinCalls);
++        await run(circuit, fixture, 0, fixture.save);
++        await run(twin, fixture, 0, fixture.save);
++        const ticks = [];
++        circuit.on('postUpdateGates', (tick) => { ticks.push(tick); });
++        await circuit.switchEngine(engine == SynchEngine ? WorkerEngine : SynchEngine, engineOptions);
++        expect(circuit.tick).toBe(twin.tick);
++        expect(await run(circuit, fixture, fixture.save, fixture.save + fixture.more))
++            .toEqual(await run(twin, fixture, fixture.save, fixture.save + fixture.more));
++        await circuit.synchronize();
++        await twin.synchronize();
++        expect(calls).toEqual(twinCalls);
++        expect(ticks).toContain(fixture.save + fixture.more - 1);
++    });
++});
+diff --git a/tests/seeded_random_03797d.js b/tests/seeded_random_03797d.js
+new file mode 100644
+index 0000000..c62bcbe
+--- /dev/null
++++ b/tests/seeded_random_03797d.js
+@@ -0,0 +1,8 @@
++let seed = 0x6b8b4567;
++
++Math.random = () => {
++    seed = (seed + 0x6d2b79f5) | 0;
++    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
++    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
++    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
++};
+diff --git a/tests/unique_names_d7cd5a.js b/tests/unique_names_d7cd5a.js
+new file mode 100644
+index 0000000..158aecf
+--- /dev/null
++++ b/tests/unique_names_d7cd5a.js
+@@ -0,0 +1,22 @@
++const { TestEnvironment } = require('jest-environment-node');
++
++class UniqueNamesEnvironment extends TestEnvironment {
++    constructor(config, context) {
++        super(config, context);
++        this.seenNames = new Map();
++    }
++
++    handleTestEvent(event, state) {
++        if (event.name !== 'add_test') return;
++        const block = state.currentDescribeBlock;
++        const test = block.children[block.children.length - 1];
++        const names = [test.name];
++        for (let b = block; b && b.parent; b = b.parent) names.unshift(b.name);
++        const fullName = names.join(' ');
++        const count = (this.seenNames.get(fullName) || 0) + 1;
++        this.seenNames.set(fullName, count);
++        if (count > 1) test.name = `${test.name} (${count})`;
++    }
++}
++
++module.exports = UniqueNamesEnvironment;

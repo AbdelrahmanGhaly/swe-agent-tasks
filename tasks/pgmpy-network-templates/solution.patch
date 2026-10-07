@@ -1,0 +1,602 @@
+diff --git a/docs/api/models.rst b/docs/api/models.rst
+index 84aa6532..3d8404cc 100644
+--- a/docs/api/models.rst
++++ b/docs/api/models.rst
+@@ -16,6 +16,7 @@ Directed Probabilistic Models
+    ~pgmpy.models.FunctionalBayesianNetwork
+    ~pgmpy.models.DynamicBayesianNetwork
+    ~pgmpy.models.NaiveBayes
++   ~pgmpy.models.NetworkTemplate
+ 
+ Structural Equation Models
+ --------------------------
+diff --git a/pgmpy/factors/discrete/CPD.py b/pgmpy/factors/discrete/CPD.py
+index cbd4f2e9..d0619b58 100644
+--- a/pgmpy/factors/discrete/CPD.py
++++ b/pgmpy/factors/discrete/CPD.py
+@@ -701,6 +701,51 @@ class TabularCPD(DiscreteFactor):
+         """
+         return self.variables[:0:-1]
+ 
++    def rename(self, mapping: dict[Hashable, Hashable]) -> "TabularCPD":
++        """
++        Returns a copy of the CPD with some of its variables renamed.
++
++        The table itself is untouched, so every entry keeps the states it was
++        written for.
++
++        Parameters
++        ----------
++        mapping: dict
++            A dict of the form {old name: new name} over any subset of the
++            variables of the CPD.
++
++        Returns
++        -------
++        Renamed CPD: pgmpy.factors.discrete.TabularCPD
++
++        Examples
++        --------
++        >>> from pgmpy.factors.discrete import TabularCPD
++        >>> cpd = TabularCPD(
++        ...     "grade", 2, [[0.7, 0.2], [0.3, 0.8]], evidence=["diff"], evidence_card=[2]
++        ... )
++        >>> cpd.rename({"diff": "difficulty"}).variables
++        ['grade', 'difficulty']
++        """
++        if not isinstance(mapping, dict):
++            raise ValueError("mapping must be a dict of the form {old_name: new_name}")
++
++        unknown = set(mapping) - set(self.variables)
++        if unknown:
++            raise ValueError(f"Not variables of this CPD: {sorted(unknown, key=str)}")
++
++        renamed = [mapping.get(variable, variable) for variable in self.variables]
++        if len(set(renamed)) != len(renamed):
++            raise ValueError(f"Renaming the CPD of {self.variable} would give two variables the same name")
++
++        cpd = self.copy()
++        cpd.variables = renamed
++        cpd.variable = renamed[0]
++        cpd.state_names = {mapping.get(key, key): value for key, value in cpd.state_names.items()}
++        cpd.name_to_no = {mapping.get(key, key): value for key, value in cpd.name_to_no.items()}
++        cpd.no_to_name = {mapping.get(key, key): value for key, value in cpd.no_to_name.items()}
++        return cpd
++
+     @staticmethod
+     def get_random(variable, evidence=None, cardinality=None, state_names={}, seed=None):
+         """
+diff --git a/pgmpy/models/DiscreteBayesianNetwork.py b/pgmpy/models/DiscreteBayesianNetwork.py
+index b1163f88..38376117 100644
+--- a/pgmpy/models/DiscreteBayesianNetwork.py
++++ b/pgmpy/models/DiscreteBayesianNetwork.py
+@@ -1087,6 +1087,48 @@ class DiscreteBayesianNetwork(DAG):
+ 
+         return model_copy
+ 
++    def embed(self, template: Any, prefix: str, bindings: dict | None = None) -> "DiscreteBayesianNetwork":
++        """
++        Returns a copy of this network with a `NetworkTemplate` embedded in it.
++
++        Every interior node of the template joins the network under a name made
++        of `prefix`, a dot and the node. Every boundary node is bound to a
++        variable that is already in the network, and the children the boundary
++        node had in the template take that variable as a parent instead.
++
++        Parameters
++        ----------
++        template: pgmpy.models.NetworkTemplate
++            The template to embed.
++
++        prefix: str
++            The prefix the interior nodes of the template take.
++
++        bindings: dict
++            A dict of the form {boundary node: variable of this network}.
++
++        Returns
++        -------
++        Network with the template embedded: pgmpy.models.DiscreteBayesianNetwork
++        """
++        from pgmpy.models.NetworkTemplate import NetworkTemplate, _plan_embedding
++
++        if not isinstance(template, NetworkTemplate):
++            raise ValueError("Only a NetworkTemplate can be embedded")
++        self.check_model()
++
++        host_states = self.states
++        renaming, edges, cpds = _plan_embedding(
++            template, prefix, bindings, set(self.nodes()), lambda node: host_states[node]
++        )
++
++        embedded = self.copy()
++        embedded.add_nodes_from(renaming[node] for node in template.interior)
++        embedded.add_edges_from(edges)
++        embedded.add_cpds(*cpds)
++        embedded.check_model()
++        return embedded
++
+     def get_markov_blanket(self, node: Hashable) -> list[Hashable]:
+         """
+         Returns a markov blanket for a random variable. In the case
+diff --git a/pgmpy/models/NetworkTemplate.py b/pgmpy/models/NetworkTemplate.py
+new file mode 100644
+index 00000000..470b9f28
+--- /dev/null
++++ b/pgmpy/models/NetworkTemplate.py
+@@ -0,0 +1,457 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++from collections.abc import Callable, Hashable, Iterable
++
++import networkx as nx
++import numpy as np
++
++from pgmpy.base import DAG
++from pgmpy.factors.discrete import DiscreteFactor, TabularCPD
++from pgmpy.models.DiscreteBayesianNetwork import DiscreteBayesianNetwork
++from pgmpy.utils import compat_fns
++
++
++def _plan_embedding(
++    template: NetworkTemplate,
++    prefix: str,
++    bindings: dict | None,
++    known: set[Hashable],
++    states_of: Callable[[Hashable], list],
++) -> tuple[dict, list, list]:
++    template.check_template()
++
++    bindings = {} if bindings is None else dict(bindings)
++    unbound = template.boundary - set(bindings)
++    if unbound:
++        raise ValueError(f"No binding given for the boundary nodes {sorted(unbound, key=str)}")
++    stray = set(bindings) - template.boundary
++    if stray:
++        raise ValueError(f"Bindings given for nodes that are not on the boundary: {sorted(stray, key=str)}")
++    if len(set(bindings.values())) != len(bindings):
++        raise ValueError("Two boundary nodes can not be bound to the same variable")
++
++    for node, target in bindings.items():
++        if target not in known:
++            raise ValueError(f"{node} is bound to {target}, which is not there to bind to")
++        wanted = template.boundary_states(node)
++        found = list(states_of(target))
++        if found != wanted:
++            raise ValueError(f"{target} has states {found} but {node} needs {wanted}")
++
++    renaming = {node: f"{prefix}.{node}" for node in template.interior}
++    if len(set(renaming.values())) != len(renaming):
++        raise ValueError(f"Embedding under {prefix} would give two interior nodes the same name")
++    clash = set(renaming.values()) & set(known)
++    if clash:
++        raise ValueError(f"Embedding under {prefix} would reuse the names {sorted(clash, key=str)}")
++    renaming.update(bindings)
++
++    edges = [(renaming[start], renaming[end]) for start, end in template.edges()]
++    cpds = [
++        cpd.rename({old: new for old, new in renaming.items() if old in cpd.variables}) for cpd in template.get_cpds()
++    ]
++    return renaming, edges, cpds
++
++
++def _conditional_values(current: DiscreteFactor, denominator: DiscreteFactor, variable: Hashable) -> np.ndarray:
++    numerator = compat_fns.to_numpy(current.values)
++    shared = [name for name in current.variables if name in denominator.variables]
++    aligned = np.transpose(
++        compat_fns.to_numpy(denominator.values), [denominator.variables.index(name) for name in shared]
++    )
++    shape = [aligned.shape[shared.index(name)] if name in shared else 1 for name in current.variables]
++    aligned = aligned.reshape(tuple(shape))
++
++    with np.errstate(divide="ignore", invalid="ignore"):
++        ratio = numerator / aligned
++    return np.where(aligned > 0, ratio, 1.0 / len(current.state_names[variable]))
++
++
++def _cpd_from_values(
++    values: np.ndarray,
++    variables: list[Hashable],
++    state_names: dict,
++    variable: Hashable,
++    evidence: list[Hashable],
++) -> TabularCPD:
++    order = [variable] + list(evidence)
++    values = np.transpose(values, [variables.index(name) for name in order])
++    cardinality = [len(state_names[name]) for name in order]
++    return TabularCPD(
++        variable,
++        cardinality[0],
++        values.reshape(cardinality[0], -1),
++        evidence=list(evidence) if evidence else None,
++        evidence_card=cardinality[1:] if evidence else None,
++        state_names={name: list(state_names[name]) for name in order},
++    )
++
++
++class NetworkTemplate(DAG):
++    """
++    A reusable piece of a discrete Bayesian network.
++
++    A template is a directed acyclic graph split into boundary nodes and
++    interior nodes. A boundary node stands in for a variable that is supplied
++    only when the template is embedded, so it has no parents and no CPD of its
++    own; its states are the ones the CPDs of its children give it. Every
++    interior node carries a `TabularCPD` over its parents, exactly as in a
++    `DiscreteBayesianNetwork`.
++
++    Parameters
++    ----------
++    ebunch: input graph
++        Data to initialize the graph, in any format `DAG` accepts.
++
++    boundary: array-like
++        The nodes that stand in for variables supplied later.
++
++    Examples
++    --------
++    >>> from pgmpy.factors.discrete import TabularCPD
++    >>> from pgmpy.models import NetworkTemplate
++    >>> template = NetworkTemplate([("load", "alarm")], boundary=["load"])
++    >>> template.add_cpds(
++    ...     TabularCPD(
++    ...         "alarm",
++    ...         2,
++    ...         [[0.9, 0.2], [0.1, 0.8]],
++    ...         evidence=["load"],
++    ...         evidence_card=[2],
++    ...         state_names={"alarm": ["off", "on"], "load": ["low", "high"]},
++    ...     )
++    ... )
++    >>> sorted(template.interior)
++    ['alarm']
++    >>> template.boundary_states("load")
++    ['low', 'high']
++    """
++
++    def __init__(
++        self,
++        ebunch: Iterable[tuple[Hashable, Hashable]] | None = None,
++        boundary: Iterable[Hashable] | None = None,
++        latents: set[Hashable] | None = None,
++    ) -> None:
++        super().__init__(ebunch=ebunch, latents=latents)
++
++        self.boundary = set() if boundary is None else set(boundary)
++        self.add_nodes_from(self.boundary)
++        self.cpds = []
++
++    @property
++    def interior(self) -> set[Hashable]:
++        """The nodes of the template that are not boundary nodes."""
++        return set(self.nodes()) - self.boundary
++
++    def add_cpds(self, *cpds: TabularCPD) -> None:
++        """
++        Associates `TabularCPD` objects with the interior nodes of the template.
++
++        Parameters
++        ----------
++        *cpds: pgmpy.factors.discrete.TabularCPD
++            One CPD for every interior node of the template.
++        """
++        for cpd in cpds:
++            if not isinstance(cpd, TabularCPD):
++                raise ValueError("Only TabularCPD can be added.")
++            if cpd.variable not in self.nodes():
++                raise ValueError(f"CPD defined on variable not in the template: {cpd.variable}")
++            if cpd.variable in self.boundary:
++                raise ValueError(f"{cpd.variable} is a boundary node and can not have a CPD")
++
++            for index, existing in enumerate(self.cpds):
++                if existing.variable == cpd.variable:
++                    self.cpds[index] = cpd
++                    break
++            else:
++                self.cpds.append(cpd)
++
++    def get_cpds(self, node: Hashable | None = None) -> TabularCPD | list[TabularCPD] | None:
++        """
++        Returns the CPD of `node`, or every CPD of the template when `node` is None.
++
++        Parameters
++        ----------
++        node: any hashable python object
++            The interior node whose CPD is wanted.
++        """
++        if node is None:
++            return self.cpds
++        if node not in self.nodes():
++            raise ValueError(f"{node} is not in the template")
++        for cpd in self.cpds:
++            if cpd.variable == node:
++                return cpd
++        return None
++
++    def boundary_states(self, node: Hashable) -> list:
++        """
++        Returns the states a boundary node takes, as the CPDs of its children spell them.
++
++        Parameters
++        ----------
++        node: any hashable python object
++            The boundary node whose states are wanted.
++        """
++        if node not in self.boundary:
++            raise ValueError(f"{node} is not a boundary node of the template")
++
++        found = None
++        for child in self.get_children(node):
++            cpd = self.get_cpds(child)
++            if cpd is None:
++                continue
++            states = cpd.state_names.get(node)
++            if states is None:
++                continue
++            states = list(states)
++            if found is None:
++                found = states
++            elif found != states:
++                raise ValueError(f"The children of {node} disagree about its states: {found} and {states}")
++        if found is None:
++            raise ValueError(f"No CPD of the template gives {node} any states")
++        return found
++
++    def _states_of(self, node: Hashable) -> list:
++        """Returns the states of any node of the template, boundary or interior."""
++        if node in self.boundary:
++            return self.boundary_states(node)
++        cpd = self.get_cpds(node)
++        if cpd is None:
++            raise ValueError(f"{node} has no CPD, so its states are unknown")
++        return list(cpd.state_names[node])
++
++    def check_template(self) -> bool:
++        """
++        Checks that the template is well formed.
++
++        Raises a `ValueError` describing the first problem found and returns
++        True when there is none.
++        """
++        for node in self.boundary:
++            parents = self.get_parents(node)
++            if parents:
++                raise ValueError(f"Boundary node {node} must have no parents but has {sorted(parents, key=str)}")
++            if not self.get_children(node):
++                raise ValueError(f"Boundary node {node} is never used, so nothing gives it states")
++
++        for node in self.interior:
++            cpd = self.get_cpds(node)
++            if cpd is None:
++                raise ValueError(f"No CPD associated with the interior node {node}")
++            parents = set(self.get_parents(node))
++            if set(cpd.get_evidence()) != parents:
++                raise ValueError(f"CPD of {node} does not match its parents {sorted(parents, key=str)}")
++            for index, variable in enumerate(cpd.variables):
++                named = cpd.state_names.get(variable)
++                if named is None or len(named) != cpd.cardinality[index]:
++                    raise ValueError(f"CPD of {node} does not name every state of {variable}")
++            if not cpd.is_valid_cpd():
++                raise ValueError(f"The CPD of {node} is not a valid probability distribution")
++
++        for node in self.boundary:
++            self.boundary_states(node)
++
++        for node in self.interior:
++            cpd = self.get_cpds(node)
++            for index, parent in enumerate(cpd.variables[1:]):
++                states = self._states_of(parent)
++                if len(states) != cpd.cardinality[1 + index]:
++                    raise ValueError(f"The CPD of {node} gives {parent} the wrong number of states")
++                if list(cpd.state_names[parent]) != states:
++                    raise ValueError(f"The CPD of {node} gives {parent} states that {parent} does not have")
++        return True
++
++    def copy(self) -> NetworkTemplate:
++        """
++        Returns a copy of the template carrying copies of its CPDs.
++
++        Returns
++        -------
++        Copy of self: pgmpy.models.NetworkTemplate
++        """
++        template = NetworkTemplate(ebunch=list(self.edges()), boundary=self.boundary, latents=set(self.latents))
++        template.add_nodes_from(self.nodes())
++        template.add_cpds(*[cpd.copy() for cpd in self.cpds])
++        return template
++
++    def compose(self, other: NetworkTemplate, prefix: str, bindings: dict | None = None) -> NetworkTemplate:
++        """
++        Returns this template with another template composed into it.
++
++        The interior of `other` joins this template under `prefix`, and each of
++        its boundary nodes is bound to a node that is already here, boundary or
++        interior. The boundary of the result is the boundary of this template.
++
++        Parameters
++        ----------
++        other: pgmpy.models.NetworkTemplate
++            The template to compose in.
++
++        prefix: str
++            The prefix the interior nodes of `other` take.
++
++        bindings: dict
++            A dict of the form {boundary node of other: node of this template}.
++
++        Returns
++        -------
++        Composed template: pgmpy.models.NetworkTemplate
++        """
++        self.check_template()
++        if not isinstance(other, NetworkTemplate):
++            raise ValueError("Only a NetworkTemplate can be composed in")
++
++        renaming, edges, cpds = _plan_embedding(other, prefix, bindings, set(self.nodes()), self._states_of)
++
++        composed = NetworkTemplate(ebunch=list(self.edges()) + edges, boundary=self.boundary, latents=set(self.latents))
++        composed.add_nodes_from(self.nodes())
++        composed.add_nodes_from(renaming[node] for node in other.interior)
++        composed.add_cpds(*[cpd.copy() for cpd in self.cpds])
++        composed.add_cpds(*cpds)
++        composed.check_template()
++        return composed
++
++    def to_network(self, priors: dict | None = None) -> DiscreteBayesianNetwork:
++        """
++        Closes the template into a `DiscreteBayesianNetwork`.
++
++        Every boundary node is given a prior, a `TabularCPD` over that node
++        alone, and the result is an ordinary network over the same graph.
++
++        Parameters
++        ----------
++        priors: dict
++            A dict of the form {boundary node: TabularCPD}.
++
++        Returns
++        -------
++        Closed network: pgmpy.models.DiscreteBayesianNetwork
++        """
++        self.check_template()
++
++        priors = {} if priors is None else dict(priors)
++        missing = self.boundary - set(priors)
++        if missing:
++            raise ValueError(f"No prior given for the boundary nodes {sorted(missing, key=str)}")
++        stray = set(priors) - self.boundary
++        if stray:
++            raise ValueError(f"Priors given for nodes that are not on the boundary: {sorted(stray, key=str)}")
++
++        for node, prior in priors.items():
++            if not isinstance(prior, TabularCPD):
++                raise ValueError(f"The prior for {node} must be a TabularCPD")
++            if prior.variable != node:
++                raise ValueError(f"The prior filed under {node} is a CPD of {prior.variable}")
++            if prior.get_evidence():
++                raise ValueError(f"The prior for {node} must not depend on anything else")
++            named = prior.state_names.get(node)
++            if named is None or list(named) != self.boundary_states(node):
++                raise ValueError(f"The prior for {node} does not use the states the template gives it")
++
++        network = DiscreteBayesianNetwork(list(self.edges()))
++        network.add_nodes_from(self.nodes())
++        network.add_cpds(*[cpd.copy() for cpd in self.cpds])
++        network.add_cpds(*[priors[node].copy() for node in self.boundary])
++        network.check_model()
++        return network
++
++    def marginalize(self, nodes: Iterable[Hashable]) -> NetworkTemplate:
++        """
++        Returns a copy of the template with `nodes` summed out of it.
++
++        The nodes go, the distribution the template describes over what is
++        left does not, and the result is a well formed template. How that
++        result is factorized is not fixed: children that shared a removed node
++        are left depending on one another and may gain edges among themselves.
++        A boundary node the result no longer uses drops out with it.
++
++        Parameters
++        ----------
++        nodes: array-like
++            The interior nodes to sum out.
++
++        Returns
++        -------
++        Reduced template: pgmpy.models.NetworkTemplate
++        """
++        self.check_template()
++
++        template = self.copy()
++        for node in dict.fromkeys(nodes):
++            if node not in template.nodes():
++                raise ValueError(f"{node} is not in the template")
++            if node in template.boundary:
++                raise ValueError(f"{node} is a boundary node, so there is nothing to sum out")
++            template = template._sum_out(node)
++        return template
++
++    def _sum_out(self, node: Hashable) -> NetworkTemplate:
++        children = [name for name in nx.topological_sort(self) if name in set(self.get_children(node))]
++        edges = [(start, end) for start, end in self.edges() if node not in (start, end)]
++        kept = [cpd.copy() for cpd in self.cpds if cpd.variable not in set(children) | {node}]
++
++        running = self.get_cpds(node).to_factor()
++        for child in children:
++            running = running.product(self.get_cpds(child).to_factor(), inplace=False)
++            current = running.marginalize([node], inplace=False)
++            denominator = current.marginalize([child], inplace=False)
++            evidence = [name for name in current.variables if name != child]
++            values = _conditional_values(current, denominator, child)
++            kept.append(_cpd_from_values(values, current.variables, current.state_names, child, evidence))
++            edges.extend((parent, child) for parent in evidence)
++
++        consumed = {start for start, _ in edges}
++        boundary = {name for name in self.boundary if name in consumed}
++        dropped = (self.boundary - boundary) | {node}
++
++        template = NetworkTemplate(ebunch=edges, boundary=boundary, latents=set(self.latents) - dropped)
++        template.add_nodes_from(name for name in self.nodes() if name not in dropped)
++        template.add_cpds(*kept)
++        return template
++
++    @classmethod
++    def from_network(cls, network: DiscreteBayesianNetwork, nodes: Iterable[Hashable]) -> NetworkTemplate:
++        """
++        Lifts part of a `DiscreteBayesianNetwork` out as a reusable template.
++
++        The variables in `nodes` become the interior of the template and keep
++        their CPDs. Every parent of one of them that is not itself in `nodes`
++        becomes a boundary node.
++
++        Parameters
++        ----------
++        network: pgmpy.models.DiscreteBayesianNetwork
++            The network to lift a piece out of.
++
++        nodes: array-like
++            The variables that become the interior of the template.
++
++        Returns
++        -------
++        Lifted template: pgmpy.models.NetworkTemplate
++        """
++        network.check_model()
++
++        nodes = list(dict.fromkeys(nodes))
++        if not nodes:
++            raise ValueError("At least one node is needed to build a template")
++        for node in nodes:
++            if node not in network.nodes():
++                raise ValueError(f"{node} is not in the network")
++
++        interior = set(nodes)
++        boundary = set()
++        for node in nodes:
++            boundary.update(set(network.get_parents(node)) - interior)
++
++        edges = [(parent, node) for node in nodes for parent in network.get_parents(node)]
++        template = cls(ebunch=edges, boundary=boundary)
++        template.add_nodes_from(interior | boundary)
++        template.add_cpds(*[network.get_cpds(node).copy() for node in nodes])
++        template.check_template()
++        return template
+diff --git a/pgmpy/models/__init__.py b/pgmpy/models/__init__.py
+index 8c6ebb5a..ee1c9e5a 100644
+--- a/pgmpy/models/__init__.py
++++ b/pgmpy/models/__init__.py
+@@ -10,6 +10,7 @@ from .LinearGaussianBayesianNetwork import LinearGaussianBayesianNetwork
+ from .MarkovChain import MarkovChain
+ from .MarkovNetwork import MarkovNetwork
+ from .NaiveBayes import NaiveBayes
++from .NetworkTemplate import NetworkTemplate
+ from .SEM import SEM, SEMAlg, SEMGraph
+ 
+ __all__ = [
+@@ -28,4 +29,5 @@ __all__ = [
+     "SEMAlg",
+     "SEM",
+     "FunctionalBayesianNetwork",
++    "NetworkTemplate",
+ ]

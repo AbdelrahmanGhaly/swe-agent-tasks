@@ -1,0 +1,1174 @@
+diff --git a/pythran/tests/test_range_analysis_a473f1.py b/pythran/tests/test_range_analysis_a473f1.py
+new file mode 100644
+index 000000000..4876af514
+--- /dev/null
++++ b/pythran/tests/test_range_analysis_a473f1.py
+@@ -0,0 +1,1124 @@
++import builtins
++import contextlib
++import io
++import operator
++import unittest
++
++import gast as ast
++
++from pythran import backend, passmanager
++from pythran.analyses import RangeValues
++from pythran.optimizations import RangeBasedSimplify
++
++INF = float('inf')
++
++OPERATIONS = {
++    '&': operator.and_,
++    '|': operator.or_,
++    '^': operator.xor,
++    '%': operator.mod,
++    '//': operator.floordiv,
++    '<<': operator.lshift,
++    '>>': operator.rshift,
++    '**': operator.pow,
++    '*': operator.mul,
++    '+': operator.add,
++    '-': operator.sub,
++}
++
++
++def pins(name, window):
++    low, high = window
++    lines = []
++    if low != -INF:
++        lines.append('    assert {} >= {}'.format(name, low))
++    if high != INF:
++        lines.append('    assert {} <= {}'.format(name, high))
++    return lines
++
++
++def analyse(source):
++    return passmanager.PassManager('test').gather(RangeValues, ast.parse(source))
++
++
++def bounds(source, name='outcome'):
++    reported = analyse(source)[name]
++    return reported.low, reported.high
++
++
++def kernel(expression, left=None, right=None):
++    body = ['def kernel(a, b):']
++    if left is not None:
++        body.extend(pins('a', left))
++    if right is not None:
++        body.extend(pins('b', right))
++    body.append('    outcome = ' + expression)
++    return '\n'.join(body)
++
++
++def reported(symbol, left, right):
++    return bounds(kernel('a {} b'.format(symbol), left, right))
++
++
++def hull(symbol, left, right):
++    operation = OPERATIONS[symbol]
++    values = []
++    for x in range(left[0], left[1] + 1):
++        for y in range(right[0], right[1] + 1):
++            try:
++                values.append(operation(x, y))
++            except (ZeroDivisionError, ValueError):
++                continue
++    return (min(values), max(values)) if values else None
++
++
++def windows(lowest, highest, span):
++    return [(low, high) for low in range(lowest, highest + 1)
++            for high in range(low, min(highest, low + span) + 1)]
++
++
++def plain(source):
++    return passmanager.PassManager('test').dump(backend.Python, ast.parse(source))
++
++
++def simplified(source):
++    manager = passmanager.PassManager('test')
++    _, node = manager.apply(RangeBasedSimplify, ast.parse(source))
++    return manager.dump(backend.Python, node)
++
++
++def run(source, name, *args):
++    namespace = {'builtins': builtins}
++    exec(compile(source, '<range-analysis-test>', 'exec'), namespace)
++    return namespace[name](*args)
++
++
++def effects(source, name, *args):
++    stream = io.StringIO()
++    with contextlib.redirect_stdout(stream):
++        value = run(source, name, *args)
++    return value, stream.getvalue().count('\n')
++
++
++NEGATIVE_DIVIDEND = '''def walk():
++    total = 0
++    for value in builtins.range(-5, 6):
++        total = total + (value % 5)
++    return total'''
++
++BOUNDED_MODULUS = '''def walk(divisor):
++    assert divisor >= 3
++    assert divisor <= 7
++    total = 0
++    for value in builtins.range(11):
++        total = total + (value % divisor)
++    return total'''
++
++MAYBE_ZERO_MODULUS = '''def walk(divisor):
++    assert divisor >= 0
++    assert divisor <= 5
++    total = 0
++    for value in builtins.range(4):
++        total = total + (value % divisor)
++    return total'''
++
++EFFECTFUL_DIVISOR = '''def divisor():
++    builtins.print(1)
++    return 8
++def walk():
++    total = 0
++    for value in builtins.range(4):
++        total = total + (value % divisor())
++    return total'''
++
++DUPLICATING_DIVISOR = '''def divisor():
++    builtins.print(1)
++    return 8
++def walk():
++    total = 0
++    for value in builtins.range(12):
++        total = total + (value % divisor())
++    return total'''
++
++EFFECTFUL_DIVIDEND = '''def source():
++    builtins.print(1)
++    return 9
++def walk():
++    total = 0
++    for value in builtins.range(3):
++        total = total + (source() % 8)
++    return total'''
++
++BELOW_TWICE = '''def walk(value, divisor):
++    assert value >= 0
++    assert value <= 5
++    assert divisor >= 3
++    assert divisor <= 7
++    return value % divisor'''
++
++AT_TWICE = '''def walk(value, divisor):
++    assert value >= 0
++    assert value <= 6
++    assert divisor >= 3
++    assert divisor <= 7
++    return value % divisor'''
++
++UNBOUNDED_DIVISOR = '''def walk(value, divisor):
++    assert value >= 0
++    assert value <= 5
++    assert divisor >= 3
++    return value % divisor'''
++
++COMPOUND_DIVIDEND = '''def walk(value, divisor):
++    assert value >= 0
++    assert value <= 4
++    assert divisor >= 3
++    return (value + 1) % divisor'''
++
++NESTED_DIFFERENCE_DIVIDEND = '''def walk(value, divisor):
++    assert value >= 0
++    assert value <= 4
++    assert divisor >= 3
++    return (value + 2 - 1) % divisor'''
++
++FOLDABLE_DIVIDEND = '''def walk(value, divisor):
++    assert value >= 0
++    assert value <= 4
++    assert divisor >= 3
++    return (2 + 3) % divisor'''
++
++ABS_DIVIDEND = '''def walk(value, divisor):
++    assert value >= 0
++    assert value <= 4
++    assert divisor >= 3
++    return builtins.abs(value) % divisor'''
++
++CONDITIONAL_DIVIDEND = '''def walk(value, divisor, flag):
++    assert value >= 0
++    assert value <= 4
++    assert divisor >= 3
++    return (value if flag else value) % divisor'''
++
++COMPOUND_DIVISOR = '''def walk(value, divisor):
++    assert value >= 0
++    assert value <= 5
++    assert divisor >= 3
++    return value % (divisor + 1)'''
++
++WIDER_UNBOUNDED_DIVISOR = '''def walk(value, divisor):
++    assert value >= 0
++    assert value <= 9
++    assert divisor >= 5
++    return value % divisor'''
++
++
++class TestBitwiseRanges(unittest.TestCase):
++
++    def check(self, symbol, left, right):
++        self.assertEqual(reported(symbol, left, right), hull(symbol, left, right))
++
++    def test_and_non_negative_operands_is_exact(self):
++        self.check('&', (0, 7), (0, 7))
++
++    def test_and_disjoint_high_bits_is_exact(self):
++        self.check('&', (4, 5), (2, 3))
++
++    def test_and_wide_left_operand_is_exact(self):
++        self.check('&', (0, 12), (3, 7))
++
++    def test_and_both_negative_operands_is_exact(self):
++        self.check('&', (-8, -1), (-8, -1))
++
++    def test_and_mixed_sign_operands_is_exact(self):
++        self.check('&', (-5, 5), (-13, -1))
++
++    def test_and_crossing_zero_on_both_sides_is_exact(self):
++        self.check('&', (-4, 4), (-4, 4))
++
++    def test_and_negative_left_non_negative_right_is_exact(self):
++        self.check('&', (-21, -3), (1, 13))
++
++    def test_or_non_negative_operands_is_exact(self):
++        self.check('|', (4, 5), (2, 3))
++
++    def test_or_single_values_is_exact(self):
++        self.check('|', (6, 6), (9, 9))
++
++    def test_or_both_negative_operands_stays_negative(self):
++        self.check('|', (-8, -1), (-8, -1))
++
++    def test_or_mixed_sign_operands_is_exact(self):
++        self.check('|', (-1, 5), (1, 13))
++
++    def test_or_crossing_zero_on_both_sides_is_exact(self):
++        self.check('|', (-4, 4), (-4, 4))
++
++    def test_xor_non_negative_operands_is_exact(self):
++        self.check('^', (4, 5), (2, 3))
++
++    def test_xor_both_negative_operands_is_non_negative(self):
++        self.check('^', (-8, -1), (-8, -1))
++
++    def test_xor_mixed_sign_operands_is_exact(self):
++        self.check('^', (-5, 5), (-13, -1))
++
++    def test_xor_crossing_zero_on_both_sides_is_exact(self):
++        self.check('^', (-4, 4), (-4, 4))
++
++    def test_xor_equal_operands_reaches_zero(self):
++        self.check('^', (3, 9), (3, 9))
++
++    def test_and_of_nested_expression_is_exact(self):
++        source = kernel('(a + 1) & (b - 1)', (0, 6), (1, 8))
++        self.assertEqual(bounds(source), hull('&', (1, 7), (0, 7)))
++
++    def test_or_chained_with_and_is_exact(self):
++        source = kernel('(a & 6) | b', (0, 15), (1, 3))
++        self.assertEqual(bounds(source), (1, 7))
++
++    def test_bitwise_and_of_singletons_is_a_single_value(self):
++        self.assertEqual(reported('&', (12, 12), (10, 10)), (8, 8))
++
++
++class TestBitwiseUnbounded(unittest.TestCase):
++
++    def test_and_with_unbounded_left_keeps_right_bound(self):
++        self.assertEqual(reported('&', (0, INF), (0, 7)), (0, 7))
++
++    def test_and_with_far_unbounded_left_keeps_right_bound(self):
++        self.assertEqual(reported('&', (8, INF), (0, 7)), (0, 7))
++
++    def test_and_with_fully_unknown_left_keeps_right_bound(self):
++        self.assertEqual(reported('&', (-INF, INF), (0, 7)), (0, 7))
++
++    def test_and_of_two_unbounded_negatives_stays_negative(self):
++        self.assertEqual(reported('&', (-INF, -1), (-INF, -1)), (-INF, -1))
++
++    def test_and_of_two_unbounded_non_negatives_stays_unbounded(self):
++        self.assertEqual(reported('&', (0, INF), (0, INF)), (0, INF))
++
++    def test_or_with_unbounded_left_is_unbounded_above(self):
++        self.assertEqual(reported('|', (0, INF), (0, 7)), (0, INF))
++
++    def test_or_of_unbounded_negative_and_non_negative_stays_negative(self):
++        self.assertEqual(reported('|', (-INF, -1), (0, 7)), (-INF, -1))
++
++    def test_xor_with_unbounded_left_is_unbounded_above(self):
++        self.assertEqual(reported('^', (0, INF), (0, 7)), (0, INF))
++
++    def test_and_with_unbounded_negative_right_keeps_left_low(self):
++        self.assertEqual(reported('&', (0, 7), (-INF, -1)), (0, 7))
++
++    def test_mask_with_a_negative_constant_stays_unbounded(self):
++        self.assertEqual(reported('&', (0, INF), (-2, -2)), (0, INF))
++        self.assertEqual(reported('&', (0, INF), (-4, -4)), (0, INF))
++        self.assertEqual(reported('^', (0, INF), (-2, -2)), (-INF, -1))
++
++    def test_mask_with_a_high_bit_stays_reachable(self):
++        self.assertEqual(reported('&', (0, INF), (64, 64)), (0, 64))
++        self.assertEqual(reported('&', (0, INF), (100, 100)), (0, 100))
++        self.assertEqual(reported('&', (0, INF), (1024, 1024)), (0, 1024))
++        self.assertEqual(bounds(kernel('a & 64', (0, INF), None)), (0, 64))
++
++    def test_unbounded_negative_operand_keeps_the_other_end(self):
++        self.assertEqual(reported('|', (-INF, -10), (-10, -10)), (-10, -1))
++        self.assertEqual(reported('^', (-INF, -10), (5, 5)), (-INF, -9))
++        self.assertEqual(reported('|', (-INF, -8), (-8, -8)), (-8, -1))
++
++    def test_mask_of_unbounded_variable_is_bounded(self):
++        self.assertEqual(bounds(kernel('a & 15', (0, INF), None)), (0, 15))
++
++    def test_mask_of_unknown_variable_is_bounded(self):
++        self.assertEqual(bounds(kernel('a & 15', None, None)), (0, 15))
++
++
++class TestRemainderRanges(unittest.TestCase):
++
++    def test_positive_divisor_window_holds_every_value(self):
++        self.assertEqual(reported('%', (-1, 5), (1, 13)), hull('%', (-1, 5), (1, 13)))
++
++    def test_wide_dividend_positive_divisor_window(self):
++        self.assertEqual(reported('%', (-21, 5), (1, 13)), (0, 12))
++
++    def test_negative_divisor_gives_a_negative_window(self):
++        self.assertEqual(reported('%', (-5, 5), (-13, -1)),
++                         hull('%', (-5, 5), (-13, -1)))
++
++    def test_negative_operands_keep_the_divisor_sign(self):
++        self.assertEqual(reported('%', (-8, -1), (-8, -1)),
++                         hull('%', (-8, -1), (-8, -1)))
++
++    def test_divisor_of_either_sign_joins_both_windows(self):
++        self.assertEqual(reported('%', (-4, 4), (-4, 4)), hull('%', (-4, 4), (-4, 4)))
++
++    def test_small_dividend_keeps_its_own_interval(self):
++        self.assertEqual(reported('%', (0, 3), (8, 10)), (0, 3))
++        self.assertEqual(reported('%', (-3, 0), (-10, -8)), (-3, 0))
++
++    def test_small_negative_dividend_keeps_its_own_interval(self):
++        self.assertEqual(reported('%', (-2, -1), (-8, -3)), (-2, -1))
++
++    def test_dividend_reaching_the_divisor_uses_the_window(self):
++        self.assertEqual(reported('%', (0, 8), (8, 10)), hull('%', (0, 8), (8, 10)))
++        self.assertEqual(reported('%', (0, 9), (2, 3)), hull('%', (0, 9), (2, 3)))
++
++    def test_divisor_larger_than_every_dividend_shifts_it(self):
++        self.assertEqual(reported('%', (2, 3), (10, 20)), hull('%', (2, 3), (10, 20)))
++        self.assertEqual(reported('%', (-3, -2), (-20, -10)),
++                         hull('%', (-3, -2), (-20, -10)))
++        self.assertEqual(reported('%', (-1, -1), (500, 1000)), (499, 999))
++        self.assertEqual(reported('%', (-4, 6), (100, 200)),
++                         hull('%', (-4, 6), (100, 200)))
++
++    def test_divisor_no_larger_than_the_dividend_uses_the_window(self):
++        self.assertEqual(reported('%', (5, 5), (2, 3)), (0, 2))
++        self.assertEqual(reported('%', (4, 4), (2, 3)), (0, 2))
++        self.assertEqual(reported('%', (-7, -7), (-4, -2)), (-3, 0))
++
++    def test_wide_divisor_span_stays_exact(self):
++        self.assertEqual(reported('%', (-1, -1), (500, 1000)), (499, 999))
++        self.assertEqual(reported('%', (-1, -1), (500, 700)), (499, 699))
++        self.assertEqual(reported('%', (1, 1), (1, 100000)), (0, 1))
++
++    def test_divisor_pinned_to_zero_is_unknown(self):
++        self.assertEqual(reported('%', (1, 5), (0, 0)), (-INF, INF))
++
++    def test_unbounded_divisor_still_shifts_a_smaller_dividend(self):
++        self.assertEqual(reported('%', (-5, -1), (8, INF)), (3, INF))
++        self.assertEqual(reported('%', (1, 5), (-INF, -8)), (-INF, -3))
++
++    def test_unbounded_dividend_still_fits_the_window(self):
++        self.assertEqual(reported('%', (0, INF), (1, 5)), (0, 4))
++
++    def test_unbounded_positive_divisor_keeps_a_dividend_bound(self):
++        self.assertEqual(reported('%', (0, 9), (2, INF)), (0, 9))
++        self.assertEqual(reported('%', (-1, 9), (2, INF)), (0, INF))
++
++    def test_unknown_dividend_negative_divisor_window(self):
++        self.assertEqual(reported('%', (-INF, INF), (-4, -1)), (-3, 0))
++
++
++class TestFloorDivisionRanges(unittest.TestCase):
++
++    def test_positive_divisor_is_exact(self):
++        self.assertEqual(reported('//', (-1, 5), (3, 8)), hull('//', (-1, 5), (3, 8)))
++        self.assertEqual(reported('//', (-1, 5), (0, 8)), hull('//', (-1, 5), (0, 8)))
++
++    def test_negative_divisor_is_exact(self):
++        self.assertEqual(reported('//', (-1, 5), (-5, -4)),
++                         hull('//', (-1, 5), (-5, -4)))
++        self.assertEqual(reported('//', (-1, 5), (-5, 0)),
++                         hull('//', (-1, 5), (-5, 0)))
++
++    def test_divisor_crossing_zero_skips_zero(self):
++        self.assertEqual(reported('//', (0, 7), (0, 7)), hull('//', (0, 7), (0, 7)))
++
++    def test_divisor_of_either_sign_is_exact(self):
++        self.assertEqual(reported('//', (-4, 4), (-4, 4)), hull('//', (-4, 4), (-4, 4)))
++
++    def test_rounding_goes_toward_negative_infinity(self):
++        self.assertEqual(reported('//', (-7, -7), (2, 2)), (-4, -4))
++        self.assertEqual(reported('//', (-7, -7), (-2, 2)), (-7, 7))
++
++    def test_zero_divisor_contributes_nothing(self):
++        self.assertEqual(reported('//', (1, 5), (0, 0)), (-INF, INF))
++        self.assertEqual(reported('//', (1, 5), (0, 3)), (0, 5))
++
++    def test_unbounded_dividend_positive_divisor(self):
++        self.assertEqual(reported('//', (1, INF), (2, 3)), (0, INF))
++        self.assertEqual(reported('//', (1, INF), (0, 3)), (0, INF))
++
++    def test_unbounded_divisor_collapses_the_quotient(self):
++        self.assertEqual(reported('//', (1, 9), (2, INF)), (0, 4))
++        self.assertEqual(reported('//', (1, 9), (-3, 3)), (-9, 9))
++
++
++class TestPowerRanges(unittest.TestCase):
++
++    def test_even_exponent_over_zero_reaches_zero(self):
++        self.assertEqual(reported('**', (-2, 3), (2, 2)), hull('**', (-2, 3), (2, 2)))
++
++    def test_mixed_parity_exponents_are_exact(self):
++        self.assertEqual(reported('**', (-9, 5), (1, 6)), hull('**', (-9, 5), (1, 6)))
++
++    def test_negative_base_reaches_both_parities(self):
++        self.assertEqual(reported('**', (-4, -2), (3, 3)), hull('**', (-4, -2), (3, 3)))
++        self.assertEqual(reported('**', (-4, -2), (2, 4)), hull('**', (-4, -2), (2, 4)))
++
++    def test_exponent_zero_gives_one(self):
++        self.assertEqual(reported('**', (-9, 9), (0, 0)), (1, 1))
++        self.assertEqual(reported('**', (-9, 9), (0, 2)), hull('**', (-9, 9), (0, 2)))
++
++    def test_non_negative_base_is_exact(self):
++        self.assertEqual(reported('**', (1, 5), (3, 8)), (1, 390625))
++        self.assertEqual(reported('**', (-1, 5), (0, 4)), hull('**', (-1, 5), (0, 4)))
++
++    def test_zero_base_keeps_the_exponents_python_accepts(self):
++        self.assertEqual(reported('**', (0, 0), (-1, 0)), (1, 1))
++        self.assertEqual(reported('**', (0, 0), (-3, 1)), (0, 1))
++        self.assertEqual(reported('**', (0, 0), (-3, -1)), (-INF, INF))
++
++    def test_exponent_that_can_be_negative_is_unknown(self):
++        self.assertEqual(reported('**', (1, 5), (-5, -4)), (-INF, INF))
++
++    def test_exponent_spanning_zero_downward_is_unknown(self):
++        self.assertEqual(reported('**', (-1, 5), (-5, 3)), (-INF, INF))
++
++    def test_unbounded_exponent_over_a_small_base(self):
++        self.assertEqual(reported('**', (2, 2), (0, INF)), (1, INF))
++        self.assertEqual(reported('**', (-2, 2), (0, INF)), (-INF, INF))
++
++    def test_unbounded_positive_base_keeps_its_finite_low_bound(self):
++        self.assertEqual(reported('**', (-2, 2), (0, INF)), (-INF, INF))
++        self.assertEqual(reported('**', (2, INF), (0, INF)), (1, INF))
++        self.assertEqual(reported('**', (2, INF), (1, INF)), (2, INF))
++        self.assertEqual(reported('**', (1, INF), (0, INF)), (1, INF))
++
++    def test_unbounded_negative_base_keeps_its_finite_end(self):
++        self.assertEqual(reported('**', (-2, INF), (0, 1)), (-2, INF))
++        self.assertEqual(reported('**', (-2, INF), (0, 2)), (-2, INF))
++        self.assertEqual(reported('**', (-3, INF), (1, 2)), (-3, INF))
++        self.assertEqual(reported('**', (-2, INF), (1, 1)), (-2, INF))
++        self.assertEqual(reported('**', (-INF, -2), (0, 1)), (-INF, 1))
++
++    def test_unbounded_base_with_even_exponent_is_non_negative(self):
++        self.assertEqual(reported('**', (-INF, INF), (2, 2)), (0, INF))
++
++
++class TestShiftRanges(unittest.TestCase):
++
++    def test_left_shift_of_mixed_sign_operand_is_exact(self):
++        self.assertEqual(reported('<<', (-1, 5), (1, 13)),
++                         hull('<<', (-1, 5), (1, 13)))
++
++    def test_left_shift_of_negative_operand_is_exact(self):
++        self.assertEqual(reported('<<', (-21, 5), (1, 13)),
++                         hull('<<', (-21, 5), (1, 13)))
++
++    def test_left_shift_keeps_non_negative_operands_exact(self):
++        self.assertEqual(reported('<<', (1, 5), (3, 8)), (8, 1280))
++        self.assertEqual(reported('<<', (-1, 5), (0, 8)), hull('<<', (-1, 5), (0, 8)))
++
++    def test_left_shift_by_unbounded_count_loses_both_ends(self):
++        self.assertEqual(reported('<<', (-3, 1), (3, INF)), (-INF, INF))
++
++    def test_left_shift_of_zero_stays_zero(self):
++        self.assertEqual(reported('<<', (0, 0), (3, INF)), (0, 0))
++
++    def test_left_shift_ignores_counts_python_rejects(self):
++        self.assertEqual(reported('<<', (1, 5), (-2, 3)), hull('<<', (1, 5), (-2, 3)))
++
++    def test_left_shift_by_a_wholly_negative_count_is_unknown(self):
++        self.assertEqual(reported('<<', (1, 5), (-4, -1)), (-INF, INF))
++
++    def test_right_shift_is_exact(self):
++        self.assertEqual(reported('>>', (10, 100), (3, 8)),
++                         hull('>>', (10, 100), (3, 8)))
++        self.assertEqual(reported('>>', (-30, 10), (1, 4)),
++                         hull('>>', (-30, 10), (1, 4)))
++        self.assertEqual(reported('>>', (10, 100), (-1, 8)),
++                         hull('>>', (10, 100), (-1, 8)))
++
++    def test_right_shift_by_unbounded_count_settles(self):
++        self.assertEqual(reported('>>', (-30, 10), (3, INF)), (-4, 1))
++        self.assertEqual(reported('>>', (-30, 10), (-3, INF)), (-30, 10))
++
++    def test_right_shift_by_a_wholly_negative_count_is_unknown(self):
++        self.assertEqual(reported('>>', (10, 100), (-4, -1)), (-INF, INF))
++
++
++class TestOtherOperations(unittest.TestCase):
++
++    def test_sums_and_differences_are_exact(self):
++        self.assertEqual(reported('+', (-12, 5), (-5, -3)), hull('+', (-12, 5), (-5, -3)))
++        self.assertEqual(reported('+', (0, 4), (-9, 9)), hull('+', (0, 4), (-9, 9)))
++        self.assertEqual(reported('-', (1, 5), (-5, -4)), hull('-', (1, 5), (-5, -4)))
++        self.assertEqual(reported('-', (-6, 2), (-3, 7)), hull('-', (-6, 2), (-3, 7)))
++        self.assertEqual(reported('+', (-INF, 5), (3, 9)), (-INF, 14))
++        self.assertEqual(reported('-', (2, 9), (-INF, -1)), (3, INF))
++        self.assertEqual(reported('+', (0, 0), (0, INF)), (0, INF))
++        self.assertEqual(reported('*', (0, 0), (1, INF)), (0, 0))
++
++    def test_products_are_exact_for_every_sign_pair(self):
++        for left, right in (((2, 7), (3, 6)), ((-7, -2), (-6, -3)), ((-7, -2), (3, 6)),
++                            ((2, 7), (-6, -3)), ((-4, 4), (-4, 4)), ((-1, 5), (-5, 3)),
++                            ((0, 6), (-5, 0))):
++            self.assertEqual(reported('*', left, right), hull('*', left, right))
++        self.assertEqual(reported('*', (0, 0), (1, INF)), (0, 0))
++
++    def test_true_division_is_unknown(self):
++        self.assertEqual(reported('/', (-1, 5), (3, 8)), (-INF, INF))
++        self.assertEqual(reported('/', (-1, 5), (-8, -3)), (-INF, INF))
++        self.assertEqual(reported('/', (2, 9), (1, 1)), (-INF, INF))
++        self.assertEqual(reported('/', (-INF, INF), (2, 4)), (-INF, INF))
++        self.assertEqual(reported('/', (4, 4), (2, 2)), (-INF, INF))
++
++    def test_product_with_a_zero_bound_and_an_unbounded_one(self):
++        self.assertEqual(reported('*', (-1, 5), (-5, 3)), (-25, 15))
++        self.assertEqual(reported('*', (0, 0), (1, INF)), (0, 0))
++
++    def test_product_spanning_zero_with_an_unbounded_operand(self):
++        self.assertEqual(reported('*', (0, 5), (2, INF)), (0, INF))
++
++    def test_complement_follows_the_operand(self):
++        self.assertEqual(bounds(kernel('-a', (2, 9), None)), (-9, -2))
++        self.assertEqual(bounds(kernel('~a', (2, 9), None)), (-10, -3))
++        self.assertEqual(bounds(kernel('~a', (-7, -3), None)), (2, 6))
++        self.assertEqual(bounds(kernel('~a', (-4, 4), None)), (-5, 3))
++        self.assertEqual(bounds(kernel('~a', (0, INF), None)), (-INF, -1))
++        self.assertEqual(bounds(kernel('~a', (-INF, -1), None)), (0, INF))
++
++    def test_absolute_value_of_a_mixed_sign_operand(self):
++        self.assertEqual(bounds(kernel('builtins.abs(a)', (-7, 3), None)), (0, 7))
++
++    def test_absolute_value_of_a_positive_operand(self):
++        self.assertEqual(bounds(kernel('builtins.abs(a)', (2, 9), None)), (2, 9))
++        self.assertEqual(bounds(kernel('builtins.abs(a)', (0, 9), None)), (0, 9))
++
++    def test_absolute_value_of_a_negative_operand(self):
++        self.assertEqual(bounds(kernel('builtins.abs(a)', (-7, -3), None)), (3, 7))
++
++    def test_difference_of_unbounded_ends_keeps_the_finite_side(self):
++        self.assertEqual(reported('-', (-INF, -2), (3, INF)), (-INF, -5))
++        self.assertEqual(reported('-', (3, INF), (-INF, -2)), (5, INF))
++        self.assertEqual(reported('-', (-INF, 4), (3, INF)), (-INF, 1))
++        self.assertEqual(reported('-', (-INF, INF), (-INF, INF)), (-INF, INF))
++
++    def test_absolute_value_keeps_a_lone_finite_bound(self):
++        self.assertEqual(bounds(kernel('builtins.abs(a)', (2, INF), None)), (2, INF))
++        self.assertEqual(bounds(kernel('builtins.abs(a)', (-INF, -3), None)), (3, INF))
++        self.assertEqual(bounds(kernel('builtins.abs(a)', (-INF, 4), None)), (0, INF))
++        self.assertEqual(bounds(kernel('builtins.abs(a)', (-4, INF), None)), (0, INF))
++
++    def test_absolute_value_of_an_unknown_operand_is_non_negative(self):
++        self.assertEqual(bounds(kernel('a', None, None)), (-INF, INF))
++        self.assertEqual(bounds(kernel('builtins.abs(a)', None, None)), (0, INF))
++
++
++class TestBooleanOperators(unittest.TestCase):
++
++    def test_or_keeps_a_left_side_that_cannot_be_zero(self):
++        self.assertEqual(bounds(kernel('a or b', (2, 5), (30, 40))), (2, 5))
++
++    def test_or_drops_zero_from_a_left_side_that_can_be_zero(self):
++        self.assertEqual(bounds(kernel('a or b', (0, 5), (30, 40))), (1, 40))
++
++    def test_or_of_a_left_side_pinned_to_zero_is_the_right_side(self):
++        self.assertEqual(bounds(kernel('a or b', (0, 0), (30, 40))), (30, 40))
++
++    def test_or_of_a_negative_left_side_keeps_it(self):
++        self.assertEqual(bounds(kernel('a or b', (-5, -2), (30, 40))), (-5, -2))
++        self.assertEqual(bounds(kernel('a or b', (-3, 5), (30, 40))), (-3, 40))
++        self.assertEqual(bounds(kernel('a or b', (-3, 0), (30, 40))), (-3, 40))
++
++    def test_and_of_a_left_side_that_cannot_be_zero_is_the_right_side(self):
++        self.assertEqual(bounds(kernel('a and b', (2, 5), (30, 40))), (30, 40))
++
++    def test_and_of_a_left_side_that_can_be_zero_reaches_zero(self):
++        self.assertEqual(bounds(kernel('a and b', (0, 5), (30, 40))), (0, 40))
++        self.assertEqual(bounds(kernel('a and b', (-3, 5), (30, 40))), (0, 40))
++
++    def test_and_of_a_left_side_pinned_to_zero_is_zero(self):
++        self.assertEqual(bounds(kernel('a and b', (0, 0), (30, 40))), (0, 0))
++
++    def test_not_of_a_settled_operand_is_a_single_value(self):
++        self.assertEqual(bounds(kernel('not a', (2, 5), None)), (0, 0))
++        self.assertEqual(bounds(kernel('not a', (-4, -2), None)), (0, 0))
++        self.assertEqual(bounds(kernel('not a', (0, 0), None)), (1, 1))
++        self.assertEqual(bounds(kernel('not a', (0, 3), None)), (0, 1))
++
++    def test_chain_of_or_folds_left_to_right(self):
++        source = kernel('(a * 0) or (b * 0) or 7', (1, 4), (1, 4))
++        self.assertEqual(bounds(source), (7, 7))
++
++    def test_chain_mixing_and_with_or(self):
++        source = kernel('(a and 5) or b', (0, 3), (8, 9))
++        self.assertEqual(bounds(source), (1, 9))
++
++    def test_settled_operands_decide_a_comparison(self):
++        self.assertEqual(bounds('def kernel():\n'
++                                '    outcome = 4 != 4'), (0, 0))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    outcome = 4 != 5'), (1, 1))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    outcome = 4 == 4'), (1, 1))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    outcome = 4 == 5'), (0, 0))
++
++    def test_chain_of_and_folds_left_to_right(self):
++        source = ('def kernel(a, b, c):\n'
++                  '    assert a >= {}\n'
++                  '    assert a <= {}\n'
++                  '    assert b >= {}\n'
++                  '    assert b <= {}\n'
++                  '    assert c >= 20\n'
++                  '    assert c <= 30\n'
++                  '    outcome = a and b and c')
++        self.assertEqual(bounds(source.format(0, 3, 5, 9)), (0, 30))
++        self.assertEqual(bounds(source.format(2, 3, 5, 9)), (20, 30))
++        self.assertEqual(bounds(source.format(2, 3, -2, 4)), (0, 30))
++
++
++class TestGuardNarrowing(unittest.TestCase):
++
++    def test_sum_and_difference_guards_pin_a_variable(self):
++        source = ('def kernel(i):\n'
++                  '    assert 0 <= i - 1\n'
++                  '    assert i + 2 < 10\n'
++                  '    outcome = i')
++        self.assertEqual(bounds(source), (1, 7))
++
++    def test_difference_guard_raises_the_lower_bound(self):
++        source = 'def kernel(i):\n    assert i - 3 >= 0\n    outcome = i'
++        self.assertEqual(bounds(source), (3, INF))
++
++    def test_reversed_difference_guard_lowers_the_upper_bound(self):
++        source = 'def kernel(i):\n    assert 5 - i >= 0\n    outcome = i'
++        self.assertEqual(bounds(source), (-INF, 5))
++
++    def test_leading_minus_sign_is_undone(self):
++        source = ('def kernel(i):\n'
++                  '    assert i >= 2\n'
++                  '    assert -i >= -6\n'
++                  '    outcome = i')
++        self.assertEqual(bounds(source), (2, 6))
++
++    def test_minus_sign_composed_with_a_sum_is_undone(self):
++        self.assertEqual(bounds('def kernel(i):\n'
++                                '    assert -(i + 2) >= -7\n'
++                                '    outcome = i'), (-INF, 5))
++        self.assertEqual(bounds('def kernel(i):\n'
++                                '    assert -(i - 2) <= 5\n'
++                                '    outcome = i'), (-3, INF))
++        self.assertEqual(bounds('def kernel(i):\n'
++                                '    assert -(i + 2) >= -7\n'
++                                '    assert i >= 0\n'
++                                '    outcome = i'), (0, 5))
++
++    def test_nested_sums_are_undone_in_order(self):
++        source = ('def kernel(i):\n'
++                  '    assert (i + 1) + 2 <= 10\n'
++                  '    assert i >= 0\n'
++                  '    outcome = i')
++        self.assertEqual(bounds(source), (0, 7))
++
++    def test_two_variable_guards_narrow_without_losing_a_bound(self):
++        difference = ('def kernel(x, y):\n'
++                      '    assert x >= 0\n'
++                      '    assert x <= 20\n'
++                      '    assert y >= 0\n'
++                      '    assert y <= 10\n'
++                      '    assert x - y <= 0\n'
++                      '    outcome = x')
++        summed = ('def kernel(x, y):\n'
++                  '    assert x >= 0\n'
++                  '    assert x <= 20\n'
++                  '    assert y >= 4\n'
++                  '    assert y <= 10\n'
++                  '    assert x + y <= 12\n'
++                  '    outcome = x')
++        self.assertEqual(bounds(difference), (0, 10))
++        self.assertEqual(bounds(summed), (0, 8))
++
++    def test_branch_guard_narrows_through_a_sum(self):
++        narrowed = ('def kernel(i):\n'
++                    '    if 3 <= i + 1 <= 9:\n'
++                    '        outcome = i\n'
++                    '    else:\n'
++                    '        outcome = 0')
++        merged = ('def kernel(flag):\n'
++                  '    if flag > 1:\n'
++                  '        outcome = 1\n'
++                  '    else:\n'
++                  '        outcome = 3')
++        self.assertEqual(bounds(narrowed), (0, 8))
++        self.assertEqual(bounds(merged), (1, 3))
++
++    def test_two_variable_guards_narrow_the_right_variable_too(self):
++        summed = ('def kernel(x, y):\n'
++                  '    assert x >= 4\n'
++                  '    assert x <= 10\n'
++                  '    assert y >= 0\n'
++                  '    assert y <= 20\n'
++                  '    assert x + y <= 12\n'
++                  '    outcome = y')
++        difference = ('def kernel(x, y):\n'
++                      '    assert x >= 5\n'
++                      '    assert x <= 7\n'
++                      '    assert y >= 0\n'
++                      '    assert y <= 10\n'
++                      '    assert x - y <= 0\n'
++                      '    outcome = y')
++        self.assertEqual(bounds(summed), (0, 8))
++        self.assertEqual(bounds(difference), (5, 10))
++
++    def test_a_guard_with_a_composite_on_both_sides_narrows_both(self):
++        source = ('def kernel(x, y):\n'
++                  '    assert x >= 0\n'
++                  '    assert x <= 20\n'
++                  '    assert y >= 0\n'
++                  '    assert y <= 10\n'
++                  '    assert x + 1 <= y - 2\n'
++                  '    outcome = {}')
++        self.assertEqual(bounds(source.format('x')), (0, 7))
++        self.assertEqual(bounds(source.format('y')), (3, 10))
++
++    def test_branch_guard_narrows_through_a_two_variable_difference(self):
++        source = ('def kernel(x, y):\n'
++                  '    assert x >= 0\n'
++                  '    assert x <= 20\n'
++                  '    assert y >= 0\n'
++                  '    assert y <= 10\n'
++                  '    if x - y <= 0:\n'
++                  '        outcome = x\n'
++                  '    else:\n'
++                  '        outcome = 12')
++        self.assertEqual(bounds(source), (0, 12))
++
++    def test_narrowed_variable_feeds_a_remainder(self):
++        source = ('def kernel(i):\n'
++                  '    assert 0 <= i - 1\n'
++                  '    assert i + 2 < 10\n'
++                  '    outcome = i % 16')
++        self.assertEqual(bounds(source), (1, 7))
++
++    def test_narrowed_variable_feeds_a_mask(self):
++        source = ('def kernel(i):\n'
++                  '    assert i - 4 >= 0\n'
++                  '    assert i - 4 <= 3\n'
++                  '    outcome = i & 3')
++        self.assertEqual(bounds(source), hull('&', (4, 7), (3, 3)))
++
++    def test_direct_variable_guards_keep_their_behaviour(self):
++        for guard, expected in (('a >= 3', (3, INF)), ('3 <= a', (3, INF)),
++                                ('a > 3', (4, INF)), ('3 < a', (4, INF)),
++                                ('a <= 3', (-INF, 3)), ('3 >= a', (-INF, 3)),
++                                ('a < 3', (-INF, 2)), ('3 > a', (-INF, 2))):
++            source = ('def kernel(a):\n'
++                      '    assert {}\n'
++                      '    outcome = a').format(guard)
++            self.assertEqual(bounds(source), expected)
++        self.assertEqual(bounds(kernel('a & 7', (0, INF), None)), (0, 7))
++
++    def test_guard_that_leaves_nothing_is_ignored(self):
++        reachable = ('def kernel(i):\n'
++                     '    assert i >= 2\n'
++                     '    assert i - 1 <= 5\n'
++                     '    outcome = i')
++        impossible = ('def kernel(i):\n'
++                      '    assert i >= 20\n'
++                      '    assert i + 1 <= 5\n'
++                      '    outcome = i')
++        self.assertEqual(bounds(reachable), (2, 6))
++        self.assertEqual(bounds(impossible), (20, INF))
++
++
++class TestRemainderRewrite(unittest.TestCase):
++
++    def check_same(self, source, name, *args):
++        self.assertEqual(run(simplified(source), name, *args),
++                         run(plain(source), name, *args))
++
++    def test_negative_dividend_keeps_python_semantics(self):
++        self.check_same(NEGATIVE_DIVIDEND, 'walk')
++
++    def test_negative_dividend_result_is_the_python_one(self):
++        self.assertEqual(run(simplified(NEGATIVE_DIVIDEND), 'walk'), 20)
++
++    def test_negative_dividend_keeps_its_source(self):
++        self.assertEqual(simplified(NEGATIVE_DIVIDEND), plain(NEGATIVE_DIVIDEND))
++
++    def test_dividend_beyond_twice_the_smallest_divisor(self):
++        for divisor in (3, 4, 5, 6, 7):
++            self.check_same(BOUNDED_MODULUS, 'walk', divisor)
++        self.assertEqual(run(simplified(BOUNDED_MODULUS), 'walk', 3), 10)
++        self.assertEqual(run(simplified(BOUNDED_MODULUS), 'walk', 4), 15)
++
++    def test_divisor_that_can_be_zero_still_raises(self):
++        self.check_same(MAYBE_ZERO_MODULUS, 'walk', 5)
++        with self.assertRaises(ZeroDivisionError):
++            run(simplified(MAYBE_ZERO_MODULUS), 'walk', 0)
++
++    def test_effectful_divisor_runs_exactly_as_often(self):
++        self.assertEqual(effects(simplified(DUPLICATING_DIVISOR), 'walk'),
++                         effects(plain(DUPLICATING_DIVISOR), 'walk'))
++        self.assertEqual(effects(simplified(EFFECTFUL_DIVISOR), 'walk'),
++                         effects(plain(EFFECTFUL_DIVISOR), 'walk'))
++
++    def test_effectful_dividend_runs_exactly_as_often(self):
++        self.assertEqual(effects(simplified(EFFECTFUL_DIVIDEND), 'walk'),
++                         effects(plain(EFFECTFUL_DIVIDEND), 'walk'))
++
++    def test_rewrite_stops_at_twice_the_smallest_divisor(self):
++        below, below_plain = simplified(BELOW_TWICE), plain(BELOW_TWICE)
++        at, at_plain = simplified(AT_TWICE), plain(AT_TWICE)
++        self.assertNotEqual(below, below_plain)
++        self.assertEqual(at, at_plain)
++        for divisor in (3, 5, 7):
++            for value in range(6):
++                self.assertEqual(run(below, 'walk', value, divisor),
++                                 run(below_plain, 'walk', value, divisor))
++            for value in range(7):
++                self.assertEqual(run(at, 'walk', value, divisor),
++                                 run(at_plain, 'walk', value, divisor))
++
++    def test_divisor_without_an_upper_bound_still_rewrites(self):
++        rewritten, untouched = simplified(UNBOUNDED_DIVISOR), plain(UNBOUNDED_DIVISOR)
++        self.assertNotEqual(rewritten, untouched)
++        self.assertNotIn('%', rewritten)
++        self.assertIn('if', rewritten)
++        self.assertIn(' - ', rewritten)
++        for divisor in (3, 4, 7, 100):
++            for value in range(6):
++                self.assertEqual(run(rewritten, 'walk', value, divisor),
++                                 run(untouched, 'walk', value, divisor))
++
++    def test_a_pure_compound_dividend_still_rewrites(self):
++        rewritten = simplified(COMPOUND_DIVIDEND)
++        untouched = plain(COMPOUND_DIVIDEND)
++        self.assertNotEqual(rewritten, untouched)
++        self.assertNotIn('%', rewritten)
++        self.assertIn('if', rewritten)
++        self.assertIn(' - ', rewritten)
++        for divisor in (3, 5, 8, 50):
++            for value in range(5):
++                self.assertEqual(run(rewritten, 'walk', value, divisor),
++                                 run(untouched, 'walk', value, divisor))
++
++    def test_other_pure_dividend_shapes_still_rewrite(self):
++        for source in (NESTED_DIFFERENCE_DIVIDEND, FOLDABLE_DIVIDEND):
++            rewritten, untouched = simplified(source), plain(source)
++            self.assertNotEqual(rewritten, untouched)
++            self.assertNotIn('%', rewritten)
++            self.assertIn('if', rewritten)
++            self.assertIn(' - ', rewritten)
++            for divisor in (3, 6, 9, 40):
++                for value in range(5):
++                    self.assertEqual(run(rewritten, 'walk', value, divisor),
++                                     run(untouched, 'walk', value, divisor))
++
++    def test_an_effect_free_call_dividend_still_rewrites(self):
++        rewritten = simplified(ABS_DIVIDEND)
++        untouched = plain(ABS_DIVIDEND)
++        self.assertNotEqual(rewritten, untouched)
++        self.assertNotIn('%', rewritten)
++        self.assertIn('if', rewritten)
++        self.assertIn(' - ', rewritten)
++        for divisor in (3, 5, 9, 40):
++            for value in range(5):
++                self.assertEqual(run(rewritten, 'walk', value, divisor),
++                                 run(untouched, 'walk', value, divisor))
++
++    def test_an_effect_free_conditional_dividend_still_rewrites(self):
++        rewritten = simplified(CONDITIONAL_DIVIDEND)
++        untouched = plain(CONDITIONAL_DIVIDEND)
++        self.assertNotEqual(rewritten, untouched)
++        self.assertNotIn('%', rewritten)
++        self.assertIn('if', rewritten)
++        self.assertIn(' - ', rewritten)
++        for divisor in (3, 6, 11, 40):
++            for value in range(5):
++                for flag in (0, 1):
++                    args = (value, divisor, flag)
++                    self.assertEqual(run(rewritten, 'walk', *args),
++                                     run(untouched, 'walk', *args))
++
++    def test_a_pure_compound_divisor_still_rewrites(self):
++        rewritten = simplified(COMPOUND_DIVISOR)
++        untouched = plain(COMPOUND_DIVISOR)
++        self.assertNotEqual(rewritten, untouched)
++        self.assertNotIn('%', rewritten)
++        self.assertIn('if', rewritten)
++        self.assertIn(' - ', rewritten)
++        for divisor in (3, 5, 8, 40):
++            for value in range(6):
++                self.assertEqual(run(rewritten, 'walk', value, divisor),
++                                 run(untouched, 'walk', value, divisor))
++
++    def test_a_wider_qualifying_range_rewrites_the_same_way(self):
++        rewritten = simplified(WIDER_UNBOUNDED_DIVISOR)
++        untouched = plain(WIDER_UNBOUNDED_DIVISOR)
++        self.assertNotEqual(rewritten, untouched)
++        self.assertNotIn('%', rewritten)
++        self.assertIn('if', rewritten)
++        self.assertIn(' - ', rewritten)
++        for divisor in (5, 6, 9, 17):
++            for value in range(10):
++                self.assertEqual(run(rewritten, 'walk', value, divisor),
++                                 run(untouched, 'walk', value, divisor))
++
++
++class TestExhaustiveHulls(unittest.TestCase):
++
++    SYMBOLS = ('+', '-', '*', '//', '<<', '>>', '&', '|', '^', '**')
++
++    def test_every_ordinary_operator_matches_the_exhaustive_hull(self):
++        boxes = windows(-5, 5, 3)
++        for symbol in self.SYMBOLS:
++            for left in boxes:
++                for right in boxes:
++                    if symbol == '**' and right[0] < 0:
++                        continue
++                    expected = hull(symbol, left, right)
++                    if expected is None:
++                        expected = (-INF, INF)
++                    self.assertEqual(reported(symbol, left, right), expected,
++                                     (symbol, left, right))
++
++    def test_far_boxes_match_the_exhaustive_hull(self):
++        masks = ((62, 66), (126, 130), (254, 258), (1022, 1026),
++                 (-130, -126), (-66, -62), (96, 100))
++        for symbol in ('&', '|', '^'):
++            for left in masks:
++                for right in masks:
++                    self.assertEqual(reported(symbol, left, right),
++                                     hull(symbol, left, right),
++                                     (symbol, left, right))
++        for symbol in ('+', '-', '*', '//'):
++            for left in masks:
++                for right in ((7, 9), (-9, -7), (96, 100)):
++                    self.assertEqual(reported(symbol, left, right),
++                                     hull(symbol, left, right),
++                                     (symbol, left, right))
++        for left, right in (((120, 130), (7, 9)), ((-130, -120), (3, 5)),
++                            ((-130, 130), (11, 13))):
++            self.assertEqual(reported('<<', left, right),
++                             hull('<<', left, right), (left, right))
++            self.assertEqual(reported('>>', left, right),
++                             hull('>>', left, right), (left, right))
++        for left, right in (((10, 12), (3, 4)), ((-12, -10), (2, 3)),
++                            ((-12, 12), (4, 4)), ((100, 101), (2, 3)),
++                            ((-101, -100), (3, 3)), ((7, 9), (0, 5))):
++            self.assertEqual(reported('**', left, right),
++                             hull('**', left, right), (left, right))
++
++
++class TestAnalysisIntegration(unittest.TestCase):
++
++    def test_mask_of_a_loop_variable_is_bounded(self):
++        masked = ('def kernel():\n'
++                  '    for step in builtins.range(1, 10):\n'
++                  '        outcome = step & 6')
++        halved = ('def kernel():\n'
++                  '    for step in builtins.range(1, 10):\n'
++                  '        outcome = step // 2')
++        self.assertEqual(bounds(masked), (0, 6))
++        self.assertEqual(bounds(halved), (0, 5))
++
++    def test_comparison_of_a_masked_value_is_decided(self):
++        self.assertEqual(bounds(kernel('a < b', None, None)), (0, 1))
++        self.assertEqual(bounds(kernel('(a & 3) < b', (0, INF), (4, 4))), (1, 1))
++
++    def test_further_legacy_values_are_untouched(self):
++        self.assertEqual(bounds('def kernel(a, b):\n'
++                                '    outcome = builtins.min(a, b)'), (-INF, INF))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    outcome = 0\n'
++                                '    for step in builtins.range(3):\n'
++                                '        outcome += 2'), (0, INF))
++        self.assertEqual(bounds('def kernel(a):\n'
++                                '    outcome = a if a else 7'), (-INF, INF))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    outcome = builtins.abs(-4)'), (4, 4))
++        self.assertEqual(bounds('def kernel(xs):\n'
++                                '    outcome = builtins.len(xs) + 1'), (1, INF))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    a = 2\n'
++                                '    c = 3\n'
++                                '    outcome = a - c'), (-1, -1))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    a = 2\n'
++                                '    outcome = ~a'), (-3, -3))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    a = 2\n'
++                                '    outcome = +a'), (2, 2))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    b = 4\n'
++                                '    outcome = b < 3'), (0, 0))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    b = 4\n'
++                                '    outcome = b == 4'), (1, 1))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    t = (1, 2, 4)\n'
++                                '    outcome = t[1]'), (2, 2))
++        self.assertEqual(bounds('def kernel(a, b):\n'
++                                '    outcome = (a < b) + 1'), (1, 2))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    for i in builtins.range(2, 11, 3):\n'
++                                '        outcome = i'), (2, 10))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    a = 2\n'
++                                '    b = 5\n'
++                                '    outcome = a if a else b'), (2, 5))
++
++    def test_values_settled_before_the_change_are_untouched(self):
++        self.assertEqual(bounds('def kernel(a):\n'
++                                '    assert a >= 1\n'
++                                '    outcome = a + 1'), (2, INF))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    outcome = 2\n'
++                                '    outcome -= 1'), (1, 1))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    for step in (1, 2, 4):\n'
++                                '        outcome = step'), (1, 4))
++        self.assertEqual(bounds('def kernel(a):\n'
++                                '    if 0 < a < 4:\n'
++                                '        outcome = a\n'
++                                '    else:\n'
++                                '        outcome = 3'), (1, 3))
++        self.assertEqual(bounds('def kernel(x):\n'
++                                '    outcome = builtins.len(x)'), (0, INF))
++        self.assertEqual(bounds('def kernel(x):\n'
++                                '    outcome = builtins.ord(x)'), (0, 255))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    outcome = builtins.range(10)'), (-INF, INF))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    outcome = builtins.len(builtins.range(4))'),
++                         (0, INF))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    for step in builtins.range(1, 10):\n'
++                                '        outcome = step'), (1, 10))
++        self.assertEqual(bounds('def kernel(a):\n'
++                                '    if a > 1:\n'
++                                '        outcome = a\n'
++                                '    else:\n'
++                                '        outcome = 3'), (2, INF))
++        widened = ('def kernel():\n'
++                   '    outcome = seen = 2\n'
++                   '    while outcome > 0:\n'
++                   '        outcome -= 1\n'
++                   '        seen += 1')
++        self.assertEqual(bounds(widened), (-INF, 0))
++        self.assertEqual(bounds(widened, 'seen'), (3, INF))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    outcome = 2\n'
++                                '    outcome += 3'), (5, 5))
++        self.assertEqual(bounds('def kernel(a):\n'
++                                '    assert a >= 2\n'
++                                '    assert a <= 5\n'
++                                '    outcome = a if a else 3'), (2, 5))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    for step in (-2, 0, 7):\n'
++                                '        outcome = step'), (-2, 7))
++        self.assertEqual(bounds('def kernel(a):\n'
++                                '    t = (1, 2, 4)\n'
++                                '    outcome = t[a]'), (-INF, INF))
++        self.assertEqual(bounds('def kernel(a, b):\n'
++                                '    outcome = builtins.max(a, b)'), (-INF, INF))
++        self.assertEqual(bounds('def kernel(s):\n'
++                                '    outcome = builtins.len(s)'), (0, INF))
++        self.assertEqual(bounds('def kernel(a):\n'
++                                '    outcome = 5\n'
++                                '    while a > 0:\n'
++                                '        outcome = 7'), (5, 7))
++        self.assertEqual(bounds('def kernel():\n'
++                                '    outcome = other = 9'), (9, 9))
++        self.assertEqual(bounds('def kernel(a):\n'
++                                '    outcome = not a'), (0, 1))
++        self.assertEqual(bounds('def kernel(a, b):\n'
++                                '    outcome = a < b < 4'), (0, 1))
++        self.assertEqual(bounds(kernel('a & 7', (0, INF), None)), (0, 7))
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..30a4928be
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,38 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++cd /app || exit 1
++
++export PYTHONDONTWRITEBYTECODE=1
++
++NEW_TESTS="pythran/tests/test_range_analysis_a473f1.py"
++
++# Every other module under pythran/tests drives the C++ toolchain once per test
++# case, which takes hours; test_xdoc runs the doctests of every pythran module,
++# including the range analysis, its consumers and the compilation toolchain.
++BASE_TESTS="pythran/tests/test_xdoc.py pythran/tests/test_spec_parser.py"
++
++ARGS=(-p no:cacheprovider -o addopts=)
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  ARGS+=(--junitxml="$OUTPUT_PATH")
++fi
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "${ARGS[@]}" "$NEW_TESTS"
++else
++  python -m pytest "${ARGS[@]}" $BASE_TESTS
++fi
++exit $?

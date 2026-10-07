@@ -1,0 +1,586 @@
+diff --git a/nibabel/cifti2/__init__.py b/nibabel/cifti2/__init__.py
+index 9c6805f8..1bfce00a 100644
+--- a/nibabel/cifti2/__init__.py
++++ b/nibabel/cifti2/__init__.py
+@@ -15,6 +15,7 @@
+ 
+    cifti2
+    cifti2_axes
++   operations
+ """
+ 
+ from .cifti2 import (
+@@ -41,4 +42,5 @@ from .cifti2 import (
+     save,
+ )
+ from .cifti2_axes import Axis, BrainModelAxis, LabelAxis, ParcelsAxis, ScalarAxis, SeriesAxis
++from .operations import concat, merge_parcels, parcellate, split
+ from .parse_cifti2 import Cifti2Extension
+diff --git a/nibabel/cifti2/cifti2_axes.py b/nibabel/cifti2/cifti2_axes.py
+index 54dfc791..a1a5470d 100644
+--- a/nibabel/cifti2/cifti2_axes.py
++++ b/nibabel/cifti2/cifti2_axes.py
+@@ -126,6 +126,8 @@ import numpy as np
+ 
+ from . import cifti2
+ 
++UNLABELED_PARCEL_NAME = '???'
++
+ 
+ def from_index_mapping(mim):
+     """
+@@ -848,6 +850,75 @@ class ParcelsAxis(Axis):
+             all_vertices[idx_parcel] = vertices
+         return ParcelsAxis(all_names, all_voxels, all_vertices, affine, volume_shape, nvertices)
+ 
++    @classmethod
++    def from_greyordinate_labels(cls, brain_model, labels, label_table):
++        """
++        Creates a Parcel axis by grouping the greyordinates of a brain model by label
++
++        Parameters
++        ----------
++        brain_model : BrainModelAxis
++            axis describing the greyordinate carrying each label
++        labels : array_like
++            (N, ) array with one label key per greyordinate of `brain_model`
++        label_table : dict
++            maps label keys to (name, rgba) pairs, the way a :class:`LabelAxis` stores them
++
++        Returns
++        -------
++        ParcelsAxis
++            one parcel for every label key that names a region and covers at least one
++            greyordinate, in ascending order of the key
++        """
++        labels = np.asanyarray(labels)
++        if labels.shape != (len(brain_model),):
++            raise ValueError(
++                f'Got labels of shape {labels.shape} for a brain model '
++                f'of {len(brain_model)} greyordinates'
++            )
++        if np.issubdtype(labels.dtype, np.integer):
++            exact = labels.ravel().tolist()
++        else:
++            values = labels.astype('f8')
++            if not np.isfinite(values).all() or not np.array_equal(values, np.rint(values)):
++                raise ValueError('Label values should be whole numbers')
++            exact = np.rint(values).ravel().tolist()
++        keys = np.asarray([int(value) for value in exact], dtype=object)
++        table = {int(key): value for key, value in label_table.items()}
++        missing = sorted(set(keys.tolist()) - set(table))
++        if missing:
++            raise ValueError(f'Label keys {missing} are missing from the label table')
++        surface_mask = brain_model.surface_mask
++        all_names = []
++        all_voxels = []
++        all_vertices = []
++        nvertices = {}
++        affine = None
++        volume_shape = None
++        for key in sorted(table):
++            name = table[key][0]
++            if name == UNLABELED_PARCEL_NAME:
++                continue
++            selected = keys == key
++            if not selected.any():
++                continue
++            voxels = brain_model.voxel[selected & ~surface_mask]
++            vertices = {}
++            for structure in brain_model.name[selected & surface_mask]:
++                structure = str(structure)
++                if structure in vertices:
++                    continue
++                in_structure = selected & surface_mask & (brain_model.name == structure)
++                vertices[structure] = brain_model.vertex[in_structure]
++                nvertices[structure] = brain_model.nvertices[structure]
++            if len(voxels) > 0:
++                affine = brain_model.affine
++                volume_shape = brain_model.volume_shape
++            all_names.append(name)
++            all_voxels.append(voxels)
++            all_vertices.append(vertices)
++        return cls(all_names, all_voxels, all_vertices, affine, volume_shape, nvertices)
++
+     @classmethod
+     def from_index_mapping(cls, mim):
+         """
+diff --git a/nibabel/cifti2/operations.py b/nibabel/cifti2/operations.py
+new file mode 100644
+index 00000000..672f846f
+--- /dev/null
++++ b/nibabel/cifti2/operations.py
+@@ -0,0 +1,473 @@
++# emacs: -*- mode: python-mode; py-indent-offset: 4; indent-tabs-mode: nil -*-
++# vi: set ft=python sts=4 ts=4 sw=4 et:
++### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ##
++#
++#   See COPYING file distributed along with the NiBabel package for the
++#   copyright and license terms.
++#
++### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ##
++"""Operations combining CIFTI-2 images through their axes
++
++The functions here work on whole :class:`.cifti2.Cifti2Image` objects rather than on
++:class:`.cifti2_axes.Axis` objects, so both the data array and the CIFTI-2 header are kept
++consistent with each other.
++"""
++
++import numpy as np
++
++from .cifti2 import Cifti2Header, Cifti2Image
++from .cifti2_axes import BrainModelAxis, LabelAxis, ParcelsAxis
++
++__all__ = ['concat', 'merge_parcels', 'parcellate', 'split']
++
++
++REDUCTIONS = {
++    'mean': np.mean,
++    'sum': np.sum,
++    'max': np.max,
++    'min': np.min,
++}
++
++
++def _image_axes(img):
++    """Sequence of CIFTI-2 axes describing each dimension of `img`"""
++    return [img.header.get_axis(index) for index in range(len(img.shape))]
++
++
++def _canonical(name):
++    """CIFTI-2 canonical form of a brain structure name"""
++    return BrainModelAxis.to_cifti_brain_structure_name(str(name))
++
++
++def _resolve_axis(axis, ndim):
++    """Turn a possibly negative axis index into a positive one"""
++    resolved = axis + ndim if axis < 0 else axis
++    if not 0 <= resolved < ndim:
++        raise ValueError(f'Axis {axis} is out of range for an image with {ndim} dimensions')
++    return resolved
++
++
++def _brain_model_axes(axes, axis):
++    """Indices of the axes to operate on, checking that they are brain models"""
++    if axis is None:
++        selected = [idx for idx, ax in enumerate(axes) if isinstance(ax, BrainModelAxis)]
++        if not selected:
++            raise ValueError('Image has no BrainModelAxis to operate on')
++        return selected
++    resolved = _resolve_axis(axis, len(axes))
++    if not isinstance(axes[resolved], BrainModelAxis):
++        raise ValueError(f'Axis {axis} is a {type(axes[resolved]).__name__}, not a BrainModelAxis')
++    return [resolved]
++
++
++def _greyordinate_keys(brain_model):
++    """Hashable identifier of the greyordinate described by each row of `brain_model`
++
++    Surface elements are identified by their canonical structure name and vertex index,
++    volume elements by their voxel indices.
++
++    Parameters
++    ----------
++    brain_model : :class:`.cifti2_axes.BrainModelAxis`
++
++    Returns
++    -------
++    list of tuples, one per row of `brain_model`
++    """
++    surface_mask = brain_model.surface_mask
++    keys = []
++    for index in range(len(brain_model)):
++        if surface_mask[index]:
++            keys.append(
++                ('surface', _canonical(brain_model.name[index]), int(brain_model.vertex[index]))
++            )
++        else:
++            keys.append(('volume',) + tuple(int(value) for value in brain_model.voxel[index]))
++    return keys
++
++
++def _same_affine(one, other):
++    """Whether two affines describe the same voxel grid
++
++    The comparison is exact: two volumes that differ at all describe different spatial
++    coordinate systems, however small the difference looks.
++    """
++    one = np.asanyarray(one, dtype=np.float64)
++    other = np.asanyarray(other, dtype=np.float64)
++    return one.shape == other.shape and bool(np.array_equal(one, other))
++
++
++def _check_volume(brain_model, affine, volume_shape, description):
++    """Check that `brain_model` describes voxels in the given volume"""
++    if brain_model.affine is None:
++        return
++    if volume_shape is not None and tuple(brain_model.volume_shape) != tuple(volume_shape):
++        raise ValueError(
++            f'{description} was defined in a volume of shape {tuple(volume_shape)}, '
++            f'but the image uses {tuple(brain_model.volume_shape)}'
++        )
++    if affine is not None and not _same_affine(brain_model.affine, affine):
++        raise ValueError(f'{description} was defined in a volume with a different affine')
++
++
++def _check_shared_volume(one, other, description):
++    """Check that two axes joined along a dimension describe the same volume"""
++    first = getattr(one, 'affine', None)
++    second = getattr(other, 'affine', None)
++    if first is None or second is None:
++        return
++    if tuple(one.volume_shape) != tuple(other.volume_shape):
++        raise ValueError(
++            f'{description} was defined in a volume of shape {tuple(other.volume_shape)}, '
++            f'but the first image uses {tuple(one.volume_shape)}'
++        )
++    if not _same_affine(first, second):
++        raise ValueError(f'{description} was defined in a volume with a different affine')
++
++
++def _check_surface(brain_model, structure, nvertices, description):
++    """Check that `brain_model` covers `structure` with the expected number of vertices"""
++    if structure not in brain_model.nvertices:
++        raise ValueError(f'{description} references {structure}, which the image does not cover')
++    if nvertices is not None and brain_model.nvertices[structure] != nvertices:
++        raise ValueError(
++            f'{description} defines {structure} with {nvertices} vertices, '
++            f'but the image uses {brain_model.nvertices[structure]}'
++        )
++
++
++def _conform_parcels(parcels, brain_model):
++    """Parcels stated in the terms the image uses
++
++    Structure names are put in their canonical form and the vertex counts and the volume are
++    taken from `brain_model`, so that the parcels can describe a dimension of an image built
++    on that brain model.
++
++    Parameters
++    ----------
++    parcels : :class:`.cifti2_axes.ParcelsAxis`
++    brain_model : :class:`.cifti2_axes.BrainModelAxis`
++
++    Returns
++    -------
++    :class:`.cifti2_axes.ParcelsAxis`
++    """
++    _check_volume(brain_model, parcels.affine, parcels.volume_shape, 'The parcels')
++    all_voxels = []
++    all_vertices = []
++    nvertices = {}
++    has_voxels = False
++    for name, voxels, vertices in zip(parcels.name, parcels.voxels, parcels.vertices):
++        conformed = {}
++        for structure, indices in vertices.items():
++            structure = _canonical(structure)
++            _check_surface(
++                brain_model, structure, parcels.nvertices.get(structure), f'Parcel {name}'
++            )
++            found = np.asanyarray(indices).ravel()
++            if structure in conformed:
++                found = np.concatenate([conformed[structure], found])
++            conformed[structure] = found
++            nvertices[structure] = brain_model.nvertices[structure]
++        all_vertices.append(conformed)
++        kept = np.asanyarray(voxels).reshape(-1, 3)
++        if brain_model.affine is None:
++            kept = np.zeros((0, 3), dtype=int)
++        all_voxels.append(kept)
++        if kept.shape[0] > 0:
++            has_voxels = True
++    affine = brain_model.affine if has_voxels else None
++    volume_shape = brain_model.volume_shape if has_voxels else None
++    return ParcelsAxis(parcels.name, all_voxels, all_vertices, affine, volume_shape, nvertices)
++
++
++def _parcel_rows(parcels, brain_model):
++    """Rows of `brain_model` selected by each parcel of `parcels`
++
++    Parameters
++    ----------
++    parcels : :class:`.cifti2_axes.ParcelsAxis`
++        parcels already conformed to `brain_model`
++    brain_model : :class:`.cifti2_axes.BrainModelAxis`
++
++    Returns
++    -------
++    list of integer arrays with the distinct rows selected by each parcel, in ascending order
++    """
++    lookup = {}
++    for row, key in enumerate(_greyordinate_keys(brain_model)):
++        lookup.setdefault(key, row)
++    rows = []
++    for name, voxels, vertices in zip(parcels.name, parcels.voxels, parcels.vertices):
++        selected = []
++        for structure, indices in vertices.items():
++            for vertex in np.asanyarray(indices).ravel():
++                row = lookup.get(('surface', structure, int(vertex)))
++                if row is not None:
++                    selected.append(row)
++        for voxel in np.asanyarray(voxels).reshape(-1, 3):
++            row = lookup.get(('volume',) + tuple(int(value) for value in voxel))
++            if row is not None:
++                selected.append(row)
++        if not selected:
++            raise ValueError(f'Parcel {name} selects no greyordinate of the image')
++        rows.append(np.unique(np.asarray(selected, dtype=int)))
++    return rows
++
++
++def _aggregate(data, rows, axis, method):
++    """Reduce `data` along `axis`, one output element per entry of `rows`"""
++    reduction = REDUCTIONS[method]
++    source = np.asanyarray(data, dtype=np.float64)
++    if not rows:
++        shape = list(source.shape)
++        shape[axis] = 0
++        return np.zeros(shape, dtype=np.float64)
++    reduced = [reduction(np.take(source, selected, axis=axis), axis=axis) for selected in rows]
++    return np.stack(reduced, axis=axis)
++
++
++def _parcels_from_label_image(label_img):
++    """Build a ParcelsAxis from a dense label image"""
++    axes = _image_axes(label_img)
++    if len(axes) != 2:
++        raise ValueError('A label image should have two dimensions')
++    label_axes = [idx for idx, ax in enumerate(axes) if isinstance(ax, LabelAxis)]
++    dense_axes = [idx for idx, ax in enumerate(axes) if isinstance(ax, BrainModelAxis)]
++    if len(label_axes) != 1 or len(dense_axes) != 1:
++        raise ValueError('A label image should have one LabelAxis and one BrainModelAxis')
++    label_axis = axes[label_axes[0]]
++    if len(label_axis) != 1:
++        raise ValueError(f'A label image should hold a single label map, got {len(label_axis)}')
++    values = np.take(np.asanyarray(label_img.dataobj), 0, axis=label_axes[0])
++    return ParcelsAxis.from_greyordinate_labels(axes[dense_axes[0]], values, label_axis.label[0])
++
++
++def parcellate(img, parcels, axis=None, method='mean'):
++    """Reduce the greyordinates of a CIFTI-2 image to parcels
++
++    Parameters
++    ----------
++    img : :class:`.cifti2.Cifti2Image`
++        image with at least one :class:`.cifti2_axes.BrainModelAxis`
++    parcels : :class:`.cifti2_axes.ParcelsAxis` or :class:`.cifti2.Cifti2Image`
++        parcel definition, either directly or as a dense label image
++    axis : int, optional
++        dimension to parcellate; every brain model dimension is parcellated when omitted
++    method : str, optional
++        one of 'mean', 'sum', 'max' or 'min'
++
++    Returns
++    -------
++    :class:`.cifti2.Cifti2Image`
++        image with the parcelled dimensions replaced by `parcels`
++    """
++    if method not in REDUCTIONS:
++        raise ValueError(
++            f'Unknown parcellation method {method!r}; expected one of {sorted(REDUCTIONS)}'
++        )
++    if isinstance(parcels, Cifti2Image):
++        parcels = _parcels_from_label_image(parcels)
++    if not isinstance(parcels, ParcelsAxis):
++        raise ValueError('Parcels should be a ParcelsAxis or a dense label image')
++    axes = _image_axes(img)
++    targets = _brain_model_axes(axes, axis)
++    data = np.asanyarray(img.dataobj, dtype=np.float64)
++    for target in targets:
++        conformed = _conform_parcels(parcels, axes[target])
++        data = _aggregate(data, _parcel_rows(conformed, axes[target]), target, method)
++        axes[target] = conformed
++    return Cifti2Image(data, Cifti2Header.from_axes(axes))
++
++
++def concat(images, axis=0):
++    """Concatenate CIFTI-2 images along one dimension
++
++    Parameters
++    ----------
++    images : sequence of :class:`.cifti2.Cifti2Image`
++        images to join, in order
++    axis : int, optional
++        dimension to concatenate along
++
++    Returns
++    -------
++    :class:`.cifti2.Cifti2Image`
++    """
++    images = list(images)
++    if not images:
++        raise ValueError('Cannot concatenate an empty sequence of images')
++    all_axes = [_image_axes(img) for img in images]
++    ndim = len(all_axes[0])
++    if any(len(axes) != ndim for axes in all_axes):
++        raise ValueError('All images should have the same number of dimensions')
++    target = _resolve_axis(axis, ndim)
++    merged = list(all_axes[0])
++    for position, axes in enumerate(all_axes[1:], start=1):
++        for index in range(ndim):
++            _check_shared_volume(merged[index], axes[index], f'Image {position}')
++            if index == target:
++                continue
++            if axes[index] != merged[index]:
++                raise ValueError(
++                    f'Image {position} differs from the first image along axis {index}'
++                )
++        merged[target] = merged[target] + axes[target]
++    data = np.concatenate([np.asanyarray(img.dataobj) for img in images], axis=target)
++    return Cifti2Image(data, Cifti2Header.from_axes(merged))
++
++
++def _parcels_axes(axes, axis):
++    """Indices of the axes to operate on, checking that they hold parcels"""
++    if axis is None:
++        selected = [idx for idx, ax in enumerate(axes) if isinstance(ax, ParcelsAxis)]
++        if not selected:
++            raise ValueError('Image has no ParcelsAxis to operate on')
++        return selected
++    resolved = _resolve_axis(axis, len(axes))
++    if not isinstance(axes[resolved], ParcelsAxis):
++        raise ValueError(f'Axis {axis} is a {type(axes[resolved]).__name__}, not a ParcelsAxis')
++    return [resolved]
++
++
++def _group_rows(parcels, groups):
++    """Rows of `parcels` named by each group, in the order the group names them"""
++    index = {}
++    for row, name in enumerate(parcels.name):
++        index.setdefault(str(name), []).append(row)
++    rows = []
++    for name, members in groups:
++        selected = []
++        taken = set()
++        for member in members:
++            member = str(member)
++            if member not in index:
++                raise ValueError(f'Group {name} names {member}, which the image does not hold')
++            for row in index[member]:
++                if row not in taken:
++                    taken.add(row)
++                    selected.append(row)
++        if not selected:
++            raise ValueError(f'Group {name} names no parcel')
++        rows.append(selected)
++    return rows
++
++
++def _grouped_parcels(parcels, groups, rows):
++    """Parcels covering everything the parcels of each group cover"""
++    all_names = []
++    all_voxels = []
++    all_vertices = []
++    nvertices = {}
++    has_voxels = False
++    for (name, _), selected in zip(groups, rows):
++        voxels = []
++        seen_voxels = set()
++        vertices = {}
++        seen_vertices = {}
++        for row in selected:
++            for voxel in np.asanyarray(parcels.voxels[row]).reshape(-1, 3):
++                key = tuple(int(value) for value in voxel)
++                if key not in seen_voxels:
++                    seen_voxels.add(key)
++                    voxels.append(key)
++            for structure, indices in parcels.vertices[row].items():
++                structure = _canonical(structure)
++                collected = vertices.setdefault(structure, [])
++                taken = seen_vertices.setdefault(structure, set())
++                for vertex in np.asanyarray(indices).ravel():
++                    vertex = int(vertex)
++                    if vertex not in taken:
++                        taken.add(vertex)
++                        collected.append(vertex)
++                nvertices[structure] = parcels.nvertices[structure]
++        if voxels:
++            has_voxels = True
++        all_names.append(name)
++        all_voxels.append(np.asarray(voxels, dtype=int).reshape(-1, 3))
++        all_vertices.append({key: np.asarray(value, dtype=int) for key, value in vertices.items()})
++    affine = parcels.affine if has_voxels else None
++    volume_shape = parcels.volume_shape if has_voxels else None
++    return ParcelsAxis(all_names, all_voxels, all_vertices, affine, volume_shape, nvertices)
++
++
++def merge_parcels(img, groups, axis=None, method='mean'):
++    """Aggregate the parcels of a CIFTI-2 image into larger ones
++
++    Parameters
++    ----------
++    img : :class:`.cifti2.Cifti2Image`
++        image with at least one :class:`.cifti2_axes.ParcelsAxis`
++    groups : sequence of (str, sequence of str)
++        name of each new parcel and the parcels it is built from, in order
++    axis : int, optional
++        dimension to merge; every parcel dimension is merged when omitted
++    method : str, optional
++        one of 'mean', 'sum', 'max' or 'min'
++
++    Returns
++    -------
++    :class:`.cifti2.Cifti2Image`
++        image with the merged dimensions replaced by the grouped parcels
++    """
++    if method not in REDUCTIONS:
++        raise ValueError(
++            f'Unknown parcellation method {method!r}; expected one of {sorted(REDUCTIONS)}'
++        )
++    groups = [(str(name), list(members)) for name, members in groups]
++    if not groups:
++        raise ValueError('Cannot merge parcels into an empty set of groups')
++    axes = _image_axes(img)
++    targets = _parcels_axes(axes, axis)
++    data = np.asanyarray(img.dataobj, dtype=np.float64)
++    for target in targets:
++        rows = _group_rows(axes[target], groups)
++        data = _aggregate(data, [np.asarray(row, dtype=int) for row in rows], target, method)
++        axes[target] = _grouped_parcels(axes[target], groups, rows)
++    return Cifti2Image(data, Cifti2Header.from_axes(axes))
++
++
++def split(img, axis=0, sizes=None):
++    """Cut a CIFTI-2 image along one dimension
++
++    Parameters
++    ----------
++    img : :class:`.cifti2.Cifti2Image`
++        image to cut up
++    axis : int, optional
++        dimension to cut along
++    sizes : sequence of int, optional
++        length of each piece; one piece per element of the dimension when omitted
++
++    Returns
++    -------
++    tuple of :class:`.cifti2.Cifti2Image`
++        the pieces, in order
++    """
++    axes = _image_axes(img)
++    target = _resolve_axis(axis, len(axes))
++    length = len(axes[target])
++    if sizes is None:
++        sizes = [1] * length
++    sizes = [int(size) for size in sizes]
++    if any(size < 1 for size in sizes):
++        raise ValueError('Every piece has to hold at least one element')
++    if sum(sizes) != length:
++        raise ValueError(
++            f'Pieces of {sizes} do not add up to the {length} elements of axis {target}'
++        )
++    data = np.asanyarray(img.dataobj)
++    pieces = []
++    start = 0
++    for size in sizes:
++        stop = start + size
++        piece_axes = list(axes)
++        piece_axes[target] = axes[target][start:stop]
++        pieces.append(
++            Cifti2Image(
++                np.take(data, np.arange(start, stop), axis=target),
++                Cifti2Header.from_axes(piece_axes),
++            )
++        )
++        start = stop
++    return tuple(pieces)

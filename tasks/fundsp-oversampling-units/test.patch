@@ -1,0 +1,1712 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..a00be55
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,125 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || { echo "missing value for --output_path" >&2; usage; }
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 2
++
++export CARGO_HOME="${CARGO_HOME:-/opt/cargo}"
++export PATH="$CARGO_HOME/bin:$PATH"
++export CARGO_NET_OFFLINE=true
++export CARGO_TERM_COLOR=never
++export RUSTC_BOOTSTRAP=1
++
++NEW_TARGETS="oversample_blocks_5e8f09 oversample_linear_5e8f09 oversample_prelude_5e8f09 oversample_unit_5e8f09 oversample_alloc_5e8f09"
++TEST_JSON="$(mktemp)"
++TEST_ERR="$(mktemp)"
++trap 'rm -f "$TEST_JSON" "$TEST_ERR"' EXIT
++
++LIMIT=""
++if command -v timeout >/dev/null 2>&1; then
++  LIMIT="timeout 1800"
++fi
++
++STATUS=0
++if [ "$MODE" = "base" ]; then
++  $LIMIT cargo test --offline --lib \
++    --test test_basic --test test_dynamics --test test_flow --test test_follow \
++    -- -Z unstable-options --format json --report-time >"$TEST_JSON" 2>"$TEST_ERR"
++  STATUS=$?
++else
++  for target in $NEW_TARGETS; do
++    $LIMIT cargo test --offline --test "$target" \
++      -- -Z unstable-options --format json --report-time >>"$TEST_JSON" 2>>"$TEST_ERR"
++    RESULT=$?
++    [ "$RESULT" -ne 0 ] && STATUS=$RESULT
++  done
++fi
++tail -n 200 "$TEST_ERR" >&2
++
++xml_escape() {
++  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
++}
++
++expected_tests() {
++  for target in $NEW_TARGETS; do
++    awk '/#\[test\]/ { want = 1; next }
++         want && /fn [A-Za-z0-9_]+/ { sub(/.*fn /, ""); sub(/\(.*/, ""); print; want = 0 }' \
++      "tests/$target.rs"
++  done
++}
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  cargo2junit <"$TEST_JSON" >"$OUTPUT_PATH" 2>/dev/null || true
++  DETAIL="$({ tail -c 3000 "$TEST_ERR"; tail -c 1000 "$TEST_JSON"; } | xml_escape)"
++  if [ "$MODE" = "new" ]; then
++    MISSING=""
++    for name in $(expected_tests); do
++      grep -q "name=\"$name\"" "$OUTPUT_PATH" 2>/dev/null || MISSING="$MISSING $name"
++    done
++    if [ -n "$MISSING" ]; then
++      [ "$STATUS" -eq 0 ] && STATUS=1
++      MERGED="$(mktemp)"
++      {
++        if grep -q '^</testsuites>$' "$OUTPUT_PATH" 2>/dev/null; then
++          grep -v '^</testsuites>$' "$OUTPUT_PATH"
++        else
++          echo '<?xml version="1.0" encoding="UTF-8"?>'
++          echo '<testsuites>'
++        fi
++        echo '  <testsuite name="tests that did not run" errors="0">'
++        for name in $MISSING; do
++          echo "    <testcase name=\"$name\" classname=\"\"><failure message=\"test did not run to completion\">$DETAIL</failure></testcase>"
++        done
++        echo '  </testsuite>'
++        echo '</testsuites>'
++      } >"$MERGED"
++      mv "$MERGED" "$OUTPUT_PATH"
++    fi
++  elif ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    {
++      echo '<?xml version="1.0" encoding="UTF-8"?>'
++      echo '<testsuites>'
++      echo '  <testsuite name="cargo test #0" errors="0">'
++      echo "    <testcase name=\"compilation\" classname=\"\"><failure message=\"build failed\">$DETAIL</failure></testcase>"
++      echo '  </testsuite>'
++      echo '</testsuites>'
++    } >"$OUTPUT_PATH"
++  fi
++fi
++
++exit "$STATUS"
+diff --git a/tests/oversample_alloc_5e8f09.rs b/tests/oversample_alloc_5e8f09.rs
+new file mode 100644
+index 0000000..a0155ed
+--- /dev/null
++++ b/tests/oversample_alloc_5e8f09.rs
+@@ -0,0 +1,105 @@
++use fundsp::prelude64::*;
++use std::alloc::{GlobalAlloc, Layout, System};
++use std::cell::Cell;
++
++struct CountingAllocator;
++
++thread_local! {
++    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
++}
++
++fn count_allocation() {
++    let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
++}
++
++unsafe impl GlobalAlloc for CountingAllocator {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        count_allocation();
++        unsafe { System.alloc(layout) }
++    }
++
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        count_allocation();
++        unsafe { System.alloc_zeroed(layout) }
++    }
++
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        count_allocation();
++        unsafe { System.realloc(ptr, layout, new_size) }
++    }
++
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        unsafe { System.dealloc(ptr, layout) }
++    }
++}
++
++#[global_allocator]
++static GLOBAL: CountingAllocator = CountingAllocator;
++
++fn allocations() -> usize {
++    ALLOCATIONS.with(|count| count.get())
++}
++
++fn units() -> Vec<(String, OversampleUnit)> {
++    let mut list = Vec::new();
++    for factor in [2, 4, 8, 16] {
++        list.push((
++            format!("minimum phase x{factor}"),
++            OversampleUnit::new(
++                factor,
++                Box::new(
++                    (noise() >> lowpass_hz(1000.0, 1.0) >> limiter(0.002, 0.01))
++                        | (pass() + pass()),
++                ),
++            ),
++        ));
++        list.push((
++            format!("linear phase x{factor}"),
++            OversampleUnit::linear(
++                factor,
++                Box::new(
++                    (noise() >> lowpass_hz(1000.0, 1.0) >> limiter(0.002, 0.01))
++                        | (pass() + pass()),
++                ),
++            ),
++        ));
++    }
++    list
++}
++
++#[test]
++fn ticking_allocates_nothing_after_allocate() {
++    for (name, mut unit) in units() {
++        unit.allocate();
++        let input = [0.25f32, -0.5];
++        let mut output = [0.0f32; 2];
++        let before = allocations();
++        for i in 0..2000 {
++            let x = (i % 17) as f32 * 0.05;
++            unit.tick(&[input[0] + x, input[1] - x], &mut output);
++        }
++        let after = allocations();
++        assert_eq!(after - before, 0, "{name} allocated while ticking");
++        assert!(output.iter().all(|x| x.is_finite()));
++    }
++}
++
++#[test]
++fn processing_blocks_allocates_nothing_after_allocate() {
++    for (name, mut unit) in units() {
++        unit.allocate();
++        let mut input = BufferVec::new(2);
++        let mut output = BufferVec::new(2);
++        for i in 0..MAX_BUFFER_SIZE {
++            input.set_f32(0, i, (i as f32 * 0.1).sin());
++            input.set_f32(1, i, (i as f32 * 0.07).cos());
++        }
++        let before = allocations();
++        for size in [64, 1, 33, 7, 64, 2, 63, 32] {
++            unit.process(size, &input.buffer_ref(), &mut output.buffer_mut());
++        }
++        let after = allocations();
++        assert_eq!(after - before, 0, "{name} allocated while processing");
++        assert!(output.at_f32(1, 0).is_finite());
++    }
++}
+diff --git a/tests/oversample_blocks_5e8f09.rs b/tests/oversample_blocks_5e8f09.rs
+new file mode 100644
+index 0000000..d2ab952
+--- /dev/null
++++ b/tests/oversample_blocks_5e8f09.rs
+@@ -0,0 +1,496 @@
++#![allow(clippy::excessive_precision)]
++
++use fundsp::prelude64::*;
++use num_complex::Complex64;
++
++fn input_signal(channels: usize, length: usize) -> Vec<Vec<f32>> {
++    let mut state = 0x2545f4914f6cdd1du64;
++    (0..channels)
++        .map(|channel| {
++            (0..length)
++                .map(|i| {
++                    state = state
++                        .wrapping_mul(6364136223846793005)
++                        .wrapping_add(1442695040888963407);
++                    let noise = (state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0;
++                    let t = i as f32 / 44100.0;
++                    0.4 * (t * 523.0 * (channel as f32 + 1.0) * core::f32::consts::TAU).sin()
++                        + 0.3 * noise
++                })
++                .collect()
++        })
++        .collect()
++}
++
++fn run_ticks(unit: &mut dyn AudioUnit, input: &[Vec<f32>], length: usize) -> Vec<Vec<f32>> {
++    let mut output = vec![vec![0.0; length]; unit.outputs()];
++    let mut frame_in = vec![0.0; unit.inputs()];
++    let mut frame_out = vec![0.0; unit.outputs()];
++    for i in 0..length {
++        for (channel, x) in frame_in.iter_mut().enumerate() {
++            *x = input[channel][i];
++        }
++        unit.tick(&frame_in, &mut frame_out);
++        for (channel, y) in frame_out.iter().enumerate() {
++            output[channel][i] = *y;
++        }
++    }
++    output
++}
++
++fn run_blocks(
++    unit: &mut dyn AudioUnit,
++    input: &[Vec<f32>],
++    length: usize,
++    sizes: &[usize],
++) -> Vec<Vec<f32>> {
++    let mut output = vec![vec![0.0; length]; unit.outputs()];
++    let mut buffer_in = BufferVec::new(unit.inputs());
++    let mut buffer_out = BufferVec::new(unit.outputs());
++    let mut i = 0;
++    let mut k = 0;
++    while i < length {
++        let n = Ord::min(sizes[k % sizes.len()], length - i);
++        k += 1;
++        for (channel, samples) in input.iter().enumerate() {
++            for j in 0..n {
++                buffer_in.set_f32(channel, j, samples[i + j]);
++            }
++        }
++        unit.process(n, &buffer_in.buffer_ref(), &mut buffer_out.buffer_mut());
++        for (channel, samples) in output.iter_mut().enumerate() {
++            for j in 0..n {
++                samples[i + j] = buffer_out.at_f32(channel, j);
++            }
++        }
++        i += n;
++    }
++    output
++}
++
++fn assert_close(actual: &[Vec<f32>], expected: &[Vec<f32>], tolerance: f32) {
++    assert_eq!(actual.len(), expected.len());
++    for (channel, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
++        for (i, (x, y)) in a.iter().zip(e.iter()).enumerate() {
++            assert!(
++                (x - y).abs() <= tolerance,
++                "channel {channel} sample {i}: {x} != {y}"
++            );
++        }
++    }
++}
++
++fn check_blocks(unit: &dyn AudioUnit, length: usize, sizes: &[usize]) {
++    let input = input_signal(unit.inputs(), length);
++    let mut ticked = dyn_clone::clone_box(unit);
++    let mut blocked = dyn_clone::clone_box(unit);
++    let expected = run_ticks(&mut *ticked, &input, length);
++    let actual = run_blocks(&mut *blocked, &input, length, sizes);
++    assert_close(&actual, &expected, 1.0e-5);
++}
++
++fn energy(signal: &[Vec<f32>]) -> f32 {
++    signal.iter().flatten().map(|x| x * x).sum()
++}
++
++fn measured_response(
++    unit: &dyn AudioUnit,
++    output: usize,
++    frequency: f64,
++    sample_rate: f64,
++) -> Complex64 {
++    let mut unit = dyn_clone::clone_box(unit);
++    unit.reset();
++    let length = 4096;
++    let mut frame_in = vec![0.0; unit.inputs()];
++    let mut frame_out = vec![0.0; unit.outputs()];
++    let mut response = Complex64::new(0.0, 0.0);
++    for i in 0..length {
++        frame_in.fill(if i == 0 { 1.0 } else { 0.0 });
++        unit.tick(&frame_in, &mut frame_out);
++        let phase = -core::f64::consts::TAU * frequency * i as f64 / sample_rate;
++        response += Complex64::from_polar(frame_out[output] as f64, phase);
++    }
++    response
++}
++
++fn check_analysis(unit: &mut dyn AudioUnit, output: usize, sample_rate: f64, frequencies: &[f64]) {
++    let latency = unit.latency().expect("linear network has a latency");
++    for &frequency in frequencies {
++        let reported = unit
++            .response(output, frequency)
++            .expect("linear network has a response");
++        let delayed = reported
++            * Complex64::from_polar(
++                1.0,
++                -core::f64::consts::TAU * frequency * latency / sample_rate,
++            );
++        let measured = measured_response(unit, output, frequency, sample_rate);
++        assert!(
++            (delayed - measured).norm() <= 1.0e-3,
++            "output {output} at {frequency} Hz: reported {delayed} measured {measured}"
++        );
++    }
++}
++
++const FREQUENCIES: [f64; 6] = [100.0, 1000.0, 4000.0, 9000.0, 13000.0, 16000.0];
++
++const PASS_IMPULSE: [f32; 48] = [
++    1.6947744e-6,
++    -5.509104e-6,
++    1.3878232e-5,
++    -3.0841988e-5,
++    6.218697e-5,
++    -0.00011490438,
++    0.00019543346,
++    -0.00030611048,
++    0.00043943734,
++    -0.00057018874,
++    0.00064628554,
++    -0.00058064517,
++    0.00024798384,
++    0.000507387,
++    -0.0018444308,
++    0.0038679533,
++    -0.0065260082,
++    0.009439314,
++    -0.011626095,
++    0.011176817,
++    -0.010558175,
++    0.0052883737,
++    0.004214883,
++    -0.017676458,
++    0.033366293,
++    -0.047991876,
++    0.05693578,
++    -0.05502203,
++    0.037840415,
++    -0.0035379687,
++    -0.045150615,
++    0.09901939,
++    -0.14127037,
++    0.14821514,
++    -0.09383325,
++    -0.037691943,
++    0.22349828,
++    -0.34628102,
++    0.12421025,
++    0.69729704,
++    0.3285581,
++    0.034472346,
++    0.0,
++    0.0,
++    0.0,
++    0.0,
++    0.0,
++    0.0,
++];
++
++const MULTI_OUTPUT: [(f32, f32); 24] = [
++    (0.0, 0.0),
++    (5.7400957e-8, -3.064283e-7),
++    (1.299218e-7, 4.2470566e-7),
++    (2.3217238e-7, -1.4109338e-6),
++    (3.9224875e-7, 2.52086e-6),
++    (2.4140857e-7, -5.132418e-6),
++    (7.323327e-7, 8.684553e-6),
++    (-3.5203914e-7, -1.4009768e-5),
++    (1.2990258e-6, 2.0539203e-5),
++    (-1.7549964e-6, -2.7145368e-5),
++    (2.2268844e-6, 3.193858e-5),
++    (-3.3474134e-6, -3.0153613e-5),
++    (2.6510575e-6, 1.6820451e-5),
++    (-2.7859987e-6, 1.668058e-5),
++    (-5.8415844e-7, -7.745647e-5),
++    (4.5468696e-6, 0.00017237727),
++    (-1.2780436e-5, -0.0003004754),
++    (2.3372215e-5, 0.00044729264),
++    (-3.5943216e-5, -0.0005721792),
++    (4.7185706e-5, 0.0005878785),
++    (-4.2201416e-5, -0.00035248516),
++    (-6.4416585e-5, 0.0006638577),
++    (-0.0003683852, 0.000634172),
++    (-0.00072954444, -0.0002434298),
++];
++
++#[test]
++fn oversampled_generator_renders_like_ticking() {
++    let mut rendered_node = oversample(sine_hz(1000.0));
++    let mut ticked_node = rendered_node.clone();
++    let wave = Wave::render(44100.0, 0.05, &mut rendered_node);
++    ticked_node.set_sample_rate(44100.0);
++    let expected = run_ticks(&mut ticked_node, &[], wave.length());
++    assert!(wave.amplitude() > 0.9);
++    let actual = vec![wave.channel(0).clone()];
++    assert_close(&actual, &expected, 1.0e-5);
++}
++
++#[test]
++fn oversampled_fm_oscillator_renders_like_ticking() {
++    let f: f32 = 440.0;
++    let m: f32 = 1.0;
++    let mut rendered_node = oversample((sine_hz(f) * f * m + f) >> sine());
++    let mut ticked_node = rendered_node.clone();
++    let wave = Wave::render(44100.0, 0.05, &mut rendered_node);
++    ticked_node.set_sample_rate(44100.0);
++    let expected = run_ticks(&mut ticked_node, &[], wave.length());
++    assert!(wave.amplitude() > 0.9);
++    assert_close(&[wave.channel(0).clone()], &expected, 1.0e-4);
++}
++
++#[test]
++fn stereo_generator_blocks_match_ticks() {
++    let unit = oversample(noise() | (pink() >> lowpass_hz(2000.0, 1.0)));
++    check_blocks(&unit, 1500, &[64]);
++    check_blocks(&unit, 1500, &[5]);
++    check_blocks(&unit, 300, &[1]);
++}
++
++#[test]
++fn filter_odd_block_sizes_match_ticks() {
++    let unit = oversample(lowpass_hz(3000.0, 1.0));
++    for size in [3, 7, 31, 33, 63] {
++        check_blocks(&unit, 1200, &[size]);
++    }
++}
++
++#[test]
++fn single_sample_blocks_match_ticks() {
++    check_blocks(&oversample(pass()), 400, &[1]);
++    check_blocks(&oversample(highpass_hz(500.0, 1.0)), 400, &[1]);
++}
++
++#[test]
++fn two_inputs_one_output_blocks_match_ticks() {
++    let unit = oversample(pass() + lowpass_hz(1500.0, 1.0));
++    check_blocks(&unit, 1300, &[64]);
++    check_blocks(&unit, 1300, &[2, 9, 64]);
++}
++
++#[test]
++fn one_input_two_outputs_blocks_match_ticks() {
++    let unit = oversample(split::<U2>() >> (lowpass_hz(1000.0, 1.0) | highpass_hz(1000.0, 1.0)));
++    check_blocks(&unit, 1300, &[64]);
++    check_blocks(&unit, 1300, &[17, 4]);
++}
++
++#[test]
++fn three_inputs_two_outputs_blocks_match_ticks() {
++    let unit = oversample((pass() + pass()) | bandpass_hz(2000.0, 2.0));
++    check_blocks(&unit, 1300, &[64]);
++    check_blocks(&unit, 1300, &[13, 32, 1]);
++}
++
++#[test]
++fn mixed_block_sequence_matches_ticks() {
++    let unit = oversample((noise() >> lowpole_hz(800.0)) | pass());
++    check_blocks(&unit, 2000, &[64, 1, 63, 2, 32, 33, 7, 64]);
++}
++
++#[test]
++fn oversampler_in_net_renders_like_ticking() {
++    let mut net = Net::wrap(Box::new(oversample(noise() >> lowpass_hz(1200.0, 1.0))));
++    net = net >> highpass_hz(100.0, 1.0);
++    let mut ticked = net.clone();
++    let wave = Wave::render(44100.0, 0.04, &mut net);
++    ticked.set_sample_rate(44100.0);
++    let expected = run_ticks(&mut ticked, &[], wave.length());
++    assert!(energy(&expected) > 1.0);
++    assert_close(&[wave.channel(0).clone()], &expected, 1.0e-5);
++}
++
++#[test]
++fn settings_reach_the_oversampled_node() {
++    let mut unit = oversample(lowpass_hz(1000.0, 1.0));
++    unit.set(Setting::center(5000.0));
++    let mut expected_unit = oversample(lowpass_hz(5000.0, 1.0));
++    let input = input_signal(1, 800);
++    let actual = run_ticks(&mut unit.clone(), &input, 800);
++    let expected = run_ticks(&mut expected_unit.clone(), &input, 800);
++    assert_close(&actual, &expected, 1.0e-6);
++    let actual = run_blocks(&mut unit, &input, 800, &[64]);
++    let expected = run_blocks(&mut expected_unit, &input, 800, &[64]);
++    assert_close(&actual, &expected, 1.0e-6);
++}
++
++#[test]
++fn addressed_settings_pass_through_unchanged() {
++    let mut unit = oversample(lowpass_hz(1000.0, 1.0) | highpass_hz(1000.0, 1.0));
++    unit.set(Setting::center(3000.0).right());
++    let mut expected_unit = oversample(lowpass_hz(1000.0, 1.0) | highpass_hz(3000.0, 1.0));
++    let input = input_signal(2, 800);
++    let actual = run_ticks(&mut unit, &input, 800);
++    let expected = run_ticks(&mut expected_unit, &input, 800);
++    assert_close(&actual, &expected, 1.0e-6);
++}
++
++#[test]
++fn tick_output_is_unchanged_and_blocks_agree() {
++    let mut unit = oversample(pass());
++    for (i, expected) in PASS_IMPULSE.iter().enumerate() {
++        let actual = unit.filter_mono(if i == 0 { 1.0 } else { 0.0 });
++        assert!(
++            (actual - expected).abs() <= 1.0e-6,
++            "sample {i}: {actual} != {expected}"
++        );
++    }
++    let mut multi = oversample(lowpass_hz(4000.0, 2.0) | (pass() + pass()));
++    for (i, expected) in MULTI_OUTPUT.iter().enumerate() {
++        let x = (i as f32 * 0.37).sin();
++        let mut output = [0.0f32; 2];
++        AudioUnit::tick(&mut multi, &[x, 0.5 * x, -x], &mut output);
++        assert!((output[0] - expected.0).abs() <= 1.0e-6, "sample {i}");
++        assert!((output[1] - expected.1).abs() <= 1.0e-6, "sample {i}");
++    }
++    check_blocks(&oversample(pass()), 600, &[3]);
++}
++
++#[test]
++fn latency_is_counted_at_the_outer_rate() {
++    assert_eq!(oversample(limiter(0.01, 0.1)).latency(), Some(441.0));
++    assert_eq!(oversample(limiter(0.02, 0.1)).latency(), Some(882.0));
++    assert_eq!(oversample(limiter_stereo(0.01, 0.1)).latency(), Some(441.0));
++}
++
++#[test]
++fn nested_oversamplers_report_outer_latency() {
++    assert_eq!(
++        oversample(oversample(limiter(0.01, 0.1))).latency(),
++        Some(441.0)
++    );
++    assert_eq!(
++        oversample(oversample(oversample(limiter(0.005, 0.1)))).latency(),
++        Some(220.5)
++    );
++}
++
++#[test]
++fn latency_composes_with_neighbors() {
++    assert_eq!(
++        (oversample(limiter(0.01, 0.1)) >> limiter(0.01, 0.1)).latency(),
++        Some(882.0)
++    );
++    assert_eq!(
++        (limiter(0.01, 0.1) >> oversample(pass())).latency(),
++        Some(441.0)
++    );
++    assert_eq!(
++        (limiter(0.01, 0.1) >> oversample(limiter(0.01, 0.1))).latency(),
++        Some(882.0)
++    );
++}
++
++#[test]
++fn latency_follows_sample_rate_changes() {
++    let mut unit = oversample(limiter(0.01, 0.1));
++    unit.set_sample_rate(48000.0);
++    assert_eq!(unit.latency(), Some(480.0));
++    unit.set_sample_rate(32000.0);
++    assert_eq!(unit.latency(), Some(320.0));
++}
++
++#[test]
++fn response_of_oversampled_pass_matches_measurement() {
++    let mut unit = oversample(pass());
++    assert_eq!(unit.latency(), Some(0.0));
++    check_analysis(&mut unit, 0, 44100.0, &FREQUENCIES);
++}
++
++#[test]
++fn response_of_oversampled_filters_matches_measurement() {
++    check_analysis(
++        &mut oversample(lowpass_hz(5000.0, 1.0)),
++        0,
++        44100.0,
++        &FREQUENCIES,
++    );
++    check_analysis(
++        &mut oversample(bell_hz(3000.0, 1.0, 2.0)),
++        0,
++        44100.0,
++        &FREQUENCIES,
++    );
++    check_analysis(
++        &mut oversample(highpole_hz(2000.0)),
++        0,
++        44100.0,
++        &FREQUENCIES,
++    );
++}
++
++#[test]
++fn response_reflects_inner_rate_delays() {
++    check_analysis(&mut oversample(pass() & tick()), 0, 44100.0, &FREQUENCIES);
++    check_analysis(&mut oversample(delay(0.0005)), 0, 44100.0, &FREQUENCIES);
++}
++
++#[test]
++fn response_at_other_sample_rates_matches_measurement() {
++    let mut unit = oversample(lowpass_hz(6000.0, 0.7));
++    unit.set_sample_rate(48000.0);
++    check_analysis(&mut unit, 0, 48000.0, &FREQUENCIES);
++    let mut unit = oversample(pass() & tick());
++    unit.set_sample_rate(32000.0);
++    check_analysis(&mut unit, 0, 32000.0, &[100.0, 2000.0, 7000.0, 11000.0]);
++}
++
++#[test]
++fn nested_oversampler_response_matches_measurement() {
++    check_analysis(
++        &mut oversample(oversample(lowpass_hz(5000.0, 1.0))),
++        0,
++        44100.0,
++        &FREQUENCIES,
++    );
++    let mut unit = oversample(oversample(pass() & tick()));
++    unit.set_sample_rate(48000.0);
++    check_analysis(&mut unit, 0, 48000.0, &FREQUENCIES);
++}
++
++#[test]
++fn multi_output_responses_match_measurement() {
++    let mut unit = oversample(lowpass_hz(2000.0, 1.0) | highpass_hz(2000.0, 1.0));
++    check_analysis(&mut unit, 0, 44100.0, &FREQUENCIES);
++    check_analysis(&mut unit, 1, 44100.0, &FREQUENCIES);
++}
++
++#[test]
++fn reset_restarts_the_oversampled_stream() {
++    let mut unit = oversample(noise() >> lowpass_hz(3000.0, 1.0));
++    let fresh = unit.clone();
++    let mut warm = unit.clone();
++    run_blocks(&mut warm, &[], 500, &[5]);
++    warm.reset();
++    let after_reset = run_blocks(&mut warm, &[], 700, &[5]);
++    let expected = run_ticks(&mut fresh.clone(), &[], 700);
++    assert_close(&after_reset, &expected, 1.0e-5);
++    run_ticks(&mut unit, &[], 300);
++    unit.reset();
++    assert_close(&run_ticks(&mut unit, &[], 700), &expected, 1.0e-5);
++}
++
++#[test]
++fn clone_continues_identically_in_blocks() {
++    let mut unit = oversample(pink() | (noise() >> bandpass_hz(1000.0, 3.0)));
++    run_blocks(&mut unit, &[], 333, &[64]);
++    let mut copy = unit.clone();
++    let mut ticked = unit.clone();
++    let original = run_blocks(&mut unit, &[], 900, &[7]);
++    let copied = run_blocks(&mut copy, &[], 900, &[7]);
++    assert_close(&copied, &original, 0.0);
++    assert_close(&original, &run_ticks(&mut ticked, &[], 900), 1.0e-5);
++}
++
++#[test]
++fn zero_sized_blocks_and_sink_nodes_match_ticks() {
++    check_blocks(&oversample(sine_hz(440.0)), 600, &[0, 7, 0, 64, 0, 1]);
++    check_blocks(&oversample(sink() | pass()), 900, &[0, 5, 0, 64, 1, 0, 33]);
++    check_blocks(&oversample(noise() | sink()), 900, &[0, 3, 0, 64]);
++    let mut unit = oversample(sink());
++    assert_eq!(unit.inputs(), 1);
++    assert_eq!(unit.outputs(), 0);
++    let input = input_signal(1, 400);
++    let processed = run_blocks(&mut unit, &input, 400, &[64, 0, 3, 1, 0, 63]);
++    assert!(processed.is_empty());
++    run_ticks(&mut unit, &input, 50);
++}
+diff --git a/tests/oversample_linear_5e8f09.rs b/tests/oversample_linear_5e8f09.rs
+new file mode 100644
+index 0000000..98f354e
+--- /dev/null
++++ b/tests/oversample_linear_5e8f09.rs
+@@ -0,0 +1,361 @@
++use fundsp::prelude64::*;
++use num_complex::Complex64;
++
++fn input_signal(channels: usize, length: usize) -> Vec<Vec<f32>> {
++    let mut state = 0x2545f4914f6cdd1du64;
++    (0..channels)
++        .map(|channel| {
++            (0..length)
++                .map(|i| {
++                    state = state
++                        .wrapping_mul(6364136223846793005)
++                        .wrapping_add(1442695040888963407);
++                    let noise = (state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0;
++                    let t = i as f32 / 44100.0;
++                    0.4 * (t * 523.0 * (channel as f32 + 1.0) * core::f32::consts::TAU).sin()
++                        + 0.3 * noise
++                })
++                .collect()
++        })
++        .collect()
++}
++
++fn run_ticks(unit: &mut dyn AudioUnit, input: &[Vec<f32>], length: usize) -> Vec<Vec<f32>> {
++    let mut output = vec![vec![0.0; length]; unit.outputs()];
++    let mut frame_in = vec![0.0; unit.inputs()];
++    let mut frame_out = vec![0.0; unit.outputs()];
++    for i in 0..length {
++        for (channel, x) in frame_in.iter_mut().enumerate() {
++            *x = input[channel][i];
++        }
++        unit.tick(&frame_in, &mut frame_out);
++        for (channel, y) in frame_out.iter().enumerate() {
++            output[channel][i] = *y;
++        }
++    }
++    output
++}
++
++fn run_blocks(
++    unit: &mut dyn AudioUnit,
++    input: &[Vec<f32>],
++    length: usize,
++    sizes: &[usize],
++) -> Vec<Vec<f32>> {
++    let mut output = vec![vec![0.0; length]; unit.outputs()];
++    let mut buffer_in = BufferVec::new(unit.inputs());
++    let mut buffer_out = BufferVec::new(unit.outputs());
++    let mut i = 0;
++    let mut k = 0;
++    while i < length {
++        let n = Ord::min(sizes[k % sizes.len()], length - i);
++        k += 1;
++        for (channel, samples) in input.iter().enumerate() {
++            for j in 0..n {
++                buffer_in.set_f32(channel, j, samples[i + j]);
++            }
++        }
++        unit.process(n, &buffer_in.buffer_ref(), &mut buffer_out.buffer_mut());
++        for (channel, samples) in output.iter_mut().enumerate() {
++            for j in 0..n {
++                samples[i + j] = buffer_out.at_f32(channel, j);
++            }
++        }
++        i += n;
++    }
++    output
++}
++
++fn assert_close(actual: &[Vec<f32>], expected: &[Vec<f32>], tolerance: f32) {
++    assert_eq!(actual.len(), expected.len());
++    for (channel, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
++        for (i, (x, y)) in a.iter().zip(e.iter()).enumerate() {
++            assert!(
++                (x - y).abs() <= tolerance,
++                "channel {channel} sample {i}: {x} != {y}"
++            );
++        }
++    }
++}
++
++fn check_blocks(unit: &dyn AudioUnit, length: usize, sizes: &[usize]) {
++    let input = input_signal(unit.inputs(), length);
++    let mut ticked = dyn_clone::clone_box(unit);
++    let mut blocked = dyn_clone::clone_box(unit);
++    let expected = run_ticks(&mut *ticked, &input, length);
++    let actual = run_blocks(&mut *blocked, &input, length, sizes);
++    assert_close(&actual, &expected, 1.0e-5);
++}
++
++fn measured_response(
++    unit: &dyn AudioUnit,
++    output: usize,
++    frequency: f64,
++    sample_rate: f64,
++) -> Complex64 {
++    let mut unit = dyn_clone::clone_box(unit);
++    unit.reset();
++    let length = 4096;
++    let mut frame_in = vec![0.0; unit.inputs()];
++    let mut frame_out = vec![0.0; unit.outputs()];
++    let mut response = Complex64::new(0.0, 0.0);
++    for i in 0..length {
++        frame_in.fill(if i == 0 { 1.0 } else { 0.0 });
++        unit.tick(&frame_in, &mut frame_out);
++        let phase = -core::f64::consts::TAU * frequency * i as f64 / sample_rate;
++        response += Complex64::from_polar(frame_out[output] as f64, phase);
++    }
++    response
++}
++
++fn check_analysis(unit: &mut dyn AudioUnit, output: usize, sample_rate: f64, frequencies: &[f64]) {
++    let latency = unit.latency().expect("linear network has a latency");
++    for &frequency in frequencies {
++        let reported = unit
++            .response(output, frequency)
++            .expect("linear network has a response");
++        let delayed = reported
++            * Complex64::from_polar(
++                1.0,
++                -core::f64::consts::TAU * frequency * latency / sample_rate,
++            );
++        let measured = measured_response(unit, output, frequency, sample_rate);
++        assert!(
++            (delayed - measured).norm() <= 1.0e-3,
++            "output {output} at {frequency} Hz: reported {delayed} measured {measured}"
++        );
++    }
++}
++
++const FREQUENCIES: [f64; 6] = [100.0, 1000.0, 4000.0, 9000.0, 13000.0, 16000.0];
++
++fn filter_latency() -> f64 {
++    oversample_linear(pass())
++        .latency()
++        .expect("linear oversampler has a latency")
++}
++
++fn assert_zero_phase(unit: &mut dyn AudioUnit, frequencies: &[f64]) {
++    for &frequency in frequencies {
++        let response = unit.response(0, frequency).expect("response");
++        assert!(
++            response.im.abs() <= 1.0e-4,
++            "{frequency} Hz: response {response} has a phase"
++        );
++        assert!(response.re > 0.5, "{frequency} Hz: response {response}");
++    }
++}
++
++#[test]
++fn linear_generator_renders_like_ticking() {
++    let mut rendered_node = oversample_linear(sine_hz(1000.0));
++    let mut ticked_node = rendered_node.clone();
++    let wave = Wave::render(44100.0, 0.05, &mut rendered_node);
++    ticked_node.set_sample_rate(44100.0);
++    let expected = run_ticks(&mut ticked_node, &[], wave.length());
++    assert!(wave.amplitude() > 0.9);
++    assert_close(&[wave.channel(0).clone()], &expected, 1.0e-5);
++}
++
++#[test]
++fn linear_blocks_match_ticks_for_every_arity() {
++    let generator = oversample_linear(noise() | (pink() >> lowpass_hz(2000.0, 1.0)));
++    check_blocks(&generator, 1500, &[64]);
++    check_blocks(&generator, 1500, &[5]);
++    check_blocks(&generator, 300, &[1]);
++    let merge = oversample_linear(pass() + lowpass_hz(1500.0, 1.0));
++    check_blocks(&merge, 1300, &[2, 9, 64]);
++    let fan_out =
++        oversample_linear(split::<U2>() >> (lowpass_hz(1000.0, 1.0) | highpass_hz(1000.0, 1.0)));
++    check_blocks(&fan_out, 1300, &[17, 4]);
++    let mixed = oversample_linear((pass() + pass()) | bandpass_hz(2000.0, 2.0));
++    check_blocks(&mixed, 1300, &[13, 32, 1, 63]);
++}
++
++#[test]
++fn linear_pass_reports_its_delay_as_latency() {
++    let latency = filter_latency();
++    assert!(latency > 1.0, "latency {latency}");
++    let mut unit = oversample_linear(pass());
++    assert_zero_phase(&mut unit, &FREQUENCIES);
++    check_analysis(&mut unit, 0, 44100.0, &FREQUENCIES);
++}
++
++#[test]
++fn linear_response_matches_measurement() {
++    check_analysis(
++        &mut oversample_linear(lowpass_hz(5000.0, 1.0)),
++        0,
++        44100.0,
++        &FREQUENCIES,
++    );
++    check_analysis(
++        &mut oversample_linear(bell_hz(3000.0, 1.0, 2.0)),
++        0,
++        44100.0,
++        &FREQUENCIES,
++    );
++    check_analysis(
++        &mut oversample_linear(pass() & tick()),
++        0,
++        44100.0,
++        &FREQUENCIES,
++    );
++    check_analysis(
++        &mut oversample_linear(delay(0.0005)),
++        0,
++        44100.0,
++        &FREQUENCIES,
++    );
++    let mut unit = oversample_linear(lowpass_hz(6000.0, 0.7));
++    unit.set_sample_rate(48000.0);
++    check_analysis(&mut unit, 0, 48000.0, &FREQUENCIES);
++}
++
++#[test]
++fn linear_zero_phase_holds_at_other_sample_rates() {
++    let mut unit = oversample_linear(pass());
++    unit.set_sample_rate(48000.0);
++    assert_eq!(unit.latency(), Some(filter_latency()));
++    assert_zero_phase(&mut unit, &FREQUENCIES);
++    check_analysis(&mut unit, 0, 48000.0, &FREQUENCIES);
++    unit.set_sample_rate(32000.0);
++    assert_zero_phase(&mut unit, &[100.0, 2000.0, 7000.0, 11000.0]);
++    check_analysis(&mut unit, 0, 32000.0, &[100.0, 2000.0, 7000.0, 11000.0]);
++}
++
++#[test]
++fn linear_latency_adds_to_enclosed_latency() {
++    let latency = filter_latency();
++    assert_eq!(
++        oversample_linear(limiter(0.01, 0.1)).latency(),
++        Some(441.0 + latency)
++    );
++    let mut unit = oversample_linear(limiter(0.01, 0.1));
++    unit.set_sample_rate(48000.0);
++    assert_eq!(unit.latency(), Some(480.0 + latency));
++    assert_eq!(
++        (limiter(0.01, 0.1) >> oversample_linear(pass())).latency(),
++        Some(441.0 + latency)
++    );
++}
++
++#[test]
++fn nested_linear_latency_accumulates() {
++    let latency = filter_latency();
++    let mut nested = oversample_linear(oversample_linear(pass()));
++    assert_eq!(nested.latency(), Some(latency * 1.5));
++    check_analysis(&mut nested, 0, 44100.0, &FREQUENCIES);
++    assert_zero_phase(&mut nested, &FREQUENCIES);
++    assert_eq!(
++        oversample_linear(oversample_linear(limiter(0.01, 0.1))).latency(),
++        Some(441.0 + latency * 1.5)
++    );
++    check_analysis(
++        &mut oversample_linear(oversample_linear(lowpass_hz(5000.0, 1.0))),
++        0,
++        44100.0,
++        &FREQUENCIES,
++    );
++}
++
++#[test]
++fn mixed_nesting_counts_only_linear_delays() {
++    let latency = filter_latency();
++    let mut inner_linear = oversample(oversample_linear(pass()));
++    assert_eq!(inner_linear.latency(), Some(latency * 0.5));
++    check_analysis(&mut inner_linear, 0, 44100.0, &FREQUENCIES);
++    let mut outer_linear = oversample_linear(oversample(pass()));
++    assert_eq!(outer_linear.latency(), Some(latency));
++    check_analysis(&mut outer_linear, 0, 44100.0, &FREQUENCIES);
++    assert_eq!(oversample(pass()).latency(), Some(0.0));
++}
++
++#[test]
++fn linear_settings_reach_the_node() {
++    let mut unit = oversample_linear(lowpass_hz(1000.0, 1.0) | highpass_hz(1000.0, 1.0));
++    unit.set(Setting::center(3000.0).right());
++    unit.set(Setting::center(5000.0).left());
++    let mut expected_unit = oversample_linear(lowpass_hz(5000.0, 1.0) | highpass_hz(3000.0, 1.0));
++    let input = input_signal(2, 800);
++    let actual = run_ticks(&mut unit.clone(), &input, 800);
++    let expected = run_ticks(&mut expected_unit.clone(), &input, 800);
++    assert_close(&actual, &expected, 1.0e-6);
++    let actual = run_blocks(&mut unit, &input, 800, &[64]);
++    let expected = run_blocks(&mut expected_unit, &input, 800, &[64]);
++    assert_close(&actual, &expected, 1.0e-6);
++}
++
++#[test]
++fn linear_multi_output_responses_match_measurement() {
++    let mut unit = oversample_linear(lowpass_hz(2000.0, 1.0) | highpass_hz(2000.0, 1.0));
++    check_analysis(&mut unit, 0, 44100.0, &FREQUENCIES);
++    check_analysis(&mut unit, 1, 44100.0, &FREQUENCIES);
++}
++
++#[test]
++fn linear_reset_and_clone_keep_the_stream_consistent() {
++    let mut unit = oversample_linear(noise() >> lowpass_hz(3000.0, 1.0));
++    let expected = run_ticks(&mut unit.clone(), &[], 700);
++    run_blocks(&mut unit, &[], 450, &[9]);
++    unit.reset();
++    assert_close(&run_blocks(&mut unit, &[], 700, &[9]), &expected, 1.0e-5);
++    let mut copy = unit.clone();
++    assert_close(
++        &run_blocks(&mut copy, &[], 500, &[64]),
++        &run_ticks(&mut unit, &[], 500),
++        1.0e-5,
++    );
++}
++
++#[test]
++fn linear_oversampler_uses_the_module_filter() {
++    let expected = [
++        (44100.0, 100.0, 0.9999999),
++        (44100.0, 1000.0, 0.9999967),
++        (44100.0, 10000.0, 1.0000048),
++        (44100.0, 16000.0, 0.9998072),
++        (44100.0, 18000.0, 0.8785430),
++        (44100.0, 19000.0, 0.4417696),
++        (44100.0, 20000.0, 0.0699687),
++        (48000.0, 18000.0, 1.0002088),
++        (48000.0, 20000.0, 0.7476637),
++        (48000.0, 21000.0, 0.2981888),
++    ];
++    for (sample_rate, frequency, magnitude) in expected {
++        let mut unit = oversample_linear(pass());
++        unit.set_sample_rate(sample_rate);
++        let reported = unit.response(0, frequency).expect("response").norm();
++        let measured = measured_response(&unit, 0, frequency, sample_rate).norm();
++        assert!(
++            (reported - magnitude).abs() <= 1.0e-4,
++            "{frequency} Hz at {sample_rate} Hz: reported {reported}, expected {magnitude}"
++        );
++        assert!(
++            (measured - magnitude).abs() <= 1.0e-4,
++            "{frequency} Hz at {sample_rate} Hz: measured {measured}, expected {magnitude}"
++        );
++    }
++}
++
++#[test]
++fn linear_zero_sized_blocks_and_sink_nodes_match_ticks() {
++    check_blocks(
++        &oversample_linear(sine_hz(440.0)),
++        600,
++        &[0, 7, 0, 64, 0, 1],
++    );
++    check_blocks(
++        &oversample_linear(sink() | pass()),
++        900,
++        &[0, 5, 0, 64, 1, 0, 33],
++    );
++    check_blocks(&oversample_linear(noise() | sink()), 900, &[0, 3, 0, 64]);
++    let mut unit = oversample_linear(sink());
++    assert_eq!(unit.inputs(), 1);
++    assert_eq!(unit.outputs(), 0);
++    let input = input_signal(1, 400);
++    let processed = run_blocks(&mut unit, &input, 400, &[64, 0, 3, 1, 0, 63]);
++    assert!(processed.is_empty());
++    run_ticks(&mut unit, &input, 50);
++}
+diff --git a/tests/oversample_prelude_5e8f09.rs b/tests/oversample_prelude_5e8f09.rs
+new file mode 100644
+index 0000000..7b7f5ba
+--- /dev/null
++++ b/tests/oversample_prelude_5e8f09.rs
+@@ -0,0 +1,102 @@
++use fundsp::prelude64::*;
++
++fn input_signal(channels: usize, length: usize) -> Vec<Vec<f32>> {
++    let mut state = 0x2545f4914f6cdd1du64;
++    (0..channels)
++        .map(|channel| {
++            (0..length)
++                .map(|i| {
++                    state = state
++                        .wrapping_mul(6364136223846793005)
++                        .wrapping_add(1442695040888963407);
++                    let noise = (state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0;
++                    let t = i as f32 / 44100.0;
++                    0.4 * (t * 523.0 * (channel as f32 + 1.0) * core::f32::consts::TAU).sin()
++                        + 0.3 * noise
++                })
++                .collect()
++        })
++        .collect()
++}
++
++fn run_ticks(unit: &mut dyn AudioUnit, input: &[Vec<f32>], length: usize) -> Vec<Vec<f32>> {
++    let mut output = vec![vec![0.0; length]; unit.outputs()];
++    let mut frame_in = vec![0.0; unit.inputs()];
++    let mut frame_out = vec![0.0; unit.outputs()];
++    for i in 0..length {
++        for (channel, x) in frame_in.iter_mut().enumerate() {
++            *x = input[channel][i];
++        }
++        unit.tick(&frame_in, &mut frame_out);
++        for (channel, y) in frame_out.iter().enumerate() {
++            output[channel][i] = *y;
++        }
++    }
++    output
++}
++
++fn run_blocks(
++    unit: &mut dyn AudioUnit,
++    input: &[Vec<f32>],
++    length: usize,
++    sizes: &[usize],
++) -> Vec<Vec<f32>> {
++    let mut output = vec![vec![0.0; length]; unit.outputs()];
++    let mut buffer_in = BufferVec::new(unit.inputs());
++    let mut buffer_out = BufferVec::new(unit.outputs());
++    let mut i = 0;
++    let mut k = 0;
++    while i < length {
++        let n = Ord::min(sizes[k % sizes.len()], length - i);
++        k += 1;
++        for (channel, samples) in input.iter().enumerate() {
++            for j in 0..n {
++                buffer_in.set_f32(channel, j, samples[i + j]);
++            }
++        }
++        unit.process(n, &buffer_in.buffer_ref(), &mut buffer_out.buffer_mut());
++        for (channel, samples) in output.iter_mut().enumerate() {
++            for j in 0..n {
++                samples[i + j] = buffer_out.at_f32(channel, j);
++            }
++        }
++        i += n;
++    }
++    output
++}
++
++fn assert_close(actual: &[Vec<f32>], expected: &[Vec<f32>], tolerance: f32) {
++    assert_eq!(actual.len(), expected.len());
++    for (channel, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
++        for (i, (x, y)) in a.iter().zip(e.iter()).enumerate() {
++            assert!(
++                (x - y).abs() <= tolerance,
++                "channel {channel} sample {i}: {x} != {y}"
++            );
++        }
++    }
++}
++
++#[test]
++fn linear_oversampler_is_in_every_prelude() {
++    let latency = fundsp::prelude64::oversample_linear(fundsp::prelude64::pass())
++        .latency()
++        .expect("linear oversampler has a latency");
++    let mut generic = fundsp::prelude::oversample_linear(fundsp::prelude::pass());
++    let mut single = fundsp::prelude32::oversample_linear(fundsp::prelude32::pass());
++    let mut double = fundsp::prelude64::oversample_linear(fundsp::prelude64::pass());
++    assert_eq!(generic.latency(), Some(latency));
++    assert_eq!(single.latency(), Some(latency));
++    let input = input_signal(1, 300);
++    let expected = run_ticks(&mut double, &input, 300);
++    assert_close(
++        &run_blocks(&mut generic, &input, 300, &[11]),
++        &expected,
++        1.0e-6,
++    );
++    assert_close(
++        &run_blocks(&mut single, &input, 300, &[3]),
++        &expected,
++        1.0e-6,
++    );
++}
+diff --git a/tests/oversample_unit_5e8f09.rs b/tests/oversample_unit_5e8f09.rs
+new file mode 100644
+index 0000000..ef9d3b7
+--- /dev/null
++++ b/tests/oversample_unit_5e8f09.rs
+@@ -0,0 +1,487 @@
++use fundsp::prelude64::*;
++use num_complex::Complex64;
++
++fn input_signal(channels: usize, length: usize) -> Vec<Vec<f32>> {
++    let mut state = 0x2545f4914f6cdd1du64;
++    (0..channels)
++        .map(|channel| {
++            (0..length)
++                .map(|i| {
++                    state = state
++                        .wrapping_mul(6364136223846793005)
++                        .wrapping_add(1442695040888963407);
++                    let noise = (state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0;
++                    let t = i as f32 / 44100.0;
++                    0.4 * (t * 523.0 * (channel as f32 + 1.0) * core::f32::consts::TAU).sin()
++                        + 0.3 * noise
++                })
++                .collect()
++        })
++        .collect()
++}
++
++fn run_ticks(unit: &mut dyn AudioUnit, input: &[Vec<f32>], length: usize) -> Vec<Vec<f32>> {
++    let mut output = vec![vec![0.0; length]; unit.outputs()];
++    let mut frame_in = vec![0.0; unit.inputs()];
++    let mut frame_out = vec![0.0; unit.outputs()];
++    for i in 0..length {
++        for (channel, x) in frame_in.iter_mut().enumerate() {
++            *x = input[channel][i];
++        }
++        unit.tick(&frame_in, &mut frame_out);
++        for (channel, y) in frame_out.iter().enumerate() {
++            output[channel][i] = *y;
++        }
++    }
++    output
++}
++
++fn run_blocks(
++    unit: &mut dyn AudioUnit,
++    input: &[Vec<f32>],
++    length: usize,
++    sizes: &[usize],
++) -> Vec<Vec<f32>> {
++    let mut output = vec![vec![0.0; length]; unit.outputs()];
++    let mut buffer_in = BufferVec::new(unit.inputs());
++    let mut buffer_out = BufferVec::new(unit.outputs());
++    let mut i = 0;
++    let mut k = 0;
++    while i < length {
++        let n = Ord::min(sizes[k % sizes.len()], length - i);
++        k += 1;
++        for (channel, samples) in input.iter().enumerate() {
++            for j in 0..n {
++                buffer_in.set_f32(channel, j, samples[i + j]);
++            }
++        }
++        unit.process(n, &buffer_in.buffer_ref(), &mut buffer_out.buffer_mut());
++        for (channel, samples) in output.iter_mut().enumerate() {
++            for j in 0..n {
++                samples[i + j] = buffer_out.at_f32(channel, j);
++            }
++        }
++        i += n;
++    }
++    output
++}
++
++fn assert_close(actual: &[Vec<f32>], expected: &[Vec<f32>], tolerance: f32) {
++    assert_eq!(actual.len(), expected.len());
++    for (channel, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
++        for (i, (x, y)) in a.iter().zip(e.iter()).enumerate() {
++            assert!(
++                (x - y).abs() <= tolerance,
++                "channel {channel} sample {i}: {x} != {y}"
++            );
++        }
++    }
++}
++
++fn check_blocks(unit: &dyn AudioUnit, length: usize, sizes: &[usize]) {
++    let input = input_signal(unit.inputs(), length);
++    let mut ticked = dyn_clone::clone_box(unit);
++    let mut blocked = dyn_clone::clone_box(unit);
++    let expected = run_ticks(&mut *ticked, &input, length);
++    let actual = run_blocks(&mut *blocked, &input, length, sizes);
++    assert_close(&actual, &expected, 1.0e-5);
++}
++
++fn energy(signal: &[Vec<f32>]) -> f32 {
++    signal.iter().flatten().map(|x| x * x).sum()
++}
++
++fn measured_response(
++    unit: &dyn AudioUnit,
++    output: usize,
++    frequency: f64,
++    sample_rate: f64,
++) -> Complex64 {
++    let mut unit = dyn_clone::clone_box(unit);
++    unit.reset();
++    let length = 4096;
++    let mut frame_in = vec![0.0; unit.inputs()];
++    let mut frame_out = vec![0.0; unit.outputs()];
++    let mut response = Complex64::new(0.0, 0.0);
++    for i in 0..length {
++        frame_in.fill(if i == 0 { 1.0 } else { 0.0 });
++        unit.tick(&frame_in, &mut frame_out);
++        let phase = -core::f64::consts::TAU * frequency * i as f64 / sample_rate;
++        response += Complex64::from_polar(frame_out[output] as f64, phase);
++    }
++    response
++}
++
++fn check_analysis(unit: &mut dyn AudioUnit, output: usize, sample_rate: f64, frequencies: &[f64]) {
++    let latency = unit.latency().expect("linear network has a latency");
++    for &frequency in frequencies {
++        let reported = unit
++            .response(output, frequency)
++            .expect("linear network has a response");
++        let delayed = reported
++            * Complex64::from_polar(
++                1.0,
++                -core::f64::consts::TAU * frequency * latency / sample_rate,
++            );
++        let measured = measured_response(unit, output, frequency, sample_rate);
++        assert!(
++            (delayed - measured).norm() <= 1.0e-3,
++            "output {output} at {frequency} Hz: reported {delayed} measured {measured}"
++        );
++    }
++}
++
++const FREQUENCIES: [f64; 6] = [100.0, 1000.0, 4000.0, 9000.0, 13000.0, 16000.0];
++
++fn assert_same_stream(dynamic: &dyn AudioUnit, fixed: &dyn AudioUnit, length: usize) {
++    assert_eq!(dynamic.inputs(), fixed.inputs());
++    assert_eq!(dynamic.outputs(), fixed.outputs());
++    let input = input_signal(fixed.inputs(), length);
++    let mut a = dyn_clone::clone_box(dynamic);
++    let mut b = dyn_clone::clone_box(fixed);
++    let expected = run_ticks(&mut *b, &input, length);
++    assert!(energy(&expected) > 0.1);
++    assert_close(&run_ticks(&mut *a, &input, length), &expected, 1.0e-5);
++    let mut a = dyn_clone::clone_box(dynamic);
++    let mut b = dyn_clone::clone_box(fixed);
++    assert_close(
++        &run_blocks(&mut *a, &input, length, &[64, 5, 33]),
++        &run_blocks(&mut *b, &input, length, &[64, 5, 33]),
++        1.0e-5,
++    );
++}
++
++fn assert_same_analysis(
++    dynamic: &mut dyn AudioUnit,
++    fixed: &mut dyn AudioUnit,
++    frequencies: &[f64],
++) {
++    assert_eq!(dynamic.latency(), fixed.latency());
++    for output in 0..fixed.outputs() {
++        for &frequency in frequencies {
++            let a = dynamic.response(output, frequency).expect("response");
++            let b = fixed.response(output, frequency).expect("response");
++            assert!((a - b).norm() <= 1.0e-9, "{frequency} Hz: {a} != {b}");
++        }
++    }
++}
++
++#[test]
++fn factor_two_matches_oversample_sample_for_sample() {
++    let unit = OversampleUnit::new(2, Box::new(noise() | pink()));
++    assert_same_stream(&unit, &oversample(noise() | pink()), 1500);
++}
++
++#[test]
++fn factor_two_matches_oversample_for_filters() {
++    let unit = OversampleUnit::new(2, Box::new(lowpass_hz(3000.0, 1.0) | pass()));
++    assert_same_stream(&unit, &oversample(lowpass_hz(3000.0, 1.0) | pass()), 1500);
++}
++
++#[test]
++fn factor_four_matches_two_nested_oversamplers() {
++    let unit = OversampleUnit::new(4, Box::new(noise() >> lowpass_hz(2500.0, 1.0)));
++    let nested = oversample(oversample(noise() >> lowpass_hz(2500.0, 1.0)));
++    assert_same_stream(&unit, &nested, 1500);
++}
++
++#[test]
++fn factor_eight_matches_three_nested_oversamplers() {
++    let unit = OversampleUnit::new(8, Box::new(highpass_hz(400.0, 1.0) | brown()));
++    let nested = oversample(oversample(oversample(highpass_hz(400.0, 1.0) | brown())));
++    assert_same_stream(&unit, &nested, 1200);
++}
++
++#[test]
++fn factor_sixteen_matches_four_nested_oversamplers() {
++    let unit = OversampleUnit::new(16, Box::new(pink() >> bell_hz(1000.0, 1.0, 2.0)));
++    let nested = oversample(oversample(oversample(oversample(
++        pink() >> bell_hz(1000.0, 1.0, 2.0),
++    ))));
++    assert_same_stream(&unit, &nested, 900);
++}
++
++#[test]
++fn linear_factors_match_nested_linear_oversamplers() {
++    let unit = OversampleUnit::linear(2, Box::new(noise() | lowpass_hz(2000.0, 1.0)));
++    assert_same_stream(
++        &unit,
++        &oversample_linear(noise() | lowpass_hz(2000.0, 1.0)),
++        1200,
++    );
++    let unit = OversampleUnit::linear(4, Box::new(pink() >> highpass_hz(300.0, 1.0)));
++    let nested = oversample_linear(oversample_linear(pink() >> highpass_hz(300.0, 1.0)));
++    assert_same_stream(&unit, &nested, 1200);
++    let unit = OversampleUnit::linear(8, Box::new(pass() + noise()));
++    let nested = oversample_linear(oversample_linear(oversample_linear(pass() + noise())));
++    assert_same_stream(&unit, &nested, 900);
++}
++
++#[test]
++fn unit_takes_its_arity_from_the_wrapped_unit() {
++    let net = Net::wrap(Box::new((pass() + pass()) | lowpass_hz(2000.0, 1.0)));
++    let unit = OversampleUnit::new(4, Box::new(net.clone()));
++    assert_eq!(unit.inputs(), 3);
++    assert_eq!(unit.outputs(), 2);
++    let nested = oversample(oversample(An(Unit::<U3, U2>::new(Box::new(net)))));
++    assert_same_stream(&unit, &nested, 1000);
++}
++
++#[test]
++fn invalid_factors_panic() {
++    for factor in [0, 1, 3, 6, 12, 24, 32, 64] {
++        let minimum = std::panic::catch_unwind(|| OversampleUnit::new(factor, Box::new(pass())));
++        assert!(minimum.is_err(), "factor {factor} was accepted");
++        let linear = std::panic::catch_unwind(|| OversampleUnit::linear(factor, Box::new(pass())));
++        assert!(linear.is_err(), "factor {factor} was accepted");
++    }
++    for factor in [2, 4, 8, 16] {
++        assert_eq!(OversampleUnit::new(factor, Box::new(pass())).outputs(), 1);
++        assert_eq!(OversampleUnit::linear(factor, Box::new(pass())).inputs(), 1);
++    }
++}
++
++#[test]
++fn settings_reach_the_wrapped_unit() {
++    let mut unit = OversampleUnit::new(
++        4,
++        Box::new(lowpass_hz(1000.0, 1.0) | highpass_hz(800.0, 1.0)),
++    );
++    unit.set(Setting::center(5000.0).left());
++    let nested = oversample(oversample(
++        lowpass_hz(5000.0, 1.0) | highpass_hz(800.0, 1.0),
++    ));
++    assert_same_stream(&unit, &nested, 900);
++    let mut unit = OversampleUnit::linear(2, Box::new(lowpass_hz(1000.0, 1.0)));
++    unit.set(Setting::center_q(2500.0, 2.0));
++    assert_same_stream(&unit, &oversample_linear(lowpass_hz(2500.0, 2.0)), 900);
++}
++
++#[test]
++fn latency_matches_nested_oversamplers() {
++    assert_eq!(
++        OversampleUnit::new(2, Box::new(limiter(0.01, 0.1))).latency(),
++        Some(441.0)
++    );
++    assert_eq!(
++        OversampleUnit::new(4, Box::new(limiter(0.01, 0.1))).latency(),
++        Some(441.0)
++    );
++    assert_eq!(
++        OversampleUnit::new(16, Box::new(limiter(0.01, 0.1))).latency(),
++        Some(441.0)
++    );
++    assert_eq!(
++        OversampleUnit::linear(2, Box::new(limiter(0.01, 0.1))).latency(),
++        oversample_linear(limiter(0.01, 0.1)).latency()
++    );
++    assert_eq!(
++        OversampleUnit::linear(4, Box::new(limiter(0.01, 0.1))).latency(),
++        oversample_linear(oversample_linear(limiter(0.01, 0.1))).latency()
++    );
++    assert_eq!(
++        OversampleUnit::linear(8, Box::new(pass())).latency(),
++        oversample_linear(oversample_linear(oversample_linear(pass()))).latency()
++    );
++}
++
++#[test]
++fn response_matches_nested_oversamplers_and_measurement() {
++    let mut unit = OversampleUnit::new(4, Box::new(lowpass_hz(5000.0, 1.0)));
++    let mut nested = oversample(oversample(lowpass_hz(5000.0, 1.0)));
++    assert_same_analysis(&mut unit, &mut nested, &FREQUENCIES);
++    check_analysis(&mut unit, 0, 44100.0, &FREQUENCIES);
++    let mut unit = OversampleUnit::linear(4, Box::new(pass() & tick()));
++    let mut nested = oversample_linear(oversample_linear(pass() & tick()));
++    assert_same_analysis(&mut unit, &mut nested, &FREQUENCIES);
++    check_analysis(&mut unit, 0, 44100.0, &FREQUENCIES);
++    let mut unit = OversampleUnit::new(8, Box::new(lowpass_hz(2000.0, 1.0) | delay(0.0004)));
++    check_analysis(&mut unit, 0, 44100.0, &FREQUENCIES);
++    check_analysis(&mut unit, 1, 44100.0, &FREQUENCIES);
++}
++
++#[test]
++fn reset_restarts_like_a_fresh_unit() {
++    let mut unit = OversampleUnit::new(4, Box::new(noise() >> lowpass_hz(1500.0, 1.0)));
++    let fresh = unit.clone();
++    run_blocks(&mut unit, &[], 777, &[64, 3]);
++    unit.reset();
++    assert_same_stream(&unit, &fresh, 900);
++    let nested = oversample(oversample(noise() >> lowpass_hz(1500.0, 1.0)));
++    assert_same_stream(&unit, &nested, 900);
++}
++
++#[test]
++fn clone_continues_identically() {
++    let mut unit = OversampleUnit::linear(2, Box::new(pink() | (noise() >> lowpole_hz(900.0))));
++    run_blocks(&mut unit, &[], 501, &[64, 7]);
++    let copy = unit.clone();
++    assert_same_stream(&copy, &unit, 800);
++}
++
++#[test]
++fn sample_rate_change_matches_nested_oversamplers() {
++    let mut unit = OversampleUnit::new(4, Box::new(lowpass_hz(3000.0, 1.0) | limiter(0.01, 0.1)));
++    let mut nested = oversample(oversample(lowpass_hz(3000.0, 1.0) | limiter(0.01, 0.1)));
++    unit.set_sample_rate(48000.0);
++    nested.set_sample_rate(48000.0);
++    assert_same_stream(&unit, &nested, 900);
++    assert_eq!(unit.latency(), Some(0.0));
++    let mut unit = OversampleUnit::linear(2, Box::new(limiter(0.01, 0.1)));
++    unit.set_sample_rate(48000.0);
++    let latency = oversample_linear(pass()).latency().unwrap();
++    assert_eq!(unit.latency(), Some(480.0 + latency));
++    let mut unit = OversampleUnit::new(2, Box::new(lowpass_hz(6000.0, 1.0)));
++    let mut nested = oversample(lowpass_hz(6000.0, 1.0));
++    unit.set_sample_rate(48000.0);
++    nested.set_sample_rate(48000.0);
++    assert_same_analysis(&mut unit, &mut nested, &FREQUENCIES);
++    check_analysis(&mut unit, 0, 48000.0, &FREQUENCIES);
++}
++
++#[test]
++fn unit_inside_net_renders_like_ticking() {
++    let unit = OversampleUnit::new(4, Box::new(noise() >> lowpass_hz(1000.0, 1.0)));
++    let mut net = Net::wrap(Box::new(unit)) >> highpass_hz(80.0, 1.0);
++    let mut ticked = net.clone();
++    let wave = Wave::render(44100.0, 0.04, &mut net);
++    ticked.set_sample_rate(44100.0);
++    let expected = run_ticks(&mut ticked, &[], wave.length());
++    assert!(energy(&expected) > 1.0);
++    assert_close(&[wave.channel(0).clone()], &expected, 1.0e-5);
++}
++
++#[test]
++fn pseudorandom_phase_matches_static_oversampler() {
++    let dynamic = An(Unit::<U0, U1>::new(Box::new(OversampleUnit::new(
++        2,
++        Box::new(noise()),
++    )))) | oversample(noise());
++    let fixed = oversample(noise()) | oversample(noise());
++    assert_same_stream(&dynamic, &fixed, 1000);
++    let output = run_ticks(&mut fixed.clone(), &[], 200);
++    assert!(
++        output[0]
++            .iter()
++            .zip(output[1].iter())
++            .any(|(x, y)| (x - y).abs() > 0.01)
++    );
++    let dynamic = An(Unit::<U0, U1>::new(Box::new(OversampleUnit::linear(
++        4,
++        Box::new(pink()),
++    )))) | sine_hz(220.0);
++    let fixed = oversample_linear(oversample_linear(pink())) | sine_hz(220.0);
++    assert_same_stream(&dynamic, &fixed, 1000);
++}
++
++#[test]
++fn seeding_matches_static_oversampler() {
++    let mut unit = OversampleUnit::new(4, Box::new(noise() | brown()));
++    let mut nested = oversample(oversample(noise() | brown()));
++    unit.set_seed(7);
++    nested.set_seed(7);
++    assert_same_stream(&unit, &nested, 800);
++    let mut other = unit.clone();
++    other.set_seed(8);
++    let a = run_ticks(&mut unit, &[], 200);
++    let b = run_ticks(&mut other, &[], 200);
++    assert!(
++        a[0].iter()
++            .zip(b[0].iter())
++            .any(|(x, y)| (x - y).abs() > 0.01)
++    );
++}
++
++#[test]
++fn generator_unit_renders_in_blocks() {
++    let mut unit = OversampleUnit::new(8, Box::new(sine_hz(1000.0)));
++    let mut ticked = unit.clone();
++    let wave = Wave::render(44100.0, 0.05, &mut unit);
++    ticked.set_sample_rate(44100.0);
++    let expected = run_ticks(&mut ticked, &[], wave.length());
++    assert!(wave.amplitude() > 0.9);
++    assert_close(&[wave.channel(0).clone()], &expected, 1.0e-5);
++}
++
++#[test]
++fn odd_blocks_and_single_samples_match_ticks() {
++    let unit = OversampleUnit::new(
++        2,
++        Box::new(split::<U2>() >> (lowpass_hz(900.0, 1.0) | pass())),
++    );
++    for sizes in [[1], [3], [33], [63]] {
++        check_blocks(&unit, 700, &sizes);
++    }
++    let unit = OversampleUnit::linear(16, Box::new((pass() + pass()) | noise()));
++    check_blocks(&unit, 500, &[64, 1, 31]);
++}
++
++#[test]
++fn linear_factor_sixteen_matches_four_nested_linear_oversamplers() {
++    let unit = OversampleUnit::linear(
++        16,
++        Box::new((pass() + noise()) | (pink() >> lowpass_hz(3000.0, 1.0))),
++    );
++    let nested = oversample_linear(oversample_linear(oversample_linear(oversample_linear(
++        (pass() + noise()) | (pink() >> lowpass_hz(3000.0, 1.0)),
++    ))));
++    assert_same_stream(&unit, &nested, 900);
++}
++
++#[test]
++fn linear_unit_lifecycle_matches_nested_static() {
++    let graph = || lowpass_hz(1000.0, 1.0) | (noise() >> lowpole_hz(2000.0));
++    let mut unit = OversampleUnit::linear(8, Box::new(graph()));
++    let mut nested = oversample_linear(oversample_linear(oversample_linear(graph())));
++    unit.set(Setting::center(3000.0).left());
++    nested.set(Setting::center(3000.0).left());
++    unit.set_sample_rate(48000.0);
++    nested.set_sample_rate(48000.0);
++    let input = input_signal(1, 300);
++    let warm_unit = run_blocks(&mut unit, &input, 300, &[64, 7]);
++    let warm_nested = run_blocks(&mut nested, &input, 300, &[64, 7]);
++    assert_close(&warm_unit, &warm_nested, 1.0e-5);
++    let copy = unit.clone();
++    let nested_copy = nested.clone();
++    assert_same_stream(&copy, &nested_copy, 700);
++    unit.reset();
++    nested.reset();
++    assert_same_stream(&unit, &nested, 700);
++    assert_eq!(unit.latency(), nested.latency());
++    for &frequency in &FREQUENCIES {
++        let a = unit.response(0, frequency).expect("response");
++        let b = nested.response(0, frequency).expect("response");
++        assert!((a - b).norm() <= 1.0e-9, "{frequency} Hz: {a} != {b}");
++    }
++    check_analysis(&mut unit, 0, 48000.0, &FREQUENCIES);
++}
++
++#[test]
++fn zero_sized_blocks_and_sink_nodes_match_nested_static() {
++    let unit = OversampleUnit::new(4, Box::new(sink() | pass()));
++    let nested = oversample(oversample(sink() | pass()));
++    let input = input_signal(2, 900);
++    let expected = run_ticks(&mut nested.clone(), &input, 900);
++    assert!(energy(&expected) > 1.0);
++    assert_close(
++        &run_blocks(&mut unit.clone(), &input, 900, &[0, 5, 0, 64, 1, 0, 33]),
++        &expected,
++        1.0e-5,
++    );
++    assert_close(
++        &run_ticks(&mut unit.clone(), &input, 900),
++        &expected,
++        1.0e-5,
++    );
++    let mut sink_unit = OversampleUnit::linear(2, Box::new(sink()));
++    assert_eq!(sink_unit.inputs(), 1);
++    assert_eq!(sink_unit.outputs(), 0);
++    let input = input_signal(1, 300);
++    assert!(run_blocks(&mut sink_unit, &input, 300, &[64, 0, 3, 1]).is_empty());
++    run_ticks(&mut sink_unit, &input, 40);
++    check_blocks(
++        &OversampleUnit::linear(4, Box::new(noise() | sink())),
++        600,
++        &[0, 3, 0, 64],
++    );
++}

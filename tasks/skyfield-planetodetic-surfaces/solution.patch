@@ -1,0 +1,567 @@
+diff --git a/documentation/planetary.rst b/documentation/planetary.rst
+index 431a662..6c47a0f 100644
+--- a/documentation/planetary.rst
++++ b/documentation/planetary.rst
+@@ -23,26 +23,27 @@ Skyfield can:
+ * Compute the position of a location on a body’s surface
+   relative to that body’s center,
+   given (1) a Solar System body
+-  that’s spherical
+-  and whose orientation is defined by a data series in a ``.bcp`` file
++  whose orientation is defined by a data series in a ``.bcp`` file
+   (the Moon is a good example),
+   and (2) the latitude and longitude of the position.
++  On a body whose three axes are not the same length,
++  the latitude and longitude are planetodetic:
++  they give the direction of the surface’s outward normal.
+   This allows the user
+   both to observe other targets from that surface position,
+   and to observe the surface position itself
+   from elsewhere in the Solar System.
+ 
+-This leaves several features of such files still unsupported, though.
+-Skyfield:
++* Compute the planetodetic latitude, longitude, and height
++  of any position relative to a body,
++  and find the point on the body’s surface nearest that position,
++  with the ``latlon_of()``, ``height_of()``, ``subpoint_of()``,
++  and ``planetodetic_position_of()`` methods.
+ 
+-* *Cannot* yet support a planetary reference frame
+-  whose orientation is specified as a numeric series in a text file.
+-
+-* *Cannot* yet compute latitude and longitude positions
+-  on the surface of non-spherical objects,
+-  whose three axes in the text file are not the same length.
+-
+-It is expected that support for these features will be added someday,
++This leaves one feature of such files still unsupported, though.
++Skyfield *cannot* yet support a planetary reference frame
++whose orientation is specified as a numeric series in a text file.
++It is expected that support for this feature will be added someday,
+ making Skyfield’s support for planetary constants complete.
+ 
+ Observing a Moon location
+diff --git a/skyfield/almanac.py b/skyfield/almanac.py
+index b509048..2b26027 100644
+--- a/skyfield/almanac.py
++++ b/skyfield/almanac.py
+@@ -194,11 +194,14 @@ def meridian_transits(ephemeris, target, topos):
+     meridian transits and antimeridian transits.
+ 
+     """
+-    topos_at = (ephemeris['earth'] + topos).at
++    topos_at = (ephemeris[topos.center] + topos).at
+ 
+     def west_of_meridian_at(t):
+         """Return `True` if the target is west of the observer’s meridian."""
+         t._nutation_angles_radians = iau2000b_radians(t)
++        if topos.center != 399:
++            ha, _, _ = topos_at(t).observe(target).apparent().hadec()
++            return ha.radians % tau < pi
+         # TODO: should we work to avoid computing Topos position twice?
+         # We could grab its hidden GCRS vector and do the trig ourselves.
+         # Or there might be something clever we can do with the two raw
+@@ -207,7 +210,7 @@ def meridian_transits(ephemeris, target, topos):
+         ra2, _, _ = topos_at(t).observe(target).apparent().radec(epoch='date')
+         return (ra1.radians - ra2.radians) % tau < pi
+ 
+-    west_of_meridian_at.step_days = 0.4  # twice a day
++    west_of_meridian_at.step_days = _site_step_days(topos, 0.4)  # twice a day
+     return west_of_meridian_at
+ 
+ def sunrise_sunset(ephemeris, topos):
+@@ -231,7 +234,7 @@ def sunrise_sunset(ephemeris, topos):
+ 
+     """
+     sun = ephemeris['sun']
+-    topos_at = (ephemeris['earth'] + topos).at
++    topos_at = (ephemeris[topos.center] + topos).at
+ 
+     def is_sun_up_at(t):
+         """Return `True` if the Sun is up at time `t`.
+@@ -243,7 +246,8 @@ def sunrise_sunset(ephemeris, topos):
+         t._nutation_angles_radians = iau2000b_radians(t)
+         return topos_at(t).observe(sun).apparent().altaz()[0].degrees >= -0.8333
+ 
+-    is_sun_up_at.step_days = 0.04  # catch days at least an hour long
++    # Catch days at least an hour long.
++    is_sun_up_at.step_days = _site_step_days(topos, 0.04)
+     return is_sun_up_at
+ 
+ TWILIGHTS = {
+@@ -268,7 +272,7 @@ def dark_twilight_day(ephemeris, topos):
+ 
+     """
+     sun = ephemeris['sun']
+-    topos_at = (ephemeris['earth'] + topos).at
++    topos_at = (ephemeris[topos.center] + topos).at
+ 
+     def is_it_dark_twilight_day_at(t):
+         """Return whether the Sun is up, down, or whether there is twilight."""
+@@ -281,7 +285,8 @@ def dark_twilight_day(ephemeris, topos):
+         r[degrees >= -0.8333] = 4
+         return r
+ 
+-    is_it_dark_twilight_day_at.step_days = 0.04  # catch days at least an hour long
++    # Catch days at least an hour long.
++    is_it_dark_twilight_day_at.step_days = _site_step_days(topos, 0.04)
+     return is_it_dark_twilight_day_at
+ 
+ def risings_and_settings(ephemeris, target, topos,
+@@ -296,7 +301,7 @@ def risings_and_settings(ephemeris, target, topos,
+     parameters ``horizon_degrees`` and ``radius_degrees``.
+ 
+     """
+-    topos_at = (ephemeris['earth'] + topos).at
++    topos_at = (ephemeris[topos.center] + topos).at
+     h = horizon_degrees - radius_degrees
+ 
+     def is_body_up_at(t):
+@@ -304,7 +309,7 @@ def risings_and_settings(ephemeris, target, topos,
+         t._nutation_angles_radians = iau2000b_radians(t)
+         return topos_at(t).observe(target).apparent().altaz()[0].degrees > h
+ 
+-    is_body_up_at.step_days = 0.25
++    is_body_up_at.step_days = _site_step_days(topos, 0.25)
+     return is_body_up_at
+ 
+ # Direct-search routines using geometry, that don't need find_discrete().
+@@ -384,6 +389,9 @@ def _find(observer, target, start_time, end_time, horizon_degrees, f):
+         def h(distance): return horizon_radians
+ 
+     geo = observer.vector_functions[-1]  # should we check observer.center?
++    if geo.center != 399:
++        return _find_off_earth(observer, geo, target, start_time, end_time,
++                               h, f)
+     latitude = geo.latitude
+ 
+     # Build an array of times 0.8 days apart, in the hopes that nothing
+@@ -516,6 +524,49 @@ def _find(observer, target, start_time, end_time, horizon_degrees, f):
+ 
+     return t, is_above_horizon
+ 
++def _find_off_earth(observer, geo, target, start_time, end_time, h, f):
++    # Other bodies can spin quickly, and targets like the Earth seen
++    # from the Moon never circle the sky, so search the sky directly.
++    def y_at(t):
++        apparent = observer.at(t).observe(target).apparent(())
++        if f is _transit_ha:
++            ha, _, _ = apparent.hadec()
++            return ha.radians
++        alt, _, distance = apparent.altaz()
++        return alt.radians - h(distance)
++
++    ts = start_time.ts
++    step_days = _site_step_days(geo, 0.8)
++    sample_count = int(np.ceil((end_time.tt - start_time.tt) / step_days)) + 1
++    t = ts.tt_jd(np.linspace(start_time.tt, end_time.tt, sample_count))
++    y = y_at(t)
++    y0, y1 = y[:-1], y[1:]
++    if f is _setting_hour_angle:
++        i, = np.nonzero((y0 >= 0.0) & (y1 < 0.0))
++    else:
++        i, = np.nonzero((y0 < 0.0) & (y1 >= 0.0) & (y1 - y0 < pi))
++
++    tt0, tt1, y0 = t.tt[i], t.tt[i + 1], y0[i]
++    for iteration in range(40):
++        tt = (tt0 + tt1) / 2.0
++        y = y_at(ts.tt_jd(tt))
++        is_early = (y < 0.0) == (y0 < 0.0)
++        tt0 = np.where(is_early, tt, tt0)
++        tt1 = np.where(is_early, tt1, tt)
++        y0 = np.where(is_early, y, y0)
++    t = ts.tt_jd((tt0 + tt1) / 2.0)
++
++    if f is _transit_ha:
++        return t
++    return t, np.ones(len(i), dtype=bool)
++
++def _site_step_days(topos, step_days):
++    # Sample a site on another body often enough for that body's spin.
++    frame = getattr(topos, '_frame', None)
++    if frame is not None:
++        step_days = min(step_days, frame._spin_period_days() / 20.0)
++    return step_days
++
+ def find_risings(observer, target, start_time, end_time, horizon_degrees=None):
+     """Return the times at which a target rises above the eastern horizon.
+ 
+diff --git a/skyfield/geometry.py b/skyfield/geometry.py
+index 40497d7..95e83aa 100644
+--- a/skyfield/geometry.py
++++ b/skyfield/geometry.py
+@@ -1,5 +1,6 @@
+ """Routines solving basic geometric problems in astronomy."""
+ 
++from numpy import argmin, copysign, errstate, maximum, sqrt
+ from .functions import dots, length_of, nan, sqrt_nan, where
+ 
+ def intersect_line_and_sphere(endpoint, center, radius):
+@@ -59,5 +60,54 @@ def line_and_ellipsoid_intersection(line_start, line_direction, radii):
+     intersection = closest_point + sign * half_chord_length * unit_direction
+     return where(startmag == 1.0, line_start, intersection * radii)
+ 
++def nearest_point_on_ellipsoid(position, radii):
++    """Return the point on an ellipsoid's surface nearest a position.
++
++    The ellipsoid is centered at the origin and is specified by its
++    three ``radii`` that point along the three coordinate axes.  The
++    |xyz| ``position`` can lie inside or outside of the ellipsoid.
++
++    Returns the |xyz| surface point, and the distance to it from the
++    ``position``, which is negative for positions inside the ellipsoid.
++    Where several surface points are equally near, one is returned.
++
++    """
++    shape = (3,) + (1,) * (len(position.shape) - 1)
++    radii = radii.reshape(shape)
++    r2 = radii * radii
++    m = r2.min()
++    is_smallest = r2 == m
++    y = abs(position)
++    ry = radii * y
++
++    # Bisect for the u > 0 where sum((ry / (r2 - m + u))**2) == 1.
++    shift = r2 - m
++    lo = where(is_smallest, ry, 0.0).max(axis=0)
++    hi = maximum(length_of(ry), m)
++    with errstate(all='ignore'):
++        for i in range(2000):
++            u = (lo + hi) / 2.0
++            if ((u == lo) | (u == hi)).all():
++                break
++            q = ry / (shift + u)
++            is_outside = dots(q, q) > 1.0
++            lo = where(is_outside, u, lo)
++            hi = where(is_outside, hi, u)
++        point = r2 * y / (shift + u)
++
++    # With zeros along the smallest axis there may be no root, and the
++    # nearest point lies off the coordinate plane instead.
++    q = where(is_smallest, 0.0, ry / where(is_smallest, 1.0, r2 - m))
++    qq = dots(q, q)
++    is_flat = where(is_smallest, y, 0.0).max(axis=0) == 0.0
++    off_plane = radii * q
++    off_plane[argmin(r2)] = radii[argmin(r2)] * sqrt(maximum(1.0 - qq, 0.0))
++    point = where(is_flat & (qq <= 1.0), off_plane, point)
++
++    point = copysign(point, position)
++    height = length_of(position - point)
++    is_inside = dots(position / radii, position / radii) < 1.0
++    return point, where(is_inside, -height, height)
++
+ def _vector_projection(a, b):
+     return dots(a,b) / dots(b,b) * b
+diff --git a/skyfield/planetarylib.py b/skyfield/planetarylib.py
+index c2bccf9..e3444a6 100644
+--- a/skyfield/planetarylib.py
++++ b/skyfield/planetarylib.py
+@@ -1,11 +1,12 @@
+ # -*- coding: utf-8 -*-
+ """Open a BPC file, read its angles, and produce rotation matrices."""
+ 
+-from numpy import array, cos, nan, sin
++from numpy import arctan2, array, cos, inf, nan, sin, sqrt
+ from jplephem.pck import DAF, PCK
+-from .constants import ASEC2RAD, AU_KM, DAY_S, tau
++from .constants import ASEC2RAD, AU_KM, DAY_S, DEG2RAD, pi, tau
+ from .data import text_pck
+-from .functions import _T, mxv, mxm, mxmxm, rot_x, rot_y, rot_z
++from .functions import _T, dots, mxv, mxm, mxmxm, rot_x, rot_y, rot_z
++from .geometry import nearest_point_on_ellipsoid
+ from .units import Angle, Distance
+ from .vectorlib import VectorFunction
+ 
+@@ -99,30 +100,21 @@ class PlanetaryConstants(object):
+     def build_frame(self, integer, _segment=None):
+         """Given a frame integer code, return a :class:`Frame` object."""
+         center = self._get_assignment('FRAME_{0}_CENTER'.format(integer))
+-        spec = self.variables.get('TKFRAME_{0}_SPEC'.format(integer))
+-        if spec is None:
+-            matrix = None
+-        else:
+-            if spec == 'ANGLES':
+-                angles = self.variables['TKFRAME_{0}_ANGLES'.format(integer)]
+-                axes = self.variables['TKFRAME_{0}_AXES'.format(integer)]
+-                units = self.variables['TKFRAME_{0}_UNITS'.format(integer)]
+-                scale = _unit_scales[units]
+-                matrix = 1,0,0, 0,1,0, 0,0,1
+-                matrix = array(matrix)
+-                matrix.shape = 3, 3
+-                for angle, axis in list(zip(angles, axes)):
+-                    rot = _rotations[axis]
+-                    matrix = mxm(rot(angle * scale), matrix)
+-            elif spec == 'MATRIX':
+-                matrix = self.variables['TKFRAME_{0}_MATRIX'.format(integer)]
+-                matrix = array(matrix)
+-                matrix.shape = 3, 3
+-            else:
+-                raise NotImplementedError('spec %r not yet implemented' % spec)
+-            relative = self.variables['TKFRAME_{0}_RELATIVE'.format(integer)]
+-            integer = self.variables['FRAME_{0}'.format(relative)]
+-
++        matrix = None
++        while True:
++            name = self.variables.get('FRAME_{0}_NAME'.format(integer))
++            spec = self._tk_variable(integer, name, 'SPEC')
++            if spec is None:
++                break
++            tk_matrix = self._tk_matrix(integer, name, spec)
++            matrix = tk_matrix if matrix is None else mxm(matrix, tk_matrix)
++            relative = self._tk_variable(integer, name, 'RELATIVE', True)
++            if relative == 'J2000':
++                return Frame(center, None, matrix)
++            integer = self._get_assignment('FRAME_{0}'.format(relative))
++
++        integer = self.variables.get('FRAME_{0}_CLASS_ID'.format(integer),
++                                     integer)
+         if _segment is None:
+             segment = self._segment_map.get(integer)
+         else:
+@@ -134,21 +126,147 @@ class PlanetaryConstants(object):
+         assert segment.frame == 1  # base frame should be ITRF/J2000
+         return Frame(center, segment, matrix)
+ 
++    def _tk_variable(self, integer, name, key, required=False):
++        value = self.variables.get('TKFRAME_{0}_{1}'.format(integer, key))
++        if value is None and name is not None:
++            value = self.variables.get('TKFRAME_{0}_{1}'.format(name, key))
++        if value is None and required:
++            key = 'TKFRAME_{0}_{1}'.format(integer, key)
++            raise ValueError(_missing_name_message.format(key))
++        return value
++
++    def _tk_matrix(self, integer, name, spec):
++        def get(key):
++            return self._tk_variable(integer, name, key, True)
++
++        if spec == 'ANGLES':
++            scale = _unit_scales[get('UNITS')]
++            matrix = array(((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))
++            for angle, axis in zip(get('ANGLES'), get('AXES')):
++                matrix = mxm(_rotations[axis](angle * scale), matrix)
++        elif spec == 'MATRIX':
++            matrix = array(get('MATRIX'), dtype=float)
++            matrix.shape = 3, 3
++        elif spec == 'QUATERNION':
++            q = array(get('Q'), dtype=float)
++            q0, q1, q2, q3 = q / sqrt(dots(q, q))
++            matrix = array((
++                (1.0 - 2.0*(q2*q2 + q3*q3), 2.0*(q1*q2 + q0*q3),
++                 2.0*(q1*q3 - q0*q2)),
++                (2.0*(q1*q2 - q0*q3), 1.0 - 2.0*(q1*q1 + q3*q3),
++                 2.0*(q2*q3 + q0*q1)),
++                (2.0*(q1*q3 + q0*q2), 2.0*(q2*q3 - q0*q1),
++                 1.0 - 2.0*(q1*q1 + q2*q2)),
++            ))
++        else:
++            raise NotImplementedError('spec %r not yet implemented' % spec)
++        return matrix
++
+     def build_latlon_degrees(self, frame, latitude_degrees, longitude_degrees,
+                              elevation_m=0.0):
+-        """Build an object representing a location on a body's surface."""
++        """Build an object representing a location on a body's surface.
++
++        The latitude and longitude are planetodetic: they give the
++        direction of the body's surface normal at the location, and the
++        elevation is measured along that normal.
++
++        """
+         lat = Angle.from_degrees(latitude_degrees)
+         lon = Angle.from_degrees(longitude_degrees)
++        elevation = Distance(m=elevation_m)
++        r2 = _reshape_radii(self._radii_au(frame), lat.radians) ** 2
++        normal = _normal_of(lat.radians, lon.radians)
++        surface = r2 * normal / sqrt(dots(r2 * normal, normal))
++        position_au = surface + elevation.au * normal
++        return PlanetTopos._from_planetodetic(frame, lat, lon, elevation,
++                                              position_au)
++
++    def latlon_of(self, frame, position):
++        """Return the planetodetic latitude and longitude of a ``position``.
++
++        The position's ``.center`` must be the center of the ``frame``.
++        The latitude and longitude of the surface normal at the surface
++        point nearest the position are returned as a pair of
++        :class:`~skyfield.units.Angle` objects.
++
++        """
++        lat, lon, height, point, xyz = self._planetodetic_of(frame, position)
++        return lat, lon
++
++    def height_of(self, frame, position):
++        """Return the height of a ``position`` above a body's surface.
++
++        The position's ``.center`` must be the center of the ``frame``.
++        A :class:`~skyfield.units.Distance` is returned giving the
++        distance to the nearest surface point, negative inside the body.
++
++        """
++        lat, lon, height, point, xyz = self._planetodetic_of(frame, position)
++        return height
++
++    def planetodetic_position_of(self, frame, position):
++        """Return the `PlanetTopos` of a ``position``.
++
++        The position's ``.center`` must be the center of the ``frame``.
++        Returns a `PlanetTopos` at the position itself, whose planetodetic
++        ``latitude``, ``longitude``, and ``elevation`` are measured from
++        the surface point nearest the position.
++
++        """
++        lat, lon, height, point, xyz = self._planetodetic_of(frame, position)
++        return PlanetTopos._from_planetodetic(frame, lat, lon, height, xyz)
++
++    def subpoint_of(self, frame, position):
++        """Return the surface location nearest a ``position``.
++
++        The position's ``.center`` must be the center of the ``frame``.
++        Returns a `PlanetTopos` with the planetodetic ``latitude`` and
++        ``longitude`` of the surface point nearest the position, and an
++        ``elevation`` of zero.
++
++        """
++        lat, lon, height, point, xyz = self._planetodetic_of(frame, position)
++        zero = Distance(height.au * 0.0)
++        return PlanetTopos._from_planetodetic(frame, lat, lon, zero, point)
++
++    def _radii_au(self, frame):
+         radii = self._get_assignment('BODY{0}_RADII'.format(frame.center))
+-        if not radii[0] == radii[1] == radii[2]:
+-            raise ValueError('only spherical bodies are supported,'
+-                             ' but the radii of this body are: %s' % radii)
+-        au = (radii[0] + elevation_m * 1e-3) / AU_KM
+-        distance = Distance(au)
+-        return PlanetTopos.from_latlon_distance(frame, lat, lon, distance)
++        return array(radii, dtype=float) / AU_KM
++
++    def _planetodetic_of(self, frame, position):
++        if position.center != frame.center:
++            raise ValueError(
++                'you can only compute a planetodetic position from a position'
++                ' whose center is the frame center {0}, but this position'
++                ' has a center of {1}'.format(frame.center, position.center)
++            )
++        xyz_au = position.frame_xyz(frame).au
++        radii = _reshape_radii(self._radii_au(frame), xyz_au[0])
++        point_au, height_au = nearest_point_on_ellipsoid(xyz_au, radii)
++        x, y, z = point_au / (radii * radii)
++        lat = arctan2(z, sqrt(x*x + y*y))
++        lon = (arctan2(y, x) - pi) % tau - pi
++        return (Angle(radians=lat), Angle(radians=lon),
++                Distance(height_au), point_au, xyz_au)
++
++def _reshape_radii(radii, coordinate):
++    return radii.reshape((3,) + (1,) * len(getattr(coordinate, 'shape', ())))
++
++def _normal_of(latitude, longitude):
++    cos_lat = cos(latitude)
++    return array((cos_lat * cos(longitude), cos_lat * sin(longitude),
++                  sin(latitude)))
+ 
+ _rotations = None, rot_x, rot_y, rot_z
+-_unit_scales = {'ARCSECONDS': ASEC2RAD}
++_unit_scales = {
++    'RADIANS': 1.0,
++    'DEGREES': DEG2RAD,
++    'ARCMINUTES': DEG2RAD / 60.0,
++    'ARCSECONDS': ASEC2RAD,
++    'HOURANGLE': tau / 24.0,
++    'MINUTEANGLE': tau / 1440.0,
++    'SECONDANGLE': tau / 86400.0,
++}
+ _missing_name_message = """unknown planetary constant {0!r}
+ 
+ You should either use this object's `.read_text()` method to load an
+@@ -166,6 +284,8 @@ class Frame(object):
+ 
+     def rotation_at(self, t):
+         """Return the rotation matrix for this frame at time ``t``."""
++        if self._segment is None:
++            return self._matrix
+         ra, dec, w = self._segment.compute(t.tdb, 0.0, False)
+         R = mxm(rot_z(-w), mxm(rot_x(-dec), rot_z(-ra)))
+         if self._matrix is not None:
+@@ -178,6 +298,8 @@ class Frame(object):
+         The rate matrix returned is in units of angular motion per day.
+ 
+         """
++        if self._segment is None:
++            return self._matrix, self._matrix * 0.0
+         components, rates = self._segment.compute(t.whole, t.tdb_fraction, True)
+         ra, dec, w = components
+         radot, decdot, wdot = rates
+@@ -208,6 +330,20 @@ class Frame(object):
+ 
+         return R, dRdt * DAY_S
+ 
++    def _dRdt_times_RT_at(self, t):
++        R, dRdt = self.rotation_and_rate_at(t)
++        return mxm(dRdt, _T(R))
++
++    def _spin_period_days(self):
++        segment = self._segment
++        if segment is None:
++            return inf
++        middle = (segment.initial_jd + segment.final_jd) / 2.0
++        angles, rates = segment.compute(middle, 0.0, True)
++        if not rates[2]:
++            return inf
++        return tau / abs(rates[2]) / DAY_S
++
+ class PlanetTopos(VectorFunction):
+     """Location that rotates with the surface of another Solar System body.
+ 
+@@ -220,6 +356,15 @@ class PlanetTopos(VectorFunction):
+         self._frame = frame
+         self._position_au = position_au
+ 
++    @classmethod
++    def _from_planetodetic(cls, frame, latitude, longitude, elevation,
++                           position_au):
++        self = cls(frame, position_au)
++        self.latitude = latitude
++        self.longitude = longitude
++        self.elevation = elevation
++        return self
++
+     @classmethod
+     def from_latlon_distance(cls, frame, latitude, longitude, distance):
+         r = array((distance.au, 0.0, 0.0))
+@@ -263,3 +408,9 @@ class PlanetTopos(VectorFunction):
+         # azimuth reads north-east rather than the other direction.
+         R[1] *= -1
+         return R
++
++    def _dRdt_times_RT_at(self, t):
++        A = mxm(rot_y(_quartertau - self.latitude.radians),
++                rot_z(_halftau - self.longitude.radians))
++        A[1] *= -1
++        return mxmxm(A, self._frame._dRdt_times_RT_at(t), _T(A))
+diff --git a/skyfield/positionlib.py b/skyfield/positionlib.py
+index 5f0826f..0e3db35 100644
+--- a/skyfield/positionlib.py
++++ b/skyfield/positionlib.py
+@@ -286,7 +286,9 @@ class ICRF(object):
+         meridian along the ITRS celestial equator, and the declination
+         (±90 degees) above or below it.  This only works for positions
+         whose center is a geographic location; otherwise, there is no
+-        local meridian from which to measure the hour angle.
++        local meridian from which to measure the hour angle.  For a
++        location on another body, that body’s equator and the
++        location’s meridian are used instead.
+ 
+         Because this declination is measured from the plane of the
+         Earth’s physical geographic equator, it will be slightly
+@@ -297,7 +299,8 @@ class ICRF(object):
+         the horizon.
+ 
+         """
+-        R = framelib.itrs.rotation_at(self.t)
++        frame = getattr(self.center, '_frame', framelib.itrs)
++        R = frame.rotation_at(self.t)
+         r = mxv(R, self.xyz.au)
+         au, dec, sublongtiude = to_spherical(r)
+         lon = getattr(self.center, 'longitude', None)

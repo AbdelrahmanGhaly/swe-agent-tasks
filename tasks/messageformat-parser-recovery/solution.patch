@@ -1,0 +1,939 @@
+diff --git a/mf1/packages/core/src/compiler.ts b/mf1/packages/core/src/compiler.ts
+index 1d61d028..fae92f05 100644
+--- a/mf1/packages/core/src/compiler.ts
++++ b/mf1/packages/core/src/compiler.ts
+@@ -10,6 +10,9 @@ import { FunctionArg, Select, Token, parse } from '@messageformat/parser';
+ import * as Runtime from '@messageformat/runtime';
+ import * as Formatters from '@messageformat/runtime/lib/formatters';
+ import { identifier, property } from 'safe-identifier';
++
++/** Every {@link Token} except the recovered `error` span, which produces no output. */
++type CompiledToken = Exclude<Token, { type: 'error' }>;
+ import { biDiMarkText } from './bidi-mark-text';
+ import { MessageFormatOptionsWithDefaults } from './messageformat';
+ import { PluralObject } from './plurals';
+@@ -71,7 +74,13 @@ export default class Compiler {
+     plural: PluralObject,
+     plurals?: { [key: string]: PluralObject }
+   ) {
+-    const { localeCodeFromKey, requireAllArguments, strict, strictPluralKeys } =
++    const {
++      localeCodeFromKey,
++      onError,
++      requireAllArguments,
++      strict,
++      strictPluralKeys
++    } =
+       this.options;
+ 
+     if (typeof src === 'object') {
+@@ -89,10 +98,11 @@ export default class Compiler {
+       cardinal: plural.cardinals,
+       ordinal: plural.ordinals,
+       strict,
+-      strictPluralKeys
++      strictPluralKeys,
++      onError
+     };
+     this.arguments = [];
+-    const r = parse(src, parserOptions).map(token => this.token(token, null));
++    const r = this.tokenList(parse(src, parserOptions), null);
+     const hasArgs = this.arguments.length > 0;
+     const res = this.concatenate(r, true);
+ 
+@@ -109,7 +119,7 @@ export default class Compiler {
+     let needOther = true;
+     const r = token.cases.map(({ key, tokens }) => {
+       if (key === 'other') needOther = false;
+-      const s = tokens.map(tok => this.token(tok, pluralToken));
++      const s = this.tokenList(tokens, pluralToken);
+       return `${property(null, key.replace(/^=/, ''))}: ${this.concatenate(
+         s,
+         false
+@@ -136,7 +146,13 @@ export default class Compiler {
+       : tokens.join(' + ') || '""';
+   }
+ 
+-  token(token: Token, pluralToken: Select | null) {
++  tokenList(tokens: Token[], pluralToken: Select | null) {
++    return tokens
++      .filter((token): token is CompiledToken => token.type !== 'error')
++      .map(token => this.token(token, pluralToken));
++  }
++
++  token(token: CompiledToken, pluralToken: Select | null) {
+     if (token.type === 'content') return JSON.stringify(token.value);
+ 
+     const { id, lc } = this.plural;
+@@ -313,7 +329,7 @@ export default class Compiler {
+       }
+       return JSON.stringify(options);
+     } else {
+-      const parts = param.map(tok => this.token(tok, pluralToken));
++      const parts = this.tokenList(param, pluralToken);
+       if (argShape === 'raw') return `[${parts.join(', ')}]`;
+       const s = parts.join(' + ');
+       return s ? `(${s}).trim()` : '""';
+@@ -390,7 +406,7 @@ export default class Compiler {
+     args.push(JSON.stringify(locale));
+     if (param && param.length > 0) {
+       if (plural && this.options.strict) plural = null;
+-      const s = param.map(tok => this.token(tok, plural));
++      const s = this.tokenList(param, plural);
+       args.push('(' + (s.join(' + ') || '""') + ').trim()');
+     }
+     this.setFormatter('date');
+@@ -454,7 +470,7 @@ export default class Compiler {
+ 
+     /* istanbul ignore next: never happens */
+     if (plural && this.options.strict) plural = null;
+-    const s = param.map(tok => this.token(tok, plural));
++    const s = this.tokenList(param, plural);
+     args.push('(' + (s.join(' + ') || '""') + ').trim()');
+     args.push(JSON.stringify(this.options.currency));
+     this.setFormatter('numberFmt');
+diff --git a/mf1/packages/core/src/messageformat.ts b/mf1/packages/core/src/messageformat.ts
+index 57fdd2fa..53224ab6 100644
+--- a/mf1/packages/core/src/messageformat.ts
++++ b/mf1/packages/core/src/messageformat.ts
+@@ -1,4 +1,5 @@
+ import Compiler from './compiler';
++import type { ParseError } from '@messageformat/parser';
+ import {
+   type PluralFunction,
+   type PluralObject,
+@@ -136,6 +137,18 @@ export interface MessageFormatOptions<
+    * Default: `true`
+    */
+   strictPluralKeys?: boolean;
++
++  /**
++   * Called for each problem found while parsing a source message.
++   *
++   * When set, parsing reports every problem in source order instead of throwing
++   * on the first, and a span that could not be parsed contributes no output.
++   * Checks made after parsing, such as requiring an `other` case, are
++   * unaffected and still throw. When unset, the first parse problem throws.
++   *
++   * Also see the corresponding {@link @messageformat/parser#ParseOptions | parser option}.
++   */
++  onError?: (error: ParseError) => void;
+ }
+ 
+ /**
+@@ -144,7 +157,14 @@ export interface MessageFormatOptions<
+  */
+ export interface MessageFormatOptionsWithDefaults<
+   ReturnType extends 'string' | 'values' = 'string' | 'values'
+-> extends Required<Omit<MessageFormatOptions<ReturnType>, 'timeZone'>> {
++> extends Required<
++    Omit<MessageFormatOptions<ReturnType>, 'timeZone' | 'onError'>
++  > {
++  /**
++   * Optional parse-error callback, absent unless the caller supplies one.
++   */
++  onError?: (error: ParseError) => void;
++
+   /**
+    * Optional time zone override
+    */
+diff --git a/mf1/packages/parser/src/parser.ts b/mf1/packages/parser/src/parser.ts
+index 2acbac85..7a1730cc 100644
+--- a/mf1/packages/parser/src/parser.ts
++++ b/mf1/packages/parser/src/parser.ts
+@@ -73,9 +73,21 @@
+ 
+ import { lexer } from './lexer.js';
+ import { Lexer, Token as LexerToken } from 'moo';
++import {
++  RecoverySignal,
++  lineStarts,
++  positionAt,
++  skipPlaceholder
++} from './recover.js';
+ 
+ /** @internal */
+-export type Token = Content | PlainArg | FunctionArg | Select | Octothorpe;
++export type Token =
++  | Content
++  | PlainArg
++  | FunctionArg
++  | Select
++  | Octothorpe
++  | ErrorToken;
+ 
+ /**
+  * Text content of the message
+@@ -115,7 +127,9 @@ export interface FunctionArg {
+   type: 'function';
+   arg: string;
+   key: string;
+-  param?: Array<Content | PlainArg | FunctionArg | Select | Octothorpe>;
++  param?: Array<
++    Content | PlainArg | FunctionArg | Select | Octothorpe | ErrorToken
++  >;
+   ctx: Context;
+ }
+ 
+@@ -144,7 +158,9 @@ export interface Select {
+  */
+ export interface SelectCase {
+   key: string;
+-  tokens: Array<Content | PlainArg | FunctionArg | Select | Octothorpe>;
++  tokens: Array<
++    Content | PlainArg | FunctionArg | Select | Octothorpe | ErrorToken
++  >;
+   ctx: Context;
+ }
+ 
+@@ -160,6 +176,20 @@ export interface Octothorpe {
+   ctx: Context;
+ }
+ 
++/**
++ * A span of the source that could not be parsed.
++ *
++ * Only emitted when {@link ParseOptions.onError} is set; its `ctx.text` is the
++ * skipped source exactly as written.
++ *
++ * @public
++ */
++export interface ErrorToken {
++  type: 'error';
++  value: string;
++  ctx: Context;
++}
++
+ /**
+  * The parsing context for a token
+  *
+@@ -193,7 +223,11 @@ const getContext = (lt: LexerToken): Context => ({
+ const isSelectType = (type: string): type is Select['type'] =>
+   type === 'plural' || type === 'select' || type === 'selectordinal';
+ 
+-function strictArgStyleParam(lt: LexerToken, param: Token[]) {
++function strictArgStyleParam(
++  lt: LexerToken,
++  param: Token[],
++  report: ((msg: string) => void) | null
++) {
+   let value = '';
+   let text = '';
+   for (const p of param) {
+@@ -206,13 +240,16 @@ function strictArgStyleParam(lt: LexerToken, param: Token[]) {
+       case 'argument':
+       case 'function':
+       case 'octothorpe':
++      case 'error':
+         value += pText;
+         break;
+-      default:
+-        throw new ParseError(
+-          lt,
+-          `Unsupported part in strict mode function arg style: ${pText}`
+-        );
++      default: {
++        const msg = `Unsupported part in strict mode function arg style: ${pText}`;
++        if (!report) throw new ParseError(lt, msg);
++        report(msg);
++        value += pText;
++        break;
++      }
+     }
+   }
+   const c: Content = {
+@@ -234,15 +271,55 @@ const strictArgTypes = [
+ 
+ const defaultPluralKeys = ['zero', 'one', 'two', 'few', 'many', 'other'];
+ 
++/**
++ * The kind of problem {@link parse} found
++ *
++ * @public
++ */
++export type ParseErrorCode =
++  | 'missing-end'
++  | 'invalid-select-key'
++  | 'invalid-plural-key'
++  | 'unexpected-offset'
++  | 'offset-after-cases'
++  | 'duplicate-case'
++  | 'missing-other'
++  | 'invalid-syntax';
++
+ /**
+  * Thrown by {@link parse} on error
+  *
+  * @public
+  */
+ export class ParseError extends Error {
++  /** The kind of problem found. */
++  code: ParseErrorCode;
++
++  /** Start of the offending span, in characters from the start of the source. */
++  offset: number;
++
++  /** Start line of the offending span, counting from 1. */
++  line: number;
++
++  /** Start column of the offending span, counting from 1. */
++  col: number;
++
++  /** Length of the offending span in characters. */
++  length: number;
++
+   /** @internal */
+-  constructor(lt: LexerToken | null, msg: string) {
++  constructor(
++    lt: LexerToken | null,
++    msg: string,
++    code: ParseErrorCode = 'invalid-syntax',
++    pos?: { offset: number; line: number; col: number; length: number }
++  ) {
+     super(lexer.formatError(lt as LexerToken, msg));
++    this.code = code;
++    this.offset = pos ? pos.offset : (lt ? lt.offset : 0);
++    this.line = pos ? pos.line : (lt ? lt.line : 1);
++    this.col = pos ? pos.col : (lt ? lt.col : 1);
++    this.length = pos ? pos.length : (lt ? lt.text.length : 0);
+   }
+ }
+ 
+@@ -253,32 +330,172 @@ class Parser {
+   ordinalKeys: string[];
+   strictPluralKeys: boolean;
+ 
++  src: string;
++  onError: ((error: ParseError) => void) | null;
++  starts: number[];
++  base: number;
++  lastEnd: number;
++  reports: ParseError[];
++  open: number[];
++
+   constructor(src: string, opt: ParseOptions) {
+     this.lexer = lexer.reset(src);
+     this.cardinalKeys = opt?.cardinal ?? defaultPluralKeys;
+     this.ordinalKeys = opt?.ordinal ?? defaultPluralKeys;
+     this.strict = opt?.strict ?? false;
+     this.strictPluralKeys = opt?.strictPluralKeys ?? true;
++    this.src = src;
++    this.onError = opt?.onError ?? null;
++    this.starts = lineStarts(src);
++    this.base = 0;
++    this.lastEnd = 0;
++    this.reports = [];
++    this.open = [];
+   }
+ 
+   parse() {
+-    return this.parseBody(false, true);
++    try {
++      return this.parseBody(false, true);
++    } finally {
++      this.flush();
++    }
++  }
++
++  flush() {
++    const onError = this.onError;
++    if (!onError) return;
++    const queued = this.reports.map((error, index) => ({ error, index }));
++    this.reports = [];
++    queued.sort((a, b) => a.error.offset - b.error.offset || a.index - b.index);
++    for (const { error } of queued) onError(error);
++  }
++
++  report(
++    code: ParseErrorCode,
++    lt: LexerToken | null,
++    msg: string,
++    span?: { offset: number; length: number }
++  ) {
++    const offset = span ? span.offset : lt ? lt.offset : this.src.length;
++    const length = span ? span.length : lt ? lt.text.length : 0;
++    const { line, col } = positionAt(this.starts, offset);
++    const error = new ParseError(lt, msg, code, { offset, line, col, length });
++    if (!this.onError) throw error;
++    this.reports.push(error);
++  }
++
++  nextToken(): LexerToken | null {
++    for (;;) {
++      try {
++        const lt = this.lexer.next();
++        if (!lt) return null;
++        if (this.base > 0) {
++          lt.offset += this.base;
++          const at = positionAt(this.starts, lt.offset);
++          lt.line = at.line;
++          lt.col = at.col;
++        }
++        this.lastEnd = lt.offset + lt.text.length;
++        return lt;
++      } catch (err) {
++        if (!this.onError) throw err;
++        if (this.endsEarly()) return null;
++        const { line, col } = positionAt(this.starts, this.lastEnd);
++        this.failPlaceholder(
++          this.lastEnd,
++          `invalid syntax at line ${line} col ${col}`
++        );
++      }
++    }
++  }
++
++  outermostOpen(): number {
++    return this.open.length > 0 ? this.open[0] : -1;
++  }
++
++  deferToEnd(): boolean {
++    return !!this.onError && this.endsEarly();
++  }
++
++  endsEarly(): boolean {
++    const opener = this.outermostOpen();
++    return opener >= 0 && skipPlaceholder(this.src, opener) < 0;
++  }
++
++  failPlaceholder(
++    start: number,
++    msg: string,
++    fallback?: { start: number; end: number }
++  ): never {
++    const opener = this.outermostOpen();
++    let span: { start: number; end: number };
++    if (opener >= 0) {
++      const scanned = skipPlaceholder(this.src, opener);
++      span = { start: opener, end: scanned < 0 ? this.src.length : scanned };
++    } else {
++      span = fallback ?? { start, end: start + 1 };
++    }
++    if (span.end <= start) span = { start: span.start, end: start + 1 };
++    const { line, col } = positionAt(this.starts, start);
++    this.reports.push(
++      new ParseError(null, msg, 'invalid-syntax', {
++        offset: start,
++        line,
++        col,
++        length: Math.max(0, span.end - start)
++      })
++    );
++    this.restart(span.end);
++    throw new RecoverySignal(span.start, span.end);
++  }
++
++  restart(offset: number) {
++    this.base = offset;
++    this.lastEnd = offset;
++    this.lexer = lexer.reset(this.src.slice(offset));
+   }
+ 
+   checkSelectKey(lt: LexerToken, type: Select['type'], key: string) {
+     if (key[0] === '=') {
+       if (type === 'select') {
+-        throw new ParseError(lt, `The case ${key} is not valid with select`);
++        this.report(
++          'invalid-select-key',
++          lt,
++          `The case ${key} is not valid with select`
++        );
+       }
+     } else if (type !== 'select') {
+       const keys = type === 'plural' ? this.cardinalKeys : this.ordinalKeys;
+       if (this.strictPluralKeys && keys.length > 0 && !keys.includes(key)) {
+         const msg = `The ${type} case ${key} is not valid in this locale`;
+-        throw new ParseError(lt, msg);
++        this.report('invalid-plural-key', lt, msg);
+       }
+     }
+   }
+ 
++  checkDuplicateKey(lt: LexerToken, sel: Select, key: string) {
++    if (!this.onError) return;
++    if (sel.cases.some(c => c.key === key)) {
++      this.report(
++        'duplicate-case',
++        lt,
++        `The case ${key} is defined more than once`
++      );
++    }
++  }
++
++  checkOtherCase(lt: LexerToken, sel: Select, type: Select['type']) {
++    if (!this.onError) return;
++    if (sel.cases.some(c => c.key === 'other')) return;
++    const brace = lt.offset + lt.text.length - 1;
++    this.report(
++      'missing-other',
++      lt,
++      `The ${type} statement has no other case`,
++      { offset: brace, length: 1 }
++    );
++  }
++
+   parseSelect(
+     { value: arg }: LexerToken,
+     inPlural: boolean,
+@@ -288,14 +505,25 @@ class Parser {
+     const sel: Select = { type, arg, cases: [], ctx };
+     if (type === 'plural' || type === 'selectordinal') inPlural = true;
+     else if (this.strict) inPlural = false;
+-    for (const lt of this.lexer) {
++    let lt: LexerToken | null;
++    while ((lt = this.nextToken()) !== null) {
+       switch (lt.type) {
+         case 'offset':
+           if (type === 'select') {
+-            throw new ParseError(lt, 'Unexpected plural offset for select');
++            this.report(
++              'unexpected-offset',
++              lt,
++              'Unexpected plural offset for select'
++            );
++            break;
+           }
+           if (sel.cases.length > 0) {
+-            throw new ParseError(lt, 'Plural offset must be set before cases');
++            this.report(
++              'offset-after-cases',
++              lt,
++              'Plural offset must be set before cases'
++            );
++            break;
+           }
+           sel.pluralOffset = Number(lt.value);
+           ctx.text += lt.text;
+@@ -303,6 +531,7 @@ class Parser {
+           break;
+         case 'case': {
+           this.checkSelectKey(lt, type, lt.value);
++          this.checkDuplicateKey(lt, sel, lt.value);
+           sel.cases.push({
+             key: lt.value,
+             tokens: this.parseBody(inPlural),
+@@ -311,12 +540,17 @@ class Parser {
+           break;
+         }
+         case 'end':
++          this.checkOtherCase(lt, sel, type);
+           return sel;
+         /* istanbul ignore next: never happens */
+         default:
+           throw new ParseError(lt, `Unexpected lexer token: ${lt.type}`);
+       }
+     }
++    if (this.onError) {
++      this.report('missing-end', null, 'Unexpected message end');
++      return sel;
++    }
+     throw new ParseError(null, 'Unexpected message end');
+   }
+ 
+@@ -325,34 +559,52 @@ class Parser {
+     inPlural: boolean
+   ): PlainArg | FunctionArg | Select {
+     const ctx = getContext(lt);
+-    const argType = this.lexer.next();
+-    if (!argType) throw new ParseError(null, 'Unexpected message end');
++    const argType = this.nextToken();
++    if (!argType) {
++      if (this.onError) {
++        this.report('missing-end', null, 'Unexpected message end');
++        return { type: 'argument', arg: lt.value, ctx };
++      }
++      throw new ParseError(null, 'Unexpected message end');
++    }
+     ctx.text += argType.text;
+     ctx.lineBreaks += argType.lineBreaks;
+     if (
+       this.strict &&
+       (argType.type === 'func-simple' || argType.type === 'func-args') &&
+-      !strictArgTypes.includes(argType.value)
++      !strictArgTypes.includes(argType.value) &&
++      !this.deferToEnd()
+     ) {
+       const msg = `Invalid strict mode function arg type: ${argType.value}`;
++      if (this.onError) this.failPlaceholder(argType.offset, msg);
+       throw new ParseError(lt, msg);
+     }
+     switch (argType.type) {
+       case 'end':
+         return { type: 'argument', arg: lt.value, ctx };
+       case 'func-simple': {
+-        const end = this.lexer.next();
+-        if (!end) throw new ParseError(null, 'Unexpected message end');
++        const end = this.nextToken();
++        if (!end) {
++          if (this.onError) {
++            this.report('missing-end', null, 'Unexpected message end');
++            return {
++              type: 'function',
++              arg: lt.value,
++              key: argType.value,
++              ctx
++            };
++          }
++          throw new ParseError(null, 'Unexpected message end');
++        }
+         /* istanbul ignore if: never happens */
+         if (end.type !== 'end') {
+           throw new ParseError(end, `Unexpected lexer token: ${end.type}`);
+         }
+         ctx.text += end.text;
+-        if (isSelectType(argType.value.toLowerCase())) {
+-          throw new ParseError(
+-            argType,
+-            `Invalid type identifier: ${argType.value}`
+-          );
++        if (isSelectType(argType.value.toLowerCase()) && !this.deferToEnd()) {
++          const msg = `Invalid type identifier: ${argType.value}`;
++          if (this.onError) this.failPlaceholder(argType.offset, msg);
++          throw new ParseError(argType, msg);
+         }
+         return {
+           type: 'function',
+@@ -362,13 +614,18 @@ class Parser {
+         };
+       }
+       case 'func-args': {
+-        if (isSelectType(argType.value.toLowerCase())) {
++        if (isSelectType(argType.value.toLowerCase()) && !this.deferToEnd()) {
+           const msg = `Invalid type identifier: ${argType.value}`;
++          if (this.onError) this.failPlaceholder(argType.offset, msg);
+           throw new ParseError(argType, msg);
+         }
+         let param = this.parseBody(this.strict ? false : inPlural);
+-        if (this.strict && param.length > 0) {
+-          param = strictArgStyleParam(lt, param);
++        if (this.strict && param.length > 0 && !this.deferToEnd()) {
++          param = strictArgStyleParam(
++            lt,
++            param,
++            this.onError ? msg => this.failPlaceholder(lt.offset, msg) : null
++          );
+         }
+         return {
+           type: 'function',
+@@ -397,18 +654,57 @@ class Parser {
+     }
+   }
+ 
++  errorToken(start: number, end: number): ErrorToken {
++    const text = this.src.slice(start, end);
++    const at = positionAt(this.starts, start);
++    return {
++      type: 'error',
++      value: text,
++      ctx: {
++        offset: start,
++        line: at.line,
++        col: at.col,
++        text,
++        lineBreaks: text.split('\n').length - 1
++      }
++    };
++  }
++
+   parseBody(
+     inPlural: false,
+     atRoot: true
+-  ): Array<Content | PlainArg | FunctionArg | Select>;
++  ): Array<Content | PlainArg | FunctionArg | Select | ErrorToken>;
+   parseBody(inPlural: boolean): Token[];
+   parseBody(inPlural: boolean, atRoot?: boolean): Token[] {
+     const tokens: Token[] = [];
+     let content: Content | null = null;
+-    for (const lt of this.lexer) {
++    for (;;) {
++      let lt: LexerToken | null;
++      try {
++        lt = this.nextToken();
++      } catch (err) {
++        if (atRoot && err instanceof RecoverySignal) {
++          content = null;
++          tokens.push(this.errorToken(err.start, err.end));
++          continue;
++        }
++        throw err;
++      }
++      if (!lt) break;
+       if (lt.type === 'argument') {
+         if (content) content = null;
+-        tokens.push(this.parseArgToken(lt, inPlural));
++        this.open.push(lt.offset);
++        try {
++          tokens.push(this.parseArgToken(lt, inPlural));
++        } catch (err) {
++          if (atRoot && err instanceof RecoverySignal) {
++            tokens.push(this.errorToken(err.start, err.end));
++            continue;
++          }
++          throw err;
++        } finally {
++          this.open.pop();
++        }
+       } else if (lt.type === 'octothorpe' && inPlural) {
+         if (content) content = null;
+         tokens.push({ type: 'octothorpe', ctx: getContext(lt) });
+@@ -417,9 +713,22 @@ class Parser {
+       } else {
+         let value = lt.value;
+         if (!inPlural && lt.type === 'quoted' && value[0] === '#') {
+-          if (value.includes('{')) {
++          if (value.includes('{') && !this.deferToEnd()) {
+             const errMsg = `Unsupported escape pattern: ${value}`;
+-            throw new ParseError(lt, errMsg);
++            if (!this.onError) throw new ParseError(lt, errMsg);
++            try {
++              this.failPlaceholder(lt.offset, errMsg, {
++                start: lt.offset,
++                end: lt.offset + lt.text.length
++              });
++            } catch (err) {
++              if (atRoot && err instanceof RecoverySignal) {
++                content = null;
++                tokens.push(this.errorToken(err.start, err.end));
++                continue;
++              }
++              throw err;
++            }
+           }
+           value = lt.text;
+         }
+@@ -434,6 +743,10 @@ class Parser {
+       }
+     }
+     if (atRoot) return tokens;
++    if (this.onError) {
++      this.report('missing-end', null, 'Unexpected message end');
++      return tokens;
++    }
+     throw new ParseError(null, 'Unexpected message end');
+   }
+ }
+@@ -493,6 +806,15 @@ export interface ParseOptions {
+    * Setting `strictPluralKeys: false` will disable this check.
+    */
+   strictPluralKeys?: boolean;
++
++  /**
++   * Called for each problem found in the source.
++   *
++   * When set, parsing does not stop at the first problem: every error is
++   * reported in source order and a best-effort token list is returned.
++   * When unset, the first problem is thrown.
++   */
++  onError?: (error: ParseError) => void;
+ }
+ 
+ /**
+@@ -506,7 +828,7 @@ export interface ParseOptions {
+ export function parse(
+   src: string,
+   options: ParseOptions = {}
+-): Array<Content | PlainArg | FunctionArg | Select> {
++): Array<Content | PlainArg | FunctionArg | Select | ErrorToken> {
+   const parser = new Parser(src, options);
+   return parser.parse();
+ }
+diff --git a/mf1/packages/parser/src/recover.ts b/mf1/packages/parser/src/recover.ts
+new file mode 100644
+index 00000000..989a8cd5
+--- /dev/null
++++ b/mf1/packages/parser/src/recover.ts
+@@ -0,0 +1,181 @@
++import { states } from './lexer.js';
++
++/**
++ * Thrown internally to unwind the parse stack back to the message root after a
++ * syntax error has been reported and the lexer restarted.
++ *
++ * @internal
++ */
++export class RecoverySignal {
++  start: number;
++  end: number;
++
++  constructor(start: number, end: number) {
++    this.start = start;
++    this.end = end;
++  }
++}
++
++/**
++ * Offsets of the first character of each line in `src`.
++ *
++ * @internal
++ */
++export function lineStarts(src: string): number[] {
++  const starts = [0];
++  for (let i = 0; i < src.length; i++) {
++    if (src[i] === '\n') starts.push(i + 1);
++  }
++  return starts;
++}
++
++/**
++ * The 1-based line and column of `offset`, resolved against the original source
++ * so that positions stay absolute after the lexer has been restarted.
++ *
++ * @internal
++ */
++export function positionAt(
++  starts: number[],
++  offset: number
++): { line: number; col: number } {
++  let lo = 0;
++  let hi = starts.length - 1;
++  while (lo < hi) {
++    const mid = (lo + hi + 1) >> 1;
++    if (starts[mid] <= offset) lo = mid;
++    else hi = mid - 1;
++  }
++  return { line: lo + 1, col: offset - starts[lo] + 1 };
++}
++
++/**
++ * The offset just past the apostrophe-quoted span whose body starts at `from`,
++ * or -1 if it is never closed.
++ *
++ * This mirrors the lexer's `quoted` rule: a doubled apostrophe stands for a
++ * literal one and leaves the span open, and the span ends at the first
++ * apostrophe that is not itself doubled. A span with no closing apostrophe does
++ * not match that rule at all, which is what -1 reports.
++ *
++ * @internal
++ */
++function quotedEnd(src: string, from: number): number {
++  let i = from;
++  while (i < src.length) {
++    if (src[i] === "'") {
++      if (src[i + 1] === "'") {
++        i += 2;
++        continue;
++      }
++      return i + 1;
++    }
++    i++;
++  }
++  return -1;
++}
++
++/**
++ * A `RegExp` copy of one of the lexer's own rules, anchored so it can be tested
++ * at an exact offset.
++ */
++function anchored(state: string, name: string): RegExp {
++  const { match } = states[state][name] as { match: RegExp };
++  return new RegExp(match.source, match.flags.replace('g', '') + 'y');
++}
++
++const ARGUMENT = anchored('body', 'argument');
++const SELECT_HEAD = anchored('arg', 'select');
++const FUNC_ARGS = anchored('arg', 'func-args');
++const CASE = anchored('select', 'case');
++const OFFSET = anchored('select', 'offset');
++
++/** The offset just past `re` matched at `at`, or -1 if it does not match there. */
++function matchAt(re: RegExp, src: string, at: number): number {
++  re.lastIndex = at;
++  const found = re.exec(src);
++  return found ? at + found[0].length : -1;
++}
++
++type ScanState = 'body' | 'arg' | 'select';
++
++/**
++ * The offset just past the placeholder opened at `start`, or -1 if it is never
++ * closed.
++ *
++ * The scan follows the same lexer states the parser does, so a brace only opens
++ * something when the lexer's own `argument` or `case` rule matches there. A
++ * brace the lexer would read as content, such as the one in `{a, number, {, }`,
++ * leaves the depth alone. Braces inside an apostrophe-quoted span are skipped
++ * with the parser's ICU quoting rules.
++ *
++ * @internal
++ */
++export function skipPlaceholder(src: string, start: number): number {
++  const stack: ScanState[] = [];
++  let state: ScanState = 'body';
++  let i = start;
++  while (i < src.length) {
++    const ch = src[i];
++    if (ch === "'") {
++      const next = src[i + 1];
++      if (next === "'") {
++        i += 2;
++        continue;
++      }
++      if (next === '{' || next === '}' || next === '#') {
++        const close = quotedEnd(src, i + 2);
++        if (close >= 0) {
++          i = close;
++          continue;
++        }
++      }
++    }
++    if (ch === '}') {
++      if (stack.length <= 1) return i + 1;
++      state = stack.pop() as ScanState;
++      i++;
++      continue;
++    }
++    let next = -1;
++    if (state === 'body') {
++      if (ch === '{') {
++        next = matchAt(ARGUMENT, src, i);
++        if (next >= 0) {
++          stack.push(state);
++          state = 'arg';
++          i = next;
++          continue;
++        }
++      }
++    } else if (state === 'arg') {
++      next = matchAt(SELECT_HEAD, src, i);
++      if (next >= 0) {
++        state = 'select';
++        i = next;
++        continue;
++      }
++      next = matchAt(FUNC_ARGS, src, i);
++      if (next >= 0) {
++        state = 'body';
++        i = next;
++        continue;
++      }
++    } else {
++      next = matchAt(OFFSET, src, i);
++      if (next >= 0) {
++        i = next;
++        continue;
++      }
++      next = matchAt(CASE, src, i);
++      if (next >= 0) {
++        stack.push(state);
++        state = 'body';
++        i = next;
++        continue;
++      }
++    }
++    i++;
++  }
++  return -1;
++}
+diff --git a/mf2/icu-messageformat-1/src/mf1-to-message-data.ts b/mf2/icu-messageformat-1/src/mf1-to-message-data.ts
+index 7d4bb64d..6b5acb21 100644
+--- a/mf2/icu-messageformat-1/src/mf1-to-message-data.ts
++++ b/mf2/icu-messageformat-1/src/mf1-to-message-data.ts
+@@ -252,6 +252,8 @@ function tokenToPart(
+       return pluralArg
+         ? { type: 'expression', arg: { type: 'variable', name: pluralArg } }
+         : '#';
++    case 'error':
++      return '';
+     /* istanbul ignore next - never happens */
+     default:
+       throw new Error(`Unsupported token type: ${token.type}`);

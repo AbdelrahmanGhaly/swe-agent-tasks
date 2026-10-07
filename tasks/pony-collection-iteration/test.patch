@@ -1,0 +1,1218 @@
+diff --git a/pony/orm/tests/test_array_iteration_5c1f8e.py b/pony/orm/tests/test_array_iteration_5c1f8e.py
+new file mode 100644
+index 00000000..d445dc02
+--- /dev/null
++++ b/pony/orm/tests/test_array_iteration_5c1f8e.py
+@@ -0,0 +1,1112 @@
++import glob
++import os
++import sys
++import types
++import unittest
++from unittest import mock
++
++from pony.orm import *
++from pony.orm.tests import setup_database, teardown_database, testutils
++
++db = Database()
++
++
++class Store(db.Entity):
++    name = Required(str)
++    items = Set("Item")
++
++
++class Item(db.Entity):
++    id = PrimaryKey(int)
++    name = Required(str)
++    store = Optional(Store)
++    tags = Optional(StrArray)
++    sizes = Optional(IntArray)
++    prices = Optional(FloatArray)
++    codes = Optional(IntArray, nullable=True)
++    specs = Optional(Json)
++
++
++def by_repr(rows):
++    return sorted(rows, key=repr)
++
++
++def mocked_record_entity(provider, server_version, **bind_options):
++    class MockedDatabase(testutils.TestDatabase):
++        real_provider_name = provider
++        raw_server_version = server_version
++
++    mocked = MockedDatabase()
++
++    class Record(mocked.Entity):
++        payload = Optional(Json)
++        if provider not in ("mysql", "oracle"):
++            tags = Optional(StrArray)
++            sizes = Optional(IntArray)
++            prices = Optional(FloatArray)
++
++    mocked.bind(provider, **bind_options)
++    mocked.generate_mapping()
++    return Record
++
++
++class TestCollectionIteration(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        setup_database(db)
++
++    @classmethod
++    def tearDownClass(cls):
++        teardown_database(db)
++
++    def setUp(self):
++        with db_session:
++            Item.select().delete(bulk=True)
++            Store.select().delete(bulk=True)
++            flush()
++            north = Store(name="north")
++            south = Store(name="south")
++            Item(
++                id=1,
++                name="lamp",
++                store=north,
++                tags=["red", "blue", "red"],
++                sizes=[3, 3, 8],
++                prices=[1.5, 2.5],
++                codes=None,
++                specs={
++                    "dims": [10, "wide", True, None, {"w": 2}],
++                    "meta": {"color": "red", "weight": 1.25},
++                    "ratings": [4.5, 2.5, 5.0],
++                    "grid": [[1, 2], [3]],
++                    "labels": ["a", "b", "a"],
++                    "levels": [10, 2.5, 7],
++                    "flags": [
++                        0,
++                        1,
++                        "",
++                        "x",
++                        False,
++                        True,
++                        None,
++                        [],
++                        {},
++                        [0],
++                        {"k": 0},
++                        2.5,
++                    ],
++                },
++            )
++            Item(
++                id=2,
++                name="desk",
++                store=north,
++                tags=[],
++                sizes=[12],
++                prices=[],
++                codes=[7, 7],
++                specs={
++                    "dims": {"w": 1},
++                    "meta": ["x"],
++                    "ratings": [],
++                    "grid": None,
++                    "labels": [],
++                    "levels": [4],
++                },
++            )
++            Item(
++                id=3,
++                name="sofa",
++                store=south,
++                tags=["blue"],
++                sizes=[],
++                prices=[0.5],
++                codes=[],
++                specs=[{"w": 3}, {"w": 4}, 6],
++            )
++            Item(
++                id=4,
++                name="rug",
++                tags=["green", "red"],
++                sizes=[3, 1],
++                prices=[9.0, 1.0, 2.0],
++                codes=[1],
++                specs="plain",
++            )
++
++    @db_session
++    def test_str_array_elements_pair_with_their_row(self):
++        result = select((i.name, t) for i in Item for t in i.tags)[:]
++        self.assertEqual(
++            sorted(result),
++            [
++                ("lamp", "blue"),
++                ("lamp", "red"),
++                ("rug", "green"),
++                ("rug", "red"),
++                ("sofa", "blue"),
++            ],
++        )
++
++    @db_session
++    def test_without_distinct_keeps_repeated_elements(self):
++        result = select((i.name, t) for i in Item for t in i.tags).without_distinct()[:]
++        self.assertEqual(
++            sorted(result),
++            [
++                ("lamp", "blue"),
++                ("lamp", "red"),
++                ("lamp", "red"),
++                ("rug", "green"),
++                ("rug", "red"),
++                ("sofa", "blue"),
++            ],
++        )
++
++    @db_session
++    def test_rows_with_primary_key_and_element_are_still_distinct(self):
++        result = select((i.id, t) for i in Item for t in i.tags)[:]
++        self.assertEqual(
++            sorted(result),
++            [(1, "blue"), (1, "red"), (3, "blue"), (4, "green"), (4, "red")],
++        )
++
++    @db_session
++    def test_int_elements_support_arithmetic(self):
++        result = select(s * 10 for i in Item for s in i.sizes).without_distinct()[:]
++        self.assertEqual(sorted(result), [10, 30, 30, 30, 80, 120])
++        halved = select(s // 2 for i in Item for s in i.sizes).without_distinct()[:]
++        self.assertEqual(sorted(halved), [0, 1, 1, 1, 4, 6])
++        remainders = select(s % 3 for i in Item for s in i.sizes).without_distinct()[:]
++        self.assertEqual(sorted(remainders), [0, 0, 0, 0, 1, 2])
++        negated = select(-s for i in Item for s in i.sizes)[:]
++        self.assertEqual(sorted(negated), [-12, -8, -3, -1])
++
++    @db_session
++    def test_float_elements_compare_as_floats(self):
++        result = select((i.name, p) for i in Item for p in i.prices if p > 1.75)[:]
++        self.assertEqual(sorted(result), [("lamp", 2.5), ("rug", 2.0), ("rug", 9.0)])
++
++    @db_session
++    def test_float_and_string_elements_support_their_operators(self):
++        doubled = select(
++            p * 2 + 0.5 for i in Item for p in i.prices if i.name == "lamp"
++        )[:]
++        self.assertEqual(sorted(doubled), [3.5, 5.5])
++        shouted = select(
++            (i.name, t + "!") for i in Item for t in i.tags if i.name == "rug"
++        )[:]
++        self.assertEqual(sorted(shouted), [("rug", "green!"), ("rug", "red!")])
++        factor = 1.5
++        scaled = select(p * factor for i in Item for p in i.prices).without_distinct()[
++            :
++        ]
++        self.assertEqual(sorted(scaled), [0.75, 1.5, 2.25, 3.0, 3.75, 13.5])
++        ending = select(t for i in Item for t in i.tags if t.endswith("ue"))[:]
++        self.assertEqual(ending, ["blue"])
++        sized = select((t, len(t)) for i in Item for t in i.tags)[:]
++        self.assertEqual(sorted(sized), [("blue", 4), ("green", 5), ("red", 3)])
++
++    @db_session
++    def test_string_methods_apply_to_elements(self):
++        result = select(t.upper() for i in Item for t in i.tags if t.startswith("r"))[:]
++        self.assertEqual(result, ["RED"])
++
++    @db_session
++    def test_entity_results_are_not_repeated_by_matching_elements(self):
++        result = select(i for i in Item for t in i.tags if t == "red")[:]
++        self.assertEqual(sorted(item.id for item in result), [1, 4])
++
++    @db_session
++    def test_null_and_empty_arrays_produce_no_rows(self):
++        result = select((i.name, c) for i in Item for c in i.codes).without_distinct()[
++            :
++        ]
++        self.assertEqual(sorted(result), [("desk", 7), ("desk", 7), ("rug", 1)])
++
++    @db_session
++    def test_array_slices_can_be_iterated(self):
++        tail = select(
++            (i.name, s) for i in Item for s in i.sizes[1:]
++        ).without_distinct()[:]
++        self.assertEqual(sorted(tail), [("lamp", 3), ("lamp", 8), ("rug", 1)])
++        head = select(
++            (i.name, s) for i in Item for s in i.sizes[:-1]
++        ).without_distinct()[:]
++        self.assertEqual(sorted(head), [("lamp", 3), ("lamp", 3), ("rug", 3)])
++        totals = select((i.name, sum(p for p in i.prices[:-1])) for i in Item)[:]
++        self.assertEqual(
++            sorted(totals), [("desk", 0), ("lamp", 1.5), ("rug", 10.0), ("sofa", 0)]
++        )
++        joined = dict(
++            select((i.name, group_concat(t for t in i.tags[1:])) for i in Item)[:]
++        )
++        self.assertEqual(sorted(joined["lamp"].split(",")), ["blue", "red"])
++        self.assertEqual(joined["rug"], "red")
++        self.assertIsNone(joined["sofa"])
++
++    @db_session
++    def test_entity_collection_loops_keep_working_alongside_elements(self):
++        result = select(
++            (st.name, t) for st in Store for it in st.items for t in it.tags
++        )[:]
++        self.assertEqual(
++            sorted(result), [("north", "blue"), ("north", "red"), ("south", "blue")]
++        )
++        stock = select((st.name, it.name) for st in Store for it in st.items)[:]
++        self.assertEqual(
++            sorted(stock), [("north", "desk"), ("north", "lamp"), ("south", "sofa")]
++        )
++        first_two = select(i for i in Item if i.id <= 2)
++        self.assertEqual(
++            sorted(x.name for x in select(x for x in first_two)), ["desk", "lamp"]
++        )
++        pairs = select(
++            (st.name, i.name) for st in Store for i in Item if i.store == st
++        )[:]
++        self.assertEqual(
++            sorted(pairs), [("north", "desk"), ("north", "lamp"), ("south", "sofa")]
++        )
++        number = 5
++        with self.assertRaises(TranslationError):
++            select(i for i in Item for x in number)[:]
++        word = "lamp"
++        with self.assertRaises(TranslationError):
++            select(i for i in Item for c in word)[:]
++        with self.assertRaises(TranslationError):
++            select(i for i in Item for x in range(3))[:]
++        north = Store.get(name="north")
++        with self.assertRaises(TranslationError):
++            select(i for i in Item for x in north.items)[:]
++        with self.assertRaises(TranslationError):
++            select(i for i in Item for x in north)[:]
++
++    @db_session
++    def test_python_lists_and_tuples_are_not_loop_sources(self):
++        names = ["lamp"]
++        pair = ("lamp", "desk")
++        with self.assertRaises(TranslationError):
++            select(i for i in Item for n in names)[:]
++        with self.assertRaises(TranslationError):
++            select(i for i in Item for n in pair)[:]
++        with self.assertRaises(TranslationError):
++            select((t, n) for i in Item for t, n in zip(i.tags, pair))[:]
++        with self.assertRaises(TranslationError):
++            select((n, t) for i in Item for n, t in zip(names, i.tags))[:]
++        with self.assertRaises(TranslationError):
++            select((t, n) for i in Item for t, n in zip(i.tags, ["a", 1]))[:]
++        with self.assertRaises(TranslationError):
++            select((n, x) for i in Item for n, x in enumerate(pair))[:]
++
++    @db_session
++    def test_two_element_loops_combine_every_pair(self):
++        result = select(
++            (t, s) for i in Item for t in i.tags for s in i.sizes if i.name == "rug"
++        ).without_distinct()[:]
++        self.assertEqual(
++            sorted(result), [("green", 1), ("green", 3), ("red", 1), ("red", 3)]
++        )
++
++    @db_session
++    def test_element_compared_with_query_parameter(self):
++        wanted = "blue"
++        result = select(i.name for i in Item for t in i.tags if t == wanted)[:]
++        self.assertEqual(sorted(result), ["lamp", "sofa"])
++
++    @db_session
++    def test_nested_count_counts_distinct_values(self):
++        result = select((i.name, count(s for s in i.sizes)) for i in Item)[:]
++        self.assertEqual(
++            sorted(result), [("desk", 1), ("lamp", 2), ("rug", 2), ("sofa", 0)]
++        )
++
++    @db_session
++    def test_nested_sum_sees_every_element(self):
++        result = select((i.name, sum(s for s in i.sizes)) for i in Item)[:]
++        self.assertEqual(
++            sorted(result), [("desk", 12), ("lamp", 14), ("rug", 4), ("sofa", 0)]
++        )
++
++    @db_session
++    def test_nested_group_concat_sees_every_element(self):
++        result = dict(
++            select((i.name, group_concat(t for t in i.tags)) for i in Item)[:]
++        )
++        self.assertEqual(sorted(result["lamp"].split(",")), ["blue", "red", "red"])
++        self.assertEqual(sorted(result["rug"].split(",")), ["green", "red"])
++        self.assertIsNone(result["desk"])
++
++    @db_session
++    def test_nested_min_max_and_avg_over_elements(self):
++        result = {
++            name: (low, high, mean)
++            for name, low, high, mean in select(
++                (
++                    i.name,
++                    min(p for p in i.prices),
++                    max(p for p in i.prices),
++                    avg(s for s in i.sizes),
++                )
++                for i in Item
++            )
++        }
++        self.assertEqual(result["lamp"][:2], (1.5, 2.5))
++        self.assertAlmostEqual(result["lamp"][2], 14 / 3)
++        self.assertEqual(result["desk"], (None, None, 12.0))
++        self.assertEqual(result["sofa"], (0.5, 0.5, None))
++        self.assertEqual(result["rug"], (1.0, 9.0, 2.0))
++
++    @db_session
++    def test_exists_over_elements_in_a_condition(self):
++        result = select(
++            i.name for i in Item if exists(t for t in i.tags if t.startswith("b"))
++        )[:]
++        self.assertEqual(sorted(result), ["lamp", "sofa"])
++
++    @db_session
++    def test_top_level_aggregates_over_all_elements(self):
++        self.assertEqual(sum(s for i in Item for s in i.sizes), 30)
++        self.assertEqual(count(s for i in Item for s in i.sizes), 4)
++
++    @db_session
++    def test_rows_grouped_by_element(self):
++        result = select((t, count(i)) for i in Item for t in i.tags)[:]
++        self.assertEqual(sorted(result), [("blue", 2), ("green", 1), ("red", 2)])
++
++    @db_session
++    def test_query_of_elements_counts_distinct_values(self):
++        self.assertEqual(select(t for i in Item for t in i.tags).count(), 3)
++
++    @db_session
++    def test_json_array_elements_keep_their_json_types(self):
++        result = select(
++            (i.name, d) for i in Item for d in i.specs["dims"]
++        ).without_distinct()[:]
++        self.assertEqual(
++            by_repr(result),
++            by_repr(
++                [
++                    ("lamp", 10),
++                    ("lamp", "wide"),
++                    ("lamp", True),
++                    ("lamp", None),
++                    ("lamp", {"w": 2}),
++                ]
++            ),
++        )
++
++    @db_session
++    def test_json_value_that_is_not_an_array_produces_nothing(self):
++        result = select(i.name for i in Item for m in i.specs["meta"])[:]
++        self.assertEqual(result, ["desk"])
++
++    @db_session
++    def test_json_null_source_produces_nothing(self):
++        result = select((i.name, row) for i in Item for row in i.specs["grid"])[:]
++        self.assertEqual(by_repr(result), by_repr([("lamp", [1, 2]), ("lamp", [3])]))
++
++    @db_session
++    def test_json_attribute_elements_are_subscripted_and_compared(self):
++        result = select((i.name, e["w"]) for i in Item for e in i.specs if e["w"] >= 3)[
++            :
++        ]
++        self.assertEqual(sorted(result), [("sofa", 3), ("sofa", 4)])
++
++    @db_session
++    def test_json_scalar_elements_compare_with_constants(self):
++        high = select(i.name for i in Item for r in i.specs["ratings"] if r > 4.75)[:]
++        self.assertEqual(high, ["lamp"])
++        wide = select(i.name for i in Item for d in i.specs["dims"] if d == "wide")[:]
++        self.assertEqual(wide, ["lamp"])
++
++    @db_session
++    def test_json_elements_support_in(self):
++        result = select(i.name for i in Item for e in i.specs if "w" in e)[:]
++        self.assertEqual(result, ["sofa"])
++
++    @db_session
++    def test_json_elements_used_as_conditions(self):
++        kept = select(
++            f for i in Item for f in i.specs["flags"] if f
++        ).without_distinct()[:]
++        self.assertEqual(by_repr(kept), by_repr([1, "x", True, [0], {"k": 0}, 2.5]))
++        dropped = select(
++            f for i in Item for f in i.specs["flags"] if not f
++        ).without_distinct()[:]
++        self.assertEqual(by_repr(dropped), by_repr([0, "", False, None, [], {}]))
++
++    @db_session
++    def test_json_query_parameters_are_loop_sources(self):
++        payload = Json([1, "two", {"k": 3}, 1])
++        elements = select(
++            (i.name, v) for i in Item for v in payload if i.name == "desk"
++        ).without_distinct()[:]
++        self.assertEqual(
++            by_repr(elements),
++            by_repr([("desk", 1), ("desk", "two"), ("desk", {"k": 3}), ("desk", 1)]),
++        )
++        mapping = {"k": 1}
++        self.assertEqual(select(i.name for i in Item for v in mapping)[:], [])
++        with self.assertRaises(TypeError):
++            select(v for v in payload)
++        with self.assertRaises(TypeError):
++            select(v for v in mapping)
++        counts = select((i.name, count(v for v in payload)) for i in Item)[:]
++        self.assertEqual(
++            sorted(counts), [("desk", 3), ("lamp", 3), ("rug", 3), ("sofa", 3)]
++        )
++        paired = select(
++            (t, v) for i in Item for t, v in zip(i.tags, payload) if i.name == "rug"
++        ).without_distinct()[:]
++        self.assertEqual(by_repr(paired), by_repr([("green", 1), ("red", "two")]))
++        numbered = select(
++            (n, v) for i in Item for n, v in enumerate(payload) if i.name == "desk"
++        ).without_distinct()[:]
++        self.assertEqual(
++            by_repr(numbered),
++            by_repr([(0, 1), (1, "two"), (2, {"k": 3}), (3, 1)]),
++        )
++        letters = Json(["x", "y"])
++        zipped = select(
++            (a, b) for i in Item for a, b in zip(payload, letters) if i.name == "desk"
++        ).without_distinct()[:]
++        self.assertEqual(by_repr(zipped), by_repr([(1, "x"), ("two", "y")]))
++        settings = Json({"color": "red", "size": 2})
++        keys = select(k for i in Item for k in settings.keys() if i.name == "desk")[:]
++        self.assertEqual(sorted(keys), ["color", "size"])
++        values = select(v for i in Item for v in settings.values() if i.name == "desk")[
++            :
++        ]
++        self.assertEqual(by_repr(values), by_repr(["red", 2]))
++        members = select(
++            (k, v) for i in Item for k, v in settings.items() if i.name == "desk"
++        )[:]
++        self.assertEqual(by_repr(members), by_repr([("color", "red"), ("size", 2)]))
++        dict_keys = select(k for i in Item for k in mapping.keys() if i.name == "desk")[
++            :
++        ]
++        self.assertEqual(dict_keys, ["k"])
++        dict_values = select(
++            v for i in Item for v in mapping.values() if i.name == "desk"
++        )[:]
++        self.assertEqual(by_repr(dict_values), by_repr([1]))
++        dict_items = select(
++            (k, v) for i in Item for k, v in mapping.items() if i.name == "desk"
++        )[:]
++        self.assertEqual(by_repr(dict_items), by_repr([("k", 1)]))
++        self.assertEqual(
++            select((n, v) for i in Item for n, v in enumerate(mapping))[:], []
++        )
++        self.assertEqual(
++            select((a, b) for i in Item for a, b in zip(mapping, letters))[:], []
++        )
++
++    @db_session
++    def test_nested_json_arrays_are_iterated_again(self):
++        result = select(
++            (i.name, v) for i in Item for row in i.specs["grid"] for v in row
++        ).without_distinct()[:]
++        self.assertEqual(sorted(result), [("lamp", 1), ("lamp", 2), ("lamp", 3)])
++
++    @db_session
++    def test_nested_generators_over_json_arrays(self):
++        counts = select((i.name, count(r for r in i.specs["ratings"])) for i in Item)[:]
++        self.assertEqual(
++            sorted(counts), [("desk", 0), ("lamp", 3), ("rug", 0), ("sofa", 0)]
++        )
++        rated = select(
++            i.name for i in Item if exists(r for r in i.specs["ratings"] if r < 3.0)
++        )[:]
++        self.assertEqual(rated, ["lamp"])
++
++    @db_session
++    def test_nested_json_aggregates_use_numbers_and_text(self):
++        result = {
++            name: (total, mean, low, high)
++            for name, total, mean, low, high in select(
++                (
++                    i.name,
++                    sum(r for r in i.specs["ratings"]),
++                    avg(r for r in i.specs["ratings"]),
++                    min(r for r in i.specs["ratings"]),
++                    max(r for r in i.specs["ratings"]),
++                )
++                for i in Item
++            )
++        }
++        self.assertEqual(result["lamp"], (12.0, 4.0, 2.5, 5.0))
++        self.assertEqual(result["desk"], (0, None, None, None))
++        self.assertEqual(result["rug"], (0, None, None, None))
++        labels = dict(
++            select(
++                (i.name, group_concat(label for label in i.specs["labels"]))
++                for i in Item
++            )[:]
++        )
++        self.assertEqual(sorted(labels["lamp"].split(",")), ["a", "a", "b"])
++        self.assertIsNone(labels["desk"])
++        mixed = sorted(
++            select(
++                (
++                    i.name,
++                    sum(v for v in i.specs["levels"]),
++                    max(v for v in i.specs["levels"]),
++                )
++                for i in Item
++            )[:]
++        )
++        self.assertEqual(
++            mixed,
++            [
++                ("desk", 4.0, 4.0),
++                ("lamp", 19.5, 10.0),
++                ("rug", 0.0, None),
++                ("sofa", 0.0, None),
++            ],
++        )
++
++    @db_session
++    def test_json_aggregates_outside_nested_generators(self):
++        self.assertEqual(sum(r for i in Item for r in i.specs["ratings"]), 12.0)
++        self.assertEqual(avg(r for i in Item for r in i.specs["ratings"]), 4.0)
++        self.assertEqual(min(r for i in Item for r in i.specs["ratings"]), 2.5)
++        self.assertEqual(max(r for i in Item for r in i.specs["ratings"]), 5.0)
++        labels = group_concat(label for i in Item for label in i.specs["labels"])
++        self.assertEqual(sorted(labels.split(",")), ["a", "a", "b"])
++        ratings = select(r for i in Item for r in i.specs["ratings"])
++        self.assertEqual(ratings.sum(), 12.0)
++        self.assertEqual(ratings.max(), 5.0)
++        label_query = select(label for i in Item for label in i.specs["labels"])
++        joined = label_query.group_concat(sep="|")
++        self.assertEqual(sorted(joined.split("|")), ["a", "a", "b"])
++        per_item = select(
++            (i.name, sum(r), avg(r), min(r), max(r))
++            for i in Item
++            for r in i.specs["ratings"]
++        )[:]
++        self.assertEqual(list(per_item), [("lamp", 12.0, 4.0, 2.5, 5.0)])
++        grouped = select(
++            (i.name, group_concat(label)) for i in Item for label in i.specs["labels"]
++        )[:]
++        self.assertEqual([name for name, text in grouped], ["lamp"])
++        self.assertEqual(sorted(grouped[0][1].split(",")), ["a", "a", "b"])
++        self.assertEqual(sum(v for i in Item for v in i.specs["levels"]), 23.5)
++        self.assertEqual(avg(v for i in Item for v in i.specs["levels"]), 5.875)
++        self.assertEqual(min(v for i in Item for v in i.specs["levels"]), 2.5)
++        self.assertEqual(max(v for i in Item for v in i.specs["levels"]), 10.0)
++        numbers = group_concat(v for i in Item for v in i.specs["levels"])
++        self.assertEqual(sorted(numbers.split(",")), ["10", "2.5", "4", "7"])
++        levels = select(v for i in Item for v in i.specs["levels"])
++        self.assertEqual(levels.avg(), 5.875)
++        self.assertEqual(levels.min(), 2.5)
++        self.assertEqual(levels.count(), 4)
++        self.assertEqual(ratings.avg(), 4.0)
++        self.assertEqual(ratings.min(), 2.5)
++        self.assertEqual(ratings.count(), 3)
++        per_level = sorted(
++            select((i.name, sum(v), min(v)) for i in Item for v in i.specs["levels"])[:]
++        )
++        self.assertEqual(per_level, [("desk", 4.0, 4.0), ("lamp", 19.5, 2.5)])
++
++    @db_session
++    def test_json_element_queries_are_distinct_and_orderable(self):
++        labels = select(label for i in Item for label in i.specs["labels"])
++        self.assertEqual(sorted(labels[:]), ["a", "b"])
++        self.assertEqual(sorted(labels.without_distinct()[:]), ["a", "a", "b"])
++        self.assertEqual(labels.filter(lambda label: label != "a")[:], ["b"])
++        self.assertEqual(labels.order_by(lambda label: desc(label)).first(), "b")
++        ratings = select(r for i in Item for r in i.specs["ratings"])
++        self.assertEqual(list(ratings.order_by(1)[:]), [2.5, 4.5, 5.0])
++        grouped = select(
++            (label, count(i)) for i in Item for label in i.specs["labels"]
++        )[:]
++        self.assertEqual(sorted(grouped), [("a", 1), ("b", 1)])
++
++    @db_session
++    def test_enumerate_positions_start_at_zero(self):
++        result = select((i.name, n, t) for i in Item for n, t in enumerate(i.tags))[:]
++        self.assertEqual(
++            sorted(result),
++            [
++                ("lamp", 0, "red"),
++                ("lamp", 1, "blue"),
++                ("lamp", 2, "red"),
++                ("rug", 0, "green"),
++                ("rug", 1, "red"),
++                ("sofa", 0, "blue"),
++            ],
++        )
++
++    @db_session
++    def test_enumerate_start_shifts_positions(self):
++        from_one = select(
++            (n, s)
++            for i in Item
++            for n, s in enumerate(i.sizes, start=1)
++            if i.name == "rug"
++        )[:]
++        self.assertEqual(sorted(from_one), [(1, 3), (2, 1)])
++        from_minus_two = select(
++            (n, s)
++            for i in Item
++            for n, s in enumerate(i.sizes, start=-2)
++            if i.name == "rug"
++        )[:]
++        self.assertEqual(sorted(from_minus_two), [(-2, 3), (-1, 1)])
++
++    @db_session
++    def test_enumerate_position_filters_elements(self):
++        result = select(
++            (i.name, t) for i in Item for n, t in enumerate(i.tags) if n % 2 == 0
++        ).without_distinct()[:]
++        self.assertEqual(
++            sorted(result),
++            [("lamp", "red"), ("lamp", "red"), ("rug", "green"), ("sofa", "blue")],
++        )
++
++    @db_session
++    def test_enumerate_over_json_array(self):
++        result = select(
++            (n, r)
++            for i in Item
++            for n, r in enumerate(i.specs["ratings"])
++            if i.name == "lamp"
++        )[:]
++        self.assertEqual(sorted(result), [(0, 4.5), (1, 2.5), (2, 5.0)])
++
++    @db_session
++    def test_zip_pairs_by_position_and_stops_at_shortest(self):
++        result = select(
++            (i.name, t, s) for i in Item for t, s in zip(i.tags, i.sizes)
++        ).without_distinct()[:]
++        self.assertEqual(
++            sorted(result),
++            [
++                ("lamp", "blue", 3),
++                ("lamp", "red", 3),
++                ("lamp", "red", 8),
++                ("rug", "green", 3),
++                ("rug", "red", 1),
++            ],
++        )
++
++    @db_session
++    def test_zip_three_sources_including_json(self):
++        result = select(
++            (i.name, t, p, r)
++            for i in Item
++            for t, p, r in zip(i.tags, i.prices, i.specs["ratings"])
++        )[:]
++        self.assertEqual(
++            sorted(result), [("lamp", "blue", 2.5, 2.5), ("lamp", "red", 1.5, 4.5)]
++        )
++
++    @db_session
++    def test_zip_inside_nested_aggregate(self):
++        result = select(
++            (i.name, sum(s for t, s in zip(i.tags, i.sizes) if t == "red"))
++            for i in Item
++        )[:]
++        self.assertEqual(
++            sorted(result), [("desk", 0), ("lamp", 11), ("rug", 1), ("sofa", 0)]
++        )
++
++    @db_session
++    def test_json_object_keys_values_and_items(self):
++        keys = select(k for i in Item for k in i.specs["meta"].keys())[:]
++        self.assertEqual(sorted(keys), ["color", "weight"])
++        values = select(v for i in Item for v in i.specs["meta"].values())[:]
++        self.assertEqual(by_repr(values), by_repr([1.25, "red"]))
++        items = select((k, v) for i in Item for k, v in i.specs["meta"].items())[:]
++        self.assertEqual(by_repr(items), by_repr([("color", "red"), ("weight", 1.25)]))
++
++    @db_session
++    def test_members_of_json_that_is_not_an_object_produce_nothing(self):
++        keys = select(i.name for i in Item for k in i.specs["dims"].keys())[:]
++        self.assertEqual(keys, ["desk"])
++        values = select(i.name for i in Item for v in i.specs["dims"].values())[:]
++        self.assertEqual(values, ["desk"])
++        items = select(i.name for i in Item for k, v in i.specs["dims"].items())[:]
++        self.assertEqual(items, ["desk"])
++        null_or_array = select(
++            i.name for i in Item for k, v in i.specs["grid"].items()
++        )[:]
++        self.assertEqual(null_or_array, [])
++
++    @db_session
++    def test_json_member_values_compare_as_json(self):
++        result = select(
++            k for i in Item for k, v in i.specs["meta"].items() if v == "red"
++        )[:]
++        self.assertEqual(result, ["color"])
++
++    @db_session
++    def test_left_join_keeps_rows_with_empty_collections(self):
++        result = left_join((i.name, t) for i in Item for t in i.tags)[:]
++        self.assertEqual(
++            by_repr(result),
++            by_repr(
++                [
++                    ("desk", None),
++                    ("lamp", "blue"),
++                    ("lamp", "red"),
++                    ("rug", "green"),
++                    ("rug", "red"),
++                    ("sofa", "blue"),
++                ]
++            ),
++        )
++
++    @db_session
++    def test_left_join_aggregate_over_elements(self):
++        result = left_join((i.name, count(t)) for i in Item for t in i.tags)[:]
++        self.assertEqual(
++            sorted(result), [("desk", 0), ("lamp", 2), ("rug", 2), ("sofa", 1)]
++        )
++
++    @db_session
++    def test_left_join_over_json_keeps_rows_without_elements(self):
++        result = left_join((i.name, r) for i in Item for r in i.specs["ratings"])[:]
++        self.assertEqual(
++            by_repr(result),
++            by_repr(
++                [
++                    ("desk", None),
++                    ("lamp", 2.5),
++                    ("lamp", 4.5),
++                    ("lamp", 5.0),
++                    ("rug", None),
++                    ("sofa", None),
++                ]
++            ),
++        )
++
++    @db_session
++    def test_left_join_over_positions_and_json_members(self):
++        numbered = left_join(
++            (i.name, n, t) for i in Item for n, t in enumerate(i.tags)
++        )[:]
++        self.assertEqual(
++            by_repr(numbered),
++            by_repr(
++                [
++                    ("desk", None, None),
++                    ("lamp", 0, "red"),
++                    ("lamp", 1, "blue"),
++                    ("lamp", 2, "red"),
++                    ("rug", 0, "green"),
++                    ("rug", 1, "red"),
++                    ("sofa", 0, "blue"),
++                ]
++            ),
++        )
++        members = left_join(
++            (i.name, k, v) for i in Item for k, v in i.specs["meta"].items()
++        )[:]
++        self.assertEqual(
++            by_repr(members),
++            by_repr(
++                [
++                    ("desk", None, None),
++                    ("lamp", "color", "red"),
++                    ("lamp", "weight", 1.25),
++                    ("rug", None, None),
++                    ("sofa", None, None),
++                ]
++            ),
++        )
++
++    @db_session
++    def test_zip_inside_left_join_keeps_rows_without_pairs(self):
++        result = left_join(
++            (i.name, t, s) for i in Item for t, s in zip(i.tags, i.sizes)
++        )[:]
++        self.assertEqual(
++            by_repr(result),
++            by_repr(
++                [
++                    ("desk", None, None),
++                    ("lamp", "blue", 3),
++                    ("lamp", "red", 3),
++                    ("lamp", "red", 8),
++                    ("rug", "green", 3),
++                    ("rug", "red", 1),
++                    ("sofa", None, None),
++                ]
++            ),
++        )
++
++    @db_session
++    def test_ordering_turns_off_the_distinct_default(self):
++        tags = select(t for i in Item for t in i.tags)
++        self.assertEqual(sorted(tags[:]), ["blue", "green", "red"])
++        repeated = ["blue", "blue", "green", "red", "red", "red"]
++        self.assertEqual(tags.order_by(lambda t: t)[:], repeated)
++        self.assertEqual(tags.without_distinct().order_by(lambda t: t)[:], repeated)
++        self.assertEqual(
++            tags.order_by(lambda t: t).distinct()[:], ["blue", "green", "red"]
++        )
++        labels = select(label for i in Item for label in i.specs["labels"])
++        self.assertEqual(sorted(labels[:]), ["a", "b"])
++        self.assertEqual(labels.order_by(lambda label: label)[:], ["a", "a", "b"])
++        matching = select(i for i in Item for t in i.tags if t == "red").order_by(
++            lambda i: i.name
++        )
++        self.assertEqual([item.name for item in matching], ["lamp", "lamp", "rug"])
++
++    @db_session
++    def test_filter_first_and_order_by_on_element_queries(self):
++        query = select(t for i in Item for t in i.tags)
++        self.assertEqual(
++            sorted(query.filter(lambda t: t != "red")[:]), ["blue", "green"]
++        )
++        self.assertEqual(query.order_by(lambda t: t).first(), "blue")
++        top = select((i.name, s) for i in Item for s in i.sizes).order_by(
++            lambda n, s: (desc(s), n)
++        )[:2]
++        self.assertEqual(list(top), [("desk", 12), ("lamp", 8)])
++
++    def test_delete_rows_matched_through_elements(self):
++        with db_session:
++            delete(i for i in Item for c in i.codes if c == 7)
++        with db_session:
++            self.assertEqual(
++                sorted(select(i.name for i in Item)[:]), ["lamp", "rug", "sofa"]
++            )
++
++    def test_delete_rows_matched_through_json_elements(self):
++        with db_session:
++            delete(i for i in Item for r in i.specs["ratings"] if r > 4.75)
++        with db_session:
++            self.assertEqual(
++                sorted(select(i.name for i in Item)[:]), ["desk", "rug", "sofa"]
++            )
++
++    @db_session
++    def test_entity_select_with_lambda_over_elements(self):
++        result = Item.select(lambda i: exists(p for p in i.prices if p >= 9.0))[:]
++        self.assertEqual([item.name for item in result], ["rug"])
++
++    @db_session
++    def test_loop_variable_count_must_match_the_source(self):
++        pairs = select(
++            (n, t) for i in Item for n, t in enumerate(i.tags) if i.name == "sofa"
++        )[:]
++        self.assertEqual(pairs, [(0, "blue")])
++        with self.assertRaises(TypeError):
++            select(i for i in Item for a, b in i.sizes)[:]
++        with self.assertRaises(TypeError):
++            select(i for i in Item for a, b in i.specs["ratings"])[:]
++        with self.assertRaises(TypeError):
++            select(i for i in Item for t in enumerate(i.tags))[:]
++        with self.assertRaises(TypeError):
++            select(i for i in Item for t, s, x in zip(i.tags, i.sizes))[:]
++        with self.assertRaises(TypeError):
++            select(i for i in Item for k, v in i.specs["meta"].keys())[:]
++
++    def test_loops_need_a_provider_that_supports_them(self):
++        with db_session:
++            ratings = select(r for i in Item for r in i.specs["ratings"])[:]
++        self.assertEqual(sorted(ratings), [2.5, 4.5, 5.0])
++        values = Json([1, 2])
++        postgres_record = mocked_record_entity("postgres", "12.3")
++        with db_session:
++            postgres_queries = [
++                select(v for r in postgres_record for v in r.payload),
++                select(t for r in postgres_record for t in r.tags),
++                select(s for r in postgres_record for s in r.sizes),
++                select(p for r in postgres_record for p in r.prices),
++                select((n, t) for r in postgres_record for n, t in enumerate(r.tags)),
++                left_join(
++                    (t, v) for r in postgres_record for t, v in zip(r.tags, r.payload)
++                ),
++                select((k, v) for r in postgres_record for k, v in r.payload.items()),
++                select(v for r in postgres_record for v in values),
++                select((r, sum(v for v in r.payload)) for r in postgres_record),
++                select(r for r in postgres_record if exists(v for v in r.payload if v)),
++            ]
++            for query in postgres_queries:
++                self.assertIsInstance(query.get_sql(), str)
++        unsupported = (
++            ("mysql", "8.0.30", {}),
++            ("cockroach", "20.2.0", {}),
++            ("oracle", "11.2.0.2.0", {}),
++            ("sqlite", "3.40.1", {"filename": ":memory:"}),
++        )
++        oracle_driver = types.ModuleType("cx_Oracle")
++        with mock.patch.dict(sys.modules, {"cx_Oracle": oracle_driver}):
++            for provider, server_version, options in unsupported:
++                record = mocked_record_entity(provider, server_version, **options)
++                with db_session:
++                    with self.assertRaises(NotImplementedError):
++                        select(v for r in record for v in r.payload)
++                    with self.assertRaises(NotImplementedError):
++                        select(v for r in record for v in values)
++                    with self.assertRaises(NotImplementedError):
++                        select((k, v) for r in record for k, v in r.payload.items())
++                    with self.assertRaises(NotImplementedError):
++                        select((r, count(v for v in r.payload)) for r in record)
++                    with self.assertRaises(NotImplementedError):
++                        select(r for r in record if exists(v for v in r.payload))
++                    with self.assertRaises(NotImplementedError):
++                        left_join((r, v) for r in record for v in r.payload)
++                    if provider not in ("mysql", "oracle"):
++                        with self.assertRaises(NotImplementedError):
++                            select(t for r in record for t in r.tags)
++                        with self.assertRaises(NotImplementedError):
++                            select(s for r in record for s in r.sizes)
++                        with self.assertRaises(NotImplementedError):
++                            select(p for r in record for p in r.prices)
++                        with self.assertRaises(NotImplementedError):
++                            select((n, t) for r in record for n, t in enumerate(r.tags))
++                        with self.assertRaises(NotImplementedError):
++                            left_join(
++                                (t, v)
++                                for r in record
++                                for t, v in zip(r.tags, r.payload)
++                            )
++
++
++pg_db = Database()
++
++
++class Product(pg_db.Entity):
++    id = PrimaryKey(int)
++    name = Required(str)
++    tags = Optional(StrArray)
++    sizes = Optional(IntArray)
++    specs = Optional(Json)
++
++
++def postgres_socket():
++    socket_dir = os.environ.get("PONY_ELEMENT_PG_SOCKET")
++    if socket_dir:
++        return socket_dir
++    if glob.glob("/usr/lib/postgresql/*/bin"):
++        raise AssertionError(
++            "a PostgreSQL server is installed but PONY_ELEMENT_PG_SOCKET is unset"
++        )
++    return None
++
++
++def bind_postgres():
++    socket_dir = postgres_socket()
++    if socket_dir is None:
++        return False
++    pg_db.bind(
++        provider="postgres", host=socket_dir, user="postgres", database="postgres"
++    )
++    pg_db.generate_mapping(check_tables=False)
++    pg_db.drop_all_tables(with_all_data=True)
++    pg_db.create_tables()
++    return True
++
++
++class TestCollectionIterationOnPostgres(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        if not bind_postgres():
++            raise unittest.SkipTest("no PostgreSQL server available for this run")
++        with db_session:
++            Product(
++                id=1,
++                name="lamp",
++                tags=["red", "blue", "red"],
++                sizes=[3, 8],
++                specs={
++                    "ratings": [4.5, 2.5, 5.0],
++                    "labels": ["a", "b", "a"],
++                    "meta": {"color": "red"},
++                    "levels": [10, 2.5, 7],
++                },
++            )
++            Product(
++                id=2,
++                name="desk",
++                tags=[],
++                sizes=[],
++                specs={"ratings": [], "labels": []},
++            )
++            Product(id=3, name="rug", tags=["green"], sizes=[1], specs="plain")
++
++    @classmethod
++    def tearDownClass(cls):
++        if pg_db.provider is not None:
++            teardown_database(pg_db)
++
++    @db_session
++    def test_array_elements_run_on_postgres(self):
++        rows = select((p.name, t) for p in Product for t in p.tags)[:]
++        self.assertEqual(
++            sorted(rows), [("lamp", "blue"), ("lamp", "red"), ("rug", "green")]
++        )
++        repeated = select(
++            (p.name, t) for p in Product for t in p.tags
++        ).without_distinct()[:]
++        self.assertEqual(
++            sorted(repeated),
++            [("lamp", "blue"), ("lamp", "red"), ("lamp", "red"), ("rug", "green")],
++        )
++
++    @db_session
++    def test_json_elements_run_on_postgres(self):
++        labels = select(
++            (p.name, x) for p in Product for x in p.specs["labels"]
++        ).without_distinct()[:]
++        self.assertEqual(sorted(labels), [("lamp", "a"), ("lamp", "a"), ("lamp", "b")])
++        ratings = select(r for p in Product for r in p.specs["ratings"])[:]
++        self.assertEqual(sorted(ratings), [2.5, 4.5, 5.0])
++        self.assertEqual(select(p.name for p in Product for v in p.specs)[:], [])
++
++    @db_session
++    def test_enumerate_and_zip_run_on_postgres(self):
++        numbered = select(
++            (n, t) for p in Product for n, t in enumerate(p.tags) if p.name == "lamp"
++        ).without_distinct()[:]
++        self.assertEqual(sorted(numbered), [(0, "red"), (1, "blue"), (2, "red")])
++        shifted = select(
++            (n, t)
++            for p in Product
++            for n, t in enumerate(p.tags, start=1)
++            if p.name == "rug"
++        )[:]
++        self.assertEqual(shifted, [(1, "green")])
++        pairs = select(
++            (t, s) for p in Product for t, s in zip(p.tags, p.sizes) if p.name == "lamp"
++        )[:]
++        self.assertEqual(sorted(pairs), [("blue", 8), ("red", 3)])
++
++    @db_session
++    def test_aggregates_over_elements_run_on_postgres(self):
++        totals = select((p.name, sum(r for r in p.specs["ratings"])) for p in Product)[
++            :
++        ]
++        self.assertEqual(sorted(totals), [("desk", 0), ("lamp", 12.0), ("rug", 0)])
++        joined = dict(
++            select(
++                (p.name, group_concat(x for x in p.specs["labels"])) for p in Product
++            )[:]
++        )
++        self.assertEqual(sorted(joined["lamp"].split(",")), ["a", "a", "b"])
++        self.assertEqual(sum(v for p in Product for v in p.specs["levels"]), 19.5)
++        levels = select(v for p in Product for v in p.specs["levels"])
++        self.assertEqual(levels.min(), 2.5)
++        self.assertEqual(levels.count(), 3)
++
++    @db_session
++    def test_left_join_and_members_run_on_postgres(self):
++        rows = left_join((p.name, t) for p in Product for t in p.tags)[:]
++        self.assertEqual(
++            by_repr(rows),
++            by_repr(
++                [("desk", None), ("lamp", "blue"), ("lamp", "red"), ("rug", "green")]
++            ),
++        )
++        members = select((k, v) for p in Product for k, v in p.specs["meta"].items())[:]
++        self.assertEqual(by_repr(members), by_repr([("color", "red")]))
++        keys = select(k for p in Product for k in p.specs["meta"].keys())[:]
++        self.assertEqual(keys, ["color"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..2bfd6c5f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,94 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/pony-junit.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++cd "$(dirname "$0")"
++
++NEW_TESTS="pony/orm/tests/test_array_iteration_5c1f8e.py"
++BASETEMP="$(mktemp -d)"
++PG_BIN=""
++PG_DIR=""
++PG_RUN=""
++
++start_postgres() {
++  PG_BIN="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | head -n 1)"
++  [ -n "$PG_BIN" ] || return 1
++  PG_DIR="$(mktemp -d)"
++  if [ "$(id -u)" = "0" ]; then
++    chown postgres "$PG_DIR" || return 1
++    PG_RUN="runuser -u postgres --"
++  else
++    PG_RUN=""
++    if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
++      export LD_PRELOAD=libnss_wrapper.so
++      export NSS_WRAPPER_PASSWD="$PG_DIR/passwd"
++      export NSS_WRAPPER_GROUP="$PG_DIR/group"
++      printf 'pony:x:%s:%s:pony:%s:/bin/false\n' "$(id -u)" "$(id -g)" "$PG_DIR" \
++        > "$NSS_WRAPPER_PASSWD"
++      printf 'pony:x:%s:\n' "$(id -g)" > "$NSS_WRAPPER_GROUP"
++    fi
++  fi
++  $PG_RUN "$PG_BIN/initdb" -D "$PG_DIR/data" -U postgres --auth=trust -E UTF8 \
++    > "$PG_DIR/initdb.log" 2>&1 || return 1
++  $PG_RUN "$PG_BIN/pg_ctl" -D "$PG_DIR/data" \
++    -o "-k $PG_DIR -c listen_addresses=''" -w -t 60 start \
++    > "$PG_DIR/pg_ctl.log" 2>&1 || return 1
++  export PONY_ELEMENT_PG_SOCKET="$PG_DIR"
++  return 0
++}
++
++stop_postgres() {
++  if [ -n "$PG_DIR" ] && [ -d "$PG_DIR/data" ]; then
++    $PG_RUN "$PG_BIN/pg_ctl" -D "$PG_DIR/data" -w -t 60 stop > /dev/null 2>&1
++  fi
++}
++
++trap stop_postgres EXIT
++
++if [ "$MODE" = "base" ]; then
++  python -m pytest -p no:cacheprovider --basetemp="$BASETEMP" \
++    --junitxml="$OUTPUT_PATH" \
++    --ignore="$NEW_TESTS" \
++    --deselect pony/orm/tests/test_decompiler.py::test_method \
++    pony/orm/tests
++  EXIT_CODE=$?
++else
++  if ! start_postgres; then
++    echo "PostgreSQL server unavailable; its cases will be skipped"
++  fi
++  python -m pytest -p no:cacheprovider --basetemp="$BASETEMP" \
++    --junitxml="$OUTPUT_PATH" \
++    "$NEW_TESTS"
++  EXIT_CODE=$?
++  stop_postgres
++fi
++
++if [ ! -s "$OUTPUT_PATH" ] || ! grep -q '<testcase' "$OUTPUT_PATH"; then
++  cat > "$OUTPUT_PATH" <<'XMLEOF'
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++<testsuite name="pony" tests="1" failures="1" errors="0">
++<testcase name="collect pony tests" classname="pony">
++<failure message="pytest collected no tests">pytest did not collect any tests; see the output above.</failure>
++</testcase>
++</testsuite>
++</testsuites>
++XMLEOF
++  [ "$EXIT_CODE" -eq 0 ] && EXIT_CODE=1
++fi
++
++rm -rf "$BASETEMP"
++exit $EXIT_CODE

@@ -1,0 +1,1437 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..9825b82
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,87 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++cd "$(dirname "$0")"
++
++NEW_TESTS=(
++  "tests/io/test_edf_plus_911040.py"
++  "tests/test_multi_layout_9e833f.py"
++)
++
++# These tests stream records from physionet.org and cannot run without network access.
++NETWORK_TESTS=(
++  "tests/test_annotation.py::TestAnnotation::test_1"
++  "tests/test_annotation.py::TestAnnotation::test_2"
++  "tests/test_annotation.py::TestAnnotation::test_3"
++  "tests/test_record.py::TestRecord::test_1a"
++  "tests/test_record.py::TestRecord::test_1b"
++  "tests/test_record.py::TestRecord::test_1c"
++  "tests/test_record.py::TestRecord::test_1d"
++  "tests/test_record.py::TestRecord::test_1e"
++  "tests/test_record.py::TestRecord::test_2a"
++  "tests/test_record.py::TestRecord::test_2b"
++  "tests/test_record.py::TestRecord::test_3a"
++  "tests/test_record.py::TestRecord::test_3b"
++  "tests/test_record.py::TestRecord::test_4b"
++  "tests/test_record.py::TestRecord::test_4c"
++  "tests/test_record.py::TestMultiRecord::test_multi_variable_d"
++  "tests/test_record.py::TestDownload::test_dl_database_no_dat_file"
++  "tests/test_record.py::TestDownload::test_dl_database_with_dat_file"
++)
++
++ARGS=(-p no:cacheprovider --basetemp="$(mktemp -d)")
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  ARGS+=("--junitxml=$OUTPUT_PATH")
++fi
++
++LOG="$(mktemp)"
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "${NEW_TESTS[@]}" "${ARGS[@]}" 2>&1 | tee "$LOG"
++else
++  for test in "${NEW_TESTS[@]}"; do
++    ARGS+=("--ignore=$test")
++  done
++  for test in "${NETWORK_TESTS[@]}"; do
++    ARGS+=("--deselect=$test")
++  done
++  python -m pytest tests "${ARGS[@]}" 2>&1 | tee "$LOG"
++fi
++STATUS=${PIPESTATUS[0]}
++
++if [ -n "$OUTPUT_PATH" ] && [ ! -s "$OUTPUT_PATH" ]; then
++  python - "$OUTPUT_PATH" "$LOG" "$STATUS" <<'PYEOF'
++import sys
++from xml.sax.saxutils import escape, quoteattr
++
++output_path, log_path, status = sys.argv[1:4]
++with open(log_path, encoding="utf-8", errors="replace") as log:
++    lines = log.read().splitlines()
++detail = "\n".join(lines[-200:]) or "pytest printed nothing"
++message = quoteattr(f"pytest exited with status {status} before writing results")
++with open(output_path, "w", encoding="utf-8") as report:
++    report.write(
++        '<?xml version="1.0" encoding="utf-8"?>\n'
++        '<testsuites><testsuite name="pytest" errors="1" failures="0" tests="1" time="0">\n'
++        '<testcase classname="pytest" name="collection" time="0">\n'
++        f"<error message={message}>{escape(detail)}</error>\n"
++        "</testcase>\n"
++        "</testsuite></testsuites>\n"
++    )
++PYEOF
++fi
++
++exit "$STATUS"
+diff --git a/tests/io/test_edf_plus_911040.py b/tests/io/test_edf_plus_911040.py
+new file mode 100644
+index 0000000..5011057
+--- /dev/null
++++ b/tests/io/test_edf_plus_911040.py
+@@ -0,0 +1,1188 @@
++import datetime
++import shutil
++
++import numpy as np
++import pytest
++
++import wfdb
++from wfdb.io.convert.edf import rdedfann, read_edf
++
++
++def field(value, width):
++    return str(value).encode("utf-8").ljust(width)
++
++
++def tal(onset, *texts, duration=None):
++    head = onset if duration is None else onset + "\x15" + duration
++    body = "".join(text + "\x14" for text in texts or ("",))
++    return (head + "\x14" + body).encode("utf-8") + b"\x00"
++
++
++def signal(label, n, pmin=-200, pmax=200, dmin=-2048, dmax=2047, dim="mV"):
++    return {
++        "label": label,
++        "dim": dim,
++        "pmin": pmin,
++        "pmax": pmax,
++        "dmin": dmin,
++        "dmax": dmax,
++        "n": n,
++    }
++
++
++def annotations(n):
++    return {
++        "label": "EDF Annotations",
++        "dim": "",
++        "pmin": -1,
++        "pmax": 1,
++        "dmin": -32768,
++        "dmax": 32767,
++        "n": n,
++    }
++
++
++def write_edf(
++    path,
++    signals,
++    records,
++    duration="1",
++    kind="EDF+C",
++    start="05.06.07",
++    clock="08.09.10",
++):
++    head = field("0", 8) + field("X X X X", 80) + field("Startdate X", 80)
++    head += field(start, 8) + field(clock, 8)
++    head += field(256 * (len(signals) + 1), 8) + field(kind, 44)
++    head += field(len(records), 8) + field(duration, 8)
++    head += field(len(signals), 4)
++    for key, width in (
++        ("label", 16),
++        ("transducer", 80),
++        ("dim", 8),
++        ("pmin", 8),
++        ("pmax", 8),
++        ("dmin", 8),
++        ("dmax", 8),
++        ("prefilter", 80),
++        ("n", 8),
++        ("reserved", 32),
++    ):
++        for sig in signals:
++            head += field(sig.get(key, ""), width)
++    body = b""
++    for record in records:
++        for sig, data in zip(signals, record):
++            if isinstance(data, bytes):
++                assert len(data) <= 2 * sig["n"]
++                body += data.ljust(2 * sig["n"], b"\x00")
++            else:
++                assert len(data) == sig["n"]
++                body += np.asarray(data, dtype="<i2").tobytes()
++    with open(path, "wb") as f:
++        f.write(head + body)
++    return str(path)
++
++
++def physical(digital, sig):
++    scale = (sig["pmax"] - sig["pmin"]) / (sig["dmax"] - sig["dmin"])
++    return (
++        sig["pmin"] + (np.asarray(digital, dtype=float) - sig["dmin"]) * scale
++    )
++
++
++def step(sig):
++    return (sig["pmax"] - sig["pmin"]) / (sig["dmax"] - sig["dmin"]) + 1e-9
++
++
++def uniform_file(tmp_path):
++    ecg = signal("ECG", 4)
++    pleth = signal("PLETH", 4, pmin=0, pmax=100, dmin=0, dmax=4000, dim="NU")
++    records = [
++        ([1, 2, 3, 4], tal("+0"), [100, 200, 300, 400]),
++        ([-5, -6, -7, -8], tal("+1"), [500, 600, 700, 800]),
++        ([2047, -2048, 0, 9], tal("+2"), [4000, 0, 1, 2]),
++    ]
++    path = write_edf(
++        tmp_path / "ward.edf", [ecg, annotations(6), pleth], records
++    )
++    return path, ecg, pleth
++
++
++def multi_rate_file(tmp_path, kind="EDF+C", onsets=("+0", "+1", "+2")):
++    ecg = signal("ECG", 4)
++    resp = signal("RESP", 2, pmin=0, pmax=50, dmin=0, dmax=1000, dim="L")
++    records = [
++        ([10, 11, 12, 13], tal(onsets[0]), [100, 110]),
++        ([20, 21, 22, 23], tal(onsets[1]), [200, 210]),
++        ([30, 31, 32, 34], tal(onsets[2]), [300, 311]),
++    ]
++    path = write_edf(
++        tmp_path / "multi.edf",
++        [ecg, annotations(15), resp],
++        records,
++        kind=kind,
++    )
++    return path, ecg, resp
++
++
++def gap_file(tmp_path, name="night-one.edf"):
++    ecg = signal("ECG", 2)
++    records = [
++        ([1, 2], tal("+0") + tal("+0.5", "Arousal", duration="1.5")),
++        ([3, 4], tal("+1")),
++        ([5, 6], tal("+3") + tal("+4.5", "Cough")),
++        ([7, 8], tal("+4")),
++        ([9, 10], tal("+7") + tal("+5.5", "Talk", "Snore")),
++    ]
++    path = write_edf(
++        tmp_path / name,
++        [ecg, annotations(16)],
++        [(data, text) for data, text in records],
++        kind="EDF+D",
++    )
++    return path, ecg
++
++
++def contiguous_file(tmp_path, onsets, name="steps.edf", duration="1"):
++    ecg = signal("ECG", 2)
++    records = [([k, -k], tal(onset)) for k, onset in enumerate(onsets)]
++    return write_edf(
++        tmp_path / name,
++        [ecg, annotations(8)],
++        records,
++        kind="EDF+D",
++        duration=duration,
++    )
++
++
++def test_continuous_edf_plus_leaves_out_annotation_signal(tmp_path):
++    path, _, _ = uniform_file(tmp_path)
++    record = read_edf(path)
++    assert isinstance(record, wfdb.Record)
++    assert record.sig_name == ["ECG", "PLETH"]
++    assert record.n_sig == 2
++    assert record.fs == 4
++    assert record.samps_per_frame == [1, 1]
++    assert record.sig_len == 12
++
++
++def test_continuous_edf_plus_digital_samples(tmp_path):
++    path, _, _ = uniform_file(tmp_path)
++    record = read_edf(path)
++    expected = np.array(
++        [
++            [1, 100],
++            [2, 200],
++            [3, 300],
++            [4, 400],
++            [-5, 500],
++            [-6, 600],
++            [-7, 700],
++            [-8, 800],
++            [2047, 4000],
++            [-2048, 0],
++            [0, 1],
++            [9, 2],
++        ]
++    )
++    np.testing.assert_array_equal(record.d_signal, expected)
++    assert record.init_value == [1, 100]
++
++
++def test_continuous_edf_plus_physical_samples(tmp_path):
++    path, ecg, pleth = uniform_file(tmp_path)
++    record = read_edf(path)
++    np.testing.assert_allclose(
++        record.p_signal[:, 0],
++        physical(record.d_signal[:, 0], ecg),
++        rtol=0,
++        atol=step(ecg),
++    )
++    np.testing.assert_allclose(
++        record.p_signal[:, 1],
++        physical(record.d_signal[:, 1], pleth),
++        rtol=0,
++        atol=step(pleth),
++    )
++
++
++def test_frame_rate_ignores_annotation_sample_count(tmp_path):
++    path, _, _ = multi_rate_file(tmp_path)
++    record = read_edf(path)
++    assert record.sig_name == ["ECG", "RESP"]
++    assert record.fs == 2
++    assert record.samps_per_frame == [2, 1]
++    assert record.sig_len == 6
++
++
++def test_frame_rate_uses_greatest_common_divisor(tmp_path):
++    first = signal("A", 6)
++    second = signal("B", 4)
++    records = [
++        ([1, 2, 3, 4, 5, 6], tal("+0"), [7, 8, 9, 10]),
++        ([11, 12, 13, 14, 15, 16], tal("+1"), [17, 18, 19, 20]),
++    ]
++    path = write_edf(
++        tmp_path / "ratio.edf", [first, annotations(8), second], records
++    )
++    record = read_edf(path)
++    assert record.fs == 2
++    assert record.samps_per_frame == [3, 2]
++    assert record.sig_len == 4
++    np.testing.assert_array_equal(
++        record.e_d_signal[0], [1, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16]
++    )
++    np.testing.assert_array_equal(
++        record.e_d_signal[1], [7, 8, 9, 10, 17, 18, 19, 20]
++    )
++
++
++def test_frame_rate_need_not_be_whole(tmp_path):
++    first = signal("A", 2)
++    second = signal("B", 4)
++    records = [
++        ([1, 2], tal("+0") + tal("+0.75", "Mark"), [1, 2, 3, 4]),
++        ([3, 4], tal("+3"), [5, 6, 7, 8]),
++    ]
++    path = write_edf(
++        tmp_path / "slow.edf",
++        [first, annotations(12), second],
++        [(a, t, b) for a, t, b in records],
++        kind="EDF+D",
++        duration="1.5",
++    )
++    record = read_edf(path)
++    assert record.fs == pytest.approx(4 / 3)
++    assert record.segments[0].samps_per_frame == [1, 2]
++    assert record.seg_name == ["slow_layout", "slow_0001", "~", "slow_0002"]
++    assert list(record.seg_len) == [0, 2, 2, 2]
++    assert rdedfann(path)["sample_num"] == [1]
++
++
++def test_physical_conversion_keeps_existing_baseline_offset(tmp_path):
++    ranged = signal("RANGE", 3, pmin=-3, pmax=7, dmin=-100, dmax=300, dim="uV")
++    path = write_edf(
++        tmp_path / "range.edf",
++        [ranged, annotations(8)],
++        [([-100, 0, 300], tal("+0"))],
++    )
++    record = read_edf(path)
++    assert record.baseline == [21]
++    np.testing.assert_allclose(
++        record.p_signal[:, 0], [-3.025, -0.525, 6.975], rtol=0, atol=1e-12
++    )
++
++
++def test_multi_rate_samples_are_expanded(tmp_path):
++    path, _, _ = multi_rate_file(tmp_path)
++    record = read_edf(path)
++    np.testing.assert_array_equal(
++        record.e_d_signal[0], [10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 34]
++    )
++    np.testing.assert_array_equal(
++        record.e_d_signal[1], [100, 110, 200, 210, 300, 311]
++    )
++    assert record.init_value == [10, 100]
++
++
++def test_multi_rate_physical_signal_averages_frames(tmp_path):
++    path, ecg, resp = multi_rate_file(tmp_path)
++    record = read_edf(path)
++    ecg_samples = physical(
++        [10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 34], ecg
++    )
++    np.testing.assert_allclose(
++        record.p_signal[:, 0],
++        ecg_samples.reshape(-1, 2).mean(axis=1),
++        rtol=0,
++        atol=step(ecg),
++    )
++    np.testing.assert_allclose(
++        record.p_signal[:, 1],
++        physical([100, 110, 200, 210, 300, 311], resp),
++        rtol=0,
++        atol=step(resp),
++    )
++    np.testing.assert_allclose(
++        record.e_p_signal[0], ecg_samples, rtol=0, atol=step(ecg)
++    )
++    np.testing.assert_allclose(
++        record.e_p_signal[1],
++        physical([100, 110, 200, 210, 300, 311], resp),
++        rtol=0,
++        atol=step(resp),
++    )
++
++
++def test_sub_second_data_records(tmp_path):
++    ecg = signal("ECG", 5)
++    records = [
++        ([1, 2, 3, 4, 5], tal("+0")),
++        ([6, 7, 8, 9, 10], tal("+0.5")),
++    ]
++    path = write_edf(
++        tmp_path / "short.edf", [ecg, annotations(8)], records, duration="0.5"
++    )
++    record = read_edf(path)
++    assert record.fs == 10
++    assert record.samps_per_frame == [1]
++    assert record.sig_len == 10
++    np.testing.assert_array_equal(record.d_signal[:, 0], np.arange(1, 11))
++
++
++def test_start_time_includes_first_record_onset(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [([1, 2], tal("+0.25")), ([3, 4], tal("+1.25"))]
++    path = write_edf(tmp_path / "late.edf", [ecg, annotations(8)], records)
++    record = read_edf(path)
++    assert record.base_datetime == datetime.datetime(
++        2007, 6, 5, 8, 9, 10, 250000
++    )
++    assert record.sig_len == 4
++
++
++def test_start_date_and_time_roll_over_with_first_onset(tmp_path):
++    ecg = signal("ECG", 2)
++    for kind in ("EDF+C", "EDF+D"):
++        records = [([1, 2], tal("+1.5")), ([3, 4], tal("+2.5"))]
++        path = write_edf(
++            tmp_path / f"midnight_{kind[-1]}.edf",
++            [ecg, annotations(8)],
++            records,
++            kind=kind,
++            start="31.12.07",
++            clock="23.59.59",
++        )
++        record = read_edf(path)
++        assert record.base_date == datetime.date(2008, 1, 1)
++        assert record.base_time == datetime.time(0, 0, 0, 500000)
++
++
++def test_plain_edf_keeps_digital_samples(tmp_path):
++    ecg = signal("ECG", 3)
++    temp = signal("TEMP", 1, pmin=30, pmax=45, dmin=0, dmax=1500, dim="degC")
++    records = [([1, 2, 3], [370]), ([4, 5, 6], [371])]
++    path = write_edf(tmp_path / "plain.edf", [ecg, temp], records, kind="")
++    record = read_edf(path)
++    assert isinstance(record, wfdb.Record)
++    assert record.fs == 1
++    assert record.samps_per_frame == [3, 1]
++    np.testing.assert_array_equal(record.e_d_signal[0], [1, 2, 3, 4, 5, 6])
++    np.testing.assert_array_equal(record.e_d_signal[1], [370, 371])
++    assert read_edf(path, header_only=True) == {
++        "fs": record.fs,
++        "sig_len": record.sig_len,
++        "n_sig": record.n_sig,
++        "base_date": record.base_date,
++        "base_time": record.base_time,
++        "units": record.units,
++        "sig_name": record.sig_name,
++        "comments": record.comments,
++    }
++
++
++def test_header_only_matches_plain_record_at_fractional_rate(tmp_path):
++    first = signal("A", 2)
++    second = signal("B", 4, pmin=0, pmax=10, dmin=0, dmax=100, dim="L")
++    records = [([1, 2], [1, 2, 3, 4]), ([3, 4], [5, 6, 7, 8])]
++    path = write_edf(
++        tmp_path / "plain-slow.edf",
++        [first, second],
++        records,
++        kind="",
++        duration="1.5",
++    )
++    header = read_edf(path, header_only=True)
++    record = read_edf(path)
++    assert header["fs"] == pytest.approx(4 / 3)
++    assert header["sig_len"] == 4
++    assert header == {
++        "fs": record.fs,
++        "sig_len": record.sig_len,
++        "n_sig": record.n_sig,
++        "base_date": record.base_date,
++        "base_time": record.base_time,
++        "units": record.units,
++        "sig_name": record.sig_name,
++        "comments": record.comments,
++    }
++
++
++def test_bundled_generator_file():
++    record = read_edf("sample-data/test_generator_2.edf")
++    assert isinstance(record, wfdb.Record)
++    assert "EDF Annotations" not in record.sig_name
++    assert record.n_sig == 11
++    assert record.fs == 200
++    assert record.sig_len == 120000
++    assert record.samps_per_frame == [1] * 11
++    assert record.d_signal.shape == (120000, 11)
++    assert record.base_datetime == datetime.datetime(2009, 12, 10, 12, 44, 2)
++
++
++def test_discontinuous_file_returns_variable_layout_record(tmp_path):
++    path, _ = gap_file(tmp_path)
++    record = read_edf(path)
++    assert isinstance(record, wfdb.MultiRecord)
++    assert record.layout == "variable"
++    assert record.record_name == "night_one"
++    assert record.seg_name == [
++        "night_one_layout",
++        "night_one_0001",
++        "~",
++        "night_one_0002",
++        "~",
++        "night_one_0003",
++    ]
++    assert list(record.seg_len) == [0, 4, 2, 4, 4, 2]
++    assert record.sig_len == 16
++    assert record.fs == 2
++    assert record.n_sig == 1
++    assert record.base_datetime == datetime.datetime(2007, 6, 5, 8, 9, 10)
++
++
++def test_discontinuous_layout_and_null_segments(tmp_path):
++    path, _ = gap_file(tmp_path)
++    record = read_edf(path)
++    layout = record.segments[0]
++    assert layout.sig_len == 0
++    assert layout.sig_name == ["ECG"]
++    assert layout.samps_per_frame == [1]
++    assert record.segments[2] is None
++    assert record.segments[4] is None
++    assert [seg.record_name for seg in record.segments if seg is not None] == [
++        "night_one_layout",
++        "night_one_0001",
++        "night_one_0002",
++        "night_one_0003",
++    ]
++
++
++def test_discontinuous_layout_segment_has_null_format(tmp_path):
++    path, _ = gap_file(tmp_path)
++    record = read_edf(path)
++    assert record.segments[0].file_name == ["~"]
++    assert record.segments[0].fmt == ["0"]
++    out = tmp_path / "out"
++    out.mkdir()
++    record.wrsamp(write_dir=str(out))
++    back = wfdb.rdrecord(str(out / "night_one"), m2s=False, physical=False)
++    assert back.segments[0].file_name == ["~"]
++    assert back.segments[0].fmt == ["0"]
++
++
++def test_discontinuous_segments_hold_their_own_samples(tmp_path):
++    path, _ = gap_file(tmp_path)
++    record = read_edf(path)
++    first, second, third = (
++        record.segments[1],
++        record.segments[3],
++        record.segments[5],
++    )
++    np.testing.assert_array_equal(first.d_signal[:, 0], [1, 2, 3, 4])
++    np.testing.assert_array_equal(second.d_signal[:, 0], [5, 6, 7, 8])
++    np.testing.assert_array_equal(third.d_signal[:, 0], [9, 10])
++    assert [first.sig_len, second.sig_len, third.sig_len] == [4, 4, 2]
++    assert [first.init_value, second.init_value, third.init_value] == [
++        [1],
++        [5],
++        [9],
++    ]
++
++
++def test_discontinuous_gaps_are_missing_in_single_record(tmp_path):
++    path, ecg = gap_file(tmp_path)
++    single = read_edf(path).multi_to_single(physical=True)
++    values = single.p_signal[:, 0]
++    assert values.shape == (16,)
++    assert np.isnan(values[[4, 5, 10, 11, 12, 13]]).all()
++    present = [0, 1, 2, 3, 6, 7, 8, 9, 14, 15]
++    np.testing.assert_allclose(
++        values[present],
++        physical([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], ecg),
++        rtol=0,
++        atol=step(ecg),
++    )
++
++
++def test_header_only_matches_continuous_record(tmp_path):
++    ecg = signal("ECG", 4)
++    resp = signal("RESP", 2, pmin=0, pmax=50, dmin=0, dmax=1000, dim="L")
++    records = [
++        (tal("+2.5"), [10, 11, 12, 13], tal("+2.5"), [100, 110]),
++        (tal("+3.5"), [20, 21, 22, 23], tal("+3.5"), [200, 210]),
++    ]
++    path = write_edf(
++        tmp_path / "header.edf",
++        [annotations(8), ecg, annotations(8), resp],
++        records,
++    )
++    header = read_edf(path, header_only=True)
++    record = read_edf(path)
++    assert header == {
++        "fs": 2,
++        "sig_len": 4,
++        "n_sig": 2,
++        "base_date": datetime.date(2007, 6, 5),
++        "base_time": datetime.time(8, 9, 12, 500000),
++        "units": ["mV", "L"],
++        "sig_name": ["ECG", "RESP"],
++        "comments": [],
++    }
++    assert header["sig_len"] == record.sig_len
++    assert header["units"] == record.units
++    assert header["base_time"] == record.base_time
++
++
++def test_header_only_matches_discontinuous_record(tmp_path):
++    path, _ = gap_file(tmp_path)
++    header = read_edf(path, header_only=True)
++    record = read_edf(path)
++    assert isinstance(header, dict)
++    assert header == {
++        "fs": 2,
++        "sig_len": 16,
++        "n_sig": 1,
++        "base_date": datetime.date(2007, 6, 5),
++        "base_time": datetime.time(8, 9, 10),
++        "units": ["mV"],
++        "sig_name": ["ECG"],
++        "comments": [],
++    }
++    assert header["sig_len"] == record.sig_len
++    assert header["units"] == record.segments[0].units
++
++
++def test_edf_c_record_ignores_gaps_between_record_onsets(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [([1, 2], tal("+0")), ([3, 4], tal("+3"))]
++    path = write_edf(tmp_path / "packed.edf", [ecg, annotations(8)], records)
++    record = read_edf(path)
++    assert isinstance(record, wfdb.Record)
++    assert record.sig_len == 4
++    np.testing.assert_array_equal(record.d_signal[:, 0], [1, 2, 3, 4])
++    header = read_edf(path, header_only=True)
++    assert header["sig_len"] == 4
++    assert header["fs"] == record.fs
++
++
++def test_discontinuous_without_gaps_is_still_multi_segment(tmp_path):
++    path = contiguous_file(tmp_path, ["+0", "+1", "+2"])
++    record = read_edf(path)
++    assert isinstance(record, wfdb.MultiRecord)
++    assert record.seg_name == ["steps_layout", "steps_0001"]
++    assert list(record.seg_len) == [0, 6]
++    np.testing.assert_array_equal(
++        record.segments[1].d_signal[:, 0], [0, 0, 1, -1, 2, -2]
++    )
++
++
++def test_contiguity_is_measured_in_frames(tmp_path):
++    onsets = ["+0", "+0.1", "+0.2", "+0.3", "+0.4", "+0.5", "+0.8", "+0.9"]
++    path = contiguous_file(tmp_path, onsets, duration="0.1")
++    record = read_edf(path)
++    assert record.fs == 20
++    assert record.seg_name == ["steps_layout", "steps_0001", "~", "steps_0002"]
++    assert list(record.seg_len) == [0, 12, 4, 4]
++    assert record.sig_len == 20
++
++
++def test_start_frames_round_halves_up(tmp_path):
++    path = contiguous_file(tmp_path, ["+0", "+2.25", "+6.25"])
++    record = read_edf(path)
++    assert record.seg_name == [
++        "steps_layout",
++        "steps_0001",
++        "~",
++        "steps_0002",
++        "~",
++        "steps_0003",
++    ]
++    assert list(record.seg_len) == [0, 2, 3, 2, 6, 2]
++    assert record.sig_len == 15
++
++
++def test_decimal_times_round_halves_up(tmp_path):
++    ecg = signal("ECG", 1)
++    records = [
++        ([1], tal("+0") + tal("+0.285", "Tie")),
++        ([2], tal("+0.01")),
++        ([3], tal("+0.145")),
++        ([4], tal("+0.155")),
++    ]
++    path = write_edf(
++        tmp_path / "ties.edf",
++        [ecg, annotations(16)],
++        records,
++        kind="EDF+D",
++        duration="0.01",
++    )
++    record = read_edf(path)
++    assert record.fs == 100
++    assert record.seg_name == ["ties_layout", "ties_0001", "~", "ties_0002"]
++    assert list(record.seg_len) == [0, 2, 13, 2]
++    assert record.sig_len == 17
++    assert rdedfann(path)["sample_num"] == [29]
++    ann = rdedfann(path, info_only=False, record_only=True)
++    np.testing.assert_array_equal(ann.sample, [29])
++
++
++def test_discontinuous_start_counts_from_first_onset(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        ([1, 2], tal("+10.25") + tal("+10.75", "Start")),
++        ([3, 4], tal("+11.25")),
++        ([5, 6], tal("+13.75") + tal("+12.5", "Gap")),
++    ]
++    path = write_edf(
++        tmp_path / "late-gap.edf",
++        [ecg, annotations(16)],
++        records,
++        kind="EDF+D",
++    )
++    record = read_edf(path)
++    assert record.base_datetime == datetime.datetime(
++        2007, 6, 5, 8, 9, 20, 250000
++    )
++    assert record.seg_name == [
++        "late_gap_layout",
++        "late_gap_0001",
++        "~",
++        "late_gap_0002",
++    ]
++    assert list(record.seg_len) == [0, 4, 3, 2]
++    assert record.sig_len == 9
++    assert rdedfann(path)["sample_num"] == [1, 5]
++    ann = rdedfann(path, info_only=False, record_only=True)
++    assert ann.aux_note == ["Start", "Gap"]
++    np.testing.assert_array_equal(ann.sample, [1, 5])
++
++
++def test_overlapping_data_records_raise(tmp_path):
++    fine = contiguous_file(tmp_path, ["+0", "+2"], name="fine.edf")
++    assert isinstance(read_edf(fine), wfdb.MultiRecord)
++    overlap = contiguous_file(tmp_path, ["+0", "+0.5"], name="overlap.edf")
++    with pytest.raises(Exception):
++        read_edf(overlap)
++    backwards = contiguous_file(tmp_path, ["+0", "+3", "+2"], name="back.edf")
++    with pytest.raises(Exception):
++        read_edf(backwards)
++
++
++def test_overlap_is_judged_on_exact_record_onsets(tmp_path):
++    late = contiguous_file(tmp_path, ["+0", "+1.2"], name="late.edf")
++    record = read_edf(late)
++    assert record.seg_name == ["late_layout", "late_0001"]
++    assert list(record.seg_len) == [0, 4]
++    early = contiguous_file(tmp_path, ["+0", "+0.9"], name="early.edf")
++    with pytest.raises(Exception):
++        read_edf(early)
++
++
++def test_discontinuous_multi_rate_segments(tmp_path):
++    path, ecg, resp = multi_rate_file(
++        tmp_path, kind="EDF+D", onsets=("+0", "+2", "+3")
++    )
++    record = read_edf(path)
++    assert record.seg_name == ["multi_layout", "multi_0001", "~", "multi_0002"]
++    assert list(record.seg_len) == [0, 2, 2, 4]
++    assert record.segments[0].samps_per_frame == [2, 1]
++    np.testing.assert_array_equal(
++        record.segments[3].e_d_signal[0], [20, 21, 22, 23, 30, 31, 32, 34]
++    )
++    np.testing.assert_array_equal(
++        record.segments[3].e_d_signal[1], [200, 210, 300, 311]
++    )
++    assert record.segments[3].init_value == [20, 200]
++    ecg_samples = physical([20, 21, 22, 23, 30, 31, 32, 34], ecg)
++    np.testing.assert_allclose(
++        record.segments[3].e_p_signal[0], ecg_samples, rtol=0, atol=step(ecg)
++    )
++    np.testing.assert_allclose(
++        record.segments[3].e_p_signal[1],
++        physical([200, 210, 300, 311], resp),
++        rtol=0,
++        atol=step(resp),
++    )
++    np.testing.assert_allclose(
++        record.segments[3].p_signal[:, 0],
++        ecg_samples.reshape(-1, 2).mean(axis=1),
++        rtol=0,
++        atol=step(ecg),
++    )
++
++
++def test_discontinuous_record_round_trips_through_wrsamp(tmp_path):
++    path, _ = gap_file(tmp_path)
++    record = read_edf(path)
++    out = tmp_path / "out"
++    out.mkdir()
++    record.wrsamp(write_dir=str(out))
++    assert (out / "night_one_layout.hea").exists()
++    assert not (out / "night_one_layout.dat").exists()
++    back = wfdb.rdrecord(str(out / "night_one"), m2s=False, physical=False)
++    assert back.seg_name == record.seg_name
++    assert list(back.seg_len) == list(record.seg_len)
++    assert back.segments[0].sig_name == ["ECG"]
++    for original, copy in zip(record.segments[1:], back.segments[1:]):
++        if original is None:
++            assert copy is None
++        else:
++            np.testing.assert_array_equal(copy.d_signal, original.d_signal)
++
++
++def test_discontinuous_round_trip_keeps_full_16_bit_range(tmp_path):
++    wide = signal(
++        "EEG", 2, pmin=-500, pmax=500, dmin=-32768, dmax=32767, dim="uV"
++    )
++    resp = signal("RESP", 2, pmin=0, pmax=50, dmin=0, dmax=1000, dim="L")
++    records = [
++        ([-32768, 32767], tal("+0"), [10, 20]),
++        ([0, -32768], tal("+2"), [30, 40]),
++    ]
++    path = write_edf(
++        tmp_path / "wide.edf",
++        [wide, annotations(8), resp],
++        records,
++        kind="EDF+D",
++    )
++    record = read_edf(path)
++    np.testing.assert_array_equal(
++        record.segments[1].d_signal, [[-32768, 10], [32767, 20]]
++    )
++    np.testing.assert_allclose(
++        record.segments[1].p_signal[:, 0],
++        physical([-32768, 32767], wide),
++        rtol=0,
++        atol=step(wide),
++    )
++    out = tmp_path / "out"
++    out.mkdir()
++    record.wrsamp(write_dir=str(out))
++    back = wfdb.rdrecord(str(out / "wide"), m2s=False, physical=False)
++    assert list(back.seg_len) == [0, 2, 2, 2]
++    specifications = (
++        "sig_name",
++        "units",
++        "adc_gain",
++        "baseline",
++        "samps_per_frame",
++        "fmt",
++        "adc_res",
++        "adc_zero",
++        "skew",
++        "byte_offset",
++        "init_value",
++        "block_size",
++    )
++    for field in specifications:
++        assert getattr(back.segments[0], field) == getattr(
++            record.segments[0], field
++        )
++    for original, copy in zip(record.segments[1:], back.segments[1:]):
++        if original is None:
++            assert copy is None
++            continue
++        for field in specifications:
++            assert getattr(copy, field) == getattr(original, field)
++        np.testing.assert_array_equal(copy.d_signal, original.d_signal)
++    single = wfdb.rdrecord(str(out / "wide"), physical=False)
++    expected = record.multi_to_single(physical=False)
++    np.testing.assert_array_equal(single.d_signal, expected.d_signal)
++
++
++def test_discontinuous_multi_rate_round_trip_expanded(tmp_path):
++    path, _, _ = multi_rate_file(
++        tmp_path, kind="EDF+D", onsets=("+0", "+2", "+3")
++    )
++    record = read_edf(path)
++    out = tmp_path / "out"
++    out.mkdir()
++    record.wrsamp(expanded=True, write_dir=str(out))
++    back = wfdb.rdrecord(
++        str(out / "multi"), m2s=False, physical=False, smooth_frames=False
++    )
++    assert back.seg_name == record.seg_name
++    assert list(back.seg_len) == [0, 2, 2, 4]
++    for original, copy in zip(record.segments[1:], back.segments[1:]):
++        if original is None:
++            assert copy is None
++            continue
++        for ch in range(2):
++            np.testing.assert_array_equal(
++                copy.e_d_signal[ch], original.e_d_signal[ch]
++            )
++    single = wfdb.rdrecord(str(out / "multi"), smooth_frames=False)
++    expected = record.multi_to_single(physical=True, expanded=True)
++    assert single.samps_per_frame == [2, 1]
++    for ch in range(2):
++        np.testing.assert_allclose(
++            single.e_p_signal[ch], expected.e_p_signal[ch], rtol=1e-9
++        )
++
++
++def test_rdedfann_info_on_discontinuous_timeline(tmp_path):
++    path, _ = gap_file(tmp_path)
++    info = rdedfann(path)
++    assert info == {
++        "onset_time": [
++            "00:00:00.500",
++            "00:00:04.500",
++            "00:00:05.500",
++            "00:00:05.500",
++        ],
++        "sample_num": [1, 9, 11, 11],
++        "comment": ["Arousal", "Cough", "Talk", "Snore"],
++        "duration": [1.5, None, None, None],
++    }
++
++
++def test_rdedfann_samples_count_from_first_record_onset(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        ([1, 2], tal("+10.25") + tal("+10.5", "Spike")),
++        ([3, 4], tal("+11.25") + tal("+12", "Late")),
++    ]
++    path = write_edf(tmp_path / "shifted.edf", [ecg, annotations(24)], records)
++    info = rdedfann(path)
++    assert info["comment"] == ["Spike", "Late"]
++    assert info["sample_num"] == [1, 4]
++    assert info["onset_time"] == ["00:00:10.500", "00:00:12.000"]
++
++
++def test_rdedfann_times_before_first_record_round_halves_up(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        ([1, 2], tal("+1.5") + tal("+0.75", "Tie") + tal("+0.25", "Early")),
++        ([3, 4], tal("+2.5")),
++    ]
++    path = write_edf(tmp_path / "before.edf", [ecg, annotations(20)], records)
++    info = rdedfann(path)
++    assert info["comment"] == ["Tie", "Early"]
++    assert info["sample_num"] == [-1, -2]
++
++
++def test_rdedfann_info_keeps_file_order(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        ([1, 2], tal("+0") + tal("+1.5", "Late")),
++        ([3, 4], tal("+1") + tal("+0.5", "Early")),
++    ]
++    path = write_edf(tmp_path / "order.edf", [ecg, annotations(12)], records)
++    info = rdedfann(path)
++    assert info["comment"] == ["Late", "Early"]
++    assert info["sample_num"] == [3, 1]
++    ann = rdedfann(path, info_only=False, record_only=True)
++    assert ann.aux_note == ["Early", "Late"]
++    np.testing.assert_array_equal(ann.sample, [1, 3])
++
++
++def test_rdedfann_onset_time_carries_rounded_milliseconds(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        (
++            [1, 2],
++            tal("+0.25")
++            + tal("+59.9996", "Minute")
++            + tal("+3599.9999", "Hour"),
++        )
++    ]
++    path = write_edf(tmp_path / "carry.edf", [ecg, annotations(24)], records)
++    info = rdedfann(path)
++    assert info["comment"] == ["Minute", "Hour"]
++    assert info["onset_time"] == ["00:01:00.000", "01:00:00.000"]
++    assert info["sample_num"] == [119, 7199]
++
++
++def test_exact_half_frame_at_fractional_frame_rate(tmp_path):
++    ecg = signal("ECG", 4)
++    records = [
++        ([1, 2, 3, 4], tal("+0") + tal("+0.375", "Half")),
++        ([5, 6, 7, 8], tal("+3")),
++    ]
++    path = write_edf(
++        tmp_path / "third.edf",
++        [ecg, annotations(12)],
++        records,
++        duration="3",
++    )
++    record = read_edf(path)
++    assert record.fs == pytest.approx(4 / 3)
++    assert rdedfann(path)["sample_num"] == [1]
++    ann = rdedfann(path, info_only=False, record_only=True)
++    np.testing.assert_array_equal(ann.sample, [1])
++
++
++def test_rdedfann_skips_empty_annotation_lists(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        ([1, 2], tal("+0") + tal("+0") + tal("+0.5", "A", duration="0")),
++        ([3, 4], tal("+1") + tal("+1.5")),
++    ]
++    path = write_edf(tmp_path / "quiet.edf", [ecg, annotations(24)], records)
++    info = rdedfann(path)
++    assert info["comment"] == ["A"]
++    assert info["duration"] == [0.0]
++    assert info["sample_num"] == [1]
++
++
++def test_rdedfann_reads_every_annotation_signal(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        ([1, 2], tal("+0") + tal("+0.5", "first"), tal("+1", "second")),
++        ([3, 4], tal("+1"), tal("+1.5", "third")),
++    ]
++    path = write_edf(
++        tmp_path / "two.edf",
++        [ecg, annotations(12), annotations(12)],
++        records,
++        kind="EDF+D",
++    )
++    record = read_edf(path)
++    assert record.segments[0].sig_name == ["ECG"]
++    assert list(record.seg_len) == [0, 4]
++    info = rdedfann(path)
++    assert info["comment"] == ["first", "second", "third"]
++    assert info["sample_num"] == [1, 2, 3]
++
++
++def test_rdedfann_keeps_texts_as_written(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [([1, 2], tal("+0") + tal("+0.5", "  A b  ", "   "))]
++    path = write_edf(tmp_path / "spaces.edf", [ecg, annotations(16)], records)
++    info = rdedfann(path)
++    assert info["comment"] == ["  A b  ", "   "]
++    assert info["sample_num"] == [1, 1]
++
++
++def test_rdedfann_keeps_texts_that_look_like_onsets(tmp_path):
++    ecg = signal("ECG", 2)
++    raw = tal("+0") + tal("+0.5", "Arousal", "+95") + tal("+1", "+1")
++    path = write_edf(
++        tmp_path / "plus.edf", [ecg, annotations(16)], [([1, 2], raw)]
++    )
++    info = rdedfann(path)
++    assert info["comment"] == ["Arousal", "+95", "+1"]
++    assert info["sample_num"] == [1, 1, 2]
++
++
++def test_rdedfann_decodes_utf8_texts(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [([1, 2], tal("+0") + tal("+0.5", "Pause µV été"))]
++    path = write_edf(tmp_path / "text.edf", [ecg, annotations(24)], records)
++    assert rdedfann(path)["comment"] == ["Pause µV été"]
++
++
++def test_rdedfann_record_only_orders_notes(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        (
++            [1, 2],
++            tal("+0")
++            + tal("+1", "Apnea", duration="1")
++            + tal("+2", "Mark")
++            + tal("+1", "Pos")
++            + tal("+2", "Hypo", duration="0.5")
++            + tal("+2", "Zero", duration="0"),
++        ),
++        ([3, 4], tal("+1")),
++        ([5, 6], tal("+2")),
++    ]
++    path = write_edf(tmp_path / "events.edf", [ecg, annotations(40)], records)
++    ann = rdedfann(path, info_only=False, record_only=True)
++    assert isinstance(ann, wfdb.Annotation)
++    assert ann.aux_note == [
++        "Pos",
++        "(Apnea",
++        "Mark",
++        "Zero",
++        "(Hypo",
++        "Apnea)",
++        "Hypo)",
++    ]
++    np.testing.assert_array_equal(ann.sample, [2, 2, 4, 4, 4, 4, 5])
++    assert ann.symbol == ['"'] * 7
++    assert ann.fs == 2
++
++
++def test_rdedfann_negative_duration_gives_one_note(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        (
++            [1, 2],
++            tal("+0") + tal("+1", "Neg", duration="-0.5") + tal("+1", "Inst"),
++        ),
++        ([3, 4], tal("+1")),
++        ([5, 6], tal("+2")),
++    ]
++    path = write_edf(tmp_path / "neg.edf", [ecg, annotations(20)], records)
++    assert rdedfann(path)["duration"] == [-0.5, None]
++    ann = rdedfann(path, info_only=False, record_only=True)
++    assert ann.aux_note == ["Neg", "Inst"]
++    np.testing.assert_array_equal(ann.sample, [2, 2])
++
++
++def test_rdedfann_opening_and_closing_ties_keep_file_order(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        (
++            [1, 2],
++            tal("+0")
++            + tal("+1", "A", duration="1")
++            + tal("+1", "B", duration="1")
++            + tal("+0.5", "C", duration="1.5"),
++        ),
++        ([3, 4], tal("+1")),
++        ([5, 6], tal("+2")),
++    ]
++    path = write_edf(tmp_path / "ties.edf", [ecg, annotations(20)], records)
++    ann = rdedfann(path, info_only=False, record_only=True)
++    assert ann.aux_note == ["(C", "(A", "(B", "A)", "B)", "C)"]
++    np.testing.assert_array_equal(ann.sample, [1, 2, 2, 4, 4, 4])
++
++
++def test_rdedfann_record_only_on_discontinuous_file(tmp_path):
++    path, _ = gap_file(tmp_path)
++    ann = rdedfann(path, info_only=False, record_only=True)
++    assert ann.aux_note == ["(Arousal", "Arousal)", "Cough", "Talk", "Snore"]
++    np.testing.assert_array_equal(ann.sample, [1, 4, 9, 11, 11])
++
++
++def test_rdedfann_writes_annotation_file(tmp_path, monkeypatch):
++    path, _ = gap_file(tmp_path, name="sleep.edf")
++    monkeypatch.chdir(tmp_path)
++    assert rdedfann(path, info_only=False) is None
++    ann = wfdb.rdann("sleep", "atr")
++    assert ann.aux_note == ["(Arousal", "Arousal)", "Cough", "Talk", "Snore"]
++    np.testing.assert_array_equal(ann.sample, [1, 4, 9, 11, 11])
++    assert ann.symbol == ['"'] * 5
++    assert ann.fs == 2
++
++
++def test_rdedfann_annotation_only_file(tmp_path, monkeypatch):
++    source = "sample-data/test_edfann.edf"
++    info = rdedfann(source)
++    assert len(info["sample_num"]) == len(info["comment"])
++    assert all(sample is None for sample in info["sample_num"])
++    copy = shutil.copy(source, tmp_path / "hypnogram.edf")
++    with pytest.raises(Exception):
++        rdedfann(str(copy), info_only=False, record_only=True)
++    monkeypatch.chdir(tmp_path)
++    with pytest.raises(Exception):
++        rdedfann(str(copy), info_only=False, record_only=False)
++    assert not (tmp_path / "hypnogram.atr").exists()
++
++
++def test_rdedfann_writing_without_annotations_raises(tmp_path, monkeypatch):
++    ecg = signal("ECG", 2)
++    records = [([1, 2], tal("+0")), ([3, 4], tal("+1"))]
++    path = write_edf(tmp_path / "silent.edf", [ecg, annotations(8)], records)
++    assert rdedfann(path)["comment"] == []
++    monkeypatch.chdir(tmp_path)
++    with pytest.raises(Exception):
++        rdedfann(path, info_only=False, record_only=False)
++    assert not (tmp_path / "silent.atr").exists()
++
++
++def test_rdedfann_writing_note_before_frame_zero_raises(tmp_path, monkeypatch):
++    ecg = signal("ECG", 2)
++    raw = tal("+1.5") + tal("+0.75", "Early") + tal("+1.5", "Late")
++    path = write_edf(
++        tmp_path / "early.edf", [ecg, annotations(24)], [([1, 2], raw)]
++    )
++    ann = rdedfann(path, info_only=False, record_only=True)
++    np.testing.assert_array_equal(ann.sample, [-1, 0])
++    monkeypatch.chdir(tmp_path)
++    with pytest.raises(Exception):
++        rdedfann(path, info_only=False, record_only=False)
++    assert not (tmp_path / "early.atr").exists()
++
++
++def test_rdedfann_record_only_without_annotations_is_empty(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [([1, 2], tal("+0")), ([3, 4], tal("+1"))]
++    path = write_edf(tmp_path / "quiet.edf", [ecg, annotations(8)], records)
++    ann = rdedfann(path, info_only=False, record_only=True)
++    assert isinstance(ann, wfdb.Annotation)
++    assert ann.fs == 2
++    assert len(ann.sample) == 0
++    assert list(ann.aux_note) == []
++
++
++def test_first_tal_text_is_not_an_annotation(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        ([1, 2], tal("+0", "timekeeping text") + tal("+0.5", "Real")),
++    ]
++    path = write_edf(
++        tmp_path / "clock-text.edf", [ecg, annotations(24)], records
++    )
++    info = rdedfann(path)
++    assert info["comment"] == ["Real"]
++    assert info["sample_num"] == [1]
++
++
++def test_positive_duration_applies_to_every_text_in_a_tal(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        ([1, 2], tal("+0") + tal("+0.5", "A", "B", duration="1")),
++        ([3, 4], tal("+1")),
++    ]
++    path = write_edf(
++        tmp_path / "two-duration.edf", [ecg, annotations(24)], records
++    )
++    info = rdedfann(path)
++    assert info["comment"] == ["A", "B"]
++    assert info["duration"] == [1.0, 1.0]
++    ann = rdedfann(path, info_only=False, record_only=True)
++    assert ann.aux_note == ["(A", "(B", "A)", "B)"]
++    np.testing.assert_array_equal(ann.sample, [1, 1, 3, 3])
++
++
++def test_info_order_interleaves_annotation_signals_by_data_record(tmp_path):
++    ecg = signal("ECG", 2)
++    records = [
++        ([1, 2], tal("+0") + tal("+0.1", "A"), tal("+0.2", "B")),
++        ([3, 4], tal("+1") + tal("+1.1", "C"), tal("+1.2", "D")),
++    ]
++    path = write_edf(
++        tmp_path / "channel-order.edf",
++        [ecg, annotations(20), annotations(20)],
++        records,
++    )
++    info = rdedfann(path)
++    assert info["comment"] == ["A", "B", "C", "D"]
++    assert info["sample_num"] == [0, 0, 2, 2]
++
++
++def test_onset_time_hours_do_not_wrap_at_one_day(tmp_path):
++    ecg = signal("ECG", 1)
++    records = [([1], tal("+0") + tal("+90000", "Day plus"))]
++    path = write_edf(
++        tmp_path / "long-onset.edf", [ecg, annotations(20)], records
++    )
++    assert rdedfann(path)["onset_time"] == ["25:00:00.000"]
++
++
++def test_record_only_annotation_keeps_fractional_frame_rate(tmp_path):
++    first = signal("A", 2)
++    second = signal("B", 4)
++    records = [
++        ([1, 2], tal("+0") + tal("+0.75", "Mark"), [3, 4, 5, 6]),
++    ]
++    path = write_edf(
++        tmp_path / "fractional-ann.edf",
++        [first, annotations(20), second],
++        records,
++        duration="1.5",
++    )
++    ann = rdedfann(path, info_only=False, record_only=True)
++    assert ann.fs == pytest.approx(4 / 3)
++    np.testing.assert_array_equal(ann.sample, [1])
++
++
++def test_rdedfann_bundled_generator_file():
++    info = rdedfann("sample-data/test_generator_2.edf")
++    assert info["sample_num"] == [0, 120000]
++    assert len(info["comment"]) == 2
+diff --git a/tests/test_multi_layout_9e833f.py b/tests/test_multi_layout_9e833f.py
+new file mode 100644
+index 0000000..85aa508
+--- /dev/null
++++ b/tests/test_multi_layout_9e833f.py
+@@ -0,0 +1,144 @@
++import numpy as np
++
++import wfdb
++
++RECORD = "sample-data/multi-segment/s00001/s00001-2896-10-10-00-31"
++
++
++def write_and_read(tmp_path, record, expanded=False, **read_args):
++    record.wrsamp(expanded=expanded, write_dir=str(tmp_path))
++    return wfdb.rdrecord(
++        str(tmp_path / record.record_name), m2s=False, **read_args
++    )
++
++
++def assert_same_segments(original, copy, expanded=False):
++    assert list(copy.seg_len) == list(original.seg_len)
++    assert len(copy.segments) == len(original.segments)
++    assert copy.segments[0].sig_name == original.segments[0].sig_name
++    for seg_orig, seg_copy in zip(original.segments[1:], copy.segments[1:]):
++        if seg_orig is None:
++            assert seg_copy is None
++            continue
++        assert seg_copy.sig_name == seg_orig.sig_name
++        if expanded:
++            for ch in range(seg_orig.n_sig):
++                np.testing.assert_array_equal(
++                    seg_copy.e_d_signal[ch], seg_orig.e_d_signal[ch]
++                )
++        else:
++            np.testing.assert_array_equal(seg_copy.d_signal, seg_orig.d_signal)
++
++
++def test_write_partial_variable_layout_record(tmp_path):
++    original = wfdb.rdrecord(RECORD, sampto=12000, m2s=False, physical=False)
++    copy = write_and_read(tmp_path, original, physical=False)
++    assert copy.seg_name == original.seg_name
++    assert copy.sig_len == 12000
++    assert_same_segments(original, copy)
++
++
++def test_written_layout_segment_keeps_signal_specifications(tmp_path):
++    original = wfdb.rdrecord(RECORD, sampto=12000, m2s=False, physical=False)
++    copy = write_and_read(tmp_path, original, physical=False)
++    layout = copy.segments[0]
++    assert copy.seg_len[0] == 0
++    assert layout.sig_len == 0
++    assert (tmp_path / "3975656_layout.hea").exists()
++    assert not (tmp_path / "3975656_layout.dat").exists()
++    assert layout.sig_name == ["II", "V", "MCL1", "ABP"]
++    assert layout.units == ["mV", "mV", "mV", "mmHg"]
++    assert layout.adc_gain == [83.0, 55.0, 122.0, 1.0]
++    assert layout.baseline == original.segments[0].baseline
++    for field in (
++        "fmt",
++        "adc_res",
++        "adc_zero",
++        "skew",
++        "byte_offset",
++        "init_value",
++        "checksum",
++        "block_size",
++        "samps_per_frame",
++    ):
++        assert getattr(layout, field) == getattr(original.segments[0], field)
++
++
++def test_write_variable_layout_starting_inside_null_segment(tmp_path):
++    original = wfdb.rdrecord(
++        RECORD, sampfrom=100, sampto=3000, m2s=False, physical=False
++    )
++    copy = write_and_read(tmp_path, original, physical=False)
++    assert copy.seg_name[1] == "~"
++    assert list(copy.seg_len) == [0, 2900]
++    single = wfdb.rdrecord(str(tmp_path / original.record_name))
++    assert single.p_signal.shape == (2900, 4)
++    assert np.isnan(single.p_signal).all()
++
++
++def test_write_variable_layout_starting_mid_segment(tmp_path):
++    original = wfdb.rdrecord(
++        RECORD, sampfrom=5000, sampto=7300, m2s=False, physical=False
++    )
++    copy = write_and_read(tmp_path, original, physical=False)
++    assert copy.seg_name == original.seg_name
++    assert_same_segments(original, copy)
++    expected = wfdb.rdrecord(RECORD, sampfrom=5000, sampto=7300)
++    actual = wfdb.rdrecord(str(tmp_path / original.record_name))
++    assert actual.sig_name == expected.sig_name
++    np.testing.assert_array_equal(actual.p_signal, expected.p_signal)
++
++
++def test_write_variable_layout_with_selected_channels(tmp_path):
++    original = wfdb.rdrecord(
++        RECORD, sampto=12000, channels=[2, 0], m2s=False, physical=False
++    )
++    copy = write_and_read(tmp_path, original, physical=False)
++    assert copy.segments[0].sig_name == ["MCL1", "II"]
++    assert_same_segments(original, copy)
++    expected = wfdb.rdrecord(RECORD, sampto=12000, channels=[2, 0])
++    actual = wfdb.rdrecord(str(tmp_path / original.record_name))
++    np.testing.assert_array_equal(actual.p_signal, expected.p_signal)
++
++
++def test_write_variable_layout_when_segments_lack_selected_signals(tmp_path):
++    original = wfdb.rdrecord(
++        RECORD, sampto=12000, channels=[3], m2s=False, physical=False
++    )
++    copy = write_and_read(tmp_path, original, physical=False)
++    assert list(copy.seg_len) == [0, 3261, 6750, 125, 1354, 510]
++    assert copy.segments[0].sig_name == ["ABP"]
++    assert all(seg is None for seg in copy.segments[1:])
++    actual = wfdb.rdrecord(str(tmp_path / original.record_name))
++    assert actual.sig_name == ["ABP"]
++    assert actual.p_signal.shape == (12000, 1)
++    assert np.isnan(actual.p_signal).all()
++
++
++def test_write_variable_layout_mixing_present_and_absent_signals(tmp_path):
++    original = wfdb.rdrecord(
++        RECORD,
++        sampfrom=3000,
++        sampto=12000,
++        channels=[1, 3],
++        m2s=False,
++        physical=False,
++    )
++    copy = write_and_read(tmp_path, original, physical=False)
++    assert_same_segments(original, copy)
++    expected = wfdb.rdrecord(
++        RECORD, sampfrom=3000, sampto=12000, channels=[1, 3]
++    )
++    actual = wfdb.rdrecord(str(tmp_path / original.record_name))
++    assert actual.sig_name == ["V", "ABP"]
++    np.testing.assert_array_equal(actual.p_signal, expected.p_signal)
++
++
++def test_write_expanded_variable_layout_record(tmp_path):
++    original = wfdb.rdrecord(
++        RECORD, sampto=12000, m2s=False, physical=False, smooth_frames=False
++    )
++    copy = write_and_read(
++        tmp_path, original, expanded=True, physical=False, smooth_frames=False
++    )
++    assert_same_segments(original, copy, expanded=True)

@@ -1,0 +1,632 @@
+diff --git a/pony/orm/asttranslation.py b/pony/orm/asttranslation.py
+index 44ebdfd6..2307ad32 100644
+--- a/pony/orm/asttranslation.py
++++ b/pony/orm/asttranslation.py
+@@ -396,6 +396,10 @@ class PythonTranslator(ASTTranslator):
+ nonexternalizable_types = (ast.keyword, ast.Starred, ast.Slice, ast.List, ast.Tuple)
+ 
+ 
++loop_source_functions = {enumerate, zip}
++loop_source_methods = frozenset(("keys", "values", "items"))
++
++
+ class PreTranslator(ASTTranslator):
+     def __init__(
+         self,
+@@ -452,6 +456,7 @@ class PreTranslator(ASTTranslator):
+         dispatch = self.dispatch
+         for _i, qual in enumerate(node.generators):
+             dispatch(qual.iter)
++            self.keep_loop_source(qual.iter)
+             dispatch(qual.target)
+             for if_ in qual.ifs:
+                 dispatch(if_)
+@@ -459,6 +464,33 @@ class PreTranslator(ASTTranslator):
+         self.contexts.pop()
+         return True
+ 
++    def keep_loop_source(self, node):
++        if not isinstance(node, ast.Call) or not node.external:
++            return
++        func_node = node.func
++        if isinstance(func_node, ast.Attribute):
++            if func_node.attr not in loop_source_methods:
++                return
++            self.keep_for_translation(node)
++            self.keep_for_translation(func_node)
++        elif isinstance(func_node, ast.Name):
++            try:
++                func = eval(func_node.id, self.globals, self.locals)
++                if func not in loop_source_functions:
++                    return
++            except Exception:
++                return
++            self.keep_for_translation(node)
++
++    def keep_for_translation(self, node):
++        node.external = False
++        self.externals.discard(node)
++        self.externals.update(
++            child
++            for child in get_child_nodes(node)
++            if child.external and not child.constant
++        )
++
+     def preLambda(self, node):
+         # if node.varargs or node.kwargs or node.defaults:
+         #    throw(NotImplementedError)
+@@ -526,6 +558,8 @@ class PreTranslator(ASTTranslator):
+         while isinstance(func_node, ast.Attribute):
+             attrs.append(func_node.attr)
+             func_node = func_node.value
++        if attrs and attrs[0] in loop_source_methods:
++            return
+         if not isinstance(func_node, ast.Name):
+             return
+         attrs.append(func_node.id)
+diff --git a/pony/orm/core.py b/pony/orm/core.py
+index 953c93ca..368f9663 100644
+--- a/pony/orm/core.py
++++ b/pony/orm/core.py
+@@ -9139,7 +9139,7 @@ class Query:
+                 elif aggr_func_name == "GROUP_CONCAT":
+                     expr_type = str
+                 else:
+-                    expr_type = translator.expr_type
++                    expr_type = translator.aggregate_expr(aggr_func_name)[0]
+                 provider = self._database.provider
+                 converter = provider.get_converter_by_py_type(expr_type)
+                 result = converter.sql2py(result)
+diff --git a/pony/orm/dbproviders/cockroach.py b/pony/orm/dbproviders/cockroach.py
+index de1dbaef..7b4e1daf 100644
+--- a/pony/orm/dbproviders/cockroach.py
++++ b/pony/orm/dbproviders/cockroach.py
+@@ -46,7 +46,7 @@ class CRSchema(PGSchema):
+ 
+ 
+ class CRTranslator(PGTranslator):
+-    pass
++    element_iteration_syntax = False
+ 
+ 
+ class CRSQLBuilder(PGSQLBuilder):
+diff --git a/pony/orm/dbproviders/postgres.py b/pony/orm/dbproviders/postgres.py
+index 21e1a0a8..8e95fb44 100644
+--- a/pony/orm/dbproviders/postgres.py
++++ b/pony/orm/dbproviders/postgres.py
+@@ -45,6 +45,7 @@ class PGSchema(dbschema.DBSchema):
+ 
+ class PGTranslator(SQLTranslator):
+     dialect = "PostgreSQL"
++    element_iteration_syntax = True
+ 
+ 
+ class PGValue(Value):
+@@ -194,6 +195,53 @@ class PGSQLBuilder(SQLBuilder):
+     def MAKE_ARRAY(self, *items):
+         return "ARRAY[", join(", ", (self(item) for item in items)), "]"
+ 
++    def ARRAY_ELEMENTS(self, array):
++        return "unnest(", self(array), ") WITH ORDINALITY"
++
++    def JSON_ELEMENTS(self, expr):
++        function_sql = self.jsonb_function_of_type(
++            "jsonb_array_elements", expr, "array"
++        )
++        return function_sql, " WITH ORDINALITY"
++
++    def JSON_MEMBERS(self, expr):
++        return self.jsonb_function_of_type("jsonb_each", expr, "object")
++
++    def jsonb_function_of_type(self, func_name, expr, json_type):
++        expr_sql = "(", self(expr), ")::jsonb"
++        return (
++            func_name,
++            "(CASE WHEN jsonb_typeof(",
++            expr_sql,
++            ") = '%s' THEN " % json_type,
++            expr_sql,
++            " END)",
++        )
++
++    def JSON_ELEMENT(self, alias):
++        return self.quote_name(alias), ".", self.quote_name("value")
++
++    def ELEMENT_POSITION(self, alias):
++        return "(", self.quote_name(alias), ".", self.quote_name("ordinality"), " - 1)"
++
++    def COLLECTION_LENGTH(self, kind, expr):
++        if kind == "ARRAY_ELEMENTS":
++            return "COALESCE(ARRAY_LENGTH(", self(expr), ", 1), 0)"
++        expr_sql = "(", self(expr), ")::jsonb"
++        return (
++            "jsonb_array_length(CASE WHEN jsonb_typeof(",
++            expr_sql,
++            ") = 'array' THEN ",
++            expr_sql,
++            " END)",
++        )
++
++    def element_source_alias(self, alias, kind):
++        columns = (
++            ("key", "value") if kind == "JSON_MEMBERS" else ("value", "ordinality")
++        )
++        return alias, "(", join(", ", map(self.quote_name, columns)), ")"
++
+ 
+ class PGIntConverter(dbapiprovider.IntConverter):
+     signed_types = {
+diff --git a/pony/orm/dbproviders/sqlite.py b/pony/orm/dbproviders/sqlite.py
+index eb91a5d4..e88d25dc 100644
+--- a/pony/orm/dbproviders/sqlite.py
++++ b/pony/orm/dbproviders/sqlite.py
+@@ -68,6 +68,9 @@ class SQLiteTranslator(SQLTranslator):
+     StringMixin_UPPER = make_overriden_string_func("PY_UPPER")
+     StringMixin_LOWER = make_overriden_string_func("PY_LOWER")
+ 
++    def supports_element_iteration(self):
++        return self.database.provider.json1_available
++
+ 
+ class SQLiteValue(Value):
+     __slots__ = []
+@@ -333,6 +336,65 @@ class SQLiteBuilder(SQLBuilder):
+     def MAKE_ARRAY(self, *items):
+         return "py_make_array(", join(", ", (self(item) for item in items)), ")"
+ 
++    def ARRAY_ELEMENTS(self, array):
++        return "json_each(", self(array), ")"
++
++    def JSON_ELEMENTS(self, expr):
++        return self.json_each_of_type(expr, "array")
++
++    def JSON_MEMBERS(self, expr):
++        return self.json_each_of_type(expr, "object")
++
++    def json_each_of_type(self, expr, json_type):
++        expr_sql = self(expr)
++        return (
++            "json_each(CASE WHEN json_type(",
++            expr_sql,
++            ") = '%s' THEN " % json_type,
++            expr_sql,
++            " END)",
++        )
++
++    def ELEMENT_POSITION(self, alias):
++        return self.quote_name(alias), ".", self.quote_name("key")
++
++    def COLLECTION_LENGTH(self, kind, expr):
++        expr_sql = self(expr)
++        if kind == "ARRAY_ELEMENTS":
++            return "json_array_length(", expr_sql, ")"
++        return (
++            "json_array_length(CASE WHEN json_type(",
++            expr_sql,
++            ") = 'array' THEN ",
++            expr_sql,
++            " END)",
++        )
++
++    def JSON_ELEMENT(self, alias):
++        alias = self.quote_name(alias)
++        return (
++            "CASE ",
++            alias,
++            ".type WHEN 'text' THEN json_quote(",
++            alias,
++            ".value) WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' "
++            "WHEN 'null' THEN 'null' ELSE ",
++            alias,
++            ".value END",
++        )
++
++    def JSON_ELEMENT_TEXT(self, alias):
++        quoted = self.quote_name(alias)
++        return (
++            "CASE WHEN ",
++            quoted,
++            ".type IN ('integer', 'real') THEN CAST(",
++            quoted,
++            ".value AS TEXT) ELSE ",
++            self.JSON_ELEMENT(alias),
++            " END",
++        )
++
+ 
+ class SQLiteIntConverter(dbapiprovider.IntConverter):
+     def sql_type(self):
+diff --git a/pony/orm/sqlbuilding.py b/pony/orm/sqlbuilding.py
+index 0880155d..53e87764 100644
+--- a/pony/orm/sqlbuilding.py
++++ b/pony/orm/sqlbuilding.py
+@@ -419,6 +419,10 @@ class SQLBuilder:
+                     " ",
+                     alias,
+                 )  # Oracle does not support 'AS' here
++            elif kind in ("ARRAY_ELEMENTS", "JSON_ELEMENTS", "JSON_MEMBERS"):
++                if alias is None:
++                    throw(AstError, "Element source in FROM section must have an alias")
++                result += self([kind, x]), " ", self.element_source_alias(alias, kind)
+             else:
+                 throw(AstError, "Invalid source kind in FROM section: %r" % kind)
+             if join_cond is not None:
+@@ -1025,3 +1029,27 @@ class SQLBuilder:
+ 
+     def MAKE_ARRAY(self, *items):
+         throw(NotImplementedError)
++
++    def ARRAY_ELEMENTS(self, array):
++        throw(NotImplementedError)
++
++    def JSON_ELEMENTS(self, expr):
++        throw(NotImplementedError)
++
++    def JSON_MEMBERS(self, expr):
++        throw(NotImplementedError)
++
++    def JSON_ELEMENT(self, alias):
++        throw(NotImplementedError)
++
++    def JSON_ELEMENT_TEXT(self, alias):
++        return self.JSON_ELEMENT(alias)
++
++    def ELEMENT_POSITION(self, alias):
++        throw(NotImplementedError)
++
++    def COLLECTION_LENGTH(self, kind, expr):
++        throw(NotImplementedError)
++
++    def element_source_alias(self, alias, kind):
++        return alias
+diff --git a/pony/orm/sqltranslation.py b/pony/orm/sqltranslation.py
+index 25c7363a..831518c7 100644
+--- a/pony/orm/sqltranslation.py
++++ b/pony/orm/sqltranslation.py
+@@ -157,6 +157,7 @@ class SQLTranslator(ASTTranslator):
+     json_path_wildcard_syntax = False
+     json_values_are_comparable = True
+     rowid_support = False
++    element_iteration_syntax = False
+ 
+     def __enter__(self):
+         local.translators.append(self)
+@@ -503,6 +504,11 @@ class SQLTranslator(ASTTranslator):
+                         assert local.translators and local.translators[-1] is self
+                         self = e.translator
+                         local.translators[-1] = self
++                elif iterable is Json:
++                    self.dispatch(node)
++                    source = IterationSourceMonad.from_collection(node.monad)
++                    database = self.database
++                    self.iterate_over_source(names, target, generator.iter, source)
+                 else:
+                     throw(
+                         TranslationError,
+@@ -523,6 +529,10 @@ class SQLTranslator(ASTTranslator):
+                         )
+                     except UseAnotherTranslator:
+                         assert False
++                elif isinstance(monad, (ArrayMixin, JsonMixin, IterationSourceMonad)):
++                    source = IterationSourceMonad.from_collection(monad)
++                    database = self.database
++                    self.iterate_over_source(names, target, generator.iter, source)
+                 else:
+                     check_name_is_single()
+                     attr_names = []
+@@ -743,6 +753,48 @@ class SQLTranslator(ASTTranslator):
+     def namespace(self):
+         return self.namespace_stack[-1]
+ 
++    def supports_element_iteration(self):
++        return self.element_iteration_syntax
++
++    def aggregate_expr(self, func_name):
++        monads = self.expr_monads
++        if (
++            func_name == "COUNT"
++            or len(monads) != 1
++            or not isinstance(monads[0], JsonElementMonad)
++        ):
++            return self.expr_type, self.expr_columns
++        expr_type, column = JsonElementMonad.aggregate_operand(
++            func_name, self.expr_columns[0]
++        )
++        return expr_type, [column]
++
++    def iterate_over_source(self, names, target, iter_node, source):
++        if not self.supports_element_iteration():
++            throw(
++                NotImplementedError,
++                "%s does not support iterating over array or JSON values. "
++                "Got: for %s in %s"
++                % (self.dialect, ast2src(target), ast2src(iter_node)),
++            )
++        if len(names) != source.arity:
++            throw(
++                TypeError,
++                "Expected %d loop variable%s. Got: for %s in %s"
++                % (
++                    source.arity,
++                    "" if source.arity == 1 else "s",
++                    ast2src(target),
++                    ast2src(iter_node),
++                ),
++            )
++        tableref = ElementTableRef(self.sqlquery, names[-1], source)
++        self.sqlquery.tablerefs[tableref.alias] = tableref
++        tableref.make_join()
++        for name, item_monad in zip(names, tableref.make_item_monads(), strict=True):
++            self.namespace[name] = item_monad
++        self.distinct = True
++
+     def can_be_optimized(self):
+         if self.groupby_monads:
+             return False
+@@ -963,7 +1015,7 @@ class SQLTranslator(ASTTranslator):
+ 
+         select_ast = ["DISTINCT" if distinct else "ALL"] + self.expr_columns
+         if aggr_func_name:
+-            expr_type = self.expr_type
++            expr_type, expr_columns = self.aggregate_expr(aggr_func_name)
+             if isinstance(expr_type, EntityMeta):
+                 if aggr_func_name == "GROUP_CONCAT":
+                     if expr_type._pk_is_composite_:
+@@ -1004,7 +1056,7 @@ class SQLTranslator(ASTTranslator):
+                     outer_aggr_ast = ["COUNT", None]
+                 else:
+                     assert len(self.expr_columns) == 1
+-                    expr_ast = self.expr_columns[0]
++                    expr_ast = expr_columns[0]
+                     if expr_ast[0] == "COLUMN":
+                         outer_alias, column_name = expr_ast[1:]
+                         outer_aggr_ast = [
+@@ -1050,7 +1102,7 @@ class SQLTranslator(ASTTranslator):
+                     aggr_ast = [
+                         aggr_func_name,
+                         aggr_func_distinct,
+-                        self.expr_columns[0],
++                        expr_columns[0],
+                     ]
+                     if aggr_func_name == "GROUP_CONCAT" and sep is not None:
+                         aggr_ast.append(["VALUE", sep])
+@@ -1819,6 +1871,74 @@ class ExprTableRef(TableRef):
+         return self.alias, None
+ 
+ 
++class ElementTableRef:
++    def __init__(self, sqlquery, name, source):
++        self.sqlquery = sqlquery
++        self.source = source
++        self.aliases = [sqlquery.make_alias(name) for _ in source.collections]
++        self.alias = self.name_path = self.aliases[0]
++        self.entity = None
++        self.joined = False
++        self.can_affect_distinct = True
++        self.used_attrs = set()
++
++    def make_join(self, pk_only=False):
++        if self.joined:
++            return self.alias, None
++        sqlquery = self.sqlquery
++        source = self.source
++        first_position = ["ELEMENT_POSITION", self.alias]
++        sources = zip(self.aliases, source.collections, strict=True)
++        for alias, collection in sources:
++            item = [alias, source.sql_kind(collection), collection.getsql()[0]]
++            if alias == self.alias:
++                join_conditions = [
++                    ["LT", first_position, self.length_sql(other)]
++                    for other in source.collections[1:]
++                ]
++            else:
++                position = ["ELEMENT_POSITION", alias]
++                join_conditions = [["EQ", position, first_position]]
++            if sqlquery.left_join:
++                always = ["EQ", ["VALUE", 1], ["VALUE", 1]]
++                item.append(sqland(join_conditions) if join_conditions else always)
++            elif alias != self.alias:
++                sqlquery.conditions.extend(join_conditions)
++            sqlquery.from_ast.append(item)
++        self.joined = True
++        return self.alias, None
++
++    def length_sql(self, collection):
++        kind = self.source.sql_kind(collection)
++        return ["COLLECTION_LENGTH", kind, collection.getsql()[0]]
++
++    @staticmethod
++    def make_value_monad(collection, alias):
++        if isinstance(collection, JsonMixin):
++            return JsonElementMonad(alias)
++        return ExprMonad.new(collection.type.item_type, ["COLUMN", alias, "value"])
++
++    def make_item_monads(self):
++        source = self.source
++        alias = self.alias
++        collection = source.collections[0]
++        if source.mode == "keys":
++            return [StringExprMonad(str, ["COLUMN", alias, "key"])]
++        if source.mode == "items":
++            key = StringExprMonad(str, ["COLUMN", alias, "key"])
++            return [key, self.make_value_monad(collection, alias)]
++        if source.mode == "enumerate":
++            position = ["ELEMENT_POSITION", alias]
++            if source.start:
++                position = ["ADD", position, ["VALUE", source.start]]
++            value = self.make_value_monad(collection, alias)
++            return [NumericExprMonad(int, position), value]
++        return [
++            self.make_value_monad(collection, alias)
++            for collection, alias in zip(source.collections, self.aliases, strict=True)
++        ]
++
++
+ class StarTableRef(TableRef):
+     def __init__(self, sqlquery, name, entity, subquery_ast):
+         TableRef.__init__(self, sqlquery, name, entity)
+@@ -2989,6 +3109,15 @@ class JsonMixin:
+     def nonzero(self):
+         return BoolExprMonad(["JSON_NONZERO", self.getsql()[0]])
+ 
++    def call_keys(self):
++        return IterationSourceMonad([self], "keys")
++
++    def call_values(self):
++        return IterationSourceMonad([self], "values")
++
++    def call_items(self):
++        return IterationSourceMonad([self], "items")
++
+ 
+ class ArrayMixin(MonadMixin):
+     def contains(self, key, not_in=False):
+@@ -3449,6 +3578,86 @@ class ArrayExprMonad(ArrayMixin, ExprMonad):
+     pass
+ 
+ 
++class IterationSourceMonad(Monad):
++    def __init__(self, collections, mode, start=0):
++        Monad.__init__(self, "ITERATION_SOURCE", nullable=False)
++        self.collections = collections
++        self.mode = mode
++        self.start = start
++
++    @staticmethod
++    def from_collection(monad):
++        if isinstance(monad, IterationSourceMonad):
++            return monad
++        if isinstance(monad, (ListMonad, ArrayParamMonad)):
++            throw(
++                TranslationError,
++                "Python lists and tuples cannot be iterated inside a query. Got: %s"
++                % ast2src(monad.node),
++            )
++        if isinstance(monad, (ArrayMixin, JsonMixin)):
++            return IterationSourceMonad([monad], "elements")
++        throw(
++            TypeError,
++            "Only arrays and JSON values can be iterated inside a query. Got: %s"
++            % ast2src(monad.node),
++        )
++
++    @property
++    def arity(self):
++        if self.mode in ("items", "enumerate"):
++            return 2
++        return len(self.collections)
++
++    def sql_kind(self, collection):
++        if not isinstance(collection, JsonMixin):
++            return "ARRAY_ELEMENTS"
++        if self.mode in ("keys", "values", "items"):
++            return "JSON_MEMBERS"
++        return "JSON_ELEMENTS"
++
++
++class JsonElementMonad(JsonMixin, Monad):
++    disable_distinct = False
++    disable_ordering = False
++
++    def __init__(self, alias):
++        Monad.__init__(self, Json)
++        self.alias = alias
++
++    def to_int(self):
++        return self.cast_from_json(int)
++
++    def to_str(self):
++        return self.cast_from_json(str)
++
++    def to_real(self):
++        return self.cast_from_json(float)
++
++    def cast_from_json(self, type):
++        if issubclass(type, Json):
++            return self
++        sql = ["JSON_VALUE", self.getsql()[0], [], type]
++        return ExprMonad.new(Json if type is NoneType else type, sql)
++
++    @staticmethod
++    def aggregate_operand(func_name, column):
++        expr_type = str if func_name == "GROUP_CONCAT" else float
++        return expr_type, ["JSON_VALUE", column, [], expr_type]
++
++    def aggregate(self, func_name, distinct=None, sep=None):
++        expr_type, sql = self.aggregate_operand(func_name, self.getsql()[0])
++        value = ExprMonad.new(expr_type, sql)
++        value.aggregated = self.aggregated
++        return value.aggregate(func_name, distinct, sep)
++
++    def nonzero(self):
++        return BoolExprMonad(["JSON_NONZERO", ["JSON_ELEMENT_TEXT", self.alias]])
++
++    def getsql(self, sqlquery=None):
++        return [["JSON_ELEMENT", self.alias]]
++
++
+ class JsonItemMonad(JsonMixin, Monad):
+     def __init__(self, parent, key):
+         assert isinstance(parent, JsonMixin), parent
+@@ -4208,6 +4417,43 @@ class FuncLenMonad(FuncMonad):
+         return x.len()
+ 
+ 
++class FuncEnumerateMonad(FuncMonad):
++    func = enumerate
++
++    def call(self, iterable, start=None):
++        source = IterationSourceMonad.from_collection(iterable)
++        if source.mode != "elements":
++            throw(
++                NotImplementedError,
++                "enumerate() over %s() is not supported: {EXPR}" % source.mode,
++            )
++        if start is None:
++            start_value = 0
++        elif isinstance(start, NumericConstMonad) and start.type is int:
++            start_value = start.value
++        else:
++            throw(TypeError, "`start` of enumerate() must be an int constant: {EXPR}")
++        return IterationSourceMonad(source.collections, "enumerate", start_value)
++
++
++class FuncZipMonad(FuncMonad):
++    func = zip
++
++    def call(self, *iterables):
++        if len(iterables) < 2:
++            throw(TypeError, "zip() inside a query expects at least two values: {EXPR}")
++        collections = []
++        for iterable in iterables:
++            source = IterationSourceMonad.from_collection(iterable)
++            if source.mode != "elements":
++                throw(
++                    NotImplementedError,
++                    "zip() over %s() is not supported: {EXPR}" % source.mode,
++                )
++            collections.extend(source.collections)
++        return IterationSourceMonad(collections, "zip")
++
++
+ class FuncGetattrMonad(FuncMonad):
+     func = getattr
+ 
+@@ -5305,7 +5551,7 @@ class QuerySetMonad(SetMixin, Monad):
+             throw(TranslationError, "Too complex aggregation in {EXPR}")
+         subquery_ast = sub.construct_subquery_ast(distinct=False)
+         from_ast, where_ast = subquery_ast[2:4]
+-        expr_type = sub.expr_type
++        expr_type, expr_columns = sub.aggregate_expr(func_name)
+         if func_name in ("SUM", "AVG"):
+             if expr_type not in numeric_types:
+                 throw(
+@@ -5329,7 +5575,7 @@ class QuerySetMonad(SetMixin, Monad):
+         else:
+             assert False  # pragma: no cover
+         assert len(sub.expr_columns) == 1
+-        aggr_ast = [func_name, distinct, sub.expr_columns[0]]
++        aggr_ast = [func_name, distinct, expr_columns[0]]
+         if func_name == "GROUP_CONCAT":
+             if sep is not None:
+                 aggr_ast.append(["VALUE", sep])

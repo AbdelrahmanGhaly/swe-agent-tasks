@@ -1,0 +1,508 @@
+diff --git a/Elf/__init__.py b/Elf/__init__.py
+index c7073777..f998eefe 100644
+--- a/Elf/__init__.py
++++ b/Elf/__init__.py
+@@ -30,6 +30,42 @@ logger = logging.getLogger(__name__)
+ 
+ HAS_STRING = [DT_NEEDED, DT_SONAME]
+ 
++
++class ElfVersionDef:
++    def __init__(self, ndx, name, flags, parents, rva, auxrvas):
++        self.ndx = ndx
++        self.name = name
++        self.flags = flags
++        self.parents = parents
++        self.isbase = bool(flags & VER_FLG_BASE)
++        self.rva = rva
++        self.auxrvas = auxrvas
++
++    def __repr__(self):
++        return 'ElfVersionDef(ndx=%d, name=%r, flags=0x%x)' % (self.ndx, self.name, self.flags)
++
++
++class ElfVersionNeedAux:
++    def __init__(self, other, name, flags, rva):
++        self.other = other
++        self.name = name
++        self.flags = flags
++        self.rva = rva
++
++    def __repr__(self):
++        return 'ElfVersionNeedAux(other=%d, name=%r)' % (self.other, self.name)
++
++
++class ElfVersionNeed:
++    def __init__(self, file, auxs, rva):
++        self.file = file
++        self.auxs = auxs
++        self.rva = rva
++
++    def __repr__(self):
++        return 'ElfVersionNeed(file=%r, auxs=%r)' % (self.file, self.auxs)
++
++
+ class Elf(vs_elf.Elf32, vs_elf.Elf64):
+     def __init__(self, fd, inmem=False):
+         '''
+@@ -98,6 +134,12 @@ class Elf(vs_elf.Elf32, vs_elf.Elf64):
+         self.symbols_by_addr = {}
+         self.dynamics = []      # deprecated - 2019-10-21
+         self.dynamic_symbols = []
++        self.versymbols = []
++        self._versymva = None
++        self.version_defs = []
++        self.version_needs = []
++        self._verdef_names = {}
++        self._verneed_names = {}
+         self.dynstrtabmeta = (None, None)
+         self.dynstrtab = []
+         self.dynsymtabct = None     # populated by _parseDynStrs()
+@@ -141,6 +183,12 @@ class Elf(vs_elf.Elf32, vs_elf.Elf64):
+         except Exception as e:
+             logger.warning("Exception parsing Symbols (via dynamics): %r" % e, exc_info=1)
+ 
++        try:
++            logger.info('self._parseVersionInfo')
++            self._parseVersionInfo()
++        except Exception as e:
++            logger.warning("Exception parsing Symbol Versions: %r" % e, exc_info=1)
++
+         try:
+             logger.info('self._parseDynRelocs')
+             self._parseDynRelocs()
+@@ -442,6 +490,113 @@ class Elf(vs_elf.Elf32, vs_elf.Elf64):
+ 
+             dsoff += symsz
+ 
++    def _parseVersionInfo(self):
++        versymva = self.dyns.get(DT_VERSYM)
++        if versymva is None:
++            return
++
++        self._parseVersym(versymva)
++
++        verdefva = self.dyns.get(DT_VERDEF)
++        if verdefva is not None:
++            self._parseVerdefs(verdefva)
++
++        verneedva = self.dyns.get(DT_VERNEED)
++        if verneedva is not None:
++            self._parseVerneeds(verneedva)
++
++    def _parseVersym(self, rva):
++        self._versymva = rva
++        self._syncVersym()
++
++    def _syncVersym(self):
++        start = len(self.versymbols)
++        missing = len(self.dynamic_symbols) - start
++        if missing <= 0 or self._versymva is None:
++            return
++        data = self.readAtRva(self._versymva + start * 2, missing * 2)
++        order = 'big' if self.bigend else 'little'
++        self.versymbols.extend(int.from_bytes(data[i:i + 2], order) for i in range(0, len(data) - 1, 2))
++
++    def _walkVersionChain(self, rva, cls, nextfield):
++        '''
++        Yield (rva, record) for each record of a version chain, following the
++        byte offset in nextfield until it is zero.
++        '''
++        seen = set()
++        while rva not in seen:
++            seen.add(rva)
++            rec = cls(bigend=self.bigend)
++            rec.vsParse(self.readAtRva(rva, len(rec)))
++            yield rva, rec
++            nextoff = getattr(rec, nextfield)
++            if nextoff == 0:
++                break
++            rva += nextoff
++
++    def _parseVerdefs(self, rva):
++        for vdrva, vd in self._walkVersionChain(rva, vs_elf.ElfVerdef, 'vd_next'):
++            names = []
++            auxrvas = []
++            for auxrva, vda in self._walkVersionChain(vdrva + vd.vd_aux, vs_elf.ElfVerdaux, 'vda_next'):
++                names.append(self.getDynStrtabString(vda.vda_name))
++                auxrvas.append(auxrva)
++            name = names[0] if names else ''
++            vdef = ElfVersionDef(vd.vd_ndx, name, vd.vd_flags, names[1:], vdrva, auxrvas)
++            self.version_defs.append(vdef)
++            if not vdef.isbase:
++                self._verdef_names[vd.vd_ndx & VERSYM_VERSION] = name
++
++    def _parseVerneeds(self, rva):
++        for vnrva, vn in self._walkVersionChain(rva, vs_elf.ElfVerneed, 'vn_next'):
++            auxs = []
++            for auxrva, vna in self._walkVersionChain(vnrva + vn.vn_aux, vs_elf.ElfVernaux, 'vna_next'):
++                other = vna.vna_other & VERSYM_VERSION
++                aux = ElfVersionNeedAux(other, self.getDynStrtabString(vna.vna_name), vna.vna_flags, auxrva)
++                auxs.append(aux)
++                self._verneed_names[other] = aux.name
++            self.version_needs.append(ElfVersionNeed(self.getDynStrtabString(vn.vn_file), auxs, vnrva))
++
++    def getVersionSymbols(self):
++        self._syncVersym()
++        return self.versymbols
++
++    def getVersionDefs(self):
++        return self.version_defs
++
++    def getVersionNeeds(self):
++        return self.version_needs
++
++    def getSymbolVersion(self, index):
++        self._syncVersym()
++        if index < 0 or index >= len(self.versymbols):
++            return (None, True)
++        raw = self.versymbols[index]
++        ndx = raw & VERSYM_VERSION
++        if ndx == VER_NDX_LOCAL or ndx == VER_NDX_GLOBAL:
++            return (None, True)
++        sym = self.dynamic_symbols[index]
++        if sym.st_shndx == SHN_UNDEF:
++            name = self._verneed_names.get(ndx)
++            if name is not None:
++                return (name, False)
++            return (None, True)
++        name = self._verdef_names.get(ndx)
++        if name is None:
++            return (None, True)
++        if sym.st_shndx >= SHN_LORESERVE and sym.name == name:
++            return (None, True)
++        return (name, not bool(raw & VERSYM_HIDDEN))
++
++    def getVersionedName(self, index):
++        if index < 0 or index >= len(self.dynamic_symbols):
++            return ''
++        base = self.dynamic_symbols[index].name
++        name, isdefault = self.getSymbolVersion(index)
++        if name is None:
++            return base
++        return base + ('@@' if isdefault else '@') + name
++
+     # FIXME: wrap in VERDEF and SYMINFO into the analysis.
+     def _parseSectionSymbols(self):
+         """
+diff --git a/vivisect/analysis/generic/linker.py b/vivisect/analysis/generic/linker.py
+index 99e57f8e..bb32cb07 100644
+--- a/vivisect/analysis/generic/linker.py
++++ b/vivisect/analysis/generic/linker.py
+@@ -2,12 +2,69 @@
+ Connect any Exports we have to Imports we may also have
+ (most useful for multiple file workspaces)
+ '''
++import os
+ import logging
++import collections
+ 
+ from vivisect.const import LOC_OP, REF_CODE
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++def libraryNames(vw, fname):
++    '''
++    The names a needed-version entry may use for a loaded file: its soname and
++    the file name it was loaded from.
++    '''
++    names = set()
++    soname = vw.getFileMeta(fname, 'ELF_SONAME')
++    if soname:
++        names.add(soname.lower())
++    origname = vw.getFileMeta(fname, 'OrigName')
++    if origname:
++        names.add(os.path.basename(origname).lower())
++    return names
++
++
++def exportBaseName(verdefs, esym):
++    '''
++    The name an export answers imports by: a hidden ELF definition exported as
++    sym@version answers to sym, and every other export to its full name.
++    '''
++    if verdefs and esym in verdefs:
++        suffix = '@' + verdefs[esym][0]
++        if esym.endswith(suffix):
++            return esym[:-len(suffix)]
++    return esym
++
++
++def linkTargets(verdefs, libnames, need, impsym, exports):
++    '''
++    Pick the exports of one file that satisfy an import.  verdefs maps each
++    versioned export name to (version, index, hidden) and is None for a file
++    without symbol versions.  A versioned import only binds within the library
++    it was needed from, by version there, or by name if that library has no
++    versions.  An unversioned import links by name to a file without versions;
++    in a versioned file it takes a definition at version index 1 or 2 (even a
++    hidden one), else the only non-hidden one.
++    '''
++    if need is not None and os.path.basename(need[3]).lower() not in libnames:
++        return []
++
++    if verdefs is None:
++        return [eva for eva, esym in exports if esym == impsym]
++
++    if need is not None:
++        return [eva for eva, esym in exports if esym in verdefs and verdefs[esym][0] == need[2]]
++
++    direct = [eva for eva, esym in exports if esym not in verdefs or verdefs[esym][1] <= 2]
++    if direct:
++        return direct[:1]
++
++    later = [eva for eva, esym in exports if not verdefs[esym][2]]
++    return later if len(later) == 1 else []
++
++
+ def analyze(vw):
+     """
+     Look for any "imported" symbols that are satisfied by current exports.
+@@ -18,22 +75,35 @@ def analyze(vw):
+     nature through the Export/Import events.
+     """
+     logger.info('linking Imports with Exports')
++    needs = {}
++    if 'ImportVersions' in vw.getVaSetNames():
++        needs = vw.getVaSet('ImportVersions')
++
++    files = set(vw.getFiles())
++    exports = collections.defaultdict(list)
++    filedefs = {}
++    for eva, num, esym, efname in vw.getExports():
++        if vw.isFunctionThunk(eva):
++            logger.info("Skipping Exported Thunk")
++            continue
++        if efname not in filedefs:
++            filedefs[efname] = vw.getFileMeta(efname, 'ELF_VERSION_DEFS') if efname in files else None
++        exports[(efname, exportBaseName(filedefs[efname], esym))].append((eva, esym))
++
+     # store old setting and set _supervisor mode (so we can write wherever
+     # we want, regardless of permissions)
+     with vw.getAdminRights():
+         for iva, isz, itype, isym in vw.getImports():
+             impfname, impsym = isym.split('.', 1)
+-            for eva, num, esym, efname in vw.getExports():
+-                if impsym != esym:
+-                    continue
+-
+-                if impfname not in (efname, '*'):
+-                    continue
++            need = needs.get(iva)
+ 
+-                if vw.isFunctionThunk(eva):
+-                    logger.info("Skipping Exported Thunk")
+-                    continue
++            targets = []
++            for (efname, ename), fexports in exports.items():
++                if ename == impsym and impfname in (efname, '*'):
++                    libnames = libraryNames(vw, efname) if efname in files else set()
++                    targets.extend(linkTargets(filedefs[efname], libnames, need, impsym, fexports))
+ 
++            for eva in targets:
+                 # file and symbol name match.  apply the magic.
+                 # do we ever *not* write in the full address at the import site?
+                 logger.debug("connecting Import 0x%x -> Export 0x%x (%r)", iva, eva, isym)
+diff --git a/vivisect/parsers/elf.py b/vivisect/parsers/elf.py
+index 910a8045..3fbe2c4a 100644
+--- a/vivisect/parsers/elf.py
++++ b/vivisect/parsers/elf.py
+@@ -168,6 +168,22 @@ def makeDynamicTable(vw, va, maxva, baseoff=0):
+             break
+     return ret
+ 
++def makeVersionTables(vw, elf, baseoff):
++    versymva = elf.dyns.get(Elf.DT_VERSYM)
++    if versymva is not None:
++        for i in range(len(elf.getVersionSymbols())):
++            vw.makeNumber(versymva + baseoff + 2 * i, 2)
++
++    for vdef in elf.getVersionDefs():
++        vw.makeStructure(vdef.rva + baseoff, 'elf.ElfVerdef')
++        for auxrva in vdef.auxrvas:
++            vw.makeStructure(auxrva + baseoff, 'elf.ElfVerdaux')
++
++    for need in elf.getVersionNeeds():
++        vw.makeStructure(need.rva + baseoff, 'elf.ElfVerneed')
++        for aux in need.auxs:
++            vw.makeStructure(aux.rva + baseoff, 'elf.ElfVernaux')
++
+ # TODO: how is baseoff supposed to be used?
+ def makeRelocTable(vw, va, maxva, baseoff, addend=False):
+     if addend:
+@@ -426,6 +442,8 @@ def loadElfIntoWorkspace(vw, elf, filename=None, baseaddr=None):
+         logger.debug("making DynSym table: 0x%x secsize: 0x%x entsize: 0x%x", sva, size, symsz)
+         [s for s in makeSymbolTable(vw, sva, sva+size)]
+ 
++    makeVersionTables(vw, elf, baseoff)
++
+     # Now trigger section specific analysis
+     # Test to make sure Dynamics info is king.  Sections info should not overwrite Dynamics
+     for sec in secs:
+@@ -515,7 +533,8 @@ def loadElfIntoWorkspace(vw, elf, filename=None, baseaddr=None):
+     postfix = applyRelocs(elf, vw, addbase, baseoff)
+ 
+     # process Dynamic Symbols - this must happen *after* relocations, which can expand the size of this
+-    for s in elf.getDynSyms():
++    verdefs = {}
++    for i, s in enumerate(elf.getDynSyms()):
+         stype = s.getInfoType()
+         sva = s.st_value
+ 
+@@ -526,7 +545,11 @@ def loadElfIntoWorkspace(vw, elf, filename=None, baseaddr=None):
+         if sva == 0:
+             continue
+ 
+-        dmglname = demangle(s.name)
++        dmglname = symbolName(elf, i, s.name)
++        vername, verdefault = elf.getSymbolVersion(i)
++        if vername is not None:
++            ndx = elf.getVersionSymbols()[i] & vdc_elf.VERSYM_VERSION
++            verdefs[dmglname] = (vername, ndx, not verdefault)
+ 
+         if stype == Elf.STT_FUNC or \
+                 (stype == Elf.STT_GNU_IFUNC and arch in ('i386', 'amd64')):   # HACK: linux is what we're really after.
+@@ -575,6 +598,10 @@ def loadElfIntoWorkspace(vw, elf, filename=None, baseaddr=None):
+             for rlva, addend in postfix[dmglname]:
+                 vw.addRelocation(rlva, v_const.RTYPE_BASEPTR, sva + addend - baseoff)
+ 
++    vw.setFileMeta(fname, 'ELF_SONAME', getSoname(elf))
++    if elf.getVersionDefs():
++        vw.setFileMeta(fname, 'ELF_VERSION_DEFS', verdefs)
++
+     vaSetNames = vw.getVaSetNames()
+     if 'FileSymbols' not in vaSetNames:
+         vw.addVaSet("FileSymbols", (("Name", v_const.VASET_STRING), ("va", v_const.VASET_ADDRESS)))
+@@ -810,6 +837,7 @@ def applyRelocs(elf, vw, addbase=False, baseoff=0):
+     '''
+     postfix = collections.defaultdict(list)
+     arch = arch_names.get(elf.e_machine)
++    needfiles = getNeedFiles(elf)
+     othr = None
+     for secidx, r in elf.getRelocs():
+         rtype = r.getType()
+@@ -827,7 +855,12 @@ def applyRelocs(elf, vw, addbase=False, baseoff=0):
+             # If it has a name, it's an externally resolved "import" entry,
+             # otherwise, just a regular reloc
+             name = r.getName()
+-            dmglname = demangle(name)
++            symidx = r.getSymTabIndex()
++            dmglname = symbolName(elf, symidx, name)
++            vername, verdefault = elf.getSymbolVersion(symidx)
++            if name and vername is not None and elf.getDynSymbol(symidx).st_shndx == vdc_elf.SHN_UNDEF:
++                ndx = elf.getVersionSymbols()[symidx] & vdc_elf.VERSYM_VERSION
++                addImportVersion(vw, rlva, name, vername, needfiles.get(ndx, ''))
+             logger.debug('relocs: 0x%x: %s (%s)', rlva, dmglname, name)
+             if arch in ('i386', 'amd64'):
+                 if name:
+@@ -1200,6 +1233,43 @@ def isPLT(vw, va):
+         return True
+     return False
+ 
++def symbolName(elf, symidx, name):
++    '''
++    Workspace name for a dynamic symbol: the default version keeps the plain name,
++    a non-default definition keeps its @version so it cannot collide with the default.
++    '''
++    dmglname = demangle(name)
++    vername, isdefault = elf.getSymbolVersion(symidx)
++    if vername is None or isdefault:
++        return dmglname
++    if elf.getDynSymbol(symidx).st_shndx == vdc_elf.SHN_UNDEF:
++        return dmglname
++    return '%s@%s' % (dmglname, vername)
++
++
++def addImportVersion(vw, va, name, version, library):
++    if 'ImportVersions' not in vw.getVaSetNames():
++        vw.addVaSet('ImportVersions', (('va', v_const.VASET_ADDRESS),
++                                       ('symbol', v_const.VASET_STRING),
++                                       ('version', v_const.VASET_STRING),
++                                       ('library', v_const.VASET_STRING)))
++    vw.setVaSetRow('ImportVersions', (va, name, version, library))
++
++
++def getSoname(elf):
++    for dyn in elf.getDynamics():
++        if dyn.d_tag == Elf.DT_SONAME:
++            return dyn.getName()
++    return ''
++
++
++def getNeedFiles(elf):
++    '''
++    Map each needed version index to the library the version is needed from.
++    '''
++    return {aux.other: need.file for need in elf.getVersionNeeds() for aux in need.auxs}
++
++
+ def normName(name):
+     '''
+     Normalize symbol names.  ie. drop the @@GOBBLEDEGOOK from the end
+diff --git a/vstruct/defs/constants/elf.py b/vstruct/defs/constants/elf.py
+index 71384240..e352512c 100644
+--- a/vstruct/defs/constants/elf.py
++++ b/vstruct/defs/constants/elf.py
+@@ -789,6 +789,14 @@ DT_VERDEF           = 0x6ffffffc
+ DT_VERDEFNUM        = 0x6ffffffd
+ DT_VERNEED          = 0x6ffffffe
+ DT_VERNEEDNUM       = 0x6fffffff
++
++VER_NDX_LOCAL       = 0
++VER_NDX_GLOBAL      = 1
++VERSYM_VERSION      = 0x7fff
++VERSYM_HIDDEN       = 0x8000
++
++VER_FLG_BASE        = 0x1
++VER_FLG_WEAK        = 0x2
+ DT_AUXILIARY        = 0x7ffffffd
+ DT_FILTER           = 0x7fffffff
+ DT_LOOS             = 0x6000000d
+diff --git a/vstruct/defs/elf.py b/vstruct/defs/elf.py
+index 061a0af3..69f8408e 100644
+--- a/vstruct/defs/elf.py
++++ b/vstruct/defs/elf.py
+@@ -380,3 +380,42 @@ class ElfNote(vstruct.VStruct):
+         descct = ((self.descsz +3) >> 2)
+         elems = [ v_uint32() for i in range(descct) ]
+         self.desc = vstruct.VArray(elems=elems)
++
++
++class ElfVerdef(vstruct.VStruct):
++    def __init__(self, bigend=False):
++        vstruct.VStruct.__init__(self)
++        self.vd_version = v_uint16(bigend=bigend)
++        self.vd_flags   = v_uint16(bigend=bigend)
++        self.vd_ndx     = v_uint16(bigend=bigend)
++        self.vd_cnt     = v_uint16(bigend=bigend)
++        self.vd_hash    = v_uint32(bigend=bigend)
++        self.vd_aux     = v_uint32(bigend=bigend)
++        self.vd_next    = v_uint32(bigend=bigend)
++
++
++class ElfVerdaux(vstruct.VStruct):
++    def __init__(self, bigend=False):
++        vstruct.VStruct.__init__(self)
++        self.vda_name = v_uint32(bigend=bigend)
++        self.vda_next = v_uint32(bigend=bigend)
++
++
++class ElfVerneed(vstruct.VStruct):
++    def __init__(self, bigend=False):
++        vstruct.VStruct.__init__(self)
++        self.vn_version = v_uint16(bigend=bigend)
++        self.vn_cnt     = v_uint16(bigend=bigend)
++        self.vn_file    = v_uint32(bigend=bigend)
++        self.vn_aux     = v_uint32(bigend=bigend)
++        self.vn_next    = v_uint32(bigend=bigend)
++
++
++class ElfVernaux(vstruct.VStruct):
++    def __init__(self, bigend=False):
++        vstruct.VStruct.__init__(self)
++        self.vna_hash  = v_uint32(bigend=bigend)
++        self.vna_flags = v_uint16(bigend=bigend)
++        self.vna_other = v_uint16(bigend=bigend)
++        self.vna_name  = v_uint32(bigend=bigend)
++        self.vna_next  = v_uint32(bigend=bigend)

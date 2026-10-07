@@ -1,0 +1,1790 @@
+diff --git a/rdflib/graph.py b/rdflib/graph.py
+index bd4a9fb0..38e7a2ff 100644
+--- a/rdflib/graph.py
++++ b/rdflib/graph.py
+@@ -1747,10 +1747,11 @@ class Graph(Node):
+         processor: Union[str, rdflib.query.UpdateProcessor] = "sparql",
+         initNs: Optional[Mapping[str, Any]] = None,  # noqa: N803
+         initBindings: Optional[Mapping[str, Identifier]] = None,  # noqa: N803
+         use_store_provided: bool = True,
++        provenance: bool = False,
+         **kwargs: Any,
+-    ) -> None:
++    ) -> Optional[Mapping[str, Any]]:
+         """Update this graph with the given update query.
+ 
+         Args:
+             update_object: The update query string or object to execute.
+@@ -1758,10 +1759,18 @@ class Graph(Node):
+             initNs: Initial namespaces to use for resolving prefixes in the query.
+                 If none are given, the namespaces from the graph's namespace manager are used.
+             initBindings: Initial variable bindings to use.
+             use_store_provided: Whether to use the store's update method if available.
++            provenance: Whether to return a report of what the update changed.
+             kwargs: Additional arguments to pass to the update processor.
+ 
++        Returns:
++            `None` unless `provenance` was asked for, in which case
++            a mapping with an `"added"` and a `"removed"` entry, each pairing a
++            changed quad with the frozen set of quads that justified the change.
++            A request that is asked for a report is evaluated here rather than
++            handed to a store that provides its own update.
++
+         !!! warning "Caution"
+             This method can access indirectly requested network endpoints, for
+             example, query processing will attempt to access network endpoints
+             specified in `SERVICE` directives.
+@@ -1781,11 +1790,16 @@ class Graph(Node):
+             query_graph = self.default_context.identifier
+         else:
+             query_graph = self.identifier
+ 
+-        if hasattr(self.store, "update") and use_store_provided:
++        # a store that carries out the update itself cannot say what changed, so
++        # a request that asks for a report is carried out here instead
++        reporting = provenance
++
++        if hasattr(self.store, "update") and use_store_provided and not reporting:
+             try:
+-                return self.store.update(
++                # type error: "update" of "Store" does not return a value (it only ever returns None)
++                return self.store.update(  # type: ignore[func-returns-value]
+                     update_object,
+                     initNs,
+                     initBindings,
+                     query_graph,
+@@ -1793,12 +1807,27 @@ class Graph(Node):
+                 )
+             except NotImplementedError:
+                 pass  # store has no own implementation
+ 
+-        if not isinstance(processor, query.UpdateProcessor):
++        if reporting:
++            # the report is this engine's work, so a processor the caller
++            # supplied is not handed a request that asks for one
++            processor = plugin.get("sparql", query.UpdateProcessor)(self)
++        elif not isinstance(processor, query.UpdateProcessor):
+             processor = plugin.get(processor, query.UpdateProcessor)(self)
+ 
+-        return processor.update(update_object, initBindings, initNs, **kwargs)
++        if not reporting:
++            # a processor written before reports existed takes the arguments it
++            # always took
++            return processor.update(update_object, initBindings, initNs, **kwargs)
++
++        return processor.update(
++            update_object,
++            initBindings,
++            initNs,
++            provenance=provenance,
++            **kwargs,
++        )
+ 
+     def n3(self, namespace_manager: Optional[NamespaceManager] = None) -> str:
+         """Return an n3 identifier for the Graph"""
+         return "[%s]" % self.identifier.n3(namespace_manager=namespace_manager)
+diff --git a/rdflib/plugins/sparql/evaluate.py b/rdflib/plugins/sparql/evaluate.py
+index 1bdfb335..1de9f891 100644
+--- a/rdflib/plugins/sparql/evaluate.py
++++ b/rdflib/plugins/sparql/evaluate.py
+@@ -16,28 +16,42 @@ also return a dict of list of dicts
+ from __future__ import annotations
+ 
+ import collections
+ import itertools
++import json
+ import re
+ from typing import (
+     TYPE_CHECKING,
+     Any,
+     Deque,
+     Dict,
++    FrozenSet,
+     Generator,
+     Iterable,
+     List,
+     Mapping,
+     Optional,
++    Set,
+     Tuple,
++    TypeVar,
+     Union,
+ )
+ from urllib.parse import urlencode
+ from urllib.request import Request, urlopen
+ 
+ from pyparsing import ParseException
+ 
+-from rdflib.graph import Graph
++from rdflib.graph import DATASET_DEFAULT_GRAPH_ID, ConjunctiveGraph, Graph
++from rdflib.paths import (
++    AlternativePath,
++    InvPath,
++    MulPath,
++    NegatedPath,
++    Path,
++    SequencePath,
++    ZeroOrOne,
++    eval_path,
++)
+ from rdflib.plugins.sparql import CUSTOM_EVALS, parser
+ from rdflib.plugins.sparql.aggregates import Aggregator
+ from rdflib.plugins.sparql.evalutils import (
+     _ebv,
+@@ -54,36 +68,214 @@ from rdflib.plugins.sparql.sparql import (
+     FrozenDict,
+     Query,
+     QueryContext,
+     SPARQLError,
++    _Pending,
+ )
+ from rdflib.term import BNode, Identifier, Literal, URIRef, Variable
+ 
+-if TYPE_CHECKING:
+-    from rdflib.paths import Path
+-
+-import json
+-
+ try:
+     import orjson
+ 
+     _HAS_ORJSON = True
+ except ImportError:
+     orjson = None  # type: ignore[assignment, unused-ignore]
+     _HAS_ORJSON = False
+ 
++_FrozenT = TypeVar("_FrozenT", bound=FrozenDict)
++
+ _Triple = Tuple[Identifier, Identifier, Identifier]
++_Quad = Tuple[Identifier, Identifier, Identifier, Identifier]
++
++
++def _graph_name(context: Any) -> Identifier:
++    """The identifier a graph is known by inside a dataset."""
++    if context is None:
++        return DATASET_DEFAULT_GRAPH_ID
++    return getattr(context, "identifier", context)
++
++
++def _quads_of(ctx: QueryContext, triple: Any) -> Set[_Quad]:
++    """The quads of the graphs in scope that hold `triple`.
++
++    A triple pattern is matched against a single graph or against the union of
++    the graphs of a dataset; either way the solution names the graph the data
++    was read from, so the graphs holding the triple have to be recovered here.
++    """
++    graph = ctx.graph
++    if isinstance(graph, ConjunctiveGraph):
++        if not graph.default_union:
++            # a dataset that does not read its graphs as one answers an
++            # unqualified pattern from its default graph, so no other graph
++            # can have taken part in the match
++            home = graph.default_context
++            return {(s, p, o, _graph_name(home)) for s, p, o in home.triples(triple)}
++        return set(
++            (s, p, o, _graph_name(c))  # type: ignore[misc]
++            for s, p, o, c in graph.quads(triple)
++        )
++    # type error: Item "None" of "Optional[Graph]" has no attribute "identifier"
++    name = graph.identifier  # type: ignore[union-attr]
++    origins = ctx.origins.get((name, tuple(triple)))
++    if origins:
++        return {(triple[0], triple[1], triple[2], origin) for origin in origins}
++    return {(triple[0], triple[1], triple[2], name)}
++
++
++def _reaches(ctx: QueryContext, subj: Any, path: Any, obj: Any) -> bool:
++    """Whether `path` connects subj to obj."""
++    for _ in eval_path(ctx.graph, (subj, path, obj)):  # type: ignore[arg-type]
++        return True
++    return False
++
++
++def _step_targets(ctx: QueryContext, subj: Any, path: Any) -> Set[Any]:
++    return {o for _, o in eval_path(ctx.graph, (subj, path, None))}  # type: ignore[arg-type]
++
++
++def _step_sources(ctx: QueryContext, path: Any, obj: Any) -> Set[Any]:
++    return {s for s, _ in eval_path(ctx.graph, (None, path, obj))}  # type: ignore[arg-type]
++
++
++def _closure(ctx: QueryContext, start: Any, path: Any, forward: bool) -> Set[Any]:
++    """The nodes joined to `start` by any number of `path` steps."""
++    seen = {start}
++    pending = [start]
++    while pending:
++        node = pending.pop()
++        if forward:
++            neighbours = _step_targets(ctx, node, path)
++        else:
++            neighbours = _step_sources(ctx, path, node)
++        for neighbour in neighbours:
++            if neighbour not in seen:
++                seen.add(neighbour)
++                pending.append(neighbour)
++    return seen
++
++
++def _sequence_quads(
++    ctx: QueryContext, subj: Any, steps: List[Any], obj: Any
++) -> Set[_Quad]:
++    head = steps[0]
++    if len(steps) == 1:
++        return _path_quads(ctx, subj, head, obj)
++
++    tail = steps[1] if len(steps) == 2 else SequencePath(*steps[1:])
++    found: Set[_Quad] = set()
++    for mid in _step_targets(ctx, subj, head):
++        if _reaches(ctx, mid, tail, obj):
++            found |= _path_quads(ctx, subj, head, mid)
++            found |= _path_quads(ctx, mid, tail, obj)
++    return found
++
++
++def _negated_quads(
++    ctx: QueryContext, subj: Any, path: NegatedPath, obj: Any
++) -> Set[_Quad]:
++    found: Set[_Quad] = set()
++    # type error: Item "None" of "Optional[Graph]" has no attribute "triples"
++    for s, pred, o in ctx.graph.triples((subj, None, obj)):  # type: ignore[union-attr]
++        excluded = False
++        for arg in path.args:
++            if isinstance(arg, URIRef):
++                excluded = pred == arg
++            elif isinstance(arg, InvPath):
++                # type error: Unsupported right operand type for in ("Optional[Graph]")
++                excluded = (o, arg.arg, s) in ctx.graph  # type: ignore[operator]
++            if excluded:
++                break
++        if not excluded:
++            found |= _quads_of(ctx, (s, pred, o))
++    return found
++
++
++def _repeated_quads(
++    ctx: QueryContext, subj: Any, path: MulPath, obj: Any
++) -> Set[_Quad]:
++    inner = path.path
++    if path.mod == ZeroOrOne:
++        # the route of length zero reads nothing, so only a real step counts
++        if _reaches(ctx, subj, inner, obj):
++            return _path_quads(ctx, subj, inner, obj)
++        return set()
++
++    # every step that takes part in a route of at least one step; where the only
++    # route is the empty one, nothing is reachable back and this comes out empty
++    reachable = _closure(ctx, subj, inner, True)
++    reaching = _closure(ctx, obj, inner, False)
++    found: Set[_Quad] = set()
++    for node in reachable:
++        for target in _step_targets(ctx, node, inner):
++            if target in reaching:
++                found |= _path_quads(ctx, node, inner, target)
++    return found
++
++
++def _path_quads(ctx: QueryContext, subj: Any, path: Any, obj: Any) -> Set[_Quad]:
++    """Every quad lying on a route that matches `path` from subj to obj."""
++    if isinstance(path, InvPath):
++        return _path_quads(ctx, obj, path.arg, subj)
++    if isinstance(path, SequencePath):
++        return _sequence_quads(ctx, subj, path.args, obj)
++    if isinstance(path, AlternativePath):
++        found: Set[_Quad] = set()
++        for alternative in path.args:
++            if _reaches(ctx, subj, alternative, obj):
++                found |= _path_quads(ctx, subj, alternative, obj)
++        return found
++    if isinstance(path, NegatedPath):
++        return _negated_quads(ctx, subj, path, obj)
++    if isinstance(path, MulPath):
++        return _repeated_quads(ctx, subj, path, obj)
++    return _quads_of(ctx, (subj, path, obj))
++
++
++def _collapse(
++    rows: Iterable[_FrozenT],
++) -> List[_FrozenT]:
++    """Fold equal solutions into one, keeping the union of their provenance."""
++    seen: Dict[_FrozenT, Any] = {}
++    for row in rows:
++        kept = seen.get(row)
++        if kept is None:
++            seen[row] = [row, set(row.prov)]
++        else:
++            kept[1] |= row.prov
++    return [row.with_prov(prov) for row, prov in seen.values()]
++
++
++def _collapse_lazily(
++    rows: Iterable[_FrozenT],
++) -> Generator[_FrozenT, None, None]:
++    """Fold equal solutions into one without holding any of them back.
++
++    The first of a set of equal solutions is handed on straight away, carrying a
++    set the ones that follow keep adding to, so a request reads no further into
++    its input than it would without a report.
++    """
++    seen: Dict[_FrozenT, _Pending] = {}
++    for row in rows:
++        pending = seen.get(row)
++        if pending is None:
++            pending = _Pending(row.prov)
++            seen[row] = pending
++            yield row.with_prov((pending,))
++        else:
++            pending.quads.update(row.prov)
+ 
+ 
+ def evalBGP(
+-    ctx: QueryContext, bgp: List[_Triple]
++    ctx: QueryContext,
++    bgp: List[_Triple],
++    prov: FrozenSet[_Quad] = frozenset(),
+ ) -> Generator[FrozenBindings, None, None]:
+     """
+     A basic graph pattern
+     """
+ 
+     if not bgp:
+-        yield ctx.solution()
++        yield ctx.solution().with_prov(prov)
+         return
+ 
+     s, p, o = bgp[0]
+ 
+@@ -116,9 +308,17 @@ def evalBGP(
+                 c[o] = so  # type: ignore[assignment]
+         except AlreadyBound:
+             continue
+ 
+-        for x in evalBGP(c, bgp[1:]):
++        if ctx.provenance:
++            if isinstance(sp, Path):
++                found = prov | _path_quads(c, ss, sp, so)
++            else:
++                found = prov | _quads_of(c, (ss, sp, so))
++        else:
++            found = prov
++
++        for x in evalBGP(c, bgp[1:], found):
+             yield x
+ 
+ 
+ def evalExtend(
+@@ -126,17 +326,21 @@ def evalExtend(
+ ) -> Generator[FrozenBindings, None, None]:
+     # TODO: Deal with dict returned from evalPart from GROUP BY
+ 
+     for c in evalPart(ctx, extend.p):
++        held = len(ctx.witness)
+         try:
+             e = _eval(extend.expr, c.forget(ctx, _except=extend._vars))
+             if isinstance(e, SPARQLError):
+                 raise e
+ 
++            if ctx.provenance and len(ctx.witness) > held:
++                c = c.add_prov(ctx.witness[held:])
+             yield c.merge({extend.var: e})
+ 
+         except SPARQLError:
+             yield c
++        del ctx.witness[held:]
+ 
+ 
+ def evalLazyJoin(
+     ctx: QueryContext, join: CompValue
+@@ -160,9 +364,15 @@ def evalJoin(ctx: QueryContext, join: CompValue) -> Generator[FrozenDict, None,
+     if join.lazy:
+         return evalLazyJoin(ctx, join)
+     else:
+         a = evalPart(ctx, join.p1)
+-        b = set(evalPart(ctx, join.p2))
++        if ctx.provenance:
++            # equal solutions still fold into one, and the set they are put
++            # back into hands them on in the order an untracked run reads them,
++            # since what a solution stands for is no part of how it compares
++            b: Iterable[FrozenDict] = set(_collapse(evalPart(ctx, join.p2)))
++        else:
++            b = set(evalPart(ctx, join.p2))
+         return _join(a, b)
+ 
+ 
+ def evalUnion(ctx: QueryContext, union: CompValue) -> List[Any]:
+@@ -187,35 +397,49 @@ def evalLeftJoin(
+     for a in evalPart(ctx, join.p1):
+         ok = False
+         c = ctx.thaw(a)
+         for b in evalPart(c, join.p2):
++            held = len(ctx.witness)
+             if _ebv(join.expr, b.forget(ctx)):
+                 ok = True
++                if ctx.provenance and len(ctx.witness) > held:
++                    b = b.add_prov(ctx.witness[held:])
+                 yield b.merge(a)
++            del ctx.witness[held:]
+         if not ok:
+             # we've cheated, the ctx above may contain
+             # vars bound outside our scope
+             # before we yield a solution without the OPTIONAL part
+             # check that we would have had no OPTIONAL matches
+             # even without prior bindings...
+             p1_vars = join.p1._vars
+-            if p1_vars is None or not any(
++            held = len(ctx.witness)
++            # this second pass only asks whether the optional side could have
++            # matched at all, so what its condition reads is no part of why any
++            # solution was produced
++            unmatched = p1_vars is None or not any(
+                 _ebv(join.expr, b)
+                 for b in evalPart(ctx.thaw(a.remember(p1_vars)), join.p2)
+-            ):
++            )
++            del ctx.witness[held:]
++            if unmatched:
+                 yield a
+ 
+ 
+ def evalFilter(
+     ctx: QueryContext, part: CompValue
+ ) -> Generator[FrozenBindings, None, None]:
+     # TODO: Deal with dict returned from evalPart!
+     for c in evalPart(ctx, part.p):
++        held = len(ctx.witness)
+         if _ebv(
+             part.expr,
+             c.forget(ctx, _except=part._vars) if not part.no_isolated_scope else c,
+         ):
++            if ctx.provenance and len(ctx.witness) > held:
++                c = c.add_prov(ctx.witness[held:])
+             yield c
++        del ctx.witness[held:]
+ 
+ 
+ def evalGraph(
+     ctx: QueryContext, part: CompValue
+@@ -469,24 +693,33 @@ def evalAggregateJoin(
+     group_expr = agg.p.expr
+     res: Dict[Any, Any] = collections.defaultdict(
+         lambda: Aggregator(aggregations=agg.A)
+     )
++    prov: Dict[Any, Set[_Quad]] = collections.defaultdict(set)
+ 
+     if group_expr is None:
+         # no grouping, just COUNT in SELECT clause
+         # get 1 aggregator for counting
+         aggregator = res[True]
+         for row in p:
++            held = len(ctx.witness)
+             aggregator.update(row)
++            # an aggregate may read a condition of its own, and what made that
++            # condition hold is part of why the row it produces was produced
++            prov[True] |= row.prov | set(ctx.witness[held:])
++            del ctx.witness[held:]
+     else:
+         for row in p:
++            held = len(ctx.witness)
+             # determine right group aggregator for row
+             k = tuple(_eval(e, row, False) for e in group_expr)
+             res[k].update(row)
++            prov[k] |= row.prov | set(ctx.witness[held:])
++            del ctx.witness[held:]
+ 
+     # all rows are done; yield aggregated values
+-    for aggregator in res.values():
+-        yield FrozenBindings(ctx, aggregator.get_bindings())
++    for key, aggregator in res.items():
++        yield FrozenBindings(ctx, aggregator.get_bindings(), prov=prov[key])
+ 
+     # there were no matches
+     if len(res) == 0:
+         yield FrozenBindings(ctx)
+@@ -496,8 +729,33 @@ def evalOrderBy(
+     ctx: QueryContext, part: CompValue
+ ) -> Generator[FrozenBindings, None, None]:
+     res = evalPart(ctx, part.p)
+ 
++    if ctx.provenance:
++        # an ordering expression can hold a condition, and what made it hold is
++        # part of why the row it ranked survives a limit; the key is read once
++        # per row per pass, as it is without a report, so a request ordered by a
++        # fresh value still chooses what it would have chosen untracked
++        matched: Dict[int, Set[_Quad]] = {}
++
++        def ordering(row: Any, e: Any) -> Any:
++            held = len(ctx.witness)
++            key = _val(value(row, e.expr, variables=True))
++            if len(ctx.witness) > held:
++                matched.setdefault(id(row), set()).update(ctx.witness[held:])
++            del ctx.witness[held:]
++            return key
++
++        rows = list(res)
++        for e in reversed(part.expr):
++            reverse = bool(e.order and e.order == "DESC")
++            rows = sorted(rows, key=lambda x: ordering(x, e), reverse=reverse)
++        res = [
++            row.add_prov(matched[id(row)]) if id(row) in matched else row
++            for row in rows
++        ]
++        return res
++
+     for e in reversed(part.expr):
+         reverse = bool(e.order and e.order == "DESC")
+         res = sorted(
+             res, key=lambda x: _val(value(x, e.expr, variables=True)), reverse=reverse
+@@ -539,20 +797,31 @@ def evalReduced(
+ 
+     # mixed data structure: set for lookup, deque for append/pop/remove
+     mru_set = set()
+     mru_queue: Deque[Any] = collections.deque()
++    # a row that comes back later still adds to what the kept one stands for,
++    # and it adds to it in place, so the kept row goes out when it is produced
++    pending: Dict[Any, _Pending] = {}
+ 
+     for row in evalPart(ctx, part.p):
+         if row in mru_set:
++            if ctx.provenance:
++                pending[row].quads.update(row.prov)
+             # forget last position of row
+             mru_queue.remove(row)
+         else:
+             # row seems to be new
+-            yield row
++            if ctx.provenance:
++                held = _Pending(row.prov)
++                pending[row] = held
++                yield row.with_prov((held,))
++            else:
++                yield row
+             mru_set.add(row)
+             if len(mru_set) > MAX:
+                 # drop the least recently used row from buffer
+-                mru_set.remove(mru_queue.pop())
++                dropped = mru_queue.pop()
++                mru_set.remove(dropped)
+         # put row to the front
+         mru_queue.appendleft(row)
+ 
+ 
+@@ -560,8 +829,13 @@ def evalDistinct(
+     ctx: QueryContext, part: CompValue
+ ) -> Generator[FrozenBindings, None, None]:
+     res = evalPart(ctx, part.p)
+ 
++    if ctx.provenance:
++        for row in _collapse_lazily(res):
++            yield row
++        return
++
+     done = set()
+     for x in res:
+         if x not in done:
+             yield x
+diff --git a/rdflib/plugins/sparql/operators.py b/rdflib/plugins/sparql/operators.py
+index 14ac4a34..3f93e8a2 100644
+--- a/rdflib/plugins/sparql/operators.py
++++ b/rdflib/plugins/sparql/operators.py
+@@ -16,9 +16,20 @@ import re
+ import uuid
+ import warnings
+ from decimal import ROUND_HALF_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
+ from functools import reduce
+-from typing import Any, Callable, Dict, NoReturn, Optional, Tuple, Union, overload
++from typing import (
++    Any,
++    Callable,
++    Dict,
++    List,
++    NoReturn,
++    Optional,
++    Tuple,
++    Union,
++    cast,
++    overload,
++)
+ from urllib.parse import quote
+ 
+ from pyparsing import ParseResults
+ 
+@@ -582,14 +593,41 @@ def Builtin_EXISTS(e: Expr, ctx: FrozenBindings) -> Literal:
+     from rdflib.plugins.sparql.evaluate import evalPart
+ 
+     exists = e.name == "Builtin_EXISTS"
+ 
++    outer = ctx.ctx
+     # type error: Incompatible types in assignment (expression has type "QueryContext", variable has type "FrozenBindings")
+     ctx = ctx.ctx.thaw(ctx)  # type: ignore[assignment] # hmm
+-    # type error: Argument 1 to "evalPart" has incompatible type "FrozenBindings"; expected "QueryContext"
+-    for x in evalPart(ctx, e.graph):  # type: ignore[arg-type]
+-        return Literal(exists)
+-    return Literal(not exists)
++
++    if exists and outer.provenance:
++        # the quads of the first match are what makes the condition hold, and
++        # the search stops there the way it stops without a report, so a later
++        # match is never read
++        mark = len(outer.witness)
++        # type error: Argument 1 to "evalPart" has incompatible type "FrozenBindings"; expected "QueryContext"
++        for x in evalPart(ctx, e.graph):  # type: ignore[arg-type]
++            # a condition inside the pattern has already put what it read on
++            # the solution, and its own tidying never runs once the search
++            # stops here, so the list is set from the solution alone
++            found: List[Any] = list(x.prov)
++            del outer.witness[mark:]
++            outer.witness.extend(found)
++            return Literal(True)
++        del outer.witness[mark:]
++        return Literal(False)
++
++    # the answer here rests on absence, which justifies nothing, and the search
++    # can stop at the first solution without the reader of that solution ever
++    # tidying up, so whatever it read on the way goes back
++    mark = len(outer.witness)
++    try:
++        # type error: Argument 1 to "evalPart" has incompatible type "FrozenBindings"; expected "QueryContext"
++        for x in evalPart(ctx, e.graph):  # type: ignore[arg-type]
++            return Literal(exists)
++        return Literal(not exists)
++    finally:
++        if outer.provenance:
++            del outer.witness[mark:]
+ 
+ 
+ _CustomFunction = Callable[[Expr, FrozenBindings], Node]
+ 
+@@ -731,9 +769,15 @@ def default_cast(e: Expr, ctx: FrozenBindings) -> Literal:  # type: ignore[retur
+         raise SPARQLError("Cannot interpret '%r' as bool" % x)
+ 
+ 
+ def UnaryNot(expr: Expr, ctx: FrozenBindings) -> Literal:
+-    return Literal(not EBV(expr.expr))
++    outer = ctx.ctx
++    held = len(outer.witness)
++    value = EBV(expr.expr)
++    # the answer here is that the condition did not hold, and absence is
++    # justified by nothing, so whatever it matched on the way is dropped
++    del outer.witness[held:]
++    return Literal(not value)
+ 
+ 
+ def UnaryMinus(expr: Expr, ctx: FrozenBindings) -> Literal:
+     return Literal(-numeric(expr.expr))
+@@ -845,9 +889,20 @@ def AdditiveExpression(e: Expr, ctx: Union[QueryContext, FrozenBindings]) -> Lit
+ 
+         return Literal(res, datatype=dt)
+ 
+ 
++def _answer(reasons: Optional[List[Any]], start: int, held: bool) -> Literal:
++    """The answer to a comparison, keeping what it read only when it holds."""
++    if reasons is not None and not held:
++        # the comparison had to fail, so nothing read while making it explains
++        # the solution that carries its answer
++        del reasons[start:]
++    return Literal(held)
++
++
+ def RelationalExpression(e: Expr, ctx: Union[QueryContext, FrozenBindings]) -> Literal:
++    reasons = _reasons(ctx)
++    start = len(reasons) if reasons is not None else 0
+     expr = e.expr
+     other = e.other
+     op = e.op
+ 
+@@ -879,13 +934,13 @@ def RelationalExpression(e: Expr, ctx: Union[QueryContext, FrozenBindings]) -> L
+ 
+         for x in other:
+             try:
+                 if x == expr:
+-                    return Literal(True ^ res)
++                    return _answer(reasons, start, True ^ res)
+             except SPARQLError as e:
+                 error = e
+         if not error:
+-            return Literal(False ^ res)
++            return _answer(reasons, start, False ^ res)
+         else:
+             # Note on type error: this is because variable is Union[bool, SPARQLError]
+             # type error: Exception must be derived from BaseException
+             raise error  # type: ignore[misc]
+@@ -921,33 +976,58 @@ def RelationalExpression(e: Expr, ctx: Union[QueryContext, FrozenBindings]) -> L
+         if r == NotImplemented:
+             raise SPARQLError("Error when comparing")
+     except TypeError as te:
+         raise SPARQLError(*te.args)
++    if reasons is not None and not r:
++        # the comparison had to fail, so nothing read while making it explains
++        # the solution that carries its answer
++        del reasons[start:]
+     return Literal(r)
+ 
+ 
++def _reasons(ctx: Any) -> Optional[List[Any]]:
++    """The witness list a boolean expression may add to, when one is being kept."""
++    outer = getattr(ctx, "ctx", ctx)
++    if getattr(outer, "provenance", False):
++        return cast("List[Any]", outer.witness)
++    return None
++
++
+ def ConditionalAndExpression(
+     e: Expr, ctx: Union[QueryContext, FrozenBindings]
+ ) -> Literal:
+     # TODO: handle returned errors
+ 
++    reasons = _reasons(ctx)
++    start = len(reasons) if reasons is not None else 0
+     expr = e.expr
+     other = e.other
+ 
+     # because of the way the add-expr production handled operator precedence
+     # we sometimes have nothing to do
+     if other is None:
+         return expr
+ 
+-    return Literal(all(EBV(x) for x in [expr] + other))
++    held = all(EBV(x) for x in [expr] + other)
++    if reasons is not None and not held:
++        # the conjunction had to fail, so nothing read while testing it explains
++        # the solution that carries its answer
++        del reasons[start:]
++    return Literal(held)
+ 
+ 
+ def ConditionalOrExpression(
+     e: Expr, ctx: Union[QueryContext, FrozenBindings]
+ ) -> Literal:
+     # TODO: handle errors
+ 
++    reasons = _reasons(ctx)
++    # reading `e.expr` is what evaluates the first operand, and reading
++    # `e.other` evaluates the rest, so the length taken between the two reads
++    # is the boundary between what each side matched
++    start = len(reasons) if reasons is not None else 0
+     expr = e.expr
++    middle = len(reasons) if reasons is not None else 0
+     other = e.other
+ 
+     # because of the way the add-expr production handled operator precedence
+     # we sometimes have nothing to do
+@@ -956,16 +1036,34 @@ def ConditionalOrExpression(
+     # A logical-or that encounters an error on only one branch
+     # will return TRUE if the other branch is TRUE and an error
+     # if the other branch is FALSE.
+     error = None
+-    for x in [expr] + other:
++    first = False
++    rest = False
++    for position, x in enumerate([expr] + other):
+         try:
+             if EBV(x):
+-                return Literal(True)
++                if position == 0:
++                    first = True
++                else:
++                    rest = True
++                if reasons is None:
++                    return Literal(True)
++                break
+         except SPARQLError as e:
+             error = e
++    if first or rest:
++        if reasons is not None:
++            # only the side that held explains the answer
++            if not rest:
++                del reasons[middle:]
++            if not first:
++                del reasons[start:middle]
++        return Literal(True)
+     if error:
+         raise error
++    if reasons is not None:
++        del reasons[start:]
+     return Literal(False)
+ 
+ 
+ def not_(arg) -> Expr:
+diff --git a/rdflib/plugins/sparql/processor.py b/rdflib/plugins/sparql/processor.py
+index 976598ca..40f12721 100644
+--- a/rdflib/plugins/sparql/processor.py
++++ b/rdflib/plugins/sparql/processor.py
+@@ -82,9 +82,10 @@ class SPARQLUpdateProcessor(UpdateProcessor):
+         self,
+         strOrQuery: Union[str, Update],
+         initBindings: Optional[Mapping[str, Identifier]] = None,
+         initNs: Optional[Mapping[str, Any]] = None,
+-    ) -> None:
++        provenance: bool = False,
++    ) -> Optional[Mapping[str, Any]]:
+         """
+         !!! warning "Caution"
+ 
+             This method can access indirectly requested network endpoints, for
+@@ -101,9 +102,9 @@ class SPARQLUpdateProcessor(UpdateProcessor):
+ 
+         if isinstance(strOrQuery, str):
+             strOrQuery = translateUpdate(parseUpdate(strOrQuery), initNs=initNs)
+ 
+-        return evalUpdate(self.graph, strOrQuery, initBindings)
++        return evalUpdate(self.graph, strOrQuery, initBindings, provenance)
+ 
+ 
+ class SPARQLProcessor(Processor):
+     def __init__(self, graph):
+diff --git a/rdflib/plugins/sparql/sparql.py b/rdflib/plugins/sparql/sparql.py
+index 518d8fcd..bb32c25b 100644
+--- a/rdflib/plugins/sparql/sparql.py
++++ b/rdflib/plugins/sparql/sparql.py
+@@ -29,8 +29,11 @@ if TYPE_CHECKING:
+     from rdflib.paths import Path
+ 
+ 
+ _AnyT = TypeVar("_AnyT")
++_FrozenDictT = TypeVar("_FrozenDictT", bound="FrozenDict")
++
++_QuadType = Tuple[Identifier, Identifier, Identifier, Identifier]
+ 
+ 
+ class SPARQLError(Exception):
+     def __init__(self, msg: Optional[str] = None):
+@@ -110,19 +113,56 @@ class Bindings(MutableMapping):
+     def __repr__(self) -> str:
+         return str(self)
+ 
+ 
++_NO_PROV: t.FrozenSet[Any] = frozenset()
++
++
++class _Pending:
++    """Quads behind a solution that an equal solution coming later may add to.
++
++    A solution is handed on as soon as it is produced, so what a duplicate
++    arriving afterwards stands for reaches the report through this set rather
++    than by holding the first solution back until the input runs out.
++    """
++
++    __slots__ = ("quads",)
++
++    def __init__(self, quads: t.Iterable[Any] = ()):
++        self.quads: t.Set[Any] = set(quads)
++
++    def __hash__(self) -> int:
++        return id(self)
++
++    def __eq__(self, other: Any) -> bool:
++        return self is other
++
++
++_ReasonType = t.Union[_QuadType, _Pending]
++
++
++def _merged(prov: t.FrozenSet[Any], other: Any) -> t.FrozenSet[Any]:
++    """The provenance of two solutions joined, without building a set for none."""
++    theirs = getattr(other, "prov", _NO_PROV)
++    if not prov:
++        return t.cast("t.FrozenSet[Any]", theirs)
++    if not theirs:
++        return prov
++    return prov | theirs
++
++
+ class FrozenDict(Mapping):
+     """
+     An immutable hashable dict
+ 
+     Taken from http://stackoverflow.com/a/2704866/81121
+ 
+     """
+ 
+-    def __init__(self, *args: Any, **kwargs: Any):
++    def __init__(self, *args: Any, prov: t.Iterable[_ReasonType] = (), **kwargs: Any):
+         self._d: Dict[Identifier, Identifier] = dict(*args, **kwargs)
+         self._hash: Optional[int] = None
++        self.prov: t.FrozenSet[_ReasonType] = frozenset(prov) if prov else _NO_PROV
+ 
+     def __iter__(self):
+         return iter(self._d)
+ 
+@@ -145,9 +185,24 @@ class FrozenDict(Mapping):
+                 self._hash ^= hash(value)
+         return self._hash
+ 
+     def project(self, vars: Container[Variable]) -> FrozenDict:
+-        return FrozenDict(x for x in self.items() if x[0] in vars)
++        return FrozenDict((x for x in self.items() if x[0] in vars), prov=self.prov)
++
++    def _reprovenanced(
++        self: _FrozenDictT, prov: t.FrozenSet[_ReasonType]
++    ) -> _FrozenDictT:
++        """A solution equal to this one that carries `prov` instead."""
++        # type error: Incompatible return value type (got "FrozenDict", expected "_FrozenDictT")
++        return FrozenDict(self.items(), prov=prov)  # type: ignore[return-value]
++
++    def with_prov(self: _FrozenDictT, prov: t.Iterable[_ReasonType]) -> _FrozenDictT:
++        """A copy of this solution carrying `prov` as its provenance."""
++        return self._reprovenanced(frozenset(prov))
++
++    def add_prov(self: _FrozenDictT, prov: t.Iterable[_ReasonType]) -> _FrozenDictT:
++        """A copy of this solution with `prov` added to its provenance."""
++        return self._reprovenanced(self.prov | frozenset(prov))
+ 
+     def disjointDomain(self, other: t.Mapping[Identifier, Identifier]) -> bool:
+         return not bool(set(self).intersection(other))
+ 
+@@ -161,11 +216,12 @@ class FrozenDict(Mapping):
+ 
+         return True
+ 
+     def merge(self, other: t.Mapping[Identifier, Identifier]) -> FrozenDict:
+-        res = FrozenDict(itertools.chain(self.items(), other.items()))
+-
+-        return res
++        return FrozenDict(
++            itertools.chain(self.items(), other.items()),
++            prov=_merged(self.prov, other),
++        )
+ 
+     def __str__(self) -> str:
+         return str(self._d)
+ 
+@@ -177,8 +233,11 @@ class FrozenBindings(FrozenDict):
+     def __init__(self, ctx: QueryContext, *args, **kwargs):
+         FrozenDict.__init__(self, *args, **kwargs)
+         self.ctx = ctx
+ 
++    def _reprovenanced(self, prov: t.FrozenSet[_ReasonType]) -> FrozenBindings:
++        return FrozenBindings(self.ctx, self.items(), prov=prov)
++
+     def __getitem__(self, key: Union[Identifier, str]) -> Identifier:
+         if not isinstance(key, Node):
+             key = Variable(key)
+ 
+@@ -192,13 +251,18 @@ class FrozenBindings(FrozenDict):
+         else:
+             return self._d[key]
+ 
+     def project(self, vars: Container[Variable]) -> FrozenBindings:
+-        return FrozenBindings(self.ctx, (x for x in self.items() if x[0] in vars))
++        return FrozenBindings(
++            self.ctx, (x for x in self.items() if x[0] in vars), prov=self.prov
++        )
+ 
+     def merge(self, other: t.Mapping[Identifier, Identifier]) -> FrozenBindings:
+-        res = FrozenBindings(self.ctx, itertools.chain(self.items(), other.items()))
+-        return res
++        return FrozenBindings(
++            self.ctx,
++            itertools.chain(self.items(), other.items()),
++            prov=_merged(self.prov, other),
++        )
+ 
+     @property
+     def now(self) -> datetime.datetime:
+         return self.ctx.now
+@@ -233,15 +297,18 @@ class FrozenBindings(FrozenDict):
+                     or x[0] in self.ctx.initBindings  # type: ignore[operator]
+                     or before[x[0]] is None
+                 )
+             ),
++            prov=self.prov,
+         )
+ 
+     def remember(self, these) -> FrozenBindings:
+         """
+         return a frozen dict only of bindings in these
+         """
+-        return FrozenBindings(self.ctx, (x for x in self.items() if x[0] in these))
++        return FrozenBindings(
++            self.ctx, (x for x in self.items() if x[0] in these), prov=self.prov
++        )
+ 
+ 
+ class QueryContext:
+     """
+@@ -254,8 +321,17 @@ class QueryContext:
+         bindings: Optional[Union[Bindings, FrozenBindings, List[Any]]] = None,
+         initBindings: Optional[Mapping[str, Identifier]] = None,
+         datasetClause=None,
+     ):
++        # a dataset clause can read a document while this context is still
++        # being built, and that read answers to the report, so what it answers
++        # with is in place before any of it runs
++        self.provenance: bool = False
++        self.origins: Dict[Any, Any] = {}
++        self.witness: List[_QuadType] = []
++        self.report: Optional[Dict[_QuadType, Any]] = None
++        self.epoch: int = 0
++
+         self.initBindings = initBindings
+         self.bindings = Bindings(d=bindings or [])
+         if initBindings:
+             self.bindings.update(initBindings)
+@@ -313,8 +389,13 @@ class QueryContext:
+         )
+         r.prologue = self.prologue
+         r.graph = self.graph
+         r.bnodes = self.bnodes
++        r.provenance = self.provenance
++        r.origins = self.origins
++        r.witness = self.witness
++        r.report = self.report
++        r.epoch = self.epoch
+         return r
+ 
+     @property
+     def dataset(self) -> ConjunctiveGraph:
+@@ -331,8 +412,9 @@ class QueryContext:
+         self,
+         source: URIRef,
+         default: bool = False,
+         into: Optional[Identifier] = None,
++        working: bool = False,
+         **kwargs: Any,
+     ) -> None:
+         """
+         Load data from the source into the query context's.
+@@ -344,8 +426,11 @@ class QueryContext:
+                 graph with `source` URI as its name.
+             into: The name of the graph to load the data into. If
+                 `None`, the source URI will be used as as the name of the
+                 graph.
++            working: Whether the graph being loaded into belongs to the
++                request rather than to the store, in which case the
++                statements are credited to the document they came from.
+             **kwargs: Keyword arguments to pass to
+                 [`parse`][rdflib.graph.Graph.parse].
+         """
+ 
+@@ -372,13 +457,31 @@ class QueryContext:
+         if not rdflib.plugins.sparql.SPARQL_LOAD_GRAPHS:
+             # we are not loading - if we already know the graph
+             # being "loaded", just add it to the default-graph
+             if default:
++                known = self.dataset.get_context(source)
++                if self.provenance:
++                    # the statements keep the name of the graph they came from,
++                    # not the name of the working graph they are copied into
++                    for triple in known:
++                        name = self.graph.identifier  # type: ignore[union-attr]
++                        self.origins.setdefault((name, triple), set()).add(source)
+                 # Unsupported left operand type for + ("None")
+-                self.graph += self.dataset.get_context(source)  # type: ignore[operator]
++                self.graph += known  # type: ignore[operator]
+         else:
+             if default:
+-                _load(self.graph, source)
++                if working and self.provenance:
++                    # a working graph is built for this request alone, so the
++                    # statements keep the name of the document they came from,
++                    # and a statement two documents both carry keeps both names
++                    read = Graph()
++                    _load(read, source)
++                    name = self.graph.identifier  # type: ignore[union-attr]
++                    for triple in read:
++                        self.origins.setdefault((name, triple), set()).add(source)
++                    self.graph += read  # type: ignore[operator]
++                else:
++                    _load(self.graph, source)
+             else:
+                 if into is None:
+                     into = source
+                 _load(self.dataset.get_context(into), source)
+diff --git a/rdflib/plugins/sparql/update.py b/rdflib/plugins/sparql/update.py
+index 5ec1e283..b4ac932a 100644
+--- a/rdflib/plugins/sparql/update.py
++++ b/rdflib/plugins/sparql/update.py
+@@ -3,21 +3,359 @@ Code for carrying out Update Operations
+ """
+ 
+ from __future__ import annotations
+ 
+-from typing import TYPE_CHECKING, Iterator, Mapping, Optional, Sequence
+-
+-from rdflib.graph import Graph
++from dataclasses import dataclass
++from typing import (
++    TYPE_CHECKING,
++    Any,
++    Dict,
++    FrozenSet,
++    Iterator,
++    List,
++    Mapping,
++    Optional,
++    Sequence,
++    Set,
++)
++
++import rdflib.plugins.sparql
++from rdflib.graph import ConjunctiveGraph, Dataset, Graph
+ from rdflib.plugins.sparql.evaluate import evalBGP, evalPart
+ from rdflib.plugins.sparql.evalutils import _fillTemplate, _join
+ from rdflib.plugins.sparql.parserutils import CompValue
+-from rdflib.plugins.sparql.sparql import FrozenDict, QueryContext, Update
++from rdflib.plugins.sparql.sparql import (
++    FrozenDict,
++    QueryContext,
++    Update,
++    _Pending,
++)
+ from rdflib.term import Identifier, URIRef, Variable
+ 
+ 
++def _quad_key(graph: Graph, triple: Any) -> Any:
++    return (triple[0], triple[1], triple[2], graph.identifier)
++
++
++@dataclass
++class _Record:
++    """What the request has done to one quad, and why.
++
++    `initial` is the state before the request and `present` the state now, so
++    the difference between them is what the report says. `epoch` is the
++    operation that last moved the quad, because only that operation may add
++    reasons for the move.
++    """
++
++    initial: bool
++    present: bool
++    added_by: Set[Any]
++    removed_by: Set[Any]
++    graph: Graph
++    epoch: int
++
++
++def _home(target: Graph) -> Graph:
++    """The graph an addition to `target` really lands in.
++
++    A dataset stands in for its default graph while an update runs, and a quad
++    has to be credited to the graph that holds it rather than to the dataset.
++    A conjunctive graph is left alone here: it stands for the union it reads,
++    and which single graph a write of its own lands in depends on the write.
++    """
++    if isinstance(target, Dataset):
++        return target.default_context
++    return target
++
++
++def _own(target: Graph) -> Graph:
++    """The one graph a statement written into `target` lands in.
++
++    A conjunctive graph answers a membership question out of every graph it can
++    see, but a statement added to it lands under its own name alone, so what it
++    already holds there has to be asked of that one graph.
++    """
++    if isinstance(target, ConjunctiveGraph):
++        return target.get_context(target.identifier)
++    return target
++
++
++def _parsed(target: Graph) -> Graph:
++    """The one graph a document read into `target` lands in.
++
++    A conjunctive graph reads a document into its default graph rather than
++    under its own name, so a load answers to that graph.
++    """
++    if isinstance(target, ConjunctiveGraph):
++        return target.default_context
++    return target
++
++
++def _holder(target: ConjunctiveGraph, context: Any) -> Graph:
++    """The graph a quad of `target` belongs to, named by the store."""
++    if isinstance(context, Graph):
++        return context
++    return target.get_context(context)
++
++
++def _holders(target: Graph, triple: Any) -> List[Graph]:
++    """The graphs of `target` that hold `triple`."""
++    if not isinstance(target, ConjunctiveGraph):
++        return [target] if triple in target else []
++    return [_holder(target, context) for _, _, _, context in target.quads(triple)]
++
++
++def _watch(
++    ctx: QueryContext, graph: Graph, triple: Any, held: Optional[bool] = None
++) -> _Record:
++    """The record for one quad: where it started, where it is, and what moved it.
++
++    The state before the request is captured the first time the quad is touched,
++    so a quad written and taken away again by the same request can be told apart
++    from one the request really added.
++    """
++    key = _quad_key(graph, triple)
++    entry = ctx.report.get(key)  # type: ignore[union-attr]
++    if entry is None:
++        if held is None:
++            held = triple in graph
++        entry = _Record(held, held, set(), set(), graph, -1)
++        ctx.report[key] = entry  # type: ignore[index]
++    return entry
++
++
++def _add_triples(
++    ctx: QueryContext,
++    graph: Graph,
++    triples: Any,
++    prov: Any = (),
++) -> None:
++    """Add `triples` to `graph` and note what put them there."""
++    home = _home(graph)
++    if not ctx.provenance:
++        home += triples
++        return
++    written = _own(home)
++    for triple in triples:
++        entry = _watch(ctx, written, triple)
++        if not entry.present:
++            # writing the same way an untracked run writes, so the quad lands in
++            # the graph that run would have named
++            written += [triple]
++            _mark(entry, True, ctx.epoch)
++        if entry.epoch == ctx.epoch:
++            # a later operation that writes what the store already holds changes
++            # nothing, so it is no part of why the quad is there
++            entry.added_by.update(prov)
++
++
++def _held_here(ctx: QueryContext, target: Graph, triple: Any) -> List[_Record]:
++    """The records of `triple` this request has put into `target` itself.
++
++    A store may keep a write to itself until it is told to send it, so asking
++    the store what it holds can miss what this request has already written. The
++    ledger knows, and a later operation of the same request has to see it.
++    """
++    if ctx.report is None:
++        return []
++    whole = isinstance(target, ConjunctiveGraph)
++    found = []
++    for key, entry in ctx.report.items():
++        if key[:3] != (triple[0], triple[1], triple[2]) or not entry.present:
++            continue
++        if entry.graph.store is not target.store:
++            continue
++        if whole or entry.graph.identifier == target.identifier:
++            found.append(entry)
++    return found
++
++
++def _pending(ctx: QueryContext, target: Graph) -> List[Any]:
++    """Everything this request has written into `target`, paired with its record.
++
++    A store may keep a write to itself until it is told to send it, so what a
++    graph can be asked for is not the whole of what this request has put there.
++    An operation that empties the graph has to answer for the rest of it too.
++    """
++    if ctx.report is None:
++        return []
++    whole = isinstance(target, ConjunctiveGraph)
++    found = []
++    for key, entry in ctx.report.items():
++        if not entry.present or entry.graph.store is not target.store:
++            continue
++        if whole or entry.graph.identifier == target.identifier:
++            found.append(((key[0], key[1], key[2]), entry))
++    return found
++
++
++def _all_held(ctx: QueryContext, graph: Graph) -> List[Any]:
++    """Everything `graph` holds for this request, shown by the store or not."""
++    held = list(graph)
++    shown = set(held)
++    return held + [triple for triple, _ in _pending(ctx, graph) if triple not in shown]
++
++
++def _note_dropped(ctx: QueryContext, graph: Graph) -> None:
++    """Follow what taking `graph` away carries off with it.
++
++    The store removes the graph by name, so nothing is removed here: issuing a
++    removal of its own would put a step in front of the store that a request
++    without a report never takes.
++    """
++    for triple in list(graph):
++        _mark(_watch(ctx, graph, triple), False, ctx.epoch)
++    for _, entry in _pending(ctx, graph):
++        _mark(entry, False, ctx.epoch)
++
++
++def _vacated(ctx: QueryContext, target: Graph, triple: Any) -> List[_Record]:
++    """The records of `triple` this request has already emptied out of `target`.
++
++    A later solution can ask for a statement an earlier one already took away.
++    The statement is gone, so there is no holder to look up, but the removal it
++    asks for is the same removal, and its reason belongs with the rest as long
++    as the same operation made it.
++    """
++    if ctx.report is None:
++        return []
++    whole = isinstance(target, ConjunctiveGraph)
++    found = []
++    for key, entry in ctx.report.items():
++        if key[:3] != (triple[0], triple[1], triple[2]) or entry.present:
++            continue
++        graph = entry.graph
++        if graph.store is not target.store:
++            continue
++        if whole or graph.identifier == target.identifier:
++            found.append(entry)
++    return found
++
++
++def _remove_triples(
++    ctx: QueryContext, graph: Graph, triples: Any, prov: Any = ()
++) -> None:
++    """Remove `triples` from `graph` and note what took them away."""
++    if not ctx.provenance:
++        graph -= triples
++        return
++    for triple in triples:
++        holders = _holders(graph, triple)
++        if not holders:
++            for entry in _held_here(ctx, graph, triple):
++                entry.graph.remove(triple)
++                _mark(entry, False, ctx.epoch)
++                if entry.epoch == ctx.epoch:
++                    entry.removed_by.update(prov)
++                holders = [entry.graph]
++            if holders:
++                continue
++            emptied = _vacated(ctx, graph, triple)
++            for entry in emptied or [_watch(ctx, _home(graph), triple, held=False)]:
++                if entry.epoch == ctx.epoch:
++                    entry.removed_by.update(prov)
++            continue
++        for holder in holders:
++            entry = _watch(ctx, holder, triple)
++            if entry.present:
++                holder.remove(triple)
++                _mark(entry, False, ctx.epoch)
++            if entry.epoch == ctx.epoch:
++                entry.removed_by.update(prov)
++
++
++def _mark(entry: _Record, present: bool, epoch: int) -> None:
++    """Move a quad to `present`, forgetting the reason this move reverses.
++
++    Only the transition that survives into the difference explains it, so an
++    earlier reason on the other side is no longer part of the answer. The
++    operation that made the move is kept, because only that operation may go on
++    to add reasons for it.
++    """
++    if entry.present != present:
++        entry.present = present
++        entry.epoch = epoch
++        (entry.added_by if present else entry.removed_by).clear()
++
++
++def _note_added(ctx: QueryContext, graph: Graph, triple: Any) -> None:
++    """Record a statement that arrived without going through `_add_triples`."""
++    _mark(_watch(ctx, graph, triple, held=False), True, ctx.epoch)
++
++
++def _clause_graph(ctx: QueryContext, name: Any) -> None:
++    """Make the graph a dataset clause names available to the request.
++
++    Reading the document behind the name can put statements in the store, and a
++    request answers for those the way it answers for anything else it writes.
++    """
++    if (
++        not ctx.provenance
++        or ctx.dataset is None
++        or not rdflib.plugins.sparql.SPARQL_LOAD_GRAPHS
++    ):
++        ctx.load(name, default=False)
++        return
++    target = ctx.dataset.get_context(name)
++    before = set(target)
++    try:
++        ctx.load(name, default=False)
++    finally:
++        for triple in set(target) - before:
++            _note_added(ctx, target, triple)
++
++
++def _empty_graph(ctx: QueryContext, graph: Graph) -> None:
++    """Drop everything in `graph`."""
++    if not ctx.provenance:
++        graph.remove((None, None, None))
++        return
++    if isinstance(graph, ConjunctiveGraph):
++        for subject, predicate, obj, context in list(graph.quads((None, None, None))):
++            holder = _holder(graph, context)
++            _mark(_watch(ctx, holder, (subject, predicate, obj)), False, ctx.epoch)
++        for _, entry in _pending(ctx, graph):
++            _mark(entry, False, ctx.epoch)
++        # type error: Argument 1 to "remove" of "ConjunctiveGraph" has incompatible type
++        graph.remove((None, None, None))  # type: ignore[arg-type]
++        return
++    _remove_triples(ctx, graph, _all_held(ctx, graph))
++
++
++def _opened(reasons: Set[Any]) -> FrozenSet[Any]:
++    """The quads a set of reasons comes to, opening any that were still filling."""
++    found: Set[Any] = set()
++    waiting = list(reasons)
++    seen: Set[int] = set()
++    while waiting:
++        reason = waiting.pop()
++        if isinstance(reason, _Pending):
++            if id(reason) in seen:
++                continue
++            seen.add(id(reason))
++            waiting.extend(reason.quads)
++        else:
++            found.add(reason)
++    return frozenset(found)
++
++
++def _net_report(report: Dict[Any, Any]) -> Dict[str, Dict[Any, FrozenSet[Any]]]:
++    """What the request came to: the difference between before and after."""
++    added: Dict[Any, FrozenSet[Any]] = {}
++    removed: Dict[Any, FrozenSet[Any]] = {}
++    for key, entry in report.items():
++        if entry.present and not entry.initial:
++            added[key] = _opened(entry.added_by)
++        elif entry.initial and not entry.present:
++            removed[key] = _opened(entry.removed_by)
++    return {"added": added, "removed": removed}
++
++
+ def _graphOrDefault(ctx: QueryContext, g: str) -> Optional[Graph]:
+     if g == "DEFAULT":
+-        return ctx.graph
++        # a dataset stands in for its default graph here, and a graph-to-graph
++        # operation moves the statements of one graph rather than of a union
++        return _home(ctx.graph)  # type: ignore[arg-type]
+     else:
+         return ctx.dataset.get_context(g)
+ 
+ 
+@@ -25,17 +363,17 @@ def _graphAll(ctx: QueryContext, g: str) -> Sequence[Graph]:
+     """
+     return a list of graphs
+     """
+     if g == "DEFAULT":
+-        # type error: List item 0 has incompatible type "Optional[Graph]"; expected "Graph"
+-        return [ctx.graph]  # type: ignore[list-item]
++        # a dataset stands in for its default graph while an update runs, and a
++        # request that names DEFAULT means that one graph, not every graph the
++        # stand-in can see
++        # type error: Argument 1 to "_home" has incompatible type "Optional[Graph]"
++        return [_home(ctx.graph)]  # type: ignore[arg-type]
+     elif g == "NAMED":
+-        return [
+-            # type error: Item "None" of "Optional[Graph]" has no attribute "identifier"
+-            c
+-            for c in ctx.dataset.contexts()
+-            if c.identifier != ctx.graph.identifier  # type: ignore[union-attr]
+-        ]
++        # type error: Argument 1 to "_home" has incompatible type "Optional[Graph]"
++        home = _home(ctx.graph).identifier  # type: ignore[arg-type]
++        return [c for c in ctx.dataset.contexts() if c.identifier != home]
+     elif g == "ALL":
+         return list(ctx.dataset.contexts())
+     else:
+         return [ctx.dataset.get_context(g)]
+@@ -48,12 +386,35 @@ def evalLoad(ctx: QueryContext, u: CompValue) -> None:
+ 
+     if TYPE_CHECKING:
+         assert isinstance(u.iri, URIRef)
+ 
+-    if u.graphiri:
+-        ctx.load(u.iri, default=False, into=u.graphiri)
+-    else:
+-        ctx.load(u.iri, default=True)
++    if not ctx.provenance:
++        if u.graphiri:
++            ctx.load(u.iri, default=False, into=u.graphiri)
++        else:
++            ctx.load(u.iri, default=True)
++        return
++
++    target = _parsed(
++        _home(
++            ctx.dataset.get_context(u.graphiri) if u.graphiri else ctx.graph  # type: ignore[arg-type]
++        )
++    )
++
++    # the loaded statements arrive straight from the document, so what they are
++    # is only visible as the difference the load made to the target graph
++    before = set(target)
++    try:
++        if u.graphiri:
++            ctx.load(u.iri, default=False, into=u.graphiri)
++        else:
++            ctx.load(u.iri, default=True)
++    finally:
++        # a document that fails part way through leaves behind what it managed
++        # to read, and the report answers for that the way it answers for any
++        # other write
++        for triple in set(target) - before:
++            _note_added(ctx, target, triple)
+ 
+ 
+ def evalCreate(ctx: QueryContext, u: CompValue) -> None:
+     """
+@@ -69,17 +430,21 @@ def evalClear(ctx: QueryContext, u: CompValue) -> None:
+     """
+     http://www.w3.org/TR/sparql11-update/#clear
+     """
+     for g in _graphAll(ctx, u.graphiri):
+-        g.remove((None, None, None))
++        _empty_graph(ctx, g)
+ 
+ 
+ def evalDrop(ctx: QueryContext, u: CompValue) -> None:
+     """
+     http://www.w3.org/TR/sparql11-update/#drop
+     """
+     if ctx.dataset.store.graph_aware:
+         for g in _graphAll(ctx, u.graphiri):
++            # the store drops a graph by name, so what goes is what the graph
++            # of that name holds rather than everything a union can reach
++            if ctx.provenance:
++                _note_dropped(ctx, _own(g))
+             ctx.dataset.store.remove_graph(g)
+     else:
+         evalClear(ctx, u)
+ 
+@@ -89,31 +454,31 @@ def evalInsertData(ctx: QueryContext, u: CompValue) -> None:
+     http://www.w3.org/TR/sparql11-update/#insertData
+     """
+     # add triples
+     g = ctx.graph
+-    g += u.triples
++    _add_triples(ctx, g, u.triples)  # type: ignore[arg-type]
+     # add quads
+     # u.quads is a dict of graphURI=>[triples]
+     for g in u.quads:
+         # type error: Argument 1 to "get_context" of "ConjunctiveGraph" has incompatible type "Optional[Graph]"; expected "Union[IdentifiedNode, str, None]"
+         cg = ctx.dataset.get_context(g)  # type: ignore[arg-type]
+-        cg += u.quads[g]
++        _add_triples(ctx, cg, u.quads[g])
+ 
+ 
+ def evalDeleteData(ctx: QueryContext, u: CompValue) -> None:
+     """
+     http://www.w3.org/TR/sparql11-update/#deleteData
+     """
+     # remove triples
+     g = ctx.graph
+-    g -= u.triples
++    _remove_triples(ctx, g, u.triples)  # type: ignore[arg-type]
+ 
+     # remove quads
+     # u.quads is a dict of graphURI=>[triples]
+     for g in u.quads:
+         # type error: Argument 1 to "get_context" of "ConjunctiveGraph" has incompatible type "Optional[Graph]"; expected "Union[IdentifiedNode, str, None]"
+         cg = ctx.dataset.get_context(g)  # type: ignore[arg-type]
+-        cg -= u.quads[g]
++        _remove_triples(ctx, cg, u.quads[g])
+ 
+ 
+ def evalDeleteWhere(ctx: QueryContext, u: CompValue) -> None:
+     """
+@@ -128,13 +493,14 @@ def evalDeleteWhere(ctx: QueryContext, u: CompValue) -> None:
+ 
+     # type error: Incompatible types in assignment (expression has type "FrozenBindings", variable has type "QueryContext")
+     for c in res:  # type: ignore[assignment]
+         g = ctx.graph
+-        g -= _fillTemplate(u.triples, c)
++        # type error: "QueryContext" has no attribute "prov"; c is a solution here
++        _remove_triples(ctx, g, _fillTemplate(u.triples, c), c.prov)  # type: ignore[attr-defined]
+ 
+         for g in u.quads:
+             cg = ctx.dataset.get_context(c.get(g))
+-            cg -= _fillTemplate(u.quads[g], c)
++            _remove_triples(ctx, cg, _fillTemplate(u.quads[g], c), c.prov)  # type: ignore[attr-defined]
+ 
+ 
+ def evalModify(ctx: QueryContext, u: CompValue) -> None:
+     originalctx = ctx
+@@ -150,13 +516,13 @@ def evalModify(ctx: QueryContext, u: CompValue) -> None:
+                     dg = Graph()
+                     ctx = ctx.pushGraph(dg)
+                     otherDefault = True
+ 
+-                ctx.load(d.default, default=True)
++                ctx.load(d.default, default=True, working=True)
+ 
+             elif d.named:
+                 g = d.named
+-                ctx.load(g, default=False)
++                _clause_graph(ctx, g)
+ 
+     # "The WITH clause provides a convenience for when an operation
+     # primarily refers to a single graph. If a graph name is specified
+     # in a WITH clause, then - for the purposes of evaluating the
+@@ -186,22 +552,22 @@ def evalModify(ctx: QueryContext, u: CompValue) -> None:
+         dg = ctx.graph if type(ctx.graph) is Graph else ctx.dataset.default_context
+         if u.delete:
+             # type error: Unsupported left operand type for - ("None")
+             # type error: Unsupported operand types for - ("Graph" and "Generator[Tuple[Identifier, Identifier, Identifier], None, None]")
+-            dg -= _fillTemplate(u.delete.triples, c)  # type: ignore[operator]
++            _remove_triples(ctx, dg, _fillTemplate(u.delete.triples, c), c.prov)
+ 
+             for g, q in u.delete.quads.items():
+                 cg = ctx.dataset.get_context(c.get(g))
+-                cg -= _fillTemplate(q, c)
++                _remove_triples(ctx, cg, _fillTemplate(q, c), c.prov)
+ 
+         if u.insert:
+             # type error: Unsupported left operand type for + ("None")
+             # type error: Unsupported operand types for + ("Graph" and "Generator[Tuple[Identifier, Identifier, Identifier], None, None]")
+-            dg += _fillTemplate(u.insert.triples, c)  # type: ignore[operator]
++            _add_triples(ctx, dg, _fillTemplate(u.insert.triples, c), c.prov)
+ 
+             for g, q in u.insert.quads.items():
+                 cg = ctx.dataset.get_context(c.get(g))
+-                cg += _fillTemplate(q, c)
++                _add_triples(ctx, cg, _fillTemplate(q, c), c.prov)
+ 
+ 
+ def evalAdd(ctx: QueryContext, u: CompValue) -> None:
+     """
+@@ -218,10 +584,10 @@ def evalAdd(ctx: QueryContext, u: CompValue) -> None:
+     # type error: Item "None" of "Optional[Graph]" has no attribute "identifier"
+     if srcg.identifier == dstg.identifier:  # type: ignore[union-attr]
+         return
+ 
+-    # type error: Unsupported left operand type for + ("None")
+-    dstg += srcg  # type: ignore[operator]
++    # type error: Argument 2 to "_copy_graph" has incompatible type "Optional[Graph]"; expected "Graph"
++    _copy_graph(ctx, srcg, dstg)  # type: ignore[arg-type]
+ 
+ 
+ def evalMove(ctx: QueryContext, u: CompValue) -> None:
+     """
+@@ -241,20 +607,24 @@ def evalMove(ctx: QueryContext, u: CompValue) -> None:
+     # type error: Item "None" of "Optional[Graph]" has no attribute "identifier"
+     if srcg.identifier == dstg.identifier:  # type: ignore[union-attr]
+         return
+ 
+-    # type error: Item "None" of "Optional[Graph]" has no attribute "remove"
+-    dstg.remove((None, None, None))  # type: ignore[union-attr]
++    # type error: Argument 2 to "_empty_graph" has incompatible type "Optional[Graph]"; expected "Graph"
++    _empty_graph(ctx, dstg)  # type: ignore[arg-type]
+ 
+-    # type error: Unsupported left operand type for + ("None")
+-    dstg += srcg  # type: ignore[operator]
++    # type error: Argument 2 to "_copy_graph" has incompatible type "Optional[Graph]"; expected "Graph"
++    _copy_graph(ctx, srcg, dstg)  # type: ignore[arg-type]
+ 
+     if ctx.dataset.store.graph_aware:
++        if ctx.provenance:
++            # the store drops the source by name, so only the graph carrying
++            # that name goes; the rest of a union the source reads stays
++            _note_dropped(ctx, _own(srcg))  # type: ignore[arg-type]
+         # type error: Argument 1 to "remove_graph" of "Store" has incompatible type "Optional[Graph]"; expected "Graph"
+         ctx.dataset.store.remove_graph(srcg)  # type: ignore[arg-type]
+     else:
+-        # type error: Item "None" of "Optional[Graph]" has no attribute "remove"
+-        srcg.remove((None, None, None))  # type: ignore[union-attr]
++        # type error: Argument 2 to "_empty_graph" has incompatible type "Optional[Graph]"; expected "Graph"
++        _empty_graph(ctx, srcg)  # type: ignore[arg-type]
+ 
+ 
+ def evalCopy(ctx: QueryContext, u: CompValue) -> None:
+     """
+@@ -273,20 +643,40 @@ def evalCopy(ctx: QueryContext, u: CompValue) -> None:
+     # type error: Item "None" of "Optional[Graph]" has no attribute "remove"
+     if srcg.identifier == dstg.identifier:  # type: ignore[union-attr]
+         return
+ 
+-    # type error: Item "None" of "Optional[Graph]" has no attribute "remove"
+-    dstg.remove((None, None, None))  # type: ignore[union-attr]
++    # type error: Argument 2 to "_empty_graph" has incompatible type "Optional[Graph]"; expected "Graph"
++    _empty_graph(ctx, dstg)  # type: ignore[arg-type]
++
++    # type error: Argument 2 to "_copy_graph" has incompatible type "Optional[Graph]"; expected "Graph"
++    _copy_graph(ctx, srcg, dstg)  # type: ignore[arg-type]
+ 
+-    # type error: Unsupported left operand type for + ("None")
+-    dstg += srcg  # type: ignore[operator]
++
++def _copy_graph(ctx: QueryContext, srcg: Graph, dstg: Graph) -> None:
++    """Add every statement of `srcg` to `dstg`, credited to the source quad.
++
++    The source is walked exactly the way `dstg += srcg` walks it, so a request
++    the engine cannot carry out today is not quietly carried out once a report
++    is asked for. A source that reads several graphs as one is not itself the
++    graph holding what it reads, so the statement is credited to the graphs
++    that really hold it.
++    """
++    if not ctx.provenance:
++        dstg += srcg
++        return
++    for triple in list(srcg):
++        holders = _holders(srcg, triple) or [srcg]
++        _add_triples(
++            ctx, dstg, [triple], [_quad_key(holder, triple) for holder in holders]
++        )
+ 
+ 
+ def evalUpdate(
+     graph: Graph,
+     update: Update,
+     initBindings: Optional[Mapping[str, Identifier]] = None,
+-) -> None:
++    provenance: bool = False,
++) -> Optional[Dict[str, Dict[Any, FrozenSet[Any]]]]:
+     """http://www.w3.org/TR/sparql11-update/#updateLanguage
+ 
+     'A request is a sequence of operations [...] Implementations MUST
+     ensure that operations of a single request are executed in a
+@@ -315,13 +705,20 @@ def evalUpdate(
+         documentation.
+ 
+     """
+ 
+-    for u in update.algebra:
++    report: Dict[Any, Any] = {}
++
++    for epoch, u in enumerate(update.algebra):
+         initBindings = dict((Variable(k), v) for k, v in (initBindings or {}).items())
+ 
+         ctx = QueryContext(graph, initBindings=initBindings)
+         ctx.prologue = u.prologue
++        ctx.provenance = provenance
++        ctx.report = report
++        # every operation of the request gets a mark of its own, so a later one
++        # that changes nothing cannot answer for a change an earlier one made
++        ctx.epoch = epoch
+ 
+         try:
+             if u.name == "Load":
+                 evalLoad(ctx, u)
+@@ -349,4 +746,8 @@ def evalUpdate(
+                 raise Exception("Unknown update operation: %s" % (u,))
+         except:  # noqa: E722
+             if not u.silent:
+                 raise
++
++    if not provenance:
++        return None
++    return _net_report(report)
+diff --git a/rdflib/query.py b/rdflib/query.py
+index 87fdf016..32e06c07 100644
+--- a/rdflib/query.py
++++ b/rdflib/query.py
+@@ -83,10 +83,17 @@ class UpdateProcessor:
+         self,
+         strOrQuery: Union[str, Update],  # noqa: N803
+         initBindings: Mapping[str, Identifier] = {},  # noqa: N803
+         initNs: Mapping[str, Any] = {},  # noqa: N803
+-    ) -> None:
+-        pass
++        provenance: bool = False,
++    ) -> Optional[Mapping[str, Any]]:
++        """Carry out an update, reporting what it changed when asked to.
++
++        A processor returns `None` unless `provenance` is set, and
++        otherwise a mapping with an `"added"` and a `"removed"` entry pairing
++        each changed quad with the quads that justified the change.
++        """
++        return None
+ 
+ 
+ class ResultException(Exception):  # noqa: N818
+     pass

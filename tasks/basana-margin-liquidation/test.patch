@@ -1,0 +1,1373 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..f0b8c58
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,63 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/results.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++cd "$(dirname "$0")"
++
++NEW_TESTS="tests/test_backtesting_margin_liquidations_7c41e9.py"
++# Pre-existing flaky test: wall clock vs monotonic clock within 0.1 s, fails when the clock is adjusted mid-run.
++FLAKY_TEST="tests/test_core_dt.py::test_utc_now_mono"
++PYTEST_LOG="$(mktemp)"
++BASETEMP="$(mktemp -d)"
++RUN_HOME="$(mktemp -d)"
++export HOME="$RUN_HOME"
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "$NEW_TESTS" \
++    -p no:cacheprovider --basetemp="$BASETEMP" --junitxml="$OUTPUT_PATH" -q 2>&1 | tee "$PYTEST_LOG"
++  EXIT_CODE=${PIPESTATUS[0]}
++else
++  python -m pytest tests --ignore="$NEW_TESTS" --deselect="$FLAKY_TEST" \
++    -p no:cacheprovider --basetemp="$BASETEMP" --junitxml="$OUTPUT_PATH" -q 2>&1 | tee "$PYTEST_LOG"
++  EXIT_CODE=${PIPESTATUS[0]}
++fi
++
++if [ ! -f "$OUTPUT_PATH" ] || ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  DETAIL="$(tail -n 80 "$PYTEST_LOG" 2>/dev/null \
++    | tr -d '\000-\010\013\014\016-\037' \
++    | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++  if [ -z "$DETAIL" ]; then
++    DETAIL="pytest produced no test cases and no output."
++  fi
++  {
++    echo '<?xml version="1.0" encoding="UTF-8"?>'
++    echo '<testsuites>'
++    echo '  <testsuite name="pytest" tests="1" failures="1" errors="0" time="0">'
++    echo '    <testcase name="collection" classname="pytest">'
++    echo "      <failure message=\"pytest produced no test cases (exit $EXIT_CODE)\">"
++    echo "$DETAIL"
++    echo '      </failure>'
++    echo '    </testcase>'
++    echo '  </testsuite>'
++    echo '</testsuites>'
++  } > "$OUTPUT_PATH"
++  if [ "$EXIT_CODE" -eq 0 ]; then
++    EXIT_CODE=1
++  fi
++fi
++
++rm -rf "$PYTEST_LOG" "$BASETEMP" "$RUN_HOME"
++exit $EXIT_CODE
+diff --git a/tests/test_backtesting_margin_liquidations_7c41e9.py b/tests/test_backtesting_margin_liquidations_7c41e9.py
+new file mode 100644
+index 0000000..9c98f83
+--- /dev/null
++++ b/tests/test_backtesting_margin_liquidations_7c41e9.py
+@@ -0,0 +1,1298 @@
++# Basana
++#
++# Copyright 2022 Gabriel Martin Becedillas Ruiz
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from decimal import Decimal
++import datetime
++
++import pytest
++
++from basana.backtesting import exchange, fees, liquidity, requests
++from basana.backtesting.lending import margin
++from basana.core import bar, dt, event, helpers
++from basana.core.enums import OrderOperation
++from basana.core.pair import Pair, PairInfo
++
++
++BTC_USD = Pair("BTC", "USD")
++ETH_USD = Pair("ETH", "USD")
++ETH_BTC = Pair("ETH", "BTC")
++ONE_DAY = datetime.timedelta(days=1)
++BUY = OrderOperation.BUY
++SELL = OrderOperation.SELL
++
++
++def day(number):
++    return dt.local_datetime(2000, 1, number)
++
++
++def bar_event(pair, number, open, close=None, low=None, high=None, volume=1000):
++    open = Decimal(open)
++    close = open if close is None else Decimal(close)
++    low = min(open, close) if low is None else Decimal(low)
++    high = max(open, close) if high is None else Decimal(high)
++    return bar.BarEvent(
++        day(number) + ONE_DAY, bar.Bar(day(number), pair, open, high, low, close, Decimal(volume), ONE_DAY)
++    )
++
++
++def bar_source(*bar_events):
++    source = event.FifoQueueEventSource()
++    for bar_event_ in bar_events:
++        source.push(bar_event_)
++    return source
++
++
++def margin_loans(margin_requirement="0.5", interest_symbol="USD", interest_percentage=0, **kwargs):
++    return margin.MarginLoans(
++        "USD", Decimal(margin_requirement),
++        default_conditions=margin.MarginLoanConditions(
++            interest_symbol=interest_symbol, interest_percentage=Decimal(interest_percentage),
++            interest_period=datetime.timedelta(days=4), min_interest=Decimal(0)
++        ),
++        **kwargs
++    )
++
++
++def build_exchange(
++        dispatcher, balances, lending_strategy, liquidity_strategy_factory=liquidity.InfiniteLiquidity,
++        fee_strategy=None, btc_usd_info=PairInfo(8, 2)
++):
++    ret = exchange.Exchange(
++        dispatcher, {symbol: Decimal(amount) for symbol, amount in balances.items()},
++        liquidity_strategy_factory=liquidity_strategy_factory, fee_strategy=fee_strategy or fees.NoFee(),
++        lending_strategy=lending_strategy
++    )
++    for symbol, precision in {"BTC": 8, "ETH": 8, "USD": 2}.items():
++        ret.set_symbol_precision(symbol, precision)
++    ret.set_pair_info(BTC_USD, btc_usd_info)
++    ret.set_pair_info(ETH_USD, PairInfo(8, 2))
++    ret.set_pair_info(ETH_BTC, PairInfo(8, 8))
++    return ret
++
++
++def run_actions(e, actions, pair=BTC_USD):
++    async def on_bar(bar_event_):
++        if action := actions.get(bar_event_.when):
++            await action()
++
++    e.subscribe_to_bar_events(pair, on_bar)
++
++
++class Recorder:
++    def __init__(self, e):
++        self.margin_calls = []
++        self.margin_call_types = []
++        self.order_events = []
++        e.subscribe_to_margin_call_events(self.on_margin_call)
++        e.subscribe_to_order_events(self.on_order_event)
++
++    async def on_margin_call(self, margin_call):
++        self.margin_call_types.append(type(margin_call).__name__)
++        self.margin_calls.append((margin_call.when, helpers.round_decimal(margin_call.margin_level, 2)))
++
++    async def on_order_event(self, order_event):
++        self.order_events.append(order_event.order)
++
++
++def rounded(value):
++    return helpers.round_decimal(value, 2)
++
++
++async def balance(e, symbol):
++    ret = await e.get_balance(symbol)
++    return ret.available, ret.hold, ret.borrowed
++
++
++async def only_liquidation(e):
++    liquidations = await e.get_liquidations()
++    assert len(liquidations) == 1
++    return liquidations[0]
++
++
++async def liquidation_orders(e, liquidation):
++    return [await e.get_order_info(order_id) for order_id in liquidation.order_ids]
++
++
++def open_long(e, created):
++    async def action():
++        created["entry"] = await e.create_market_order(BUY, BTC_USD, Decimal(2), auto_borrow=True)
++
++    return action
++
++
++def open_short(e, created, amount=Decimal(1)):
++    async def action():
++        created["entry"] = await e.create_market_order(SELL, BTC_USD, amount, auto_borrow=True)
++
++    return action
++
++
++def btc_bars(*bars):
++    return bar_source(
++        bar_event(BTC_USD, 1, 1000), bar_event(BTC_USD, 2, 1000),
++        *[bar_event(BTC_USD, number, *prices) for number, prices in enumerate(bars, start=3)]
++    )
++
++
++async def test_nothing_changes_without_margin_levels(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans())
++    recorder = Recorder(e)
++    created = {}
++
++    async def place_exit():
++        created["exit"] = await e.create_limit_order(SELL, BTC_USD, Decimal(1), Decimal(2000))
++
++    async def after_crash():
++        created["late"] = await e.create_limit_order(SELL, BTC_USD, Decimal(1), Decimal(3000))
++
++    run_actions(e, {day(2): open_long(e, created), day(3): place_exit, day(4): after_crash})
++    e.add_bar_source(btc_bars((1000, 300), (300,)))
++    await backtesting_dispatcher.run()
++
++    assert await e.get_liquidations() == []
++    assert recorder.margin_calls == []
++    assert (await e.get_order_info(created["exit"].id)).is_open
++    assert (await e.get_order_info(created["late"].id)).is_open
++    assert len(await e.get_loans(is_open=True)) == 1
++    assert await balance(e, "BTC") == (0, 2, 0)
++    assert await balance(e, "USD") == (0, 0, 1000)
++
++
++async def test_levels_that_are_never_crossed_do_nothing(backtesting_dispatcher):
++    lending_strategy = margin_loans(margin_call_level=Decimal(75), liquidation_level=Decimal(40))
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy)
++    recorder = Recorder(e)
++    created = {}
++
++    async def place_exit():
++        created["exit"] = await e.create_limit_order(SELL, BTC_USD, Decimal(1), Decimal(2000))
++
++    run_actions(e, {day(2): open_long(e, created), day(3): place_exit})
++    e.add_bar_source(btc_bars((1000, 810), (900,)))
++    await backtesting_dispatcher.run()
++
++    assert await e.get_liquidations() == []
++    assert recorder.margin_calls == []
++    assert (await e.get_order_info(created["exit"].id)).is_open
++
++
++async def test_exchange_without_margin_loans_reports_no_liquidations(backtesting_dispatcher):
++    e = exchange.Exchange(backtesting_dispatcher, {"USD": Decimal(1000)})
++    e.add_bar_source(btc_bars((1000, 100)))
++    await backtesting_dispatcher.run()
++
++    assert await e.get_liquidations() == []
++
++
++async def test_margin_call_is_sent_once_while_level_stays_below(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(margin_call_level=Decimal(75)))
++    recorder = Recorder(e)
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 780), (760,), (700,)))
++    await backtesting_dispatcher.run()
++
++    assert recorder.margin_calls == [(day(4), Decimal("71.79"))]
++    assert recorder.margin_call_types == ["MarginCallEvent"]
++    assert await e.get_liquidations() == []
++    assert len(await e.get_loans(is_open=True)) == 1
++
++
++async def test_margin_call_needs_level_strictly_below_and_rearms_at_or_above(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(margin_call_level=Decimal(75)))
++    recorder = Recorder(e)
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 800), (780,), (800,), (780,), (770,)))
++    await backtesting_dispatcher.run()
++
++    assert recorder.margin_calls == [(day(5), Decimal("71.79")), (day(7), Decimal("71.79"))]
++
++
++def test_margin_levels_are_refused_unless_below_100():
++    for level in (Decimal("99.99"), Decimal(0), Decimal(-50)):
++        margin_loans(margin_call_level=level, liquidation_level=level)
++    for level in (Decimal(100), Decimal(150)):
++        with pytest.raises(Exception):
++            margin_loans(margin_call_level=level)
++        with pytest.raises(Exception):
++            margin_loans(liquidation_level=level)
++
++
++async def test_margin_call_level_of_zero_calls_once_the_margin_level_is_negative(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(margin_call_level=Decimal(0)))
++    recorder = Recorder(e)
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 550), (500,), (450,)))
++    await backtesting_dispatcher.run()
++
++    assert recorder.margin_calls == [(day(6), Decimal("-22.22"))]
++    assert await e.get_liquidations() == []
++
++
++async def test_liquidation_level_of_zero_liquidates_once_the_margin_level_is_negative(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(0)))
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 550), (500,), (450,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(6)
++    assert rounded(liquidation.margin_level) == Decimal("-22.22")
++
++
++async def test_margin_call_carries_the_exact_margin_level(backtesting_dispatcher):
++    lending_strategy = margin_loans(margin_call_level=Decimal(75))
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy)
++    created = {}
++    received = []
++
++    async def on_margin_call(margin_call):
++        received.append((margin_call.margin_level, lending_strategy.margin_level))
++
++    e.subscribe_to_margin_call_events(on_margin_call)
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 780), (760,)))
++    await backtesting_dispatcher.run()
++
++    [(carried, current)] = received
++    assert carried == current
++    assert rounded(carried) == Decimal("71.79")
++
++
++async def test_long_position_is_sold_on_the_bar_after_the_liquidation_starts(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(40)))
++    recorder = Recorder(e)
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 600), (610, 620), (650,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(5)
++    assert rounded(liquidation.margin_level) == Decimal("33.33")
++    assert liquidation.canceled_order_ids == []
++    assert liquidation.repaid_loan_ids == created["entry"].loan_ids
++
++    [order] = await liquidation_orders(e, liquidation)
++    assert order.operation == SELL
++    assert order.pair == BTC_USD
++    assert order.amount == Decimal(2)
++    assert order.amount_filled == Decimal(2)
++    assert order.is_open is False
++    assert order.fees == {}
++    assert [(fill.when, fill.price) for fill in order.fills] == [(day(4), Decimal(610))]
++    assert order.id in [order_info.id for order_info in await e.get_orders()]
++    reported = [
++        (order_info.is_open, order_info.amount_filled)
++        for order_info in recorder.order_events if order_info.id == order.id
++    ]
++    assert reported and reported[-1] == (False, Decimal(2))
++
++    assert await balance(e, "USD") == (220, 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++    assert await e.get_loans(is_open=True) == []
++
++
++async def test_level_equal_to_liquidation_level_does_not_start_liquidation(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(40)))
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 625), (620,), (630,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(5)
++    assert liquidation.ended_at == day(6)
++    assert rounded(liquidation.margin_level) == Decimal("38.71")
++    [order] = await liquidation_orders(e, liquidation)
++    assert order.fills[0].price == Decimal(630)
++    assert await balance(e, "USD") == (260, 0, 0)
++
++
++async def test_open_orders_on_every_pair_are_canceled_when_liquidation_starts(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000, "ETH": 1}, margin_loans(liquidation_level=Decimal(40)))
++    recorder = Recorder(e)
++    created = {}
++
++    async def place_exits():
++        created["btc_exit"] = await e.create_limit_order(SELL, BTC_USD, Decimal(1), Decimal(2000))
++        created["eth_exit"] = await e.create_limit_order(SELL, ETH_USD, Decimal(1), Decimal(500))
++
++    run_actions(e, {day(2): open_long(e, created), day(3): place_exits})
++    e.add_bar_source(bar_source(
++        bar_event(ETH_USD, 1, 100), bar_event(BTC_USD, 1, 1000),
++        bar_event(ETH_USD, 2, 100), bar_event(BTC_USD, 2, 1000),
++        bar_event(ETH_USD, 3, 100), bar_event(BTC_USD, 3, 1000, 550),
++        bar_event(ETH_USD, 4, 100), bar_event(BTC_USD, 4, 560),
++        bar_event(ETH_USD, 5, 100), bar_event(BTC_USD, 5, 600),
++    ))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert sorted(liquidation.canceled_order_ids) == sorted([created["btc_exit"].id, created["eth_exit"].id])
++    for key in ("btc_exit", "eth_exit"):
++        order = await e.get_order_info(created[key].id)
++        assert order.is_open is False
++        assert order.amount_filled == 0
++        assert (False, Decimal(0)) in [
++            (order_info.is_open, order_info.amount_filled)
++            for order_info in recorder.order_events if order_info.id == order.id
++        ]
++
++    orders = await liquidation_orders(e, liquidation)
++    assert [(order.pair, order.operation, order.amount_filled) for order in orders] == [
++        (ETH_USD, SELL, Decimal(1)), (BTC_USD, SELL, Decimal(2))
++    ]
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(5)
++    assert await balance(e, "USD") == (220, 0, 0)
++    assert await balance(e, "ETH") == (0, 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++
++
++async def test_every_kind_of_open_order_is_canceled_keeping_its_fills(backtesting_dispatcher):
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(50)),
++        liquidity_strategy_factory=lambda: liquidity.VolumeShareImpact(price_impact=Decimal(0))
++    )
++    created = {}
++
++    async def place_exits():
++        created["limit"] = await e.create_limit_order(SELL, BTC_USD, Decimal(1), Decimal(1000))
++        created["stop"] = await e.create_stop_order(SELL, BTC_USD, Decimal("0.5"), Decimal(300))
++        created["stop_limit"] = await e.create_stop_limit_order(
++            SELL, BTC_USD, Decimal("0.5"), Decimal(300), Decimal(290)
++        )
++
++    run_actions(e, {day(2): open_long(e, created), day(3): place_exits})
++    e.add_bar_source(btc_bars((1000, 550, None, None, 2), (560,), (570,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(5)
++    assert sorted(liquidation.canceled_order_ids) == sorted(
++        created[key].id for key in ("limit", "stop", "stop_limit")
++    )
++    limit = await e.get_order_info(created["limit"].id)
++    assert (limit.is_open, limit.amount_filled) == (False, Decimal("0.5"))
++    assert [fill.price for fill in limit.fills] == [Decimal(1000)]
++    for key in ("stop", "stop_limit"):
++        order = await e.get_order_info(created[key].id)
++        assert (order.is_open, order.amount_filled) == (False, Decimal(0))
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount_filled, order.fills[0].price) == (SELL, Decimal("1.5"), Decimal(560))
++    assert await balance(e, "USD") == (340, 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++
++
++async def test_pairs_not_quoted_in_the_quote_symbol_are_not_traded(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000, "ETH": 1}, margin_loans(liquidation_level=Decimal(40)))
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(bar_source(
++        bar_event(ETH_BTC, 1, "0.1"), bar_event(ETH_USD, 1, 100), bar_event(BTC_USD, 1, 1000),
++        bar_event(ETH_BTC, 2, "0.1"), bar_event(ETH_USD, 2, 100), bar_event(BTC_USD, 2, 1000),
++        bar_event(ETH_BTC, 3, "0.1"), bar_event(ETH_USD, 3, 100), bar_event(BTC_USD, 3, 1000, 550),
++        bar_event(ETH_BTC, 4, "0.1"), bar_event(ETH_USD, 4, 100), bar_event(BTC_USD, 4, 560),
++        bar_event(ETH_BTC, 5, "0.1"), bar_event(ETH_USD, 5, 100), bar_event(BTC_USD, 5, 600),
++    ))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(5)
++    orders = await liquidation_orders(e, liquidation)
++    assert [(order.pair, order.operation, order.amount_filled) for order in orders] == [
++        (ETH_USD, SELL, Decimal(1)), (BTC_USD, SELL, Decimal(2))
++    ]
++    assert await balance(e, "USD") == (220, 0, 0)
++    assert await balance(e, "ETH") == (0, 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++
++
++async def test_orders_and_loans_are_rejected_until_liquidation_ends(backtesting_dispatcher):
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(40)),
++        liquidity_strategy_factory=lambda: liquidity.VolumeShareImpact(price_impact=Decimal(0))
++    )
++    created = {}
++    rejected = []
++
++    async def try_everything():
++        attempts = [
++            e.create_limit_order(BUY, BTC_USD, Decimal("0.1"), Decimal(100)),
++            e.create_market_order(SELL, BTC_USD, Decimal("0.1")),
++            e.create_stop_order(BUY, BTC_USD, Decimal("0.1"), Decimal(900)),
++            e.create_stop_limit_order(BUY, BTC_USD, Decimal("0.1"), Decimal(900), Decimal(910)),
++            e.create_order(requests.LimitOrder(BUY, BTC_USD, PairInfo(8, 2), Decimal("0.1"), Decimal(100))),
++            e.create_loan("USD", Decimal(10)),
++        ]
++        for attempt in attempts:
++            try:
++                await attempt
++            except exchange.Error:
++                rejected.append(backtesting_dispatcher.now())
++
++    async def after_end():
++        created["market"] = await e.create_market_order(BUY, BTC_USD, Decimal("0.1"))
++        created["limit"] = await e.create_limit_order(BUY, BTC_USD, Decimal("0.1"), Decimal(100))
++        created["stop"] = await e.create_stop_order(BUY, BTC_USD, Decimal("0.05"), Decimal(900))
++        created["stop_limit"] = await e.create_stop_limit_order(
++            BUY, BTC_USD, Decimal("0.05"), Decimal(900), Decimal(910)
++        )
++        created["generic"] = await e.create_order(
++            requests.LimitOrder(BUY, BTC_USD, PairInfo(8, 2), Decimal("0.05"), Decimal(100))
++        )
++        created["loan"] = await e.create_loan("USD", Decimal(10))
++
++    run_actions(e, {
++        day(2): open_long(e, created), day(4): try_everything, day(5): try_everything, day(6): after_end
++    })
++    e.add_bar_source(btc_bars((1000, 600), (600, 600, None, None, 4), (620, 620, None, None, 6), (620,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(6)
++    assert rejected == [day(4)] * 6 + [day(5)] * 6
++    assert (await e.get_order_info(created["market"].id)).amount_filled == Decimal("0.1")
++    for key in ("limit", "stop", "stop_limit", "generic"):
++        assert (await e.get_order_info(created[key].id)).is_open
++    assert (await e.get_loan(created["loan"].id)).is_open
++    assert len(await e.get_loans()) == 2
++
++
++async def test_stop_filled_on_the_crash_bar_prevents_liquidation(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(40)))
++    created = {}
++
++    async def protect():
++        created["stop"] = await e.create_stop_order(SELL, BTC_USD, Decimal(2), Decimal(700), auto_repay=True)
++
++    run_actions(e, {day(2): open_long(e, created), day(3): protect})
++    e.add_bar_source(btc_bars((900, 600, 600, 900), (600,)))
++    await backtesting_dispatcher.run()
++
++    assert await e.get_liquidations() == []
++    stop = await e.get_order_info(created["stop"].id)
++    assert stop.amount_filled == Decimal(2)
++    assert stop.fills[0].price == Decimal(700)
++    assert await balance(e, "USD") == (400, 0, 0)
++
++
++async def test_short_position_is_bought_back(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(40)))
++    created = {}
++    run_actions(e, {day(2): open_short(e, created)})
++    e.add_bar_source(btc_bars((1000, 1700), (1650,), (1500,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(5)
++    assert liquidation.margin_level == Decimal(30)
++    assert liquidation.repaid_loan_ids == created["entry"].loan_ids
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount, order.amount_filled) == (BUY, Decimal(1), Decimal(1))
++    assert order.fills[0].price == Decimal(1650)
++    assert await balance(e, "USD") == (350, 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++
++
++async def test_buy_back_covers_interest_charged_in_the_base_symbol(backtesting_dispatcher):
++    lending_strategy = margin_loans(interest_symbol="BTC", interest_percentage=1, liquidation_level=Decimal(40))
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy)
++    created = {}
++    run_actions(e, {day(2): open_short(e, created)})
++    e.add_bar_source(btc_bars((1000, 1700), (1600,), (1500,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("29.27")
++    assert liquidation.ended_at == day(5)
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount_filled) == (BUY, Decimal("1.0075"))
++    [loan] = await e.get_loans()
++    assert loan.is_open is False
++    assert loan.paid_interest == {"BTC": Decimal("0.0075")}
++    assert await balance(e, "USD") == (388, 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++
++
++async def test_interest_charged_in_quote_symbol_is_not_bought(backtesting_dispatcher):
++    lending_strategy = margin_loans(interest_symbol="USD", interest_percentage=1, liquidation_level=Decimal(40))
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy)
++    created = {}
++    run_actions(e, {day(2): open_short(e, created)})
++    e.add_bar_source(btc_bars((1000, 1700), (1600,), (1500,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("29.27")
++    assert liquidation.ended_at == day(5)
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount_filled) == (BUY, Decimal(1))
++    [loan] = await e.get_loans()
++    assert loan.is_open is False
++    assert loan.paid_interest == {"USD": Decimal(12)}
++    assert await balance(e, "USD") == (388, 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++
++
++async def test_buy_back_is_grossed_up_for_fee_charged_in_base_symbol(backtesting_dispatcher):
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1010}, margin_loans(liquidation_level=Decimal(40)),
++        fee_strategy=fees.Percentage(Decimal(1), fee_currency=fees.FeeCurrency.BASE)
++    )
++    created = {}
++    run_actions(e, {day(2): open_short(e, created)})
++    e.add_bar_source(btc_bars((1000, 1700), (1600,), (1500,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("29.15")
++    assert liquidation.ended_at == day(5)
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount, order.amount_filled) == (BUY, Decimal("1.02020203"), Decimal("1.02020203"))
++    assert order.fees == {"BTC": Decimal("0.01020203")}
++    assert await balance(e, "USD") == (Decimal("377.68"), 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++    assert await e.get_loans(is_open=True) == []
++
++
++async def test_buy_back_gross_up_honours_minimum_fee(backtesting_dispatcher):
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1050}, margin_loans(liquidation_level=Decimal(40)),
++        fee_strategy=fees.Percentage(Decimal(1), min_fee=Decimal("0.05"), fee_currency=fees.FeeCurrency.BASE)
++    )
++    created = {}
++    run_actions(e, {day(2): open_short(e, created)})
++    e.add_bar_source(btc_bars((1000, 1700), (1600,), (1500,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("25.85")
++    assert liquidation.ended_at == day(5)
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount_filled) == (BUY, Decimal("1.1"))
++    assert order.fees == {"BTC": Decimal("0.05")}
++    assert await balance(e, "USD") == (290, 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++    assert await e.get_loans(is_open=True) == []
++
++
++async def test_buy_back_rounds_up_to_the_pair_base_precision(backtesting_dispatcher):
++    lending_strategy = margin_loans(interest_symbol="BTC", interest_percentage=1, liquidation_level=Decimal(40))
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy, btc_usd_info=PairInfo(2, 2))
++    created = {}
++    run_actions(e, {day(2): open_short(e, created)})
++    e.add_bar_source(bar_source(
++        bar_event(BTC_USD, 1, 1000), bar_event(BTC_USD, 2, 1000, 1700), bar_event(BTC_USD, 3, 1600),
++        bar_event(BTC_USD, 4, 1500),
++    ))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("29.64")
++    assert liquidation.started_at == day(3)
++    assert liquidation.ended_at == day(4)
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount_filled) == (BUY, Decimal("1.01"))
++    [loan] = await e.get_loans()
++    assert loan.paid_interest == {"BTC": Decimal("0.005")}
++    assert await balance(e, "BTC") == (Decimal("0.005"), 0, 0)
++    assert await balance(e, "USD") == (384, 0, 0)
++
++
++async def test_sales_are_capped_by_each_bars_own_liquidity(backtesting_dispatcher):
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(40)),
++        liquidity_strategy_factory=lambda: liquidity.VolumeShareImpact(price_impact=Decimal(0))
++    )
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 600), (600, 600, None, None, 4), (620, 620, None, None, 6), (620,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(6)
++    orders = await liquidation_orders(e, liquidation)
++    assert [(order.operation, order.amount, order.amount_filled, order.fills[0].price) for order in orders] == [
++        (SELL, Decimal(1), Decimal(1), Decimal(600)), (SELL, Decimal(1), Decimal(1), Decimal(620))
++    ]
++    assert all(order.is_open is False for order in orders)
++    assert await balance(e, "USD") == (220, 0, 0)
++
++
++async def test_each_trade_pays_its_own_slippage_and_minimum_fee(backtesting_dispatcher):
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1005}, margin_loans(liquidation_level=Decimal(40)),
++        liquidity_strategy_factory=liquidity.VolumeShareImpact,
++        fee_strategy=fees.Percentage(Decimal("0.1"), min_fee=Decimal(5))
++    )
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(bar_source(
++        bar_event(BTC_USD, 1, 1000, volume="1e7"), bar_event(BTC_USD, 2, 1000, volume="1e7"),
++        bar_event(BTC_USD, 3, 1000, 600, volume="1e7"), bar_event(BTC_USD, 4, 600, volume=4),
++        bar_event(BTC_USD, 5, 620, volume=8), bar_event(BTC_USD, 6, 620, volume="1e7"),
++    ))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("33.33")
++    assert liquidation.ended_at == day(6)
++    orders = await liquidation_orders(e, liquidation)
++    assert [(order.amount_filled, order.fills[0].price, order.fees) for order in orders] == [
++        (Decimal(1), Decimal(540), {"USD": Decimal(5)}),
++        (Decimal(1), Decimal("604.50"), {"USD": Decimal(5)}),
++    ]
++    assert await balance(e, "USD") == (Decimal("134.50"), 0, 0)
++
++
++async def test_multi_bar_buy_back_includes_interest_accrued_meanwhile(backtesting_dispatcher):
++    lending_strategy = margin_loans(interest_symbol="BTC", interest_percentage=1, liquidation_level=Decimal(40))
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1000}, lending_strategy,
++        liquidity_strategy_factory=lambda: liquidity.VolumeShareImpact(price_impact=Decimal(0))
++    )
++    created = {}
++    run_actions(e, {day(2): open_short(e, created)})
++    e.add_bar_source(btc_bars((1000, 1700), (1600, 1600, None, None, "2.4"), (1600,), (1500,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(6)
++    orders = await liquidation_orders(e, liquidation)
++    assert [(order.operation, order.amount_filled) for order in orders] == [
++        (BUY, Decimal("0.6")), (BUY, Decimal("0.41"))
++    ]
++    [loan] = await e.get_loans()
++    assert loan.paid_interest == {"BTC": Decimal("0.01")}
++    assert await balance(e, "USD") == (384, 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++
++
++async def test_unaffordable_buy_shrinks_to_largest_amount_including_fees(backtesting_dispatcher):
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1010}, margin_loans(liquidation_level=Decimal(40)),
++        fee_strategy=fees.Percentage(Decimal(1))
++    )
++    created = {}
++    run_actions(e, {day(2): open_short(e, created)})
++    e.add_bar_source(btc_bars((1000, 1700), (2500,), (1500,), (1400,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.margin_level == Decimal(30)
++    assert liquidation.ended_at is None
++    assert liquidation.repaid_loan_ids == []
++    order = (await liquidation_orders(e, liquidation))[0]
++    assert (order.operation, order.amount_filled) == (BUY, Decimal("0.79207799"))
++    assert order.quote_amount_filled == Decimal("1980.19")
++    assert order.fees == {"USD": Decimal("19.81")}
++    assert await balance(e, "USD") == (0, 0, 0)
++    assert await balance(e, "BTC") == (Decimal("0.79207799"), 0, 1)
++    assert len(await e.get_loans(is_open=True)) == 1
++
++
++async def test_unaffordable_buy_shrinks_with_slippage_included(backtesting_dispatcher):
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1010}, margin_loans(liquidation_level=Decimal(40)),
++        liquidity_strategy_factory=liquidity.VolumeShareImpact, fee_strategy=fees.Percentage(Decimal(1))
++    )
++    created = {}
++    run_actions(e, {day(2): open_short(e, created)})
++    e.add_bar_source(bar_source(
++        bar_event(BTC_USD, 1, 1000, volume="1e7"), bar_event(BTC_USD, 2, 1000, volume="1e7"),
++        bar_event(BTC_USD, 3, 1000, 1700, volume="1e7"), bar_event(BTC_USD, 4, 2400, volume=8),
++    ))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.margin_level == Decimal(30)
++    assert liquidation.ended_at is None
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount_filled) == (BUY, Decimal("0.81171168"))
++    assert order.fills[0].price == Decimal("2439.53")
++    assert order.quote_amount_filled == Decimal("1980.19")
++    assert order.fees == {"USD": Decimal("19.81")}
++    assert await balance(e, "USD") == (0, 0, 0)
++    assert await balance(e, "BTC") == (Decimal("0.81171168"), 0, 1)
++
++
++async def test_liquidation_fee_counts_toward_what_a_buy_can_afford(backtesting_dispatcher):
++    lending_strategy = margin_loans(liquidation_level=Decimal(40), liquidation_fee=Decimal(1))
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy)
++    created = {}
++    run_actions(e, {day(2): open_short(e, created)})
++    e.add_bar_source(btc_bars((1000, 1700), (2500,), (1500,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.ended_at is None
++    order = (await liquidation_orders(e, liquidation))[0]
++    assert (order.operation, order.amount_filled) == (BUY, Decimal("0.79207799"))
++    assert order.fees == {"USD": Decimal("19.81")}
++    assert await balance(e, "USD") == (0, 0, 0)
++    assert await balance(e, "BTC") == (Decimal("0.79207799"), 0, 1)
++
++
++async def test_liquidation_fee_is_added_to_trade_fees_in_quote_symbol(backtesting_dispatcher):
++    lending_strategy = margin_loans(liquidation_level=Decimal(40), liquidation_fee=Decimal(2))
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1010}, lending_strategy, fee_strategy=fees.Percentage(Decimal("0.5"))
++    )
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 600), (610,), (650,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("33.33")
++    assert liquidation.ended_at == day(5)
++    [order] = await liquidation_orders(e, liquidation)
++    assert order.fees == {"USD": Decimal("30.50")}
++    entry = await e.get_order_info(created["entry"].id)
++    assert entry.fees == {"USD": Decimal(10)}
++    assert await balance(e, "USD") == (Decimal("189.50"), 0, 0)
++
++
++async def test_only_holdings_beyond_what_is_owed_are_sold(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1200}, margin_loans(liquidation_level=Decimal(40)))
++    created = {}
++
++    async def borrow_btc():
++        created["btc_loan"] = await e.create_loan("BTC", Decimal("0.1"))
++
++    run_actions(e, {day(2): open_long(e, created), day(3): borrow_btc})
++    e.add_bar_source(btc_bars((1000, 500), (510,), (520,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("38.10")
++    assert liquidation.ended_at == day(5)
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount_filled) == (SELL, Decimal(2))
++    assert liquidation.repaid_loan_ids == created["entry"].loan_ids + [created["btc_loan"].id]
++    assert await balance(e, "USD") == (220, 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++
++
++async def test_loans_are_repaid_oldest_first_skipping_unaffordable_ones(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(50)))
++    created = {}
++
++    async def open_position():
++        created["older"] = await e.create_loan("USD", Decimal(300))
++        created["newer"] = await e.create_loan("USD", Decimal(500))
++        created["entry"] = await e.create_market_order(BUY, BTC_USD, Decimal("1.8"))
++
++    run_actions(e, {day(2): open_position})
++    e.add_bar_source(btc_bars((1000, 550), (350,), (400,), (380,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("38.38")
++    assert liquidation.ended_at is None
++    assert liquidation.repaid_loan_ids == [created["older"].id]
++    assert len(liquidation.order_ids) == 1
++    assert (await e.get_loan(created["older"].id)).is_open is False
++    assert (await e.get_loan(created["newer"].id)).is_open is True
++    assert await balance(e, "USD") == (330, 0, 500)
++    assert await balance(e, "BTC") == (0, 0, 0)
++
++
++async def test_an_older_loan_that_cannot_be_repaid_does_not_hold_back_newer_ones(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(50)))
++    created = {}
++
++    async def open_position():
++        created["older"] = await e.create_loan("USD", Decimal(500))
++        created["newer"] = await e.create_loan("USD", Decimal(300))
++        created["entry"] = await e.create_market_order(BUY, BTC_USD, Decimal("1.8"))
++
++    run_actions(e, {day(2): open_position})
++    e.add_bar_source(btc_bars((1000, 550), (250,), (260,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("38.38")
++    assert liquidation.ended_at is None
++    assert liquidation.repaid_loan_ids == [created["newer"].id]
++    assert (await e.get_loan(created["older"].id)).is_open is True
++    assert (await e.get_loan(created["newer"].id)).is_open is False
++    assert await balance(e, "USD") == (150, 0, 500)
++    assert await balance(e, "BTC") == (0, 0, 0)
++
++
++async def test_loans_are_repaid_on_bars_that_trade_nothing(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1100}, margin_loans(liquidation_level=Decimal(40)))
++    created = {}
++
++    async def place_bid():
++        created["bid"] = await e.create_limit_order(BUY, BTC_USD, Decimal("0.1"), Decimal(500), auto_borrow=True)
++
++    run_actions(e, {day(2): open_long(e, created), day(3): place_bid})
++    e.add_bar_source(bar_source(
++        bar_event(BTC_USD, 1, 1000), bar_event(BTC_USD, 2, 1000), bar_event(BTC_USD, 3, 1000, 560),
++        bar_event(ETH_BTC, 4, "0.05"), bar_event(BTC_USD, 4, 570), bar_event(BTC_USD, 5, 580),
++    ))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(5)
++    assert liquidation.canceled_order_ids == [created["bid"].id]
++    assert liquidation.repaid_loan_ids == created["bid"].loan_ids + created["entry"].loan_ids
++    orders = await liquidation_orders(e, liquidation)
++    assert [(order.pair, order.operation, order.amount_filled) for order in orders] == [(BTC_USD, SELL, Decimal(2))]
++    assert await balance(e, "USD") == (240, 0, 0)
++    assert await e.get_loans(is_open=True) == []
++
++
++def two_position_exchange(dispatcher, created, eth_bars_on):
++    e = build_exchange(
++        dispatcher, {"USD": 1000}, margin_loans(margin_requirement="0.25", liquidation_level=Decimal(40))
++    )
++
++    async def open_positions():
++        created["older"] = await e.create_loan("USD", Decimal(1400))
++        created["newer"] = await e.create_loan("USD", Decimal(600))
++        await e.create_market_order(BUY, BTC_USD, Decimal(2))
++        await e.create_market_order(BUY, ETH_USD, Decimal(10))
++
++    run_actions(e, {day(2): open_positions})
++    events = []
++    for number, btc_prices in enumerate([(1000,), (1000,), (1000, 600), (950,), (950,)], start=1):
++        events.append(bar_event(BTC_USD, number, *btc_prices))
++        if number in eth_bars_on:
++            events.append(bar_event(ETH_USD, number, 100))
++    e.add_bar_source(bar_source(*events))
++    return e
++
++
++async def test_liquidation_stops_once_margin_level_is_back_at_100(backtesting_dispatcher):
++    created = {}
++    e = two_position_exchange(backtesting_dispatcher, created, eth_bars_on=(1, 2, 5))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("36.36")
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(5)
++    assert liquidation.repaid_loan_ids == [created["older"].id]
++    orders = await liquidation_orders(e, liquidation)
++    assert [(order.pair, order.operation, order.amount_filled) for order in orders] == [(BTC_USD, SELL, Decimal(2))]
++    assert (await e.get_loan(created["newer"].id)).is_open is True
++    assert await balance(e, "ETH") == (10, 0, 0)
++    assert await balance(e, "USD") == (500, 0, 600)
++
++
++async def test_every_bar_of_a_timestamp_trades_before_its_check(backtesting_dispatcher):
++    created = {}
++    e = two_position_exchange(backtesting_dispatcher, created, eth_bars_on=(1, 2, 4, 5))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(5)
++    assert liquidation.repaid_loan_ids == [created["older"].id, created["newer"].id]
++    orders = await liquidation_orders(e, liquidation)
++    assert [(order.pair, order.operation, order.amount_filled) for order in orders] == [
++        (BTC_USD, SELL, Decimal(2)), (ETH_USD, SELL, Decimal(10))
++    ]
++    assert await balance(e, "ETH") == (0, 0, 0)
++    assert await balance(e, "USD") == (900, 0, 0)
++
++
++async def test_margin_is_checked_once_every_bar_of_a_timestamp_is_processed(backtesting_dispatcher):
++    lending_strategy = margin_loans(margin_call_level=Decimal(75), liquidation_level=Decimal(60))
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy)
++    recorder = Recorder(e)
++    created = {}
++
++    async def open_positions():
++        await e.create_loan("USD", Decimal(1000))
++        await e.create_market_order(BUY, BTC_USD, Decimal(1))
++        await e.create_market_order(BUY, ETH_USD, Decimal(10))
++
++    async def place_exit():
++        created["exit"] = await e.create_limit_order(SELL, BTC_USD, Decimal("0.5"), Decimal(5000))
++
++    run_actions(e, {day(2): open_positions, day(3): place_exit})
++    e.add_bar_source(bar_source(
++        bar_event(BTC_USD, 1, 1000), bar_event(ETH_USD, 1, 100),
++        bar_event(BTC_USD, 2, 1000), bar_event(ETH_USD, 2, 100),
++        bar_event(BTC_USD, 3, 1000, 400), bar_event(ETH_USD, 3, 100, 170),
++        bar_event(BTC_USD, 4, 400), bar_event(ETH_USD, 4, 170),
++    ))
++    await backtesting_dispatcher.run()
++
++    assert await e.get_liquidations() == []
++    assert recorder.margin_calls == []
++    assert (await e.get_order_info(created["exit"].id)).is_open
++    assert await balance(e, "ETH") == (10, 0, 0)
++
++
++async def test_check_after_the_last_bar_can_start_a_liquidation(backtesting_dispatcher):
++    lending_strategy = margin_loans(margin_call_level=Decimal(75), liquidation_level=Decimal(40))
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy)
++    recorder = Recorder(e)
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 600)))
++    await backtesting_dispatcher.run()
++
++    assert recorder.margin_calls == [(day(4), Decimal("33.33"))]
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at is None
++    assert liquidation.order_ids == []
++
++
++async def test_fee_charged_in_base_symbol_comes_out_of_what_is_sold(backtesting_dispatcher):
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1200}, margin_loans(liquidation_level=Decimal(40)),
++        fee_strategy=fees.Percentage(Decimal(1), fee_currency=fees.FeeCurrency.BASE)
++    )
++    created = {}
++
++    async def borrow_btc():
++        created["btc_loan"] = await e.create_loan("BTC", Decimal("0.1"))
++
++    run_actions(e, {day(2): open_long(e, created), day(3): borrow_btc})
++    e.add_bar_source(btc_bars((1000, 500), (510,), (520,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert rounded(liquidation.margin_level) == Decimal("36.54")
++    assert liquidation.ended_at == day(5)
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount, order.amount_filled) == (SELL, Decimal("1.96039603"), Decimal("1.96039603"))
++    assert order.fees == {"BTC": Decimal("0.01960397")}
++    assert liquidation.repaid_loan_ids == created["entry"].loan_ids + [created["btc_loan"].id]
++    assert await balance(e, "USD") == (Decimal("199.80"), 0, 0)
++    assert await balance(e, "BTC") == (0, 0, 0)
++
++
++async def test_liquidation_fee_is_rounded_together_with_trading_fees(backtesting_dispatcher):
++    lending_strategy = margin_loans(liquidation_level=Decimal(40), liquidation_fee=Decimal("0.5"))
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1010}, lending_strategy, fee_strategy=fees.Percentage(Decimal("0.5"))
++    )
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 600), ("610.35",), (650,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    [order] = await liquidation_orders(e, liquidation)
++    assert order.quote_amount_filled == Decimal("1220.70")
++    assert order.fees == {"USD": Decimal("12.21")}
++    assert await balance(e, "USD") == (Decimal("208.49"), 0, 0)
++
++
++async def test_unmet_margin_call_starts_liquidation_after_timeout(backtesting_dispatcher):
++    lending_strategy = margin_loans(
++        margin_call_level=Decimal(75), liquidation_level=Decimal(20), margin_call_timeout=datetime.timedelta(days=2)
++    )
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy)
++    recorder = Recorder(e)
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 780), (790,), (790,), (800,), (820,)))
++    await backtesting_dispatcher.run()
++
++    assert recorder.margin_calls == [(day(4), Decimal("71.79"))]
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(6)
++    assert liquidation.ended_at == day(7)
++    assert rounded(liquidation.margin_level) == Decimal("73.42")
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount_filled, order.fills[0].price) == (SELL, Decimal(2), Decimal(800))
++    assert await balance(e, "USD") == (600, 0, 0)
++
++
++async def test_meeting_margin_call_resets_timeout(backtesting_dispatcher):
++    lending_strategy = margin_loans(
++        margin_call_level=Decimal(75), liquidation_level=Decimal(20), margin_call_timeout=datetime.timedelta(days=2)
++    )
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy)
++    recorder = Recorder(e)
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 780), (850,), (780,), (790,), (790,), (800,)))
++    await backtesting_dispatcher.run()
++
++    assert recorder.margin_calls == [(day(4), Decimal("71.79")), (day(6), Decimal("71.79"))]
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(8)
++    assert liquidation.ended_at == day(9)
++    assert rounded(liquidation.margin_level) == Decimal("73.42")
++
++
++async def test_first_check_past_the_margin_call_timeout_starts_liquidation(backtesting_dispatcher):
++    lending_strategy = margin_loans(
++        margin_call_level=Decimal(75), liquidation_level=Decimal(20), margin_call_timeout=datetime.timedelta(days=2)
++    )
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy)
++    recorder = Recorder(e)
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(bar_source(
++        bar_event(BTC_USD, 1, 1000), bar_event(BTC_USD, 2, 1000), bar_event(BTC_USD, 3, 1000, 780),
++        bar_event(BTC_USD, 6, 790), bar_event(BTC_USD, 7, 800),
++    ))
++    await backtesting_dispatcher.run()
++
++    assert recorder.margin_calls == [(day(4), Decimal("71.79"))]
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(7)
++    assert liquidation.ended_at == day(8)
++    assert rounded(liquidation.margin_level) == Decimal("73.42")
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount_filled, order.fills[0].price) == (SELL, Decimal(2), Decimal(800))
++
++
++async def test_second_liquidation_gets_its_own_record(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(40)))
++    created = {}
++
++    async def reopen():
++        created["second"] = await e.create_market_order(BUY, BTC_USD, Decimal("0.6"), auto_borrow=True)
++
++    run_actions(e, {day(2): open_long(e, created), day(5): reopen})
++    e.add_bar_source(btc_bars((1000, 600), (610, 620), (620, 300), (310,), (320,)))
++    await backtesting_dispatcher.run()
++
++    first, second = await e.get_liquidations()
++    assert (first.started_at, first.ended_at) == (day(4), day(5))
++    assert (second.started_at, second.ended_at) == (day(6), day(7))
++    assert rounded(second.margin_level) == Decimal("31.11")
++    assert second.repaid_loan_ids == created["second"].loan_ids
++    [order] = await liquidation_orders(e, second)
++    assert (order.operation, order.amount_filled, order.fills[0].price) == (SELL, Decimal("0.6"), Decimal(310))
++    assert await balance(e, "USD") == (34, 0, 0)
++
++
++async def test_a_debt_smaller_than_the_base_precision_is_bought_as_one_unit(backtesting_dispatcher):
++    lending_strategy = margin_loans(interest_symbol="BTC", interest_percentage=1, liquidation_level=Decimal(40))
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy, btc_usd_info=PairInfo(2, 2))
++    recorder = Recorder(e)
++    created = {}
++
++    async def open_position():
++        created["entry"] = await e.create_market_order(BUY, ETH_USD, Decimal(2), auto_borrow=True)
++
++    run_actions(e, {day(2): open_position})
++    e.add_bar_source(bar_source(
++        bar_event(ETH_USD, 1, 1000), bar_event(BTC_USD, 1, 1000),
++        bar_event(ETH_USD, 2, 1000), bar_event(BTC_USD, 2, 1000),
++        bar_event(ETH_USD, 3, 1000, 600), bar_event(BTC_USD, 3, 1000),
++        bar_event(ETH_USD, 4, 600), bar_event(BTC_USD, 4, 1000),
++    ))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(5)
++    orders = await liquidation_orders(e, liquidation)
++    assert [(order.pair, order.operation, order.amount_filled) for order in orders] == [
++        (ETH_USD, SELL, Decimal(2)), (BTC_USD, BUY, Decimal("0.01"))
++    ]
++    listed = [order_info.id for order_info in await e.get_orders()]
++    for order in orders:
++        assert order.id in listed
++        reported = [
++            (order_info.is_open, order_info.amount_filled)
++            for order_info in recorder.order_events if order_info.id == order.id
++        ]
++        assert reported and reported[-1] == (False, order.amount_filled)
++    assert liquidation.repaid_loan_ids == created["entry"].loan_ids
++    [loan] = await e.get_loans()
++    assert loan.paid_interest == {"BTC": Decimal("0.0075")}
++    assert await balance(e, "USD") == (190, 0, 0)
++    assert await balance(e, "BTC") == (Decimal("0.0025"), 0, 0)
++
++
++async def test_a_sale_is_truncated_to_the_pair_base_precision(backtesting_dispatcher):
++    lending_strategy = margin_loans(interest_symbol="BTC", interest_percentage=1, liquidation_level=Decimal(40))
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy, btc_usd_info=PairInfo(2, 2))
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 600), (610,), (620,)))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(5)
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount, order.amount_filled) == (SELL, Decimal("1.98"), Decimal("1.98"))
++    assert order.fills[0].price == Decimal(610)
++    assert await balance(e, "USD") == (Decimal("207.80"), 0, 0)
++    assert await balance(e, "BTC") == (Decimal("0.00770492"), 0, 0)
++
++
++async def test_an_unmet_call_times_out_without_a_liquidation_level(backtesting_dispatcher):
++    lending_strategy = margin_loans(margin_call_level=Decimal(75), margin_call_timeout=datetime.timedelta(days=2))
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, lending_strategy)
++    recorder = Recorder(e)
++    created = {}
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 780), (790,), (790,), (800,), (820,)))
++    await backtesting_dispatcher.run()
++
++    assert recorder.margin_calls == [(day(4), Decimal("71.79"))]
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(6)
++    assert liquidation.ended_at == day(7)
++    assert rounded(liquidation.margin_level) == Decimal("73.42")
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount_filled, order.fills[0].price) == (SELL, Decimal(2), Decimal(800))
++    assert await balance(e, "USD") == (600, 0, 0)
++
++
++async def test_a_margin_call_reaches_its_handler_before_the_bars_of_that_timestamp(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(margin_call_level=Decimal(75)))
++    created = {}
++    calls = []
++    seen = []
++
++    async def on_margin_call(margin_call):
++        calls.append(margin_call.when)
++
++    async def on_bar(bar_event_):
++        seen.append((bar_event_.when, list(calls)))
++
++    e.subscribe_to_margin_call_events(on_margin_call)
++    e.subscribe_to_bar_events(BTC_USD, on_bar)
++    run_actions(e, {day(2): open_long(e, created)})
++    e.add_bar_source(btc_bars((1000, 780), (760,)))
++    await backtesting_dispatcher.run()
++
++    assert calls == [day(4)]
++    assert seen == [(day(2), []), (day(3), []), (day(4), [day(4)]), (day(5), [day(4)])]
++
++
++def test_a_negative_liquidation_fee_is_refused():
++    margin_loans(liquidation_fee=Decimal(0))
++    margin_loans(liquidation_fee=Decimal("0.5"))
++    with pytest.raises(Exception):
++        margin_loans(liquidation_fee=Decimal(-1))
++
++
++async def test_a_liquidation_buy_nothing_can_pay_for_creates_no_order(backtesting_dispatcher):
++    e = build_exchange(backtesting_dispatcher, {"USD": 1000}, margin_loans(liquidation_level=Decimal(40)))
++    created = {}
++
++    async def spend_the_quote():
++        await e.create_market_order(BUY, ETH_USD, Decimal(15))
++
++    run_actions(e, {day(2): open_short(e, created, Decimal("0.5")), day(3): spend_the_quote})
++    e.add_bar_source(bar_source(
++        bar_event(BTC_USD, 1, 1000), bar_event(ETH_USD, 1, 100),
++        bar_event(BTC_USD, 2, 1000), bar_event(ETH_USD, 2, 100),
++        bar_event(BTC_USD, 3, 1000, 2600), bar_event(ETH_USD, 3, 100),
++        bar_event(BTC_USD, 4, 2600),
++    ))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at is None
++    assert rounded(liquidation.margin_level) == Decimal("26.67")
++    assert liquidation.order_ids == []
++    assert len(await e.get_loans(is_open=True)) == 1
++    assert await balance(e, "USD") == (0, 0, 0)
++    assert await balance(e, "BTC") == (0, 0, Decimal("0.5"))
++    assert await balance(e, "ETH") == (15, 0, 0)
++
++
++async def test_a_buy_whose_slipped_price_rounds_above_zero_is_still_traded(backtesting_dispatcher):
++    lending_strategy = margin_loans(margin_requirement="0.25", liquidation_level=Decimal(40))
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1000}, lending_strategy,
++        liquidity_strategy_factory=liquidity.VolumeShareImpact, btc_usd_info=PairInfo(8, 0)
++    )
++    created = {}
++
++    async def open_position():
++        created["btc_loan"] = await e.create_loan("BTC", Decimal(1))
++        created["usd_loan"] = await e.create_loan("USD", Decimal(900))
++        await e.create_market_order(SELL, BTC_USD, Decimal(1))
++        await e.create_market_order(BUY, ETH_USD, Decimal(19))
++
++    run_actions(e, {day(2): open_position})
++    e.add_bar_source(bar_source(
++        bar_event(BTC_USD, 1, 100), bar_event(ETH_USD, 1, 100),
++        bar_event(BTC_USD, 2, 100), bar_event(ETH_USD, 2, 100),
++        bar_event(BTC_USD, 3, 100, "0.49"), bar_event(ETH_USD, 3, 100, 40),
++        bar_event(BTC_USD, 4, "0.49", volume=4),
++    ))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at is None
++    assert rounded(liquidation.margin_level) == Decimal("-19.39")
++    [order] = await liquidation_orders(e, liquidation)
++    assert (order.operation, order.amount_filled, order.quote_amount_filled) == (BUY, Decimal(1), Decimal(1))
++    assert order.fills[0].price == Decimal(1)
++    assert (await e.get_loan(created["btc_loan"].id)).is_open is False
++    assert (await e.get_loan(created["usd_loan"].id)).is_open is True
++    assert await balance(e, "USD") == (Decimal("97.86"), 0, 900)
++    assert await balance(e, "BTC") == (0, 0, 0)
++    assert await balance(e, "ETH") == (19, 0, 0)
++
++
++async def test_nothing_more_is_traded_once_the_account_owes_nothing(backtesting_dispatcher):
++    e = build_exchange(
++        backtesting_dispatcher, {"USD": 1000, "ETH": "0.5"}, margin_loans(liquidation_level=Decimal(40))
++    )
++    created = {}
++
++    async def open_position():
++        created["loan"] = await e.create_loan("USD", Decimal(800))
++        await e.create_market_order(BUY, BTC_USD, Decimal("1.8"))
++
++    run_actions(e, {day(2): open_position})
++    e.add_bar_source(bar_source(
++        bar_event(BTC_USD, 1, 1000), bar_event(ETH_USD, 1, 100),
++        bar_event(BTC_USD, 2, 1000), bar_event(ETH_USD, 2, 100),
++        bar_event(BTC_USD, 3, 1000, 500), bar_event(ETH_USD, 3, 100),
++        bar_event(BTC_USD, 4, 510), bar_event(ETH_USD, 4, 100),
++    ))
++    await backtesting_dispatcher.run()
++
++    liquidation = await only_liquidation(e)
++    assert liquidation.started_at == day(4)
++    assert liquidation.ended_at == day(5)
++    assert rounded(liquidation.margin_level) == Decimal("31.58")
++    assert liquidation.repaid_loan_ids == [created["loan"].id]
++    orders = await liquidation_orders(e, liquidation)
++    assert [(order.pair, order.operation, order.amount_filled) for order in orders] == [
++        (BTC_USD, SELL, Decimal("1.8"))
++    ]
++    assert await balance(e, "USD") == (118, 0, 0)
++    assert await balance(e, "ETH") == (Decimal("0.5"), 0, 0)

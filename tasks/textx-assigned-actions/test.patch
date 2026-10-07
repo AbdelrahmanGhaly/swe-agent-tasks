@@ -1,0 +1,866 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..a582b19
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,36 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path) OUTPUT_PATH="$2"; shift 2 ;;
++    base|new) MODE="$1"; shift ;;
++    *) shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/textx-${MODE}.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++cd "$(dirname "$0")"
++
++NEW_TESTS="tests/functional/test_rule_actions_ea9a36.py"
++BASETEMP="$(mktemp -d)"
++PYTEST_ARGS=(-p no:cacheprovider --basetemp="$BASETEMP" --junitxml="$OUTPUT_PATH" -o junit_family=xunit1)
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "${PYTEST_ARGS[@]}" "$NEW_TESTS"
++else
++  python -m pytest "${PYTEST_ARGS[@]}" tests/functional --ignore="$NEW_TESTS"
++fi
++status=$?
++
++if [ ! -s "$OUTPUT_PATH" ] || ! grep -q "<testcase" "$OUTPUT_PATH"; then
++  echo "no test results were collected" >&2
++  [ "$status" -eq 0 ] && status=1
++fi
++
++exit "$status"
+diff --git a/tests/functional/test_rule_actions_ea9a36.py b/tests/functional/test_rule_actions_ea9a36.py
+new file mode 100644
+index 0000000..82f781e
+--- /dev/null
++++ b/tests/functional/test_rule_actions_ea9a36.py
+@@ -0,0 +1,818 @@
++import pytest
++
++from textx import (
++    get_children_of_type,
++    get_location,
++    metamodel_for_language,
++    metamodel_from_str,
++    textx_isinstance,
++)
++from textx.const import MULT_ONEORMORE, MULT_ZEROORMORE
++from textx.exceptions import TextXSemanticError
++
++CALC_GRAMMAR = r"""
++Calc: exprs+=Sum[';'];
++Sum: Product ({Add.left=current} '+' right=Product
++           | {Sub.left=current} '-' right=Product)*;
++Product: Atom ({Binary.left=current} op=/[*\/]/ right=Atom)*;
++Atom: Number | '(' Sum ')';
++Number: value=INT;
++"""
++
++SHARED_GRAMMAR = r"""
++Model: expr=Sum;
++Sum: Product ({Binary.left=current} op='+' right=Product)*;
++Product: Number ({Binary.left=current} op='*' right=Number)*;
++Number: value=INT;
++"""
++
++PATH_GRAMMAR = r"""
++Model: paths+=Path[','];
++Path: name=ID ({Path.prefix=current} '.' name=ID)*;
++"""
++
++CALL_GRAMMAR = r"""
++Model: calls+=Call[';'];
++Call: Name ({Invocation.callee=current} '(' (args=Name (',' args=Name)*)? ')')*;
++Name: id=ID;
++"""
++
++TUPLE_GRAMMAR = r"""
++Model: value=Expr;
++Expr: Item ({Tuple.items+=current} (',' items+=Item)+)?;
++Item: v=INT;
++"""
++
++DECL_GRAMMAR = r"""
++Program: decls*=Declaration uses*=Use;
++Declaration: {VarDecl} 'var' name=ID ';'
++           | {ConstDecl} 'const' name=ID '=' value=INT ';';
++Use: 'use' target=[Declaration] ';';
++"""
++
++KIND_GRAMMAR = r"""
++Model: decls+=Decl;
++Decl: 'decl' ({Var} 'var' | {Const} 'const' value=INT) name=ID;
++"""
++
++LITERAL_GRAMMAR = r"""
++Model: literals+=Literal[','];
++Literal: {Null} 'null' | value=INT;
++"""
++
++LOOKUP_GRAMMAR = r"""
++Model: items+=Item;
++Item: Def | Expr;
++Def: 'def' name=ID;
++Expr: Ref ({Pair.first=current} '&' second=Ref)* ';';
++Ref: target=[Def];
++"""
++
++
++def calc_mm(**kwargs):
++    return metamodel_from_str(CALC_GRAMMAR, **kwargs)
++
++
++def render(obj):
++    cls = obj.__class__.__name__
++    if cls == "Number":
++        return str(obj.value)
++    if cls == "Add":
++        return f"({render(obj.left)} + {render(obj.right)})"
++    if cls == "Sub":
++        return f"({render(obj.left)} - {render(obj.right)})"
++    if cls == "Binary":
++        return f"({render(obj.left)} {obj.op} {render(obj.right)})"
++    raise AssertionError(cls)
++
++
++def span(model_str, obj):
++    return model_str[obj._tx_position : obj._tx_position_end]
++
++
++def test_repeated_action_builds_left_nested_tree():
++    model = calc_mm().model_from_str("1 + 2 + 3")
++    expr = model.exprs[0]
++    assert expr.__class__.__name__ == "Add"
++    assert expr.left.__class__.__name__ == "Add"
++    assert render(expr) == "((1 + 2) + 3)"
++
++
++def test_input_without_action_returns_called_rule_object():
++    model = calc_mm().model_from_str("7")
++    expr = model.exprs[0]
++    assert expr.__class__.__name__ == "Number"
++    assert expr.value == 7
++
++
++def test_rule_with_own_assignments_hands_over_its_own_object():
++    grammar = r"""
++    Model: decls+=Declaration;
++    Declaration: Modifier name=ID {Annotated.target=current};
++    Modifier: kind=ID;
++    """
++    annotated = metamodel_from_str(grammar).model_from_str("public foo").decls[0]
++    assert annotated.__class__.__name__ == "Annotated"
++    assert annotated.target.__class__.__name__ == "Declaration"
++    assert annotated.target.name == "foo"
++
++
++def test_rule_called_after_an_action_does_not_replace_the_action_object():
++    mm = metamodel_from_str("Model: value=R; R: {A} Item; Item: value=ID;")
++    assert mm.model_from_str("item").value.__class__.__name__ == "A"
++
++
++def test_action_alternatives_choose_class_per_operator():
++    model = calc_mm().model_from_str("8 - 3 + 2 - 1")
++    assert render(model.exprs[0]) == "(((8 - 3) + 2) - 1)"
++    assert model.exprs[0].__class__.__name__ == "Sub"
++    assert model.exprs[0].left.__class__.__name__ == "Add"
++
++
++def test_precedence_levels_nest_action_objects():
++    model = calc_mm().model_from_str("1 + 2 * 3 / 4 - 5; (1 + 2) * 3")
++    assert render(model.exprs[0]) == "((1 + ((2 * 3) / 4)) - 5)"
++    assert render(model.exprs[1]) == "((1 + 2) * 3)"
++
++
++def test_assignment_after_action_in_each_alternative_fills_that_object():
++    model = calc_mm().model_from_str("4 + 5; 4 - 5")
++    add, sub = model.exprs
++    assert add.right.value == 5
++    assert sub.right.value == 5
++    assert not hasattr(add, "op")
++
++
++def test_action_class_is_added_to_metamodel_and_inherits_from_rule():
++    mm = calc_mm()
++    model = mm.model_from_str("1 + 2 * 3")
++    add = model.exprs[0]
++    assert isinstance(add, mm["Add"])
++    assert textx_isinstance(add, mm["Sum"])
++    assert textx_isinstance(add.right, mm["Product"])
++    flat = metamodel_from_str(
++        "Model: sum=Sum; Sum: Term ({Plus.left=current} '+' right=Term)*; Term: v=INT;"
++    )
++    plus = flat.model_from_str("1 + 2").sum
++    assert isinstance(plus, flat["Plus"])
++    assert textx_isinstance(plus, flat["Sum"])
++    assert not textx_isinstance(plus, flat["Term"])
++
++
++def test_action_class_used_by_several_rules_inherits_from_each():
++    mm = metamodel_from_str(SHARED_GRAMMAR)
++    model = mm.model_from_str("1 * 2 + 3 * 4")
++    top = model.expr
++    assert render(top) == "((1 * 2) + (3 * 4))"
++    assert type(top) is type(top.left)
++    assert textx_isinstance(top, mm["Sum"])
++    assert textx_isinstance(top.left, mm["Product"])
++    assert textx_isinstance(top.left, mm["Sum"])
++
++
++def test_action_attribute_holds_the_rule_object_by_containment():
++    mm = calc_mm()
++    model = mm.model_from_str("1 + 2 + 3")
++    assert get_children_of_type("Add", model) == [model.exprs[0], model.exprs[0].left]
++    assert sorted(n.value for n in get_children_of_type("Number", model)) == [1, 2, 3]
++
++
++def test_action_on_rule_own_class_wraps_rule_object():
++    mm = metamodel_from_str(PATH_GRAMMAR)
++    model = mm.model_from_str("a.b.c, d")
++    abc, d = model.paths
++    assert abc.name == "c"
++    assert abc.prefix.name == "b"
++    assert abc.prefix.prefix.name == "a"
++    assert abc.prefix.prefix.prefix is None
++    assert d.name == "d"
++    assert d.prefix is None
++    assert type(abc) is mm["Path"]
++    assert type(abc.prefix.prefix) is mm["Path"]
++
++
++def test_attribute_filled_once_per_object_across_repeated_action_is_single():
++    model = metamodel_from_str(PATH_GRAMMAR).model_from_str("x.y.z")
++    path = model.paths[0]
++    assert isinstance(path.name, str)
++    assert isinstance(path.prefix.name, str)
++    assert isinstance(path.prefix.prefix.name, str)
++
++
++def test_attribute_received_repeatedly_by_one_object_is_list():
++    model = metamodel_from_str(CALL_GRAMMAR).model_from_str("f(a, b)(c)(); g")
++    outer = model.calls[0]
++    assert outer.__class__.__name__ == "Invocation"
++    assert outer.args == []
++    assert [a.id for a in outer.callee.args] == ["c"]
++    assert [a.id for a in outer.callee.callee.args] == ["a", "b"]
++    assert outer.callee.callee.callee.id == "f"
++    assert model.calls[1].id == "g"
++
++
++def test_single_argument_is_still_list():
++    model = metamodel_from_str(CALL_GRAMMAR).model_from_str("h(x)")
++    call = model.calls[0]
++    assert isinstance(call.args, list)
++    assert [a.id for a in call.args] == ["x"]
++
++
++def test_append_action_starts_list_with_current_object():
++    model = metamodel_from_str(TUPLE_GRAMMAR).model_from_str("1, 2, 3")
++    assert model.value.__class__.__name__ == "Tuple"
++    assert [i.v for i in model.value.items] == [1, 2, 3]
++    assert all(item.parent is model.value for item in model.value.items)
++
++
++def test_append_action_not_taken_returns_item():
++    model = metamodel_from_str(TUPLE_GRAMMAR).model_from_str("9")
++    assert model.value.__class__.__name__ == "Item"
++    assert model.value.v == 9
++
++
++def test_simple_action_selects_class_per_alternative():
++    mm = metamodel_from_str(DECL_GRAMMAR)
++    model = mm.model_from_str("var x; const y = 3;")
++    var, const = model.decls
++    assert var.__class__.__name__ == "VarDecl"
++    assert const.__class__.__name__ == "ConstDecl"
++    assert var.name == "x"
++    assert const.name == "y"
++    assert const.value == 3
++    assert not hasattr(var, "value")
++    assert textx_isinstance(var, mm["Declaration"])
++    assert textx_isinstance(const, mm["Declaration"])
++
++
++def test_simple_action_in_rule_with_own_assignments_replaces_rule_object():
++    mm = metamodel_from_str(LITERAL_GRAMMAR)
++    model = mm.model_from_str("null, 5")
++    null, five = model.literals
++    assert null.__class__.__name__ == "Null"
++    assert not hasattr(null, "value")
++    assert textx_isinstance(null, mm["Literal"])
++    assert five.__class__.__name__ == "Literal"
++    assert five.value == 5
++    assert null.parent is model
++
++
++def test_simple_action_after_assignment_is_semantic_error():
++    with pytest.raises(TextXSemanticError):
++        metamodel_from_str("Model: name=ID {Other} 'x';")
++
++
++def test_simple_action_after_assignment_inside_group_is_semantic_error():
++    with pytest.raises(TextXSemanticError):
++        metamodel_from_str("Model: 'm' (value=INT)? ({Other} 'x')?;")
++
++
++def test_simple_action_after_assignment_and_assigned_action_is_semantic_error():
++    with pytest.raises(TextXSemanticError):
++        metamodel_from_str("Root: value=ID {Wrap.old=current} {Other};")
++    with pytest.raises(TextXSemanticError):
++        metamodel_from_str("Root: value=ID {Wrap.old=current} 'x' {Other} 'y';")
++
++
++def test_simple_action_in_different_alternative_than_assignment_is_allowed():
++    mm = metamodel_from_str("Model: items+=Item; Item: name=ID | {Other} '#';")
++    model = mm.model_from_str("a # b")
++    assert [i.__class__.__name__ for i in model.items] == ["Item", "Other", "Item"]
++
++
++def test_wrapped_object_parent_is_action_object():
++    model = calc_mm().model_from_str("1 + 2 + 3")
++    outer = model.exprs[0]
++    inner = outer.left
++    assert inner.parent is outer
++    assert inner.left.parent is inner
++    assert inner.right.parent is inner
++    assert outer.right.parent is outer
++
++
++def test_action_object_parent_is_container_of_rule_result():
++    model = calc_mm().model_from_str("1 + 2; 3 * 4")
++    assert model.exprs[0].parent is model
++    assert model.exprs[1].parent is model
++    path_model = metamodel_from_str(PATH_GRAMMAR).model_from_str("a.b")
++    assert path_model.paths[0].parent is path_model
++    assert path_model.paths[0].prefix.parent is path_model.paths[0]
++
++
++def test_parent_of_operand_inside_parentheses():
++    model = calc_mm().model_from_str("(1 + 2) * 3")
++    mul = model.exprs[0]
++    assert mul.left.parent is mul
++    assert mul.left.left.parent is mul.left
++
++
++def test_positions_of_nested_action_objects():
++    text = "10 + 20  +  30 + 40"
++    model = calc_mm().model_from_str(text)
++    outer = model.exprs[0]
++    assert span(text, outer) == "10 + 20  +  30 + 40"
++    assert span(text, outer.left) == "10 + 20  +  30"
++    assert span(text, outer.left.left) == "10 + 20"
++    assert span(text, outer.left.left.left) == "10"
++
++
++def test_positions_of_wrapped_rule_objects():
++    text = "  alpha . beta  .  gamma ,delta"
++    model = metamodel_from_str(PATH_GRAMMAR).model_from_str(text)
++    gamma = model.paths[0]
++    assert span(text, gamma) == "alpha . beta  .  gamma"
++    assert span(text, gamma.prefix) == "alpha . beta"
++    assert span(text, gamma.prefix.prefix) == "alpha"
++    assert span(text, model.paths[1]) == "delta"
++
++
++def test_whitespace_before_trailing_action_is_not_part_of_replaced_object():
++    text = "m a   "
++    called = metamodel_from_str("Model: 'm' r=R; R: Item {W.x=current}; Item: i=ID;")
++    own = metamodel_from_str("Model: 'm' r=R; R: i=ID {W.x=current};")
++    called_model = called.model_from_str(text)
++    own_model = own.model_from_str(text)
++    assert called_model.r.__class__.__name__ == "W"
++    assert span(text, called_model.r.x) == "a"
++    assert own_model.r.__class__.__name__ == "W"
++    assert span(text, own_model.r.x) == "a"
++
++
++def test_location_of_inner_action_object():
++    text = "1 +\n  2 * 3 * 4"
++    model = calc_mm().model_from_str(text)
++    inner = model.exprs[0].right.left
++    assert span(text, inner) == "2 * 3"
++    location = get_location(inner)
++    assert location["line"] == 2
++    assert location["col"] == 3
++    assert location["nchar"] == 5
++
++
++def test_simple_action_object_starts_at_rule_match():
++    text = "  var  a ;  const b = 1;"
++    model = metamodel_from_str(DECL_GRAMMAR).model_from_str(text)
++    assert span(text, model.decls[0]) == "var  a ;"
++    assert span(text, model.decls[1]) == "const b = 1;"
++
++
++def test_simple_action_after_keyword_starts_at_rule_match():
++    text = "decl  var a\n decl const 3 b"
++    mm = metamodel_from_str(KIND_GRAMMAR)
++    model = mm.model_from_str(text)
++    var, const = model.decls
++    assert var.__class__.__name__ == "Var"
++    assert const.__class__.__name__ == "Const"
++    assert (var.name, const.name, const.value) == ("a", "b", 3)
++    assert not hasattr(var, "value")
++    assert textx_isinstance(var, mm["Decl"])
++    assert span(text, var) == "decl  var a"
++    assert span(text, const) == "decl const 3 b"
++
++
++def test_user_classes_for_action_classes_are_constructed_after_contents():
++    class Add:
++        def __init__(self, parent, left, right):
++            self.parent = parent
++            self.left = left
++            self.right = right
++            self.value = left.value + right.value
++
++    class Sub:
++        def __init__(self, parent, left, right):
++            self.parent = parent
++            self.left = left
++            self.right = right
++            self.value = left.value - right.value
++
++    class Binary:
++        def __init__(self, parent, left, op, right):
++            self.parent = parent
++            self.left = left
++            self.op = op
++            self.right = right
++            if op == "*":
++                self.value = left.value * right.value
++            else:
++                self.value = left.value / right.value
++
++    mm = calc_mm(classes=[Add, Sub, Binary])
++    model = mm.model_from_str("10 - 2 * 3 + 8 / 4; (1 + 2) * 3")
++    assert isinstance(model.exprs[0], Add)
++    assert model.exprs[0].value == 6
++    assert model.exprs[1].value == 9
++    assert isinstance(model.exprs[1].left, Add)
++    assert model.exprs[1].left.parent is model.exprs[1]
++
++
++def test_user_class_construction_order_with_actions():
++    order = []
++
++    class Path:
++        def __init__(self, parent, name, prefix):
++            self.parent = parent
++            self.name = name
++            self.prefix = prefix
++            order.append(name)
++
++    mm = metamodel_from_str(PATH_GRAMMAR, classes=[Path])
++    model = mm.model_from_str("a.b.c, d")
++    assert order == ["a", "b", "c", "d"]
++    assert model.paths[0].prefix.prefix.name == "a"
++    assert model.paths[0].prefix.parent is model.paths[0]
++
++
++def test_user_classes_for_simple_action_classes():
++    class VarDecl:
++        def __init__(self, parent, name):
++            self.parent = parent
++            self.name = name
++
++    class ConstDecl:
++        def __init__(self, parent, name, value):
++            self.parent = parent
++            self.name = name
++            self.value = value
++
++    mm = metamodel_from_str(DECL_GRAMMAR, classes=[VarDecl, ConstDecl])
++    model = mm.model_from_str("const k = 2; var v; use k;")
++    assert isinstance(model.decls[0], ConstDecl)
++    assert isinstance(model.decls[1], VarDecl)
++    assert model.uses[0].target is model.decls[0]
++
++
++def test_callable_class_provider_supplies_action_classes():
++    class Wrap:
++        def __init__(self, parent, item):
++            self.parent = parent
++            self.item = item
++
++    def provider(name):
++        return Wrap if name == "Wrap" else None
++
++    mm = metamodel_from_str(
++        "Model: value=R; R: Item {Wrap.item=current}; Item: v=INT;", classes=provider
++    )
++    model = mm.model_from_str("1")
++    assert isinstance(model.value, Wrap)
++    assert model.value.item.v == 1
++    assert model.value.item.parent is model.value
++    assert model.value.parent is model
++
++
++def test_object_processors_run_for_action_classes():
++    mm = calc_mm()
++    mm.register_obj_processors(
++        {
++            "Number": lambda n: n.value,
++            "Add": lambda a: a.left + a.right,
++            "Sub": lambda s: s.left - s.right,
++            "Binary": lambda b: b.left * b.right if b.op == "*" else b.left // b.right,
++        }
++    )
++    model = mm.model_from_str("2 * 3 * 4 - 10 / 5 + 1; 7")
++    assert model.exprs == [23, 7]
++
++
++def test_processors_follow_the_class_of_each_handed_over_object():
++    mm = metamodel_from_str("Model: value=R; R: {A} name=ID {B.child=current}; A: a=ID;")
++    seen = {"A": [], "B": []}
++    mm.register_obj_processors({name: seen[name].append for name in seen})
++    model = mm.model_from_str("x")
++    result = model.value
++    assert result.__class__.__name__ == "B"
++    assert result.child.__class__.__name__ == "A"
++    assert result.child.name == "x"
++    assert seen["B"] == [result]
++    assert seen["A"] == [result.child]
++
++    mm = metamodel_from_str(
++        "Model: vs+=R[','];"
++        " R: ('a' {A} name=ID | 'c' {C} name=ID) {B.child=current};"
++        " A: a=ID; C: c=ID;"
++    )
++    seen = {"A": [], "B": [], "C": []}
++    mm.register_obj_processors({name: seen[name].append for name in seen})
++    first, second = mm.model_from_str("a x, c y").vs
++    assert seen["B"] == [first, second]
++    assert seen["A"] == [first.child]
++    assert seen["C"] == [second.child]
++
++
++def test_references_resolve_to_simple_action_objects():
++    model = metamodel_from_str(DECL_GRAMMAR).model_from_str(
++        "var a; const b = 1; use b; use a;"
++    )
++    const = model.decls[1]
++    var = model.decls[0]
++    assert model.uses[0].target is const
++    assert model.uses[1].target is var
++
++
++def test_action_objects_of_existing_match_rule_are_referenced_and_processed():
++    grammar = r"""
++    Model: defs*=Def uses*=Use;
++    Def: {Named} 'def' name=ID;
++    Named: /[a-z]+/;
++    Use: 'use' target=[Named];
++    """
++    model = metamodel_from_str(grammar).model_from_str("def a def b use b use a")
++    first, second = model.defs
++    assert second.__class__.__name__ == "Named"
++    assert model.uses[0].target is second
++    assert model.uses[1].target is first
++
++    mm = metamodel_from_str("R: {Named} 'x' name=ID; Named: /[a-z]+/;")
++    processed = []
++    mm.register_obj_processors({"Named": processed.append})
++    root = mm.model_from_str("x q")
++    assert processed == [root]
++    assert root.name == "q"
++
++
++def test_references_inside_action_objects_resolve():
++    model = metamodel_from_str(LOOKUP_GRAMMAR).model_from_str("def a def b a & b & a; b;")
++    pair = model.items[2]
++    assert pair.__class__.__name__ == "Pair"
++    assert pair.second.target is model.items[0]
++    assert pair.first.second.target is model.items[1]
++    assert pair.first.first.target is model.items[0]
++    assert model.items[3].target is model.items[1]
++
++
++def test_reference_assigned_to_action_object_resolves():
++    grammar = r"""
++    Model: definition=Def use=Use;
++    Def: 'def' name=ID;
++    Use: {ActionUse} 'use' target=[Def];
++    """
++    model = metamodel_from_str(grammar).model_from_str("def x use x")
++    assert model.use.__class__.__name__ == "ActionUse"
++    assert model.use.target is model.definition
++
++
++def test_grammar_model_exposes_assigned_actions():
++    textx_mm = metamodel_for_language("textx")
++    grammar_model = textx_mm.grammar_model_from_str(
++        "E: T ({Bin.left = current} '+' right=T | {Lst.items+=current} ',')*; T: v=INT;"
++    )
++    actions = get_children_of_type("Action", grammar_model)
++    assert [a.class_name for a in actions] == ["Bin", "Lst"]
++    assert [a.attribute for a in actions] == ["left", "items"]
++    assert [a.operator for a in actions] == ["=", "+="]
++    assert all(a.parent.__class__.__name__ == "Expression" for a in actions)
++    assert actions[0].parent.action is actions[0]
++
++
++def test_grammar_model_exposes_simple_action():
++    textx_mm = metamodel_for_language("textx")
++    grammar_model = textx_mm.grammar_model_from_str(
++        "D: {VarDecl} 'var' name=ID | {ConstDecl} 'const' name=ID;"
++    )
++    actions = get_children_of_type("Action", grammar_model)
++    assert [a.class_name for a in actions] == ["VarDecl", "ConstDecl"]
++    assert all(a.parent.__class__.__name__ == "Expression" for a in actions)
++    assert all(a.parent.action is a for a in actions)
++
++
++def test_rule_object_does_not_get_attributes_only_action_objects_receive():
++    class Bound:
++        def __init__(self, parent, value, unit):
++            self.parent = parent
++            self.value = value
++            self.unit = unit
++
++    grammar = r"""
++    Model: bounds+=Bound[','];
++    Bound: value=INT ({Range.low=current} '..' high=INT)? unit=ID;
++    """
++    mm = metamodel_from_str(grammar, classes=[Bound])
++    model = mm.model_from_str("5 m, 1..3 s")
++    single, rng = model.bounds
++    assert isinstance(single, Bound)
++    assert (single.value, single.unit) == (5, "m")
++    assert rng.__class__.__name__ == "Range"
++    assert isinstance(rng.low, Bound)
++    assert (rng.low.value, rng.high, rng.unit) == (1, 3, "s")
++    assert not hasattr(rng, "value")
++    assert textx_isinstance(rng, mm["Bound"])
++
++
++def test_optional_action_inside_repetition_keeps_repeated_attribute_a_list():
++    grammar = r"""
++    Text: sentences+=Sentence;
++    Sentence: (words=ID ({Clause.previous=current} ',')?)+ '.';
++    """
++    model = metamodel_from_str(grammar).model_from_str("a b, c d, e. f g.")
++    first, second = model.sentences
++    assert first.__class__.__name__ == "Clause"
++    assert first.words == ["e"]
++    assert first.previous.words == ["c", "d"]
++    assert first.previous.__class__.__name__ == "Clause"
++    assert first.previous.previous.__class__.__name__ == "Sentence"
++    assert first.previous.previous.words == ["a", "b"]
++    assert second.__class__.__name__ == "Sentence"
++    assert second.words == ["f", "g"]
++
++
++def test_action_naming_another_existing_rule_uses_that_class():
++    grammar = r"""
++    Model: chains+=Chain[','];
++    Chain: Item ({Item.previous=current} '->' label=ID)*;
++    Item: label=ID;
++    """
++    mm = metamodel_from_str(grammar)
++    model = mm.model_from_str("a -> b -> c, d")
++    c, d = model.chains
++    assert type(c) is mm["Item"]
++    assert c.label == "c"
++    assert c.previous.label == "b"
++    assert type(c.previous.previous) is mm["Item"]
++    assert c.previous.previous.label == "a"
++    assert c.previous.previous.previous is None
++    assert d.label == "d"
++    assert d.previous is None
++
++
++def test_append_action_alone_still_makes_list():
++    grammar = r"""
++    Model: groups+=Group[','];
++    Group: Item ({Many.items+=current} '!')?;
++    Item: v=INT;
++    """
++    model = metamodel_from_str(grammar).model_from_str("1!, 2")
++    many, single = model.groups
++    assert many.__class__.__name__ == "Many"
++    assert isinstance(many.items, list)
++    assert [i.v for i in many.items] == [1]
++    assert single.__class__.__name__ == "Item"
++
++
++def test_grammar_without_any_action_keeps_its_behavior():
++    grammar = r"""
++    Model: 'model' items*=Item uses*=Use;
++    Item: Group | Entry;
++    Group: 'group' name=ID '{' entries+=Entry[','] '}';
++    Entry: 'entry' name=ID ('=' value=Value)? tags*=Tag;
++    Value: INT | STRING;
++    Tag: '#' label=ID;
++    Use: 'use' ref=[Entry];
++    """
++    text = 'model group g { entry a = 1 #x #y, entry b } entry c = "s" use b use c'
++    order = []
++
++    class Group:
++        def __init__(self, parent, name, entries):
++            self.parent = parent
++            self.name = name
++            self.entries = entries
++            order.append(name)
++
++    class Entry:
++        def __init__(self, parent, name, value, tags):
++            self.parent = parent
++            self.name = name
++            self.value = value
++            self.tags = tags
++            order.append(name)
++
++    mm = metamodel_from_str(grammar)
++    assert mm["Item"]._tx_type == "abstract"
++    assert mm["Group"]._tx_type == "common"
++    assert mm["Entry"]._tx_type == "common"
++    assert mm["Value"]._tx_type == "match"
++
++    model = mm.model_from_str(text)
++    group, c = model.items
++    a, b = group.entries
++    assert (type(group).__name__, type(c).__name__) == ("Group", "Entry")
++    assert group.parent is model
++    assert a.parent is group
++    assert (a.value, b.value, c.value) == (1, None, "s")
++    assert [t.label for t in a.tags] == ["x", "y"]
++    assert b.tags == []
++    assert a.tags[0].parent is a
++    assert span(text, group) == "group g { entry a = 1 #x #y, entry b }"
++    assert span(text, a) == "entry a = 1 #x #y"
++    assert model.uses[0].ref is b
++    assert model.uses[1].ref is c
++    assert [e.name for e in get_children_of_type("Entry", model)] == ["a", "b", "c"]
++
++    user_model = metamodel_from_str(grammar, classes=[Group, Entry]).model_from_str(text)
++    assert order == ["a", "b", "g", "c"]
++    assert user_model.uses[0].ref is user_model.items[0].entries[1]
++
++    processed_mm = metamodel_from_str(grammar)
++    processed_mm.register_obj_processors({"Tag": lambda t: t.label.upper()})
++    processed = processed_mm.model_from_str(text)
++    assert processed.items[0].entries[0].tags == ["X", "Y"]
++
++    config_mm = metamodel_from_str(
++        r"""
++        Config: 'config' name=ID settings*=Setting flags=Flags;
++        Setting: Toggle | Choice;
++        Toggle: 'toggle' name=ID enabled?='on';
++        Choice: 'choice' name=ID '=' options+=Option[','] ('default' default=[Toggle])?;
++        Option: /[a-z]+/;
++        Flags: (fast?='fast' safe?='safe' level=INT)#;
++        """
++    )
++    config_text = (
++        "config app toggle t1 on toggle t2 choice c = x, y, zz default t2 3 safe fast"
++    )
++    config = config_mm.model_from_str(config_text)
++    t1, t2, choice = config.settings
++    assert [type(s).__name__ for s in config.settings] == ["Toggle", "Toggle", "Choice"]
++    assert (t1.enabled, t2.enabled) == (True, False)
++    assert choice.options == ["x", "y", "zz"]
++    assert choice.default is t2
++    assert choice.parent is config
++    assert (config.flags.fast, config.flags.safe, config.flags.level) == (True, True, 3)
++    assert span(config_text, choice) == "choice c = x, y, zz default t2"
++    assert [t.name for t in get_children_of_type("Toggle", config)] == ["t1", "t2"]
++    other = config_mm.model_from_str("config b choice d = q 0 fast safe")
++    assert other.settings[0].default is None
++    assert other.flags.level == 0
++
++    for invalid in (
++        "Model: a=ID a?='x';",
++        "Model: a='y' a?='x';",
++        "Model: a+=ID a?='x';",
++        "Model: a?='x' a?='y';",
++    ):
++        with pytest.raises(TextXSemanticError):
++            metamodel_from_str(invalid)
++
++    grammar_model = metamodel_for_language("textx").grammar_model_from_str(grammar)
++    expressions = get_children_of_type("Expression", grammar_model)
++    assert expressions
++    assert all(expression.action is None for expression in expressions)
++
++
++def test_action_as_last_expression_of_a_rule():
++    mm = metamodel_from_str(
++        "Model: values+=R[',']; R: Item {Wrap.item=current} | 'go' {Done}; Item: v=INT;"
++    )
++    model = mm.model_from_str("7, go")
++    wrapped, done = model.values
++    assert wrapped.__class__.__name__ == "Wrap"
++    assert wrapped.item.v == 7
++    assert wrapped.item.parent is wrapped
++    assert done.__class__.__name__ == "Done"
++    assert textx_isinstance(done, mm["R"])
++    assert done.parent is model
++
++
++def test_simple_action_objects_are_replaced_by_their_processor():
++    mm = metamodel_from_str(DECL_GRAMMAR)
++    mm.register_obj_processors(
++        {
++            "VarDecl": lambda decl: f"var:{decl.name}",
++            "ConstDecl": lambda decl: decl.value * 10,
++        }
++    )
++    model = mm.model_from_str("var x; const y = 4;")
++    assert model.decls == ["var:x", 40]
++
++
++def test_mutually_exclusive_assignments_stay_single_on_action_object():
++    mm = metamodel_from_str(
++        "Model: values+=R[',']; R: {Selected} (value=ID | value=INT);"
++    )
++    word, number = mm.model_from_str("item, 42").values
++    assert word.__class__.__name__ == "Selected"
++    assert word.value == "item"
++    assert number.value == 42
++
++
++def test_action_classes_get_exactly_the_attributes_their_objects_receive():
++    def attributes(cls):
++        return {
++            name: (attr.mult in (MULT_ZEROORMORE, MULT_ONEORMORE), attr.cont)
++            for name, attr in cls._tx_attrs.items()
++        }
++
++    single = (False, True)
++    many = (True, True)
++
++    calc = calc_mm()
++    assert attributes(calc["Sum"]) == {}
++    assert attributes(calc["Product"]) == {}
++    assert attributes(calc["Add"]) == {"left": single, "right": single}
++    assert attributes(calc["Sub"]) == {"left": single, "right": single}
++    assert attributes(calc["Binary"]) == {"left": single, "op": single, "right": single}
++
++    path = metamodel_from_str(PATH_GRAMMAR)
++    assert attributes(path["Path"]) == {"name": single, "prefix": single}
++
++    call = metamodel_from_str(CALL_GRAMMAR)
++    assert attributes(call["Call"]) == {}
++    assert attributes(call["Invocation"]) == {"callee": single, "args": many}
++
++    tuple_mm = metamodel_from_str(TUPLE_GRAMMAR)
++    assert attributes(tuple_mm["Expr"]) == {}
++    assert attributes(tuple_mm["Tuple"]) == {"items": many}
++
++    decl = metamodel_from_str(DECL_GRAMMAR)
++    assert attributes(decl["Declaration"]) == {}
++    assert attributes(decl["VarDecl"]) == {"name": single}
++    assert attributes(decl["ConstDecl"]) == {"name": single, "value": single}

@@ -1,0 +1,2365 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..7dec237f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,54 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++cd /app || exit 1
++
++NEW_TESTS="test/test_sparql_provenance_062612.py"
++
++ARGS=(-p no:cacheprovider -o addopts=)
++# the marked cases and the graphdb/rdf4j suites need a live server or a container,
++# and test_plugins.py needs the test-only plugin packages to be installed first
++ARGS+=(-m "not webtest and not testcontainer")
++ARGS+=(--ignore=test/test_graphdb --ignore=test/test_rdf4j)
++ARGS+=(--ignore=test/test_misc/test_plugins.py)
++# the swap_n3 cases flip between pass and xfail from run to run, and the three
++# tests below build their ids from fresh blank nodes, so their ids differ every run
++ARGS+=(--ignore=test/test_parsers/test_swap_n3.py)
++ARGS+=(-k "not test_skolemization and not test_expand_curie and not test_xsv_serialize")
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  ARGS+=(--junitxml="$OUTPUT_PATH")
++fi
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "${ARGS[@]}" "$NEW_TESTS"
++else
++  python -m pytest "${ARGS[@]}" --ignore="$NEW_TESTS" test
++fi
++EXIT_CODE=$?
++
++if [ -n "$OUTPUT_PATH" ] && [ ! -s "$OUTPUT_PATH" ]; then
++  cat > "$OUTPUT_PATH" <<'XMLEOF'
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++  <testsuite name="pytest" tests="1" failures="1" errors="0" time="0">
++    <testcase name="collection" classname="pytest"><failure message="pytest produced no report">the test run ended before any test was recorded</failure></testcase>
++  </testsuite>
++</testsuites>
++XMLEOF
++fi
++
++exit $EXIT_CODE
+diff --git a/test/test_sparql_baseline_062612.py b/test/test_sparql_baseline_062612.py
+new file mode 100644
+index 00000000..3445d509
+--- /dev/null
++++ b/test/test_sparql_baseline_062612.py
+@@ -0,0 +1,420 @@
++from __future__ import annotations
++
++import pytest
++
++import rdflib.plugins.sparql
++from rdflib import Dataset, Graph, Literal, Namespace, URIRef
++from rdflib.plugins.stores.memory import Memory
++from rdflib.query import UpdateProcessor
++
++EX = Namespace("http://example.org/")
++PREFIX = "PREFIX ex: <http://example.org/>\n"
++G = URIRef("http://example.org/g")
++
++
++def build_graph(triples, identifier=G):
++    graph = Graph(identifier=identifier)
++    for triple in triples:
++        graph.add(triple)
++    return graph
++
++
++def knows_graph():
++    return build_graph(
++        [
++            (EX.alice, EX.knows, EX.bob),
++            (EX.alice, EX.knows, EX.carol),
++            (EX.bob, EX.age, Literal(30)),
++            (EX.carol, EX.age, Literal(40)),
++        ]
++    )
++
++
++def chain_graph():
++    return build_graph(
++        [
++            (EX.a, EX.step, EX.b),
++            (EX.b, EX.step, EX.c),
++            (EX.c, EX.step, EX.d),
++            (EX.c, EX.step, EX.a),
++            (EX.a, EX.hop, EX.e),
++            (EX.e, EX.step, EX.d),
++            (EX.x, EX.step, EX.y),
++        ]
++    )
++
++
++def build_dataset(default_union=False):
++    dataset = Dataset(default_union=default_union)
++    left = dataset.graph(EX.left)
++    left.add((EX.alice, EX.knows, EX.bob))
++    right = dataset.graph(EX.right)
++    right.add((EX.alice, EX.knows, EX.bob))
++    right.add((EX.bob, EX.knows, EX.carol))
++    return dataset
++
++
++def run(graph, query):
++    return graph.query(PREFIX + query)
++
++
++def bindings(result):
++    return [tuple(row) for row in result]
++
++
++def test_basic_pattern_binds_every_match():
++    graph = knows_graph()
++    assert sorted(bindings(run(graph, "SELECT ?f WHERE { ex:alice ex:knows ?f }"))) == [
++        (EX.bob,),
++        (EX.carol,),
++    ]
++
++
++def test_join_of_two_groups():
++    graph = knows_graph()
++    assert sorted(
++        bindings(
++            run(graph, "SELECT ?n WHERE { { ex:alice ex:knows ?f } { ?f ex:age ?n } }")
++        )
++    ) == [(Literal(30),), (Literal(40),)]
++
++
++def test_optional_leaves_the_variable_unbound():
++    graph = build_graph([(EX.alice, EX.knows, EX.bob), (EX.carol, EX.age, Literal(40))])
++    assert bindings(
++        run(
++            graph,
++            "SELECT ?f ?n WHERE { ex:alice ex:knows ?f OPTIONAL { ?f ex:age ?n } }",
++        )
++    ) == [(EX.bob, None)]
++
++
++def test_minus_removes_the_matching_solutions():
++    graph = knows_graph()
++    assert bindings(
++        run(graph, "SELECT ?f WHERE { ex:alice ex:knows ?f MINUS { ?f ex:age 40 } }")
++    ) == [(EX.bob,)]
++
++
++def test_union_keeps_both_branches():
++    graph = knows_graph()
++    assert sorted(
++        bindings(
++            run(
++                graph,
++                "SELECT ?x WHERE { { ex:alice ex:knows ?x } UNION { ?x ex:age 40 } }",
++            )
++        )
++    ) == [(EX.bob,), (EX.carol,), (EX.carol,)]
++
++
++def test_filter_keeps_only_what_matches():
++    graph = knows_graph()
++    assert bindings(run(graph, "SELECT ?n WHERE { ?p ex:age ?n FILTER(?n > 35) }")) == [
++        (Literal(40),)
++    ]
++
++
++def test_exists_and_not_exists_split_the_solutions():
++    graph = build_graph(
++        [
++            (EX.alice, EX.knows, EX.bob),
++            (EX.alice, EX.knows, EX.carol),
++            (EX.carol, EX.age, Literal(40)),
++        ]
++    )
++    assert bindings(
++        run(
++            graph,
++            "SELECT ?f WHERE { ex:alice ex:knows ?f FILTER EXISTS { ?f ex:age ?n } }",
++        )
++    ) == [(EX.carol,)]
++    assert bindings(
++        run(
++            graph,
++            "SELECT ?f WHERE { ex:alice ex:knows ?f FILTER NOT EXISTS { ?f ex:age ?n } }",
++        )
++    ) == [(EX.bob,)]
++
++
++def test_values_supplies_the_binding():
++    graph = knows_graph()
++    assert bindings(run(graph, "SELECT ?s WHERE { VALUES ?s { ex:alice } }")) == [
++        (EX.alice,)
++    ]
++
++
++def test_bind_computes_a_new_variable():
++    graph = knows_graph()
++    rows = bindings(
++        run(graph, "SELECT ?d WHERE { ex:bob ex:age ?n BIND(?n * 2 AS ?d) }")
++    )
++    assert len(rows) == 1
++    assert int(rows[0][0]) == 60
++
++
++def test_distinct_collapses_repeated_rows():
++    graph = knows_graph()
++    assert bindings(run(graph, "SELECT DISTINCT ?s WHERE { ?s ex:knows ?f }")) == [
++        (EX.alice,)
++    ]
++
++
++def test_reduced_collapses_adjacent_rows():
++    graph = knows_graph()
++    assert bindings(run(graph, "SELECT REDUCED ?s WHERE { ?s ex:knows ?f }")) == [
++        (EX.alice,)
++    ]
++
++
++def test_order_by_and_limit():
++    graph = knows_graph()
++    assert bindings(
++        run(graph, "SELECT ?f WHERE { ex:alice ex:knows ?f } ORDER BY DESC(?f) LIMIT 1")
++    ) == [(EX.carol,)]
++
++
++def test_group_by_counts_each_group():
++    graph = build_graph(
++        [
++            (EX.alice, EX.knows, EX.bob),
++            (EX.carol, EX.knows, EX.dan),
++            (EX.carol, EX.knows, EX.erin),
++        ]
++    )
++    assert bindings(
++        run(
++            graph,
++            "SELECT ?s (COUNT(?f) AS ?c) WHERE { ?s ex:knows ?f } GROUP BY ?s ORDER BY ?s",
++        )
++    ) == [(EX.alice, Literal(1)), (EX.carol, Literal(2))]
++
++
++def test_aggregate_over_an_empty_pattern():
++    graph = knows_graph()
++    assert bindings(
++        run(graph, "SELECT (COUNT(?f) AS ?c) WHERE { ?s ex:likes ?f }")
++    ) == [(Literal(0),)]
++
++
++def test_subquery_feeds_the_outer_pattern():
++    graph = knows_graph()
++    assert sorted(
++        bindings(
++            run(
++                graph,
++                "SELECT ?n WHERE { { SELECT ?f WHERE { ex:alice ex:knows ?f } } ?f ex:age ?n }",
++            )
++        )
++    ) == [(Literal(30),), (Literal(40),)]
++
++
++def test_ask_answers_both_ways():
++    graph = knows_graph()
++    assert bool(run(graph, "ASK { ex:alice ex:knows ?f }")) is True
++    assert bool(run(graph, "ASK { ex:alice ex:likes ?f }")) is False
++
++
++def test_construct_builds_the_template():
++    graph = knows_graph()
++    result = run(
++        graph, "CONSTRUCT { ?f ex:knownBy ex:alice } WHERE { ex:alice ex:knows ?f }"
++    )
++    assert set(result.graph) == {
++        (EX.bob, EX.knownBy, EX.alice),
++        (EX.carol, EX.knownBy, EX.alice),
++    }
++
++
++def test_describe_returns_the_statements_of_a_resource():
++    graph = knows_graph()
++    result = run(graph, "DESCRIBE ex:bob")
++    assert set(result.graph) == {(EX.bob, EX.age, Literal(30))}
++
++
++def test_named_graph_pattern_binds_the_graph():
++    dataset = build_dataset()
++    assert bindings(
++        run(dataset, "SELECT ?g WHERE { GRAPH ?g { ex:bob ex:knows ex:carol } }")
++    ) == [(EX.right,)]
++
++
++def test_union_dataset_sees_every_graph():
++    dataset = build_dataset(default_union=True)
++    assert bindings(run(dataset, "SELECT ?p WHERE { ex:bob ex:knows ?p }")) == [
++        (EX.carol,)
++    ]
++
++
++PATH_CASES = [
++    ("SELECT ?o WHERE { ex:a ex:step/ex:step ?o }", [(EX.c,)]),
++    ("SELECT ?s WHERE { ?s ^ex:step ex:a }", [(EX.b,)]),
++    ("SELECT ?o WHERE { ex:a !(ex:step) ?o }", [(EX.e,)]),
++]
++
++
++@pytest.mark.parametrize("query,expected", PATH_CASES)
++def test_property_paths_bind_their_ends(query, expected):
++    graph = chain_graph()
++    assert sorted(bindings(run(graph, query))) == sorted(expected)
++
++
++def test_repeated_path_reaches_the_whole_chain():
++    graph = chain_graph()
++    reached = {
++        row[0] for row in run(graph, PREFIX + "SELECT ?o WHERE { ex:a ex:step+ ?o }")
++    }
++    assert reached == {EX.a, EX.b, EX.c, EX.d}
++
++
++def test_zero_or_more_path_includes_the_start():
++    graph = chain_graph()
++    reached = {
++        row[0] for row in run(graph, PREFIX + "SELECT ?o WHERE { ex:x ex:step* ?o }")
++    }
++    assert reached == {EX.x, EX.y}
++
++
++def test_insert_data_and_delete_data():
++    dataset = build_dataset()
++    dataset.update(PREFIX + "INSERT DATA { GRAPH ex:left { ex:dan ex:knows ex:erin } }")
++    assert (EX.dan, EX.knows, EX.erin) in dataset.graph(EX.left)
++    dataset.update(PREFIX + "DELETE DATA { GRAPH ex:left { ex:dan ex:knows ex:erin } }")
++    assert (EX.dan, EX.knows, EX.erin) not in dataset.graph(EX.left)
++
++
++def test_delete_where_removes_the_matches():
++    dataset = build_dataset()
++    dataset.update(PREFIX + "DELETE WHERE { GRAPH ex:right { ex:bob ex:knows ?p } }")
++    assert len(dataset.graph(EX.right)) == 1
++
++
++def test_delete_insert_rewrites_the_statements():
++    dataset = build_dataset()
++    dataset.update(
++        PREFIX
++        + "DELETE { GRAPH ex:right { ex:bob ex:knows ?p } }"
++        + " INSERT { GRAPH ex:right { ex:bob ex:knew ?p } }"
++        + " WHERE { GRAPH ex:right { ex:bob ex:knows ?p } }"
++    )
++    assert (EX.bob, EX.knew, EX.carol) in dataset.graph(EX.right)
++    assert (EX.bob, EX.knows, EX.carol) not in dataset.graph(EX.right)
++
++
++def test_copy_replaces_the_target_graph():
++    dataset = build_dataset()
++    dataset.update(PREFIX + "COPY ex:left TO ex:right")
++    assert set(dataset.graph(EX.right)) == {(EX.alice, EX.knows, EX.bob)}
++
++
++def test_move_empties_the_source_graph():
++    dataset = build_dataset()
++    dataset.update(PREFIX + "MOVE ex:left TO ex:target")
++    assert set(dataset.graph(EX.target)) == {(EX.alice, EX.knows, EX.bob)}
++    assert len(dataset.graph(EX.left)) == 0
++
++
++def test_add_keeps_the_source_graph():
++    dataset = build_dataset()
++    dataset.update(PREFIX + "ADD ex:left TO ex:right")
++    assert len(dataset.graph(EX.left)) == 1
++    assert len(dataset.graph(EX.right)) == 2
++
++
++def test_clear_empties_a_graph():
++    dataset = build_dataset()
++    dataset.update(PREFIX + "CLEAR GRAPH ex:right")
++    assert len(dataset.graph(EX.right)) == 0
++
++
++def test_drop_removes_a_graph():
++    dataset = build_dataset()
++    dataset.update(PREFIX + "DROP GRAPH ex:right")
++    assert EX.right not in {graph.identifier for graph in dataset.graphs()}
++
++
++def test_update_returns_nothing():
++    dataset = build_dataset()
++    assert (
++        dataset.update(PREFIX + "INSERT DATA { GRAPH ex:left { ex:p ex:q ex:r } }")
++        is None
++    )
++
++
++def test_update_over_a_plain_graph():
++    graph = knows_graph()
++    graph.update(PREFIX + "DELETE WHERE { ?s ex:age ?n }")
++    assert set(graph) == {
++        (EX.alice, EX.knows, EX.bob),
++        (EX.alice, EX.knows, EX.carol),
++    }
++
++
++def test_init_bindings_are_applied():
++    graph = knows_graph()
++    result = graph.query(
++        PREFIX + "SELECT ?f WHERE { ?s ex:knows ?f }", initBindings={"f": EX.carol}
++    )
++    assert bindings(result) == [(EX.carol,)]
++
++
++class StoreWithUpdateReturningSomething(Memory):
++    def update(self, update, initNs, initBindings, queryGraph):  # noqa: N803
++        return EX.answered
++
++
++def test_a_request_without_the_keyword_keeps_what_the_store_returned():
++    graph = Graph(store=StoreWithUpdateReturningSomething())
++    graph.add((EX.alice, EX.knows, EX.bob))
++    assert graph.update(PREFIX + "INSERT DATA { ex:s ex:p ex:o }") == EX.answered
++
++
++class ProcessorReturningSomething(UpdateProcessor):
++    def __init__(self, graph):
++        self.graph = graph
++
++    def update(
++        self, strOrQuery, initBindings=None, initNs=None, **kwargs  # noqa: N803
++    ):
++        return EX.answered
++
++
++def test_a_request_without_the_keyword_keeps_what_a_supplied_processor_returned():
++    graph = Graph()
++    answer = graph.update(
++        PREFIX + "INSERT DATA { ex:s ex:p ex:o }",
++        processor=ProcessorReturningSomething(graph),
++    )
++    assert answer == EX.answered
++
++
++class ProcessorAnswering(UpdateProcessor):
++    def __init__(self, graph):
++        self.graph = graph
++        self.called = False
++
++    def update(
++        self, strOrQuery, initBindings=None, initNs=None, **kwargs  # noqa: N803
++    ):
++        self.called = True
++        return EX.answered
++
++
++def test_asking_for_no_report_leaves_a_supplied_processor_in_charge():
++    graph = Graph()
++    processor = ProcessorAnswering(graph)
++    answer = graph.update(
++        PREFIX + "INSERT DATA { ex:s ex:p ex:o }",
++        processor=processor,
++        provenance=False,
++    )
++    assert processor.called is True
++    assert answer == EX.answered
++    assert (EX.s, EX.p, EX.o) not in graph
++
++
++def test_a_query_over_an_empty_from_graph_still_answers(monkeypatch):
++    monkeypatch.setattr(rdflib.plugins.sparql, "SPARQL_LOAD_GRAPHS", False)
++    dataset = Dataset()
++    answer = list(dataset.query("SELECT * FROM <urn:missing> WHERE { ?s ?p ?o }"))
++    assert answer == []
+diff --git a/test/test_sparql_provenance_062612.py b/test/test_sparql_provenance_062612.py
+new file mode 100644
+index 00000000..794daf05
+--- /dev/null
++++ b/test/test_sparql_provenance_062612.py
+@@ -0,0 +1,1873 @@
++from __future__ import annotations
++
++import random
++
++import pytest
++
++from rdflib import Dataset, Graph, Literal, Namespace, URIRef
++from rdflib.graph import DATASET_DEFAULT_GRAPH_ID
++from rdflib.plugins.sparql import prepareUpdate
++from rdflib.plugins.stores.memory import Memory
++from rdflib.query import UpdateProcessor
++
++EX = Namespace("http://example.org/")
++PREFIX = "PREFIX ex: <http://example.org/>\n"
++G = URIRef("http://example.org/g")
++
++
++def build_dataset(triples=(), default_union=False):
++    dataset = Dataset(default_union=default_union)
++    graph = dataset.graph(G)
++    for triple in triples or [
++        (EX.alice, EX.knows, EX.bob),
++        (EX.alice, EX.knows, EX.carol),
++        (EX.bob, EX.age, Literal(30)),
++        (EX.carol, EX.age, Literal(40)),
++    ]:
++        graph.add(triple)
++    return dataset
++
++
++def build_graph(triples=(), identifier=G):
++    graph = Graph(identifier=identifier)
++    for triple in triples:
++        graph.add(triple)
++    return graph
++
++
++def split_dataset():
++    dataset = Dataset(default_union=True)
++    left = dataset.graph(EX.left)
++    left.add((EX.alice, EX.knows, EX.bob))
++    right = dataset.graph(EX.right)
++    right.add((EX.alice, EX.knows, EX.bob))
++    right.add((EX.bob, EX.knows, EX.carol))
++    return dataset
++
++
++def quad(subject, predicate, obj, graph=G):
++    return (subject, predicate, obj, graph)
++
++
++def run(store, request, **kwargs):
++    return store.update(PREFIX + request, **kwargs)
++
++
++def mark(where, graph=EX.out, template="ex:alice ex:marked true"):
++    return "INSERT { GRAPH <%s> { %s } } WHERE { %s }" % (str(graph), template, where)
++
++
++def marked(graph=EX.out):
++    return quad(EX.alice, EX.marked, Literal(True), graph)
++
++
++def state(dataset):
++    return set(dataset.quads())
++
++
++def test_dropping_a_graph_with_a_report_takes_the_graph_away():
++    dataset = split_dataset()
++    run(dataset, "DROP GRAPH ex:left", provenance=True)
++    assert EX.left not in {graph.identifier for graph in dataset.graphs()}
++
++
++@pytest.mark.parametrize("transfer", ["COPY", "MOVE"])
++def test_a_transfer_from_an_empty_graph_still_clears_the_target(transfer):
++    dataset = Dataset()
++    dataset.graph(EX.target).add((EX.alice, EX.p, EX.old))
++    report = run(dataset, "%s ex:source TO ex:target" % transfer, provenance=True)
++    assert report == {
++        "added": {},
++        "removed": {quad(EX.alice, EX.p, EX.old, EX.target): frozenset()},
++    }
++    assert state(dataset) == set()
++
++
++@pytest.mark.parametrize("transfer", ["COPY", "MOVE"])
++def test_a_transfer_onto_itself_changes_nothing(transfer):
++    dataset = Dataset()
++    dataset.graph(EX.same).add((EX.alice, EX.p, EX.o))
++    report = run(dataset, "%s ex:same TO ex:same" % transfer, provenance=True)
++    assert report == {"added": {}, "removed": {}}
++    assert state(dataset) == {quad(EX.alice, EX.p, EX.o, EX.same)}
++
++
++def test_moving_onto_a_graph_reports_what_it_replaced():
++    dataset = Dataset()
++    dataset.graph(EX.source).add((EX.alice, EX.p, EX.new))
++    dataset.graph(EX.target).add((EX.alice, EX.p, EX.old))
++    report = run(dataset, "MOVE ex:source TO ex:target", provenance=True)
++    assert report["removed"] == {
++        quad(EX.alice, EX.p, EX.new, EX.source): frozenset(),
++        quad(EX.alice, EX.p, EX.old, EX.target): frozenset(),
++    }
++    assert report["added"] == {
++        quad(EX.alice, EX.p, EX.new, EX.target): frozenset(
++            {quad(EX.alice, EX.p, EX.new, EX.source)}
++        )
++    }
++
++
++@pytest.mark.parametrize("request_text", ["CLEAR ALL", "DROP ALL"])
++def test_emptying_everything_reports_the_default_graph_too(request_text):
++    dataset = Dataset()
++    dataset.add((EX.dflt, EX.p, EX.o))
++    dataset.graph(EX.side).add((EX.named, EX.p, EX.o))
++    report = run(dataset, request_text, provenance=True)
++    assert report["removed"] == {
++        quad(EX.dflt, EX.p, EX.o, DATASET_DEFAULT_GRAPH_ID): frozenset(),
++        quad(EX.named, EX.p, EX.o, EX.side): frozenset(),
++    }
++    assert state(dataset) == set()
++
++
++class StoreAnswering(Memory):
++    def update(self, update, initNs, initBindings, queryGraph):  # noqa: N803
++        return EX.answered
++
++
++def test_asking_for_no_report_leaves_a_store_update_in_charge():
++    graph = Graph(store=StoreAnswering())
++    answer = graph.update(PREFIX + "INSERT DATA { ex:s ex:p ex:o }", provenance=False)
++    assert answer == EX.answered
++    assert (EX.s, EX.p, EX.o) not in graph
++
++
++def test_moving_a_graph_with_a_report_takes_the_source_away():
++    dataset = split_dataset()
++    run(dataset, "MOVE ex:left TO ex:target", provenance=True)
++    assert EX.left not in {graph.identifier for graph in dataset.graphs()}
++
++
++def test_a_report_does_not_change_what_a_graph_can_be_asked():
++    plain = Graph(identifier=G)
++    with pytest.raises(Exception):
++        plain.update(PREFIX + "DROP GRAPH ex:other")
++    tracked = Graph(identifier=G)
++    with pytest.raises(Exception):
++        tracked.update(PREFIX + "DROP GRAPH ex:other", provenance=True)
++    asked = Graph(identifier=G)
++    assert run(asked, "INSERT DATA { ex:s ex:p ex:o }", provenance=True) == {
++        "added": {quad(EX.s, EX.p, EX.o, G): frozenset()},
++        "removed": {},
++    }
++
++
++def test_insert_where_credits_the_solutions_it_came_from():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:knownBy ex:alice } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.knownBy, EX.alice, EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob)}
++        ),
++        quad(EX.carol, EX.knownBy, EX.alice, EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.carol)}
++        ),
++    }
++    assert report["removed"] == {}
++
++
++def test_insert_where_on_a_plain_graph():
++    graph = build_graph([(EX.alice, EX.knows, EX.bob)])
++    report = graph.update(
++        PREFIX + "INSERT { ?f ex:knownBy ex:alice } WHERE { ex:alice ex:knows ?f }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.knownBy, EX.alice): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob)}
++        )
++    }
++
++
++def test_data_the_request_spells_out_is_justified_by_nothing():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT DATA { GRAPH ex:g { ex:dan ex:knows ex:erin } }",
++        provenance=True,
++    )
++    assert report["added"] == {quad(EX.dan, EX.knows, EX.erin): frozenset()}
++
++
++def test_every_reason_in_a_report_is_a_frozenset():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:knownBy ex:alice } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f } } ;"
++        " DELETE DATA { GRAPH ex:g { ex:bob ex:age 30 } }",
++        provenance=True,
++    )
++    reasons = list(report["added"].values()) + list(report["removed"].values())
++    assert len(reasons) == 3
++    assert any(reason for reason in reasons)
++    assert any(not reason for reason in reasons)
++    for reason in reasons:
++        assert isinstance(reason, frozenset)
++
++
++def test_data_the_request_takes_away_itself_is_justified_by_nothing():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "DELETE DATA { GRAPH ex:g { ex:alice ex:knows ex:bob } }",
++        provenance=True,
++    )
++    assert report["removed"] == {quad(EX.alice, EX.knows, EX.bob): frozenset()}
++
++
++def test_delete_where_credits_the_statement_it_matched():
++    dataset = build_dataset()
++    report = run(
++        dataset, "DELETE WHERE { GRAPH ex:g { ex:bob ex:age ?n } }", provenance=True
++    )
++    assert report["removed"] == {
++        quad(EX.bob, EX.age, Literal(30)): frozenset(
++            {quad(EX.bob, EX.age, Literal(30))}
++        )
++    }
++    assert report["added"] == {}
++
++
++def test_delete_where_on_a_plain_graph_credits_the_statement():
++    graph = build_graph([(EX.alice, EX.knows, EX.bob), (EX.bob, EX.age, Literal(30))])
++    report = graph.update(PREFIX + "DELETE WHERE { ?s ex:age ?n }", provenance=True)
++    assert report["removed"] == {
++        quad(EX.bob, EX.age, Literal(30)): frozenset(
++            {quad(EX.bob, EX.age, Literal(30))}
++        )
++    }
++    assert len(graph) == 1
++
++
++def test_delete_insert_reports_both_sides():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "DELETE { GRAPH ex:g { ex:bob ex:age ?n } }"
++        " INSERT { GRAPH ex:g { ex:bob ex:years ?n } }"
++        " WHERE { GRAPH ex:g { ex:bob ex:age ?n } }",
++        provenance=True,
++    )
++    witness = frozenset({quad(EX.bob, EX.age, Literal(30))})
++    assert report["removed"] == {quad(EX.bob, EX.age, Literal(30)): witness}
++    assert report["added"] == {quad(EX.bob, EX.years, Literal(30)): witness}
++
++
++def test_update_without_the_keyword_reports_nothing():
++    dataset = build_dataset()
++    tracked = run(
++        dataset, "INSERT DATA { GRAPH ex:g { ex:p ex:q ex:r } }", provenance=True
++    )
++    assert tracked["added"]
++    assert run(dataset, "INSERT DATA { GRAPH ex:g { ex:r ex:q ex:p } }") is None
++
++
++def test_writing_a_statement_that_is_already_stored_reports_nothing():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT DATA { GRAPH ex:g { ex:alice ex:knows ex:bob } }",
++        provenance=True,
++    )
++    assert report == {"added": {}, "removed": {}}
++
++
++def test_deleting_a_statement_that_is_not_stored_reports_nothing():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "DELETE DATA { GRAPH ex:g { ex:alice ex:knows ex:zoe } }",
++        provenance=True,
++    )
++    assert report == {"added": {}, "removed": {}}
++
++
++def test_a_statement_written_then_deleted_is_absent_from_the_report():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT DATA { GRAPH ex:g { ex:dan ex:knows ex:erin } } ;"
++        " DELETE DATA { GRAPH ex:g { ex:dan ex:knows ex:erin } }",
++        provenance=True,
++    )
++    assert report == {"added": {}, "removed": {}}
++
++
++def test_a_statement_deleted_then_written_is_absent_from_the_report():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "DELETE DATA { GRAPH ex:g { ex:alice ex:knows ex:bob } } ;"
++        " INSERT DATA { GRAPH ex:g { ex:alice ex:knows ex:bob } }",
++        provenance=True,
++    )
++    assert report == {"added": {}, "removed": {}}
++    assert (EX.alice, EX.knows, EX.bob) in dataset.graph(G)
++
++
++def test_operations_that_do_not_cancel_are_both_reported():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "DELETE DATA { GRAPH ex:g { ex:alice ex:knows ex:bob } } ;"
++        " INSERT DATA { GRAPH ex:g { ex:alice ex:knows ex:dan } }",
++        provenance=True,
++    )
++    assert set(report["removed"]) == {quad(EX.alice, EX.knows, EX.bob)}
++    assert set(report["added"]) == {quad(EX.alice, EX.knows, EX.dan)}
++
++
++def test_a_later_operation_sees_what_an_earlier_one_wrote():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT DATA { GRAPH ex:g { ex:dan ex:knows ex:erin } } ;"
++        " INSERT { GRAPH ex:out { ?x ex:knownBy ?y } }"
++        " WHERE { GRAPH ex:g { ?y ex:knows ?x . FILTER(?y = ex:dan) } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.dan, EX.knows, EX.erin): frozenset(),
++        quad(EX.erin, EX.knownBy, EX.dan, EX.out): frozenset(
++            {quad(EX.dan, EX.knows, EX.erin)}
++        ),
++    }
++
++
++class StoreWithUpdate(Memory):
++    def update(self, update, initNs, initBindings, queryGraph):  # noqa: N803
++        return None
++
++
++def test_a_graph_whose_store_has_its_own_update_still_reports():
++    graph = Graph(store=StoreWithUpdate())
++    graph.add((EX.alice, EX.knows, EX.bob))
++    report = graph.update(
++        PREFIX + "INSERT { ?f ex:knownBy ex:alice } WHERE { ex:alice ex:knows ?f }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        (EX.bob, EX.knownBy, EX.alice, graph.identifier): frozenset(
++            {(EX.alice, EX.knows, EX.bob, graph.identifier)}
++        )
++    }
++    assert (EX.bob, EX.knownBy, EX.alice) in graph
++
++
++def test_writing_to_the_default_graph_names_the_default_graph():
++    dataset = Dataset()
++    dataset.add((EX.alice, EX.knows, EX.bob))
++    report = run(
++        dataset,
++        "INSERT { ?f ex:knownBy ex:alice } WHERE { ex:alice ex:knows ?f }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.knownBy, EX.alice, DATASET_DEFAULT_GRAPH_ID): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob, DATASET_DEFAULT_GRAPH_ID)}
++        )
++    }
++
++
++def test_writing_data_to_the_default_graph_names_the_default_graph():
++    dataset = Dataset()
++    report = run(dataset, "INSERT DATA { ex:dan ex:knows ex:erin }", provenance=True)
++    assert report["added"] == {
++        quad(EX.dan, EX.knows, EX.erin, DATASET_DEFAULT_GRAPH_ID): frozenset()
++    }
++    assert (EX.dan, EX.knows, EX.erin) in dataset.default_graph
++
++
++def test_deleting_from_the_default_graph_names_the_default_graph():
++    dataset = Dataset()
++    dataset.add((EX.alice, EX.knows, EX.bob))
++    report = run(
++        dataset,
++        "DELETE WHERE { ex:alice ex:knows ?f }",
++        provenance=True,
++    )
++    assert report["removed"] == {
++        quad(EX.alice, EX.knows, EX.bob, DATASET_DEFAULT_GRAPH_ID): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob, DATASET_DEFAULT_GRAPH_ID)}
++        )
++    }
++
++
++def test_clearing_the_default_graph_reports_every_quad_it_removed():
++    dataset = Dataset()
++    dataset.add((EX.alice, EX.knows, EX.bob))
++    dataset.add((EX.bob, EX.knows, EX.carol))
++    report = run(dataset, "CLEAR DEFAULT", provenance=True)
++    assert report["removed"] == {
++        quad(EX.alice, EX.knows, EX.bob, DATASET_DEFAULT_GRAPH_ID): frozenset(),
++        quad(EX.bob, EX.knows, EX.carol, DATASET_DEFAULT_GRAPH_ID): frozenset(),
++    }
++    assert state(dataset) == set()
++
++
++DEFAULT_GRAPH_REQUESTS = [
++    "DELETE WHERE { ex:alice ex:knows ?f }",
++    "INSERT { ?f ex:knownBy ex:alice } WHERE { ex:alice ex:knows ?f }",
++    "DELETE { ?s ex:knows ?f } INSERT { ?f ex:knownBy ?s }"
++    " WHERE { ex:alice ex:knows ?f . BIND(ex:alice AS ?s) }",
++    "CLEAR DEFAULT",
++    "COPY ex:side TO DEFAULT",
++    "MOVE ex:side TO DEFAULT",
++    "COPY DEFAULT TO ex:out",
++    "ADD DEFAULT TO ex:out",
++    "MOVE DEFAULT TO ex:out",
++]
++
++
++def default_graph_dataset():
++    dataset = Dataset()
++    dataset.add((EX.alice, EX.knows, EX.bob))
++    dataset.graph(EX.side).add((EX.bob, EX.knows, EX.carol))
++    return dataset
++
++
++@pytest.mark.parametrize("request_text", DEFAULT_GRAPH_REQUESTS)
++def test_tracking_leaves_default_graph_requests_alone(request_text):
++    tracked = default_graph_dataset()
++    run(tracked, request_text, provenance=True)
++    plain = default_graph_dataset()
++    run(plain, request_text)
++    assert state(tracked) == state(plain)
++
++
++def test_a_load_is_reported(tmp_path):
++    document = tmp_path / "input.nt"
++    document.write_text(
++        "<http://example.org/dan> <http://example.org/knows>"
++        " <http://example.org/erin> ." + chr(10),
++        encoding="utf-8",
++    )
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "LOAD <%s> INTO GRAPH ex:loaded" % document.as_uri(),
++        provenance=True,
++    )
++    assert report["added"] == {quad(EX.dan, EX.knows, EX.erin, EX.loaded): frozenset()}
++
++
++def write_document(directory, text="", name="input.nt"):
++    document = directory / name
++    document.write_text(text, encoding="utf-8")
++    return document.as_uri()
++
++
++DAN_KNOWS_ERIN = (
++    "<http://example.org/dan> <http://example.org/knows>"
++    " <http://example.org/erin> ." + chr(10)
++)
++
++
++def test_a_load_without_a_target_graph_is_reported(tmp_path):
++    source = write_document(tmp_path, DAN_KNOWS_ERIN)
++    dataset = Dataset()
++    report = run(dataset, "LOAD <%s>" % source, provenance=True)
++    assert report["added"] == {
++        quad(EX.dan, EX.knows, EX.erin, DATASET_DEFAULT_GRAPH_ID): frozenset()
++    }
++
++
++def test_a_dataset_clause_leaves_the_store_where_an_untracked_run_leaves_it(tmp_path):
++    source = write_document(tmp_path, DAN_KNOWS_ERIN)
++    request = (
++        "INSERT { GRAPH ex:out { ?s ex:copied ?o } }"
++        " USING NAMED <%s> WHERE { GRAPH <%s> { ?s ?p ?o } }" % (source, source)
++    )
++    tracked = build_dataset()
++    run(tracked, request, provenance=True)
++    plain = build_dataset()
++    run(plain, request)
++    assert state(tracked) == state(plain)
++
++
++def test_a_request_prepared_in_advance_is_reported():
++    dataset = build_dataset()
++    prepared = prepareUpdate(
++        PREFIX + "INSERT { GRAPH ex:out { ?f ex:knownBy ex:alice } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f } }"
++    )
++    report = dataset.update(prepared, provenance=True)
++    assert report["added"] == {
++        quad(EX.bob, EX.knownBy, EX.alice, EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob)}
++        ),
++        quad(EX.carol, EX.knownBy, EX.alice, EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.carol)}
++        ),
++    }
++
++
++class ProcessorThatMustNotRun(UpdateProcessor):
++    def __init__(self, graph):
++        self.graph = graph
++        self.called = False
++
++    def update(
++        self, strOrQuery, initBindings=None, initNs=None, **kwargs  # noqa: N803
++    ):
++        self.called = True
++        self.graph.add((EX.trap, EX.was, EX.reached))
++        return None
++
++
++def test_a_report_does_not_go_to_a_supplied_processor():
++    dataset = build_dataset()
++    trap = ProcessorThatMustNotRun(dataset.graph(G))
++    report = dataset.update(
++        PREFIX + "INSERT DATA { GRAPH ex:g { ex:dan ex:knows ex:erin } }",
++        processor=trap,
++        provenance=True,
++    )
++    assert trap.called is False
++    assert (EX.trap, EX.was, EX.reached) not in dataset.graph(G)
++    assert report["added"] == {quad(EX.dan, EX.knows, EX.erin): frozenset()}
++    assert (EX.dan, EX.knows, EX.erin) in dataset.graph(G)
++
++
++class ProcessorWithoutTheKeywords(UpdateProcessor):
++    def __init__(self, graph):
++        self.graph = graph
++
++    def update(self, strOrQuery, initBindings, initNs):  # noqa: N803
++        self.graph.add((EX.done, EX.by, EX.processor))
++        return None
++
++
++def test_a_processor_that_predates_the_keywords_is_still_callable():
++    graph = build_graph()
++    assert (
++        graph.update(
++            PREFIX + "INSERT DATA { ex:s ex:p ex:o }",
++            processor=ProcessorWithoutTheKeywords(graph),
++        )
++        is None
++    )
++    assert (EX.done, EX.by, EX.processor) in graph
++    assert graph.update(PREFIX + "INSERT DATA { ex:s ex:p ex:o }", provenance=True)[
++        "added"
++    ] == {quad(EX.s, EX.p, EX.o): frozenset()}
++
++
++def test_an_operation_after_a_silent_failure_still_reaches_the_report(tmp_path):
++    missing = (tmp_path / "missing.nt").as_uri()
++    report = run(
++        build_dataset(),
++        "LOAD SILENT <%s> ;"
++        " INSERT DATA { GRAPH ex:g { ex:dan ex:knows ex:erin } }" % missing,
++        provenance=True,
++    )
++    assert report["added"] == {quad(EX.dan, EX.knows, EX.erin): frozenset()}
++
++
++def test_a_using_document_reports_the_same_thing_every_time(tmp_path):
++    source = write_document(tmp_path, DAN_KNOWS_ERIN)
++    request = (
++        "INSERT { GRAPH ex:out { ?s ex:copied ?o } }"
++        " USING <%s> WHERE { ?s ?p ?o }" % source
++    )
++    first = run(Dataset(), request, provenance=True)
++    again = run(Dataset(), request, provenance=True)
++    assert first == again
++    assert first["added"] == {
++        quad(EX.dan, EX.copied, EX.erin, EX.out): frozenset(
++            {quad(EX.dan, EX.knows, EX.erin, URIRef(source))}
++        )
++    }
++
++
++def test_a_prefix_given_only_as_a_namespace_reaches_the_report():
++    graph = build_graph([(EX.alice, EX.knows, EX.bob)])
++    report = graph.update(
++        "INSERT { ?f ex:knownBy ex:alice } WHERE { ex:alice ex:knows ?f }",
++        initNs={"ex": EX},
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.knownBy, EX.alice): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob)}
++        )
++    }
++    assert (EX.bob, EX.knownBy, EX.alice) in graph
++
++
++def test_a_load_of_data_the_graph_already_holds_reports_nothing(tmp_path):
++    source = write_document(tmp_path, DAN_KNOWS_ERIN)
++    dataset = Dataset()
++    dataset.graph(EX.loaded).add((EX.dan, EX.knows, EX.erin))
++    before = state(dataset)
++    report = run(dataset, "LOAD <%s> INTO GRAPH ex:loaded" % source, provenance=True)
++    assert report == {"added": {}, "removed": {}}
++    assert state(dataset) == before
++
++
++def test_a_solution_dropped_by_a_limit_credits_nothing():
++    dataset = build_dataset([(EX.a, EX.w, EX.one), (EX.b, EX.w, EX.two)])
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ex:r ex:marked true } }"
++        " WHERE { { SELECT ?s WHERE { GRAPH ex:g { ?s ex:w ?o } }"
++        " ORDER BY ?s LIMIT 1 } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.r, EX.marked, Literal(True), EX.out): frozenset(
++            {quad(EX.a, EX.w, EX.one)}
++        )
++    }
++
++
++def test_a_load_that_cannot_be_read_is_silent_when_asked(tmp_path):
++    missing = (tmp_path / "missing.nt").as_uri()
++    dataset = build_dataset()
++    before = state(dataset)
++    report = run(dataset, "LOAD SILENT <%s>" % missing, provenance=True)
++    assert report == {"added": {}, "removed": {}}
++    assert state(dataset) == before
++
++
++def test_dropping_a_graph_that_is_not_there_is_silent_when_asked():
++    dataset = build_dataset()
++    report = run(dataset, "DROP SILENT GRAPH ex:missing", provenance=True)
++    assert report == {"added": {}, "removed": {}}
++
++
++def mixed_dataset():
++    dataset = Dataset()
++    dataset.add((EX.dflt, EX.p, EX.o))
++    dataset.graph(EX.side).add((EX.named, EX.p, EX.o))
++    return dataset
++
++
++def test_emptying_the_default_graph_leaves_the_named_graphs_alone():
++    dataset = mixed_dataset()
++    report = run(dataset, "CLEAR DEFAULT", provenance=True)
++    assert report["removed"] == {
++        quad(EX.dflt, EX.p, EX.o, DATASET_DEFAULT_GRAPH_ID): frozenset()
++    }
++    assert state(dataset) == {quad(EX.named, EX.p, EX.o, EX.side)}
++
++
++def test_clearing_the_named_graphs_reports_them_all():
++    dataset = split_dataset()
++    report = run(dataset, "CLEAR NAMED", provenance=True)
++    assert set(report["removed"]) == {
++        quad(EX.alice, EX.knows, EX.bob, EX.left),
++        quad(EX.alice, EX.knows, EX.bob, EX.right),
++        quad(EX.bob, EX.knows, EX.carol, EX.right),
++    }
++
++
++def test_dropping_everything_reports_every_quad():
++    dataset = split_dataset()
++    report = run(dataset, "DROP ALL", provenance=True)
++    assert set(report["removed"]) == {
++        quad(EX.alice, EX.knows, EX.bob, EX.left),
++        quad(EX.alice, EX.knows, EX.bob, EX.right),
++        quad(EX.bob, EX.knows, EX.carol, EX.right),
++    }
++    assert state(dataset) == set()
++
++
++def test_a_document_a_using_clause_names_credits_that_document(tmp_path):
++    source = write_document(tmp_path, DAN_KNOWS_ERIN)
++    dataset = Dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?s ex:copied ?o } }"
++        " USING <%s> WHERE { ?s ?p ?o }" % source,
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.dan, EX.copied, EX.erin, EX.out): frozenset(
++            {quad(EX.dan, EX.knows, EX.erin, URIRef(source))}
++        )
++    }
++
++
++def test_a_statement_two_using_documents_carry_credits_both(tmp_path):
++    first = write_document(tmp_path, DAN_KNOWS_ERIN, name="first.nt")
++    second = write_document(tmp_path, DAN_KNOWS_ERIN, name="second.nt")
++    dataset = Dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?s ex:copied ?o } }"
++        " USING <%s> USING <%s> WHERE { ?s ?p ?o }" % (first, second),
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.dan, EX.copied, EX.erin, EX.out): frozenset(
++            {
++                quad(EX.dan, EX.knows, EX.erin, URIRef(first)),
++                quad(EX.dan, EX.knows, EX.erin, URIRef(second)),
++            }
++        )
++    }
++
++
++def test_two_solutions_of_one_operation_still_union_their_reasons():
++    dataset = build_dataset([(EX.a, EX.q, EX.one), (EX.b, EX.q, EX.two)])
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ex:r ex:marked true } }"
++        " WHERE { GRAPH ex:g { ?s ex:q ?y } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.r, EX.marked, Literal(True), EX.out): frozenset(
++            {quad(EX.a, EX.q, EX.one), quad(EX.b, EX.q, EX.two)}
++        )
++    }
++
++
++def test_tracking_leaves_an_unqualified_dataset_write_alone():
++    tracked = Dataset()
++    plain = Dataset()
++    run(tracked, "INSERT DATA { ex:s ex:p ex:o }", provenance=True)
++    run(plain, "INSERT DATA { ex:s ex:p ex:o }")
++    assert state(tracked) == state(plain)
++    assert state(tracked) == {quad(EX.s, EX.p, EX.o, DATASET_DEFAULT_GRAPH_ID)}
++
++
++def test_tracking_leaves_a_failing_request_alone(tmp_path):
++    missing = (tmp_path / "gone.nt").as_uri()
++    request = "LOAD <%s> INTO GRAPH ex:loaded" % missing
++
++    def attempt(**keywords):
++        dataset = build_dataset()
++        try:
++            run(dataset, request, **keywords)
++        except Exception:
++            pass
++        return state(dataset)
++
++    with pytest.raises(Exception):
++        run(build_dataset(), request, provenance=True)
++    assert attempt(provenance=True) == attempt()
++    silent = build_dataset()
++    assert run(
++        silent, "LOAD SILENT <%s> INTO GRAPH ex:loaded" % missing, provenance=True
++    ) == {"added": {}, "removed": {}}
++
++
++def test_a_repeated_change_keeps_only_the_reason_that_made_it():
++    dataset = build_dataset([(EX.A, EX.w, EX.one), (EX.B, EX.w, EX.two)])
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:g { ex:t ex:p ex:o } }"
++        " WHERE { GRAPH ex:g { ex:A ex:w ?x } } ;"
++        " INSERT { GRAPH ex:g { ex:t ex:p ex:o } }"
++        " WHERE { GRAPH ex:g { ex:B ex:w ?y } }",
++        provenance=True,
++    )
++    first = quad(EX.A, EX.w, EX.one)
++    assert report["added"][quad(EX.t, EX.p, EX.o)] == frozenset({first})
++
++
++def test_a_condition_that_could_hold_two_ways_names_a_match():
++    dataset = build_dataset(
++        [(EX.alice, EX.knows, EX.bob), (EX.alice, EX.knows, EX.carol)]
++    )
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ex:r ex:marked true } }"
++        " WHERE { FILTER EXISTS { GRAPH ex:g { ex:alice ex:knows ?f } } }",
++        provenance=True,
++    )
++    reason = report["added"][quad(EX.r, EX.marked, Literal(True), EX.out)]
++    allowed = {quad(EX.alice, EX.knows, EX.bob), quad(EX.alice, EX.knows, EX.carol)}
++    assert reason and reason <= allowed
++
++
++def test_a_later_operation_takes_over_the_reason_for_a_quad():
++    dataset = build_dataset([(EX.target, EX.p, EX.value), (EX.witness, EX.q, EX.data)])
++    report = run(
++        dataset,
++        "DELETE { GRAPH ex:g { ex:target ex:p ex:value } }"
++        " WHERE { GRAPH ex:g { ex:witness ex:q ex:data } } ;"
++        " INSERT DATA { GRAPH ex:g { ex:target ex:p ex:value } } ;"
++        " CLEAR GRAPH ex:g",
++        provenance=True,
++    )
++    assert report["removed"] == {
++        quad(EX.target, EX.p, EX.value): frozenset(),
++        quad(EX.witness, EX.q, EX.data): frozenset(),
++    }
++
++
++def test_a_quad_written_again_carries_only_the_reason_that_wrote_it():
++    dataset = build_dataset([(EX.witness, EX.q, EX.data)])
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:g { ex:target ex:p ex:value } }"
++        " WHERE { GRAPH ex:g { ex:witness ex:q ex:data } } ;"
++        " DELETE DATA { GRAPH ex:g { ex:target ex:p ex:value } } ;"
++        " INSERT DATA { GRAPH ex:g { ex:target ex:p ex:value } }",
++        provenance=True,
++    )
++    assert report["added"] == {quad(EX.target, EX.p, EX.value): frozenset()}
++
++
++def test_a_with_clause_credits_the_graph_it_names():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "WITH ex:g DELETE { ?s ex:age ?n } WHERE { ?s ex:age ?n }",
++        provenance=True,
++    )
++    assert report["removed"] == {
++        quad(EX.bob, EX.age, Literal(30)): frozenset(
++            {quad(EX.bob, EX.age, Literal(30))}
++        ),
++        quad(EX.carol, EX.age, Literal(40)): frozenset(
++            {quad(EX.carol, EX.age, Literal(40))}
++        ),
++    }
++
++
++def test_initial_bindings_reach_the_report():
++    dataset = build_dataset()
++    report = dataset.update(
++        PREFIX
++        + "INSERT { GRAPH ex:out { ?f ex:knownBy ex:alice } }"
++        + " WHERE { GRAPH ex:g { ex:alice ex:knows ?f } }",
++        initBindings={"f": EX.carol},
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.carol, EX.knownBy, EX.alice, EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.carol)}
++        )
++    }
++
++
++def test_join_unions_both_patterns():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        mark(
++            "GRAPH ex:g { ex:alice ex:knows ?f . ?f ex:age ?n FILTER(?n = 30) }",
++            template="?f ex:checked true",
++        ),
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.checked, Literal(True), EX.out): frozenset(
++            {
++                quad(EX.alice, EX.knows, EX.bob),
++                quad(EX.bob, EX.age, Literal(30)),
++            }
++        )
++    }
++
++
++def test_optional_that_matched_credits_both_parts():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:checked true } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f OPTIONAL { ?f ex:age ?n } } }",
++        provenance=True,
++    )
++    assert report["added"][
++        quad(EX.bob, EX.checked, Literal(True), EX.out)
++    ] == frozenset(
++        {quad(EX.alice, EX.knows, EX.bob), quad(EX.bob, EX.age, Literal(30))}
++    )
++
++
++def test_optional_without_a_match_credits_only_the_required_part():
++    dataset = build_dataset(
++        [(EX.alice, EX.knows, EX.bob), (EX.carol, EX.age, Literal(40))]
++    )
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:checked true } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f OPTIONAL { ?f ex:age ?n } } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.checked, Literal(True), EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob)}
++        )
++    }
++
++
++def test_minus_credits_only_the_side_that_is_kept():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:checked true } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f MINUS { ?f ex:age 40 } } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.checked, Literal(True), EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob)}
++        )
++    }
++
++
++def test_not_exists_credits_nothing_extra():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:checked true } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f }"
++        " FILTER NOT EXISTS { GRAPH ex:g { ?f ex:age 40 } } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.checked, Literal(True), EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob)}
++        )
++    }
++
++
++def test_exists_credits_the_statement_that_made_it_hold():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:checked true } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f"
++        " FILTER EXISTS { ?f ex:age 40 } } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.carol, EX.checked, Literal(True), EX.out): frozenset(
++            {
++                quad(EX.alice, EX.knows, EX.carol),
++                quad(EX.carol, EX.age, Literal(40)),
++            }
++        )
++    }
++
++
++def test_a_condition_that_holds_on_an_optional_credits_its_witness():
++    dataset = build_dataset(
++        [
++            (EX.a, EX.p, EX.b),
++            (EX.b, EX.age, Literal(30)),
++            (EX.b, EX.seen, Literal(True)),
++        ]
++    )
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?b ex:checked ?n } } WHERE { GRAPH ex:g {"
++        " ex:a ex:p ?b OPTIONAL { ?b ex:age ?n FILTER EXISTS { ?b ex:seen true } } } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.b, EX.checked, Literal(30), EX.out): frozenset(
++            {
++                quad(EX.a, EX.p, EX.b),
++                quad(EX.b, EX.age, Literal(30)),
++                quad(EX.b, EX.seen, Literal(True)),
++            }
++        )
++    }
++
++
++def test_a_condition_that_fails_on_an_optional_credits_nothing_extra():
++    dataset = build_dataset(
++        [(EX.alice, EX.knows, EX.bob), (EX.bob, EX.age, Literal(30))]
++    )
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:checked true } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f"
++        " OPTIONAL { ?f ex:age ?n FILTER EXISTS { ?f ex:seenIn ?place } } } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.checked, Literal(True), EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob)}
++        )
++    }
++
++
++def test_a_condition_recorded_by_bind_credits_its_witness():
++    dataset = build_dataset(
++        [(EX.alice, EX.knows, EX.carol), (EX.carol, EX.age, Literal(40))]
++    )
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:checked ?ok } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f"
++        " BIND(EXISTS { ?f ex:age 40 } AS ?ok) } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.carol, EX.checked, Literal(True), EX.out): frozenset(
++            {
++                quad(EX.alice, EX.knows, EX.carol),
++                quad(EX.carol, EX.age, Literal(40)),
++            }
++        )
++    }
++
++
++def test_a_condition_recorded_by_bind_that_fails_credits_nothing_extra():
++    dataset = build_dataset(
++        [(EX.alice, EX.knows, EX.carol), (EX.carol, EX.age, Literal(30))]
++    )
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:checked ?ok } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f"
++        " BIND(EXISTS { ?f ex:age 40 } AS ?ok) } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.carol, EX.checked, Literal(False), EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.carol)}
++        )
++    }
++
++
++def test_a_condition_recorded_while_grouping_credits_its_witness():
++    dataset = build_dataset(
++        [
++            (EX.alice, EX.knows, EX.carol),
++            (EX.carol, EX.age, Literal(40)),
++        ]
++    )
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?ok ex:counted ?c } }"
++        " WHERE { { SELECT ?ok (COUNT(?f) AS ?c)"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f }"
++        " BIND(EXISTS { GRAPH ex:g { ?f ex:age 40 } } AS ?ok) }"
++        " GROUP BY ?ok } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(Literal(True), EX.counted, Literal(1), EX.out): frozenset(
++            {
++                quad(EX.alice, EX.knows, EX.carol),
++                quad(EX.carol, EX.age, Literal(40)),
++            }
++        )
++    }
++
++
++def test_a_condition_with_a_condition_inside_it_credits_what_matched():
++    graph = build_graph([(EX.alice, EX.knows, EX.bob), (EX.alice, EX.knows, EX.carol)])
++    report = graph.update(
++        PREFIX + "INSERT { ex:r ex:marked true }"
++        " WHERE { FILTER EXISTS { ex:alice ex:knows ?f . FILTER(?f = ex:bob) } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.r, EX.marked, Literal(True)): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob)}
++        )
++    }
++
++
++def test_a_condition_with_a_condition_inside_it_credits_both():
++    dataset = build_dataset(
++        [(EX.alice, EX.knows, EX.bob), (EX.alice, EX.knows, EX.carol)]
++    )
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ex:r ex:marked true } }"
++        " WHERE { FILTER EXISTS { GRAPH ex:g { ex:alice ex:knows ?f"
++        " . FILTER(?f = ex:bob) } } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.r, EX.marked, Literal(True), EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob)}
++        )
++    }
++
++
++def nested_dataset():
++    return build_dataset([(EX.a, EX.p, EX.b), (EX.c, EX.q, EX.d), (EX.e, EX.r, EX.f)])
++
++
++NESTED_CONDITION = (
++    "EXISTS { GRAPH ex:g { ex:a ex:p ex:b } }"
++    " && EXISTS { GRAPH ex:g { ex:c ex:q ex:d . FILTER EXISTS { ex:e ex:r ex:f } } }"
++)
++
++EVERY_NESTED_QUAD = frozenset(
++    {
++        quad(EX.a, EX.p, EX.b),
++        quad(EX.c, EX.q, EX.d),
++        quad(EX.e, EX.r, EX.f),
++    }
++)
++
++
++def test_a_condition_beside_one_holding_a_condition_keeps_both():
++    report = run(
++        nested_dataset(),
++        "INSERT { GRAPH ex:out { ex:r ex:marked true } }"
++        " WHERE { FILTER(%s) }" % NESTED_CONDITION,
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.r, EX.marked, Literal(True), EX.out): EVERY_NESTED_QUAD
++    }
++
++
++def test_a_bind_over_a_condition_holding_a_condition_keeps_both():
++    report = run(
++        nested_dataset(),
++        "INSERT { GRAPH ex:out { ex:r ex:marked ?ok } }"
++        " WHERE { BIND(%s AS ?ok) }" % NESTED_CONDITION,
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.r, EX.marked, Literal(True), EX.out): EVERY_NESTED_QUAD
++    }
++
++
++def test_a_grouping_over_a_condition_holding_a_condition_keeps_both():
++    report = run(
++        nested_dataset(),
++        "INSERT { GRAPH ex:out { ?ok ex:counted ?c } }"
++        " WHERE { { SELECT ?ok (COUNT(*) AS ?c) WHERE { BIND(%s AS ?ok) }"
++        " GROUP BY ?ok } }" % NESTED_CONDITION,
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(Literal(True), EX.counted, Literal(1), EX.out): EVERY_NESTED_QUAD
++    }
++
++
++def test_a_condition_beside_one_holding_an_optional_keeps_both():
++    report = run(
++        nested_dataset(),
++        "INSERT { GRAPH ex:out { ex:r ex:marked true } }"
++        " WHERE { FILTER(EXISTS { GRAPH ex:g { ex:a ex:p ex:b } }"
++        " && EXISTS { GRAPH ex:g { ex:c ex:q ex:d"
++        " OPTIONAL { GRAPH ex:g { ex:e ex:r ex:f } FILTER(true) } } }) }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.r, EX.marked, Literal(True), EX.out): EVERY_NESTED_QUAD
++    }
++
++
++def beside(inner):
++    return (
++        "INSERT { GRAPH ex:out { ex:r ex:marked true } }"
++        " WHERE { FILTER(EXISTS { GRAPH ex:g { ex:a ex:p ex:b } } && EXISTS { %s }) }"
++        % inner
++    )
++
++
++def test_a_condition_beside_one_holding_a_bind_keeps_both():
++    report = run(
++        nested_dataset(),
++        beside("GRAPH ex:g { ex:c ex:q ex:d } BIND(1 AS ?z)"),
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.r, EX.marked, Literal(True), EX.out): frozenset(
++            {quad(EX.a, EX.p, EX.b), quad(EX.c, EX.q, EX.d)}
++        )
++    }
++
++
++def test_a_condition_beside_one_holding_a_count_keeps_both():
++    report = run(
++        nested_dataset(),
++        beside("{ SELECT (COUNT(*) AS ?n) WHERE { GRAPH ex:g { ex:c ex:q ex:d } } }"),
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.r, EX.marked, Literal(True), EX.out): frozenset(
++            {quad(EX.a, EX.p, EX.b), quad(EX.c, EX.q, EX.d)}
++        )
++    }
++
++
++def test_a_condition_beside_one_holding_a_group_keeps_both():
++    report = run(
++        nested_dataset(),
++        beside(
++            "{ SELECT ?s (COUNT(*) AS ?n) WHERE { GRAPH ex:g { ?s ex:q ex:d } }"
++            " GROUP BY ?s }"
++        ),
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.r, EX.marked, Literal(True), EX.out): frozenset(
++            {quad(EX.a, EX.p, EX.b), quad(EX.c, EX.q, EX.d)}
++        )
++    }
++
++
++def test_comparison_filter_credits_nothing_extra():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?p ex:checked true } }"
++        " WHERE { GRAPH ex:g { ?p ex:age ?n FILTER(?n > 35) } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.carol, EX.checked, Literal(True), EX.out): frozenset(
++            {quad(EX.carol, EX.age, Literal(40))}
++        )
++    }
++
++
++def test_values_credits_nothing():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?s ex:checked true } }"
++        " WHERE { VALUES ?s { ex:alice } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.alice, EX.checked, Literal(True), EX.out): frozenset()
++    }
++
++
++def test_bind_keeps_the_quads_of_the_pattern():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ex:bob ex:doubled ?d } }"
++        " WHERE { GRAPH ex:g { ex:bob ex:age ?n } BIND(?n + ?n AS ?d) }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.doubled, Literal(60), EX.out): frozenset(
++            {quad(EX.bob, EX.age, Literal(30))}
++        )
++    }
++
++
++def test_union_credits_only_the_branch_that_produced_the_solution():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?x ex:checked true } }"
++        " WHERE { GRAPH ex:g { { ex:alice ex:knows ?x } UNION { ?x ex:age 40 } } }",
++        provenance=True,
++    )
++    assert report["added"][
++        quad(EX.bob, EX.checked, Literal(True), EX.out)
++    ] == frozenset({quad(EX.alice, EX.knows, EX.bob)})
++    assert report["added"][
++        quad(EX.carol, EX.checked, Literal(True), EX.out)
++    ] == frozenset(
++        {quad(EX.alice, EX.knows, EX.carol), quad(EX.carol, EX.age, Literal(40))}
++    )
++
++
++def test_several_solutions_writing_one_statement_union_in_the_report():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        mark("GRAPH ex:g { ex:alice ex:knows ?f }"),
++        provenance=True,
++    )
++    assert report["added"] == {
++        marked(): frozenset(
++            {
++                quad(EX.alice, EX.knows, EX.bob),
++                quad(EX.alice, EX.knows, EX.carol),
++            }
++        )
++    }
++
++
++def test_several_solutions_deleting_one_statement_union_in_the_report():
++    dataset = build_dataset(
++        [
++            (EX.alice, EX.knows, EX.bob),
++            (EX.alice, EX.knows, EX.carol),
++            (EX.target, EX.p, EX.value),
++        ]
++    )
++    report = run(
++        dataset,
++        "DELETE { GRAPH ex:g { ex:target ex:p ex:value } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f } }",
++        provenance=True,
++    )
++    assert report["removed"] == {
++        quad(EX.target, EX.p, EX.value): frozenset(
++            {
++                quad(EX.alice, EX.knows, EX.bob),
++                quad(EX.alice, EX.knows, EX.carol),
++            }
++        )
++    }
++
++
++def test_distinct_unions_the_solutions_it_collapsed():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?s ex:checked true } }"
++        " WHERE { { SELECT DISTINCT ?s WHERE { GRAPH ex:g { ?s ex:knows ?f } } } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.alice, EX.checked, Literal(True), EX.out): frozenset(
++            {
++                quad(EX.alice, EX.knows, EX.bob),
++                quad(EX.alice, EX.knows, EX.carol),
++            }
++        )
++    }
++
++
++def test_reduced_unions_the_solutions_it_collapsed():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?s ex:checked true } }"
++        " WHERE { { SELECT REDUCED ?s WHERE { GRAPH ex:g { ?s ex:knows ?f } } } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.alice, EX.checked, Literal(True), EX.out): frozenset(
++            {
++                quad(EX.alice, EX.knows, EX.bob),
++                quad(EX.alice, EX.knows, EX.carol),
++            }
++        )
++    }
++
++
++def test_a_join_unions_duplicate_solutions_of_its_right_side():
++    dataset = build_dataset(
++        [
++            (EX.alice, EX.knows, EX.bob),
++            (EX.bob, EX.seenIn, EX.paris),
++            (EX.bob, EX.seenIn, EX.rome),
++        ]
++    )
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:checked true } }"
++        " WHERE { GRAPH ex:g { ex:alice ex:knows ?f }"
++        " { SELECT ?f WHERE { GRAPH ex:g { ?f ex:seenIn ?place } } LIMIT 2 } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.checked, Literal(True), EX.out): frozenset(
++            {
++                quad(EX.alice, EX.knows, EX.bob),
++                quad(EX.bob, EX.seenIn, EX.paris),
++                quad(EX.bob, EX.seenIn, EX.rome),
++            }
++        )
++    }
++
++
++def test_a_group_row_unions_its_group():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?s ex:friends ?c } }"
++        " WHERE { { SELECT ?s (COUNT(?f) AS ?c)"
++        " WHERE { GRAPH ex:g { ?s ex:knows ?f } } GROUP BY ?s } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.alice, EX.friends, Literal(2), EX.out): frozenset(
++            {
++                quad(EX.alice, EX.knows, EX.bob),
++                quad(EX.alice, EX.knows, EX.carol),
++            }
++        )
++    }
++
++
++def test_an_aggregate_without_a_group_unions_every_solution():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ex:alice ex:total ?t } }"
++        " WHERE { { SELECT (SUM(?n) AS ?t)"
++        " WHERE { GRAPH ex:g { ?p ex:age ?n } } } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.alice, EX.total, Literal(70), EX.out): frozenset(
++            {
++                quad(EX.bob, EX.age, Literal(30)),
++                quad(EX.carol, EX.age, Literal(40)),
++            }
++        )
++    }
++
++
++def test_a_subquery_keeps_the_provenance_of_its_solutions():
++    dataset = build_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?f ex:checked ?n } }"
++        " WHERE { { SELECT ?f WHERE { GRAPH ex:g { ex:alice ex:knows ?f } } }"
++        " GRAPH ex:g { ?f ex:age ?n } }",
++        provenance=True,
++    )
++    assert report["added"][quad(EX.bob, EX.checked, Literal(30), EX.out)] == frozenset(
++        {quad(EX.alice, EX.knows, EX.bob), quad(EX.bob, EX.age, Literal(30))}
++    )
++
++
++def test_a_named_graph_quad_names_its_graph():
++    dataset = split_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?p ex:checked true } }"
++        " WHERE { GRAPH ex:right { ex:bob ex:knows ?p } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.carol, EX.checked, Literal(True), EX.out): frozenset(
++            {quad(EX.bob, EX.knows, EX.carol, EX.right)}
++        )
++    }
++
++
++def test_a_statement_in_two_graphs_credits_both():
++    dataset = split_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?p ex:checked true } }"
++        " WHERE { ex:alice ex:knows ?p }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.checked, Literal(True), EX.out): frozenset(
++            {
++                quad(EX.alice, EX.knows, EX.bob, EX.left),
++                quad(EX.alice, EX.knows, EX.bob, EX.right),
++            }
++        )
++    }
++
++
++def test_the_default_graph_is_named_too():
++    dataset = Dataset()
++    dataset.add((EX.alice, EX.knows, EX.bob))
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?p ex:checked true } }"
++        " WHERE { ex:alice ex:knows ?p }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.bob, EX.checked, Literal(True), EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob, DATASET_DEFAULT_GRAPH_ID)}
++        )
++    }
++
++
++def test_a_graph_pattern_credits_the_graph_it_bound():
++    dataset = split_dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?g ex:checked true } }"
++        " WHERE { GRAPH ?g { ex:bob ex:knows ex:carol } }",
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.right, EX.checked, Literal(True), EX.out): frozenset(
++            {quad(EX.bob, EX.knows, EX.carol, EX.right)}
++        )
++    }
++
++
++def test_a_using_named_document_left_in_the_store_is_reported(tmp_path):
++    source = write_document(tmp_path, DAN_KNOWS_ERIN)
++    dataset = Dataset()
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ?s ex:copied ?o } } USING NAMED <%s>"
++        " WHERE { GRAPH <%s> { ?s ?p ?o } }" % (source, source),
++        provenance=True,
++    )
++    assert report["added"] == {
++        quad(EX.dan, EX.copied, EX.erin, EX.out): frozenset(
++            {quad(EX.dan, EX.knows, EX.erin, URIRef(source))}
++        ),
++        quad(EX.dan, EX.knows, EX.erin, URIRef(source)): frozenset(),
++    }
++    assert set(dataset.quads()) == set(report["added"])
++
++
++def test_copying_from_the_default_graph_credits_the_default_graph():
++    dataset = Dataset()
++    dataset.add((EX.alice, EX.knows, EX.bob))
++    report = run(dataset, "COPY DEFAULT TO ex:out", provenance=True)
++    assert report["added"] == {
++        quad(EX.alice, EX.knows, EX.bob, EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob, DATASET_DEFAULT_GRAPH_ID)}
++        )
++    }
++
++
++def test_adding_from_the_default_graph_leaves_it_in_place():
++    dataset = Dataset()
++    dataset.add((EX.alice, EX.knows, EX.bob))
++    report = run(dataset, "ADD DEFAULT TO ex:out", provenance=True)
++    assert report["added"] == {
++        quad(EX.alice, EX.knows, EX.bob, EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob, DATASET_DEFAULT_GRAPH_ID)}
++        )
++    }
++    assert (EX.alice, EX.knows, EX.bob) in dataset.default_graph
++
++
++def test_moving_from_the_default_graph_reports_both_sides():
++    dataset = Dataset()
++    dataset.add((EX.alice, EX.knows, EX.bob))
++    report = run(dataset, "MOVE DEFAULT TO ex:out", provenance=True)
++    assert report["added"] == {
++        quad(EX.alice, EX.knows, EX.bob, EX.out): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob, DATASET_DEFAULT_GRAPH_ID)}
++        )
++    }
++    assert report["removed"] == {
++        quad(EX.alice, EX.knows, EX.bob, DATASET_DEFAULT_GRAPH_ID): frozenset()
++    }
++
++
++def test_copy_credits_the_statement_it_copied():
++    dataset = split_dataset()
++    report = run(dataset, "COPY ex:left TO ex:target", provenance=True)
++    assert report["added"] == {
++        quad(EX.alice, EX.knows, EX.bob, EX.target): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob, EX.left)}
++        )
++    }
++
++
++def test_copy_reports_what_it_cleared_from_the_target():
++    dataset = split_dataset()
++    report = run(dataset, "COPY ex:left TO ex:right", provenance=True)
++    assert report["removed"] == {
++        quad(EX.bob, EX.knows, EX.carol, EX.right): frozenset()
++    }
++    assert report["added"] == {}
++
++
++def test_move_reports_both_graphs():
++    dataset = split_dataset()
++    report = run(dataset, "MOVE ex:left TO ex:target", provenance=True)
++    assert report["added"] == {
++        quad(EX.alice, EX.knows, EX.bob, EX.target): frozenset(
++            {quad(EX.alice, EX.knows, EX.bob, EX.left)}
++        )
++    }
++    assert report["removed"] == {quad(EX.alice, EX.knows, EX.bob, EX.left): frozenset()}
++
++
++def test_add_keeps_the_source_graph():
++    dataset = split_dataset()
++    report = run(dataset, "ADD ex:right TO ex:left", provenance=True)
++    assert report["added"] == {
++        quad(EX.bob, EX.knows, EX.carol, EX.left): frozenset(
++            {quad(EX.bob, EX.knows, EX.carol, EX.right)}
++        )
++    }
++    assert len(dataset.graph(EX.right)) == 2
++
++
++def test_clear_reports_what_it_removed():
++    dataset = split_dataset()
++    report = run(dataset, "CLEAR GRAPH ex:right", provenance=True)
++    assert report["removed"] == {
++        quad(EX.alice, EX.knows, EX.bob, EX.right): frozenset(),
++        quad(EX.bob, EX.knows, EX.carol, EX.right): frozenset(),
++    }
++
++
++def test_dropping_the_default_graph_reports_what_it_removed():
++    dataset = Dataset()
++    dataset.add((EX.alice, EX.knows, EX.bob))
++    dataset.graph(EX.side).add((EX.bob, EX.knows, EX.carol))
++    report = run(dataset, "DROP DEFAULT", provenance=True)
++    assert report["removed"] == {
++        quad(EX.alice, EX.knows, EX.bob, DATASET_DEFAULT_GRAPH_ID): frozenset()
++    }
++    assert state(dataset) == {quad(EX.bob, EX.knows, EX.carol, EX.side)}
++
++
++def test_dropping_the_default_graph_leaves_the_store_where_an_untracked_run_leaves_it():
++    def build():
++        dataset = Dataset()
++        dataset.add((EX.alice, EX.knows, EX.bob))
++        dataset.graph(EX.side).add((EX.bob, EX.knows, EX.carol))
++        return dataset
++
++    tracked = build()
++    run(tracked, "DROP DEFAULT", provenance=True)
++    plain = build()
++    run(plain, "DROP DEFAULT")
++    assert state(tracked) == state(plain)
++
++
++def test_drop_reports_what_it_removed():
++    dataset = split_dataset()
++    report = run(dataset, "DROP GRAPH ex:left", provenance=True)
++    assert report["removed"] == {quad(EX.alice, EX.knows, EX.bob, EX.left): frozenset()}
++
++
++REQUESTS = [
++    "INSERT DATA { GRAPH ex:g { ex:dan ex:knows ex:erin } }",
++    "DELETE DATA { GRAPH ex:g { ex:alice ex:knows ex:bob } }",
++    "DELETE WHERE { GRAPH ex:g { ?s ex:age ?n } }",
++    "INSERT { GRAPH ex:out { ?f ex:knownBy ex:alice } }"
++    " WHERE { GRAPH ex:g { ex:alice ex:knows ?f } }",
++    "DELETE { GRAPH ex:g { ?s ex:age ?n } }"
++    " INSERT { GRAPH ex:g { ?s ex:years ?n } }"
++    " WHERE { GRAPH ex:g { ?s ex:age ?n } }",
++    "INSERT { GRAPH ex:out { ?f ex:checked true } }"
++    " WHERE { GRAPH ex:g { ex:alice ex:knows ?f OPTIONAL { ?f ex:age ?n } } }",
++    "INSERT { GRAPH ex:out { ?s ex:checked true } }"
++    " WHERE { { SELECT DISTINCT ?s WHERE { GRAPH ex:g { ?s ex:knows ?f } } } }",
++    "CLEAR GRAPH ex:g",
++    "COPY ex:g TO ex:target",
++    "INSERT DATA { GRAPH ex:g { ex:dan ex:knows ex:erin } } ;"
++    " DELETE DATA { GRAPH ex:g { ex:dan ex:knows ex:erin } }",
++]
++
++
++@pytest.mark.parametrize("request_text", REQUESTS)
++def test_tracking_does_not_change_what_a_request_writes(request_text):
++    tracked = build_dataset()
++    run(tracked, request_text, provenance=True)
++    plain = build_dataset()
++    run(plain, request_text)
++    assert state(tracked) == state(plain)
++
++
++COMPATIBILITY = [
++    "WITH ex:g DELETE { ?s ex:age ?n } WHERE { ?s ex:age ?n }",
++    "WITH ex:g INSERT { ?s ex:seen true } WHERE { ?s ex:knows ?f }",
++    "WITH ex:g DELETE { ?s ex:knows ?f } INSERT { ?f ex:knownBy ?s }"
++    " WHERE { ?s ex:knows ?f }",
++]
++
++
++@pytest.mark.parametrize("request_text", COMPATIBILITY)
++def test_tracking_leaves_other_update_forms_alone(request_text):
++    tracked = build_dataset()
++    run(tracked, request_text, provenance=True)
++    plain = build_dataset()
++    run(plain, request_text)
++    assert state(tracked) == state(plain)
++
++
++def test_tracking_leaves_initial_bindings_alone():
++    request = (
++        PREFIX
++        + "INSERT { GRAPH ex:out { ?f ex:knownBy ex:alice } }"
++        + " WHERE { GRAPH ex:g { ex:alice ex:knows ?f } }"
++    )
++    tracked = build_dataset()
++    tracked.update(request, initBindings={"f": EX.bob}, provenance=True)
++    plain = build_dataset()
++    plain.update(request, initBindings={"f": EX.bob})
++    assert state(tracked) == state(plain)
++
++
++def test_a_match_after_a_load_credits_the_graph_that_holds_the_data(tmp_path):
++    source = write_document(tmp_path, DAN_KNOWS_ERIN)
++    dataset = build_dataset([(EX.old, EX.knows, EX.bob)])
++    report = run(
++        dataset,
++        "LOAD <%s> INTO GRAPH ex:g ;"
++        " INSERT { GRAPH ex:out { ?s ex:copied ?o } }"
++        " WHERE { GRAPH ex:g { ?s ex:knows ?o } }" % source,
++        provenance=True,
++    )
++    assert report["added"][quad(EX.old, EX.copied, EX.bob, EX.out)] == frozenset(
++        {quad(EX.old, EX.knows, EX.bob, G)}
++    )
++
++
++class StoreBufferingItsWrites(Memory):
++    def __init__(self, *args, **keywords):
++        super().__init__(*args, **keywords)
++        self.queued = []
++
++    def add(self, triple, context, quoted=False):
++        self.queued.append(("add", triple, context))
++
++    def remove(self, triple, context=None):
++        self.queued.append(("remove", triple, context))
++
++    def commit(self):
++        for what, triple, context in self.queued:
++            if what == "add":
++                Memory.add(self, triple, context)
++            else:
++                Memory.remove(self, triple, context)
++        self.queued = []
++
++
++def test_a_store_that_buffers_its_writes_ends_where_the_engine_leaves_it():
++    request = (
++        "INSERT DATA { ex:a ex:p ex:b } ;"
++        " INSERT { ex:a ex:q ?o } WHERE { ex:a ex:p ?o }"
++    )
++    tracked = Graph(store=StoreBufferingItsWrites(), identifier=G)
++    tracked.update(PREFIX + request, provenance=True)
++    tracked.store.commit()
++    plain = Graph(store=StoreBufferingItsWrites(), identifier=G)
++    plain.update(PREFIX + request, use_store_provided=False)
++    plain.store.commit()
++    assert set(tracked) == set(plain)
++
++
++def test_an_operation_writing_what_is_already_there_adds_no_reason():
++    dataset = build_dataset([(EX.a, EX.p, EX.x)])
++    report = run(
++        dataset,
++        "INSERT DATA { GRAPH ex:out { ex:r ex:v ex:w } } ;"
++        " INSERT { GRAPH ex:out { ex:r ex:v ex:w } }"
++        " WHERE { GRAPH ex:g { ?s ex:p ?o } }",
++        provenance=True,
++    )
++    assert report["added"] == {quad(EX.r, EX.v, EX.w, EX.out): frozenset()}
++
++
++class StoreDroppingGraphsItself(StoreBufferingItsWrites):
++    def remove_graph(self, graph):
++        Memory.remove(self, (None, None, None), graph)
++
++
++def test_dropping_a_graph_takes_only_what_the_store_takes():
++    for request in (
++        "INSERT DATA { GRAPH ex:g { ex:s ex:p ex:o } } ; DROP GRAPH ex:g",
++        "INSERT DATA { GRAPH ex:g { ex:s ex:p ex:o } } ; MOVE ex:g TO ex:out",
++    ):
++        tracked = Dataset(store=StoreDroppingGraphsItself())
++        tracked.update(PREFIX + request, provenance=True)
++        tracked.store.commit()
++        plain = Dataset(store=StoreDroppingGraphsItself())
++        plain.update(PREFIX + request, use_store_provided=False)
++        plain.store.commit()
++        assert set(tracked.quads((None, None, None))) == set(
++            plain.quads((None, None, None))
++        )
++
++
++LIMITED_JOIN_VALUES = [
++    "'b' 'a' 'e' 'c' 'd'",
++    "'d' 'c' 'b' 'a' 'e'",
++    "'e' 'd' 'a' 'b' 'c'",
++]
++
++
++def limited_join_request(values):
++    return (
++        "INSERT { GRAPH ex:out { ex:r ex:pick ?x } } WHERE {"
++        " { SELECT ?x WHERE {"
++        "   GRAPH ex:g { ex:anchor ex:p ex:o }"
++        "   { SELECT DISTINCT ?x WHERE { VALUES ?x { %s } } }"
++        " } LIMIT 1 } }" % values
++    )
++
++
++@pytest.mark.parametrize("values", LIMITED_JOIN_VALUES)
++def test_a_limited_join_writes_what_the_engine_writes(values):
++    request = limited_join_request(values)
++    tracked = Dataset()
++    tracked.graph(G).add((EX.anchor, EX.p, EX.o))
++    run(tracked, request, provenance=True)
++    plain = Dataset()
++    plain.graph(G).add((EX.anchor, EX.p, EX.o))
++    plain.update(PREFIX + request, use_store_provided=False)
++    assert set(tracked.quads((None, None, None))) == set(
++        plain.quads((None, None, None))
++    )
++
++
++def test_a_path_match_reports_every_change_it_produced():
++    dataset = build_dataset([(EX.a, EX.step, EX.b), (EX.b, EX.step, EX.c)])
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ex:r ex:reached ?o } }"
++        " WHERE { GRAPH ex:g { ex:a ex:step+ ?o } }",
++        provenance=True,
++    )
++    assert set(report["added"]) == {
++        quad(EX.r, EX.reached, EX.b, EX.out),
++        quad(EX.r, EX.reached, EX.c, EX.out),
++    }
++    assert report["removed"] == {}
++
++
++def test_a_condition_inside_a_discarded_part_reports_a_permitted_reason():
++    dataset = build_dataset([(EX.c, EX.q, EX.d)])
++    report = run(
++        dataset,
++        "INSERT { GRAPH ex:out { ex:r ex:marked ?ok } }"
++        " WHERE { BIND(NOT EXISTS { FILTER EXISTS { GRAPH ex:g { ex:c ex:q ex:d } } }"
++        " AS ?ok) }",
++        provenance=True,
++    )
++    reason = report["added"][quad(EX.r, EX.marked, Literal(False), EX.out)]
++    assert reason in (frozenset(), frozenset({quad(EX.c, EX.q, EX.d)}))
++
++
++DETERMINISTIC_DRAWS = [0.11, 0.22, 0.33, 0.44, 0.55, 0.66]
++
++
++def drawing_in_order():
++    draws = iter(DETERMINISTIC_DRAWS)
++    return lambda: next(draws)
++
++
++@pytest.mark.parametrize("modifier", ["DISTINCT", "REDUCED"])
++def test_a_collapsed_subquery_reads_no_further_than_the_engine(monkeypatch, modifier):
++    request = (
++        "INSERT { GRAPH ex:out { ?s ex:drew ?r } } WHERE {"
++        " { SELECT %s ?s WHERE { VALUES ?s { ex:a ex:b }"
++        " BIND(RAND() AS ?ignored) } LIMIT 1 }"
++        " BIND(RAND() AS ?r) }" % modifier
++    )
++    monkeypatch.setattr(random, "random", drawing_in_order())
++    tracked = Dataset()
++    run(tracked, request, provenance=True)
++    monkeypatch.setattr(random, "random", drawing_in_order())
++    plain = Dataset()
++    plain.update(PREFIX + request, use_store_provided=False)
++    assert set(tracked.quads((None, None, None))) == set(
++        plain.quads((None, None, None))
++    )
++
++
++def test_a_condition_reads_no_further_than_the_engine(monkeypatch):
++    request = (
++        "INSERT { GRAPH ex:out { ex:r ex:drew ?r } } WHERE {"
++        " BIND(EXISTS { VALUES ?x { 1 2 } BIND(RAND() AS ?ignored) } AS ?ok)"
++        " BIND(RAND() AS ?r) }"
++    )
++    monkeypatch.setattr(random, "random", drawing_in_order())
++    tracked = Dataset()
++    run(tracked, request, provenance=True)
++    monkeypatch.setattr(random, "random", drawing_in_order())
++    plain = Dataset()
++    plain.update(PREFIX + request, use_store_provided=False)
++    assert set(tracked.quads((None, None, None))) == set(
++        plain.quads((None, None, None))
++    )

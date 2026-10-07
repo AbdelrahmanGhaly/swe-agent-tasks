@@ -1,0 +1,984 @@
+diff --git a/brouter-codec/src/main/java/btools/codec/MicroCache2.java b/brouter-codec/src/main/java/btools/codec/MicroCache2.java
+index b1150439..5f2f2f0c 100644
+--- a/brouter-codec/src/main/java/btools/codec/MicroCache2.java
++++ b/brouter-codec/src/main/java/btools/codec/MicroCache2.java
+@@ -88,6 +88,7 @@ public final class MicroCache2 extends MicroCache {
+         validBits[n >> 5] |= 1 << n; // mark dummy-node valid
+         continue; // empty node escape (delta files only)
+       }
++      boolean restrictionsClosed = false;
+       while (featureId != 0) {
+         int bitsize = bc.decodeNoisyNumber(5);
+ 
+@@ -103,11 +104,34 @@ public final class MicroCache2 extends MicroCache {
+           writeInt(ilat + bc.decodeNoisyDiff(10)); // fromLat
+           writeInt(ilon + bc.decodeNoisyDiff(10)); // toLon
+           writeInt(ilat + bc.decodeNoisyDiff(10)); // toLat
++        } else if (featureId == 3) {
++          if (!restrictionsClosed) {
++            writeBoolean(false);
++            restrictionsClosed = true;
++          }
++          writeBoolean(true);
++          writeShort(trExceptions);
++          trExceptions = 0;
++
++          writeBoolean(bc.decodeBit());
++          writeInt(ilon + bc.decodeNoisyDiff(10));
++          writeInt(ilat + bc.decodeNoisyDiff(10));
++          int viaCount = bc.decodeVarBits() + 1;
++          writeVarLengthUnsigned(viaCount);
++          for (int i = 0; i < viaCount; i++) {
++            writeInt(ilon + bc.decodeNoisyDiff(10));
++            writeInt(ilat + bc.decodeNoisyDiff(10));
++          }
++          writeInt(ilon + bc.decodeNoisyDiff(10));
++          writeInt(ilat + bc.decodeNoisyDiff(10));
+         } else {
+           for (int i = 0; i < bitsize; i++) bc.decodeBit(); // unknown feature, just skip
+         }
+         featureId = bc.decodeVarBits();
+       }
++      if (!restrictionsClosed) {
++        writeBoolean(false);
++      }
+       writeBoolean(false);
+ 
+       selev += nodeEleDiff.decodeSignedValue();
+@@ -297,6 +321,7 @@ public final class MicroCache2 extends MicroCache {
+     IntegerFifo3Pass linkCounts = new IntegerFifo3Pass(256);
+     IntegerFifo3Pass transCounts = new IntegerFifo3Pass(256);
+     IntegerFifo3Pass restrictionBits = new IntegerFifo3Pass(16);
++    IntegerFifo3Pass viaWayRestrictionBits = new IntegerFifo3Pass(16);
+ 
+     TagValueCoder wayTagCoder = new TagValueCoder();
+     TagValueCoder nodeTagCoder = new TagValueCoder();
+@@ -319,6 +344,7 @@ public final class MicroCache2 extends MicroCache {
+       linkCounts.init();
+       transCounts.init();
+       restrictionBits.init();
++      viaWayRestrictionBits.init();
+ 
+       wayTagCoder.encodeDictionary(bc);
+       if (dostats) bc.assignBits("wayTagDictionary");
+@@ -372,6 +398,29 @@ public final class MicroCache2 extends MicroCache {
+           bc.encodeNoisyDiff(readInt() - ilat, 10); // toLat
+           restrictionBits.add((int) (bc.getWritingBitPosition() - b0));
+         }
++        while (readBoolean()) {
++          short exceptions = readShort();
++          if (exceptions != 0) {
++            bc.encodeVarBits(2);
++            bc.encodeNoisyNumber(10, 5);
++            bc.encodeBounded(1023, exceptions & 1023);
++          }
++          bc.encodeVarBits(3);
++          bc.encodeNoisyNumber(viaWayRestrictionBits.getNext(), 5);
++          long b0 = bc.getWritingBitPosition();
++          bc.encodeBit(readBoolean());
++          bc.encodeNoisyDiff(readInt() - ilon, 10);
++          bc.encodeNoisyDiff(readInt() - ilat, 10);
++          int viaCount = readVarLengthUnsigned();
++          bc.encodeVarBits(viaCount - 1);
++          for (int i = 0; i < viaCount; i++) {
++            bc.encodeNoisyDiff(readInt() - ilon, 10);
++            bc.encodeNoisyDiff(readInt() - ilat, 10);
++          }
++          bc.encodeNoisyDiff(readInt() - ilon, 10);
++          bc.encodeNoisyDiff(readInt() - ilat, 10);
++          viaWayRestrictionBits.add((int) (bc.getWritingBitPosition() - b0));
++        }
+         bc.encodeVarBits(0); // end of extra data
+ 
+         if (dostats) bc.assignBits("extradata");
+diff --git a/brouter-core/src/main/java/btools/router/OsmPath.java b/brouter-core/src/main/java/btools/router/OsmPath.java
+index 9ce8123a..7339ca6b 100644
+--- a/brouter-core/src/main/java/btools/router/OsmPath.java
++++ b/brouter-core/src/main/java/btools/router/OsmPath.java
+@@ -35,6 +35,8 @@ abstract class OsmPath implements OsmLinkHolder {
+ 
+   public int treedepth = 0;
+ 
++  private RestrictionProgress viaWayProgress;
++
+   // the position of the waypoint just before
+   // this path position (for angle calculation)
+   public int originLon;
+@@ -227,6 +229,10 @@ abstract class OsmPath implements OsmLinkHolder {
+           cost = -1;
+           return;
+         }
++        if (!rc.inverseDirection && isViaWayTurnForbidden(origin, lon0, lat0, lon2, lat2, rc)) {
++          cost = -1;
++          return;
++        }
+       }
+ 
+       // if recording, new MessageData for each section (needed for turn-instructions)
+@@ -403,6 +409,70 @@ abstract class OsmPath implements OsmLinkHolder {
+ 
+   public abstract boolean definitlyWorseThan(OsmPath p);
+ 
++  boolean hasViaWayProgress() {
++    return viaWayProgress != null;
++  }
++
++  boolean hasSameViaWayProgress(OsmPath p) {
++    return containsAll(viaWayProgress, p.viaWayProgress) && containsAll(p.viaWayProgress, viaWayProgress);
++  }
++
++  boolean isViaWayProgressWithin(OsmPath p) {
++    return containsAll(p.viaWayProgress, viaWayProgress);
++  }
++
++  private static boolean containsAll(RestrictionProgress set, RestrictionProgress subset) {
++    for (RestrictionProgress s = subset; s != null; s = s.next) {
++      boolean found = false;
++      for (RestrictionProgress p = set; p != null && !found; p = p.next) {
++        found = p.restriction == s.restriction && p.index == s.index;
++      }
++      if (!found) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  private boolean isViaWayTurnForbidden(OsmPath origin, int lon0, int lat0, int lon2, int lat2, RoutingContext rc) {
++    RestrictionProgress progress = null;
++    for (RestrictionProgress p = origin.viaWayProgress; p != null; p = p.next) {
++      TurnRestriction tr = p.restriction;
++      int nextIndex = p.index + 1;
++      if (nextIndex < tr.viaLons.length) {
++        int reached = tr.followVia(nextIndex, lon2, lat2, targetNode.ilon, targetNode.ilat);
++        if (reached >= 0) {
++          progress = new RestrictionProgress(tr, reached, progress);
++        }
++      } else if (tr.isPositive != (lon2 == tr.toLon && lat2 == tr.toLat)) {
++        return true;
++      }
++    }
++    boolean bikeMode = rc.bikeMode || rc.footMode;
++    for (TurnRestriction tr = sourceNode.firstRestriction; tr != null; tr = tr.next) {
++      if (tr.isViaWay() && tr.appliesTo(bikeMode, rc.carMode) && tr.fromLon == lon0 && tr.fromLat == lat0) {
++        int reached = tr.followVia(0, lon2, lat2, targetNode.ilon, targetNode.ilat);
++        if (reached >= 0) {
++          progress = new RestrictionProgress(tr, reached, progress);
++        }
++      }
++    }
++    viaWayProgress = progress;
++    return false;
++  }
++
++  private static final class RestrictionProgress {
++    final TurnRestriction restriction;
++    final int index;
++    final RestrictionProgress next;
++
++    RestrictionProgress(TurnRestriction restriction, int index, RestrictionProgress next) {
++      this.restriction = restriction;
++      this.index = index;
++      this.next = next;
++    }
++  }
++
+   public OsmNode getSourceNode() {
+     return sourceNode;
+   }
+diff --git a/brouter-core/src/main/java/btools/router/RoutingEngine.java b/brouter-core/src/main/java/btools/router/RoutingEngine.java
+index 600dd35e..a63d9a7b 100644
+--- a/brouter-core/src/main/java/btools/router/RoutingEngine.java
++++ b/brouter-core/src/main/java/btools/router/RoutingEngine.java
+@@ -2139,7 +2139,7 @@ public class RoutingEngine extends Thread {
+           }
+ 
+           // check for a match with the cost-cutting-track
+-          if (costCuttingTrack != null) {
++          if (costCuttingTrack != null && !path.hasViaWayProgress()) {
+             OsmPathElement pe = costCuttingTrack.getLink(sourceNodeId, currentNodeId);
+             if (pe != null) {
+               // remember first match cost for fast termination of partial recalcs
+@@ -2167,10 +2167,13 @@ public class RoutingEngine extends Thread {
+ 
+         OsmLinkHolder firstLinkHolder = currentLink.getFirstLinkHolder(sourceNode);
+         for (OsmLinkHolder linkHolder = firstLinkHolder; linkHolder != null; linkHolder = linkHolder.getNextForLink()) {
++          if (!path.isViaWayProgressWithin((OsmPath) linkHolder)) {
++            continue;
++          }
+           ((OsmPath) linkHolder).airdistance = -1; // invalidate the entry in the open set;
+         }
+ 
+-        if (path.treedepth > 1) {
++        if (path.treedepth > 1 && !path.hasViaWayProgress()) {
+           boolean isBidir = currentLink.isBidirectional();
+           sourceNode.unlinkLink(currentLink);
+ 
+@@ -2256,6 +2259,9 @@ public class RoutingEngine extends Thread {
+ 
+           for (OsmLinkHolder linkHolder = firstLinkHolder; linkHolder != null; linkHolder = linkHolder.getNextForLink()) {
+             OsmPath otherPath = (OsmPath) linkHolder;
++            if (!otherPath.hasSameViaWayProgress(path)) {
++              continue;
++            }
+             try {
+               if (isFinalLink) {
+                 endPos.radius = 1.5; // 1.5 meters is the upper limit that will not change the unit-test result..
+@@ -2282,7 +2288,7 @@ public class RoutingEngine extends Thread {
+               OsmLinkHolder dominator = link.getFirstLinkHolder(currentNode);
+               while (dominator != null) {
+                 OsmPath dp = (OsmPath) dominator;
+-                if (dp.airdistance != -1 && bestPath.definitlyWorseThan(dp)) {
++                if (dp.airdistance != -1 && dp.isViaWayProgressWithin(bestPath) && bestPath.definitlyWorseThan(dp)) {
+                   break;
+                 }
+                 dominator = dominator.getNextForLink();
+diff --git a/brouter-map-creator/src/main/java/btools/mapcreator/BPbfBlobDecoder.java b/brouter-map-creator/src/main/java/btools/mapcreator/BPbfBlobDecoder.java
+index bf266718..7677c65d 100644
+--- a/brouter-map-creator/src/main/java/btools/mapcreator/BPbfBlobDecoder.java
++++ b/brouter-map-creator/src/main/java/btools/mapcreator/BPbfBlobDecoder.java
+@@ -190,6 +190,7 @@ public class BPbfBlobDecoder {
+   private LongList fromWid;
+   private LongList toWid;
+   private LongList viaNid;
++  private LongList viaWid;
+ 
+   private LongList addLong(LongList ll, long l) {
+     if (ll == null) {
+@@ -204,7 +205,7 @@ public class BPbfBlobDecoder {
+     BPbfFieldDecoder fieldDecoder) {
+     LongList wayIds = new LongList(16);
+ 
+-    fromWid = toWid = viaNid = null;
++    fromWid = toWid = viaNid = viaWid = null;
+ 
+     Iterator<Long> memberIdIterator = memberIds.iterator();
+     Iterator<Integer> memberRoleIterator = memberRoles.iterator();
+@@ -224,6 +225,7 @@ public class BPbfBlobDecoder {
+         wayIds.add(refId);
+         if ("from".equals(role)) fromWid = addLong(fromWid, refId);
+         if ("to".equals(role)) toWid = addLong(toWid, refId);
++        if ("via".equals(role)) viaWid = addLong(viaWid, refId);
+       }
+       if (memberType == Osmformat.Relation.MemberType.NODE) { // currently just waymembers
+         if ("via".equals(role)) viaNid = addLong(viaNid, refId);
+@@ -239,7 +241,7 @@ public class BPbfBlobDecoder {
+       LongList wayIds = buildRelationMembers(relation.getMemidsList(), relation.getRolesSidList(),
+         relation.getTypesList(), fieldDecoder);
+ 
+-      parser.addRelation(relation.getId(), tags, wayIds, fromWid, toWid, viaNid);
++      parser.addRelation(relation.getId(), tags, wayIds, fromWid, toWid, viaNid, viaWid);
+     }
+   }
+ 
+diff --git a/brouter-map-creator/src/main/java/btools/mapcreator/MapCreatorBase.java b/brouter-map-creator/src/main/java/btools/mapcreator/MapCreatorBase.java
+index 24c69a68..0d720766 100644
+--- a/brouter-map-creator/src/main/java/btools/mapcreator/MapCreatorBase.java
++++ b/brouter-map-creator/src/main/java/btools/mapcreator/MapCreatorBase.java
+@@ -17,6 +17,7 @@ import java.util.HashMap;
+ import java.util.Map;
+ 
+ import btools.util.DiffCoderDataOutputStream;
++import btools.util.LongList;
+ 
+ public abstract class MapCreatorBase implements WayListener, NodeListener, RelationListener {
+   private DiffCoderDataOutputStream[] tileOutStreams;
+@@ -156,4 +157,8 @@ public abstract class MapCreatorBase implements WayListener, NodeListener, Relat
+   public void nextRestriction(RelationData data, long fromWid, long toWid, long viaNid) throws Exception {
+   }
+ 
++  @Override
++  public void nextViaWayRestriction(RelationData data, long fromWid, long toWid, LongList viaWids) throws Exception {
++  }
++
+ }
+diff --git a/brouter-map-creator/src/main/java/btools/mapcreator/OsmCutter.java b/brouter-map-creator/src/main/java/btools/mapcreator/OsmCutter.java
+index 4c4fe543..9cf49225 100644
+--- a/brouter-map-creator/src/main/java/btools/mapcreator/OsmCutter.java
++++ b/brouter-map-creator/src/main/java/btools/mapcreator/OsmCutter.java
+@@ -17,6 +17,7 @@ import java.util.Map;
+ import btools.expressions.BExpressionContextNode;
+ import btools.expressions.BExpressionContextWay;
+ import btools.expressions.BExpressionMetaData;
++import btools.util.LongList;
+ 
+ public class OsmCutter extends MapCreatorBase {
+   private long recordCnt;
+@@ -249,6 +250,19 @@ public class OsmCutter extends MapCreatorBase {
+ 
+   @Override
+   public void nextRestriction(RelationData r, long fromWid, long toWid, long viaNid) throws Exception {
++    writeRestrictions(r, fromWid, toWid, viaNid, null);
++  }
++
++  @Override
++  public void nextViaWayRestriction(RelationData r, long fromWid, long toWid, LongList viaWids) throws Exception {
++    long[] wids = new long[viaWids.size()];
++    for (int i = 0; i < wids.length; i++) {
++      wids[i] = viaWids.get(i);
++    }
++    writeRestrictions(r, fromWid, toWid, -1L, wids);
++  }
++
++  private void writeRestrictions(RelationData r, long fromWid, long toWid, long viaNid, long[] viaWids) throws Exception {
+     String type = r.getTag("type");
+     if (type == null || !"restriction".equals(type)) {
+       return;
+@@ -277,11 +291,12 @@ public class OsmCutter extends MapCreatorBase {
+       res.fromWid = fromWid;
+       res.toWid = toWid;
+       res.viaNid = viaNid;
++      res.viaWids = viaWids;
+ 
+       if (restrictionsDos != null) {
+         res.writeTo(restrictionsDos);
+       }
+-      if (restrictionCutter != null) {
++      if (restrictionCutter != null && viaWids == null) {
+         restrictionCutter.nextRestriction(res);
+       }
+     }
+diff --git a/brouter-map-creator/src/main/java/btools/mapcreator/OsmFastCutter.java b/brouter-map-creator/src/main/java/btools/mapcreator/OsmFastCutter.java
+index fe67ee32..f9472b3c 100644
+--- a/brouter-map-creator/src/main/java/btools/mapcreator/OsmFastCutter.java
++++ b/brouter-map-creator/src/main/java/btools/mapcreator/OsmFastCutter.java
+@@ -61,7 +61,7 @@ public class OsmFastCutter extends MapCreatorBase {
+     nodeFilter.init();
+     cutter.nodeFilter = nodeFilter;
+ 
+-    cutter.process(lookupFile, nodeDir, null, relFile, null, profileAll, mapFile);
++    cutter.process(lookupFile, nodeDir, null, relFile, resFile, profileAll, mapFile);
+     cutter.wayCutter.finish();
+     cutter.restrictionCutter.finish();
+     cutter = null;
+diff --git a/brouter-map-creator/src/main/java/btools/mapcreator/OsmNodeP.java b/brouter-map-creator/src/main/java/btools/mapcreator/OsmNodeP.java
+index 3c796ee5..a3fca2f3 100644
+--- a/brouter-map-creator/src/main/java/btools/mapcreator/OsmNodeP.java
++++ b/brouter-map-creator/src/main/java/btools/mapcreator/OsmNodeP.java
+@@ -93,10 +93,10 @@ public class OsmNodeP extends OsmLinkP {
+     return null;
+   }
+ 
+-  public void writeNodeData(MicroCache mc) throws IOException {
++  public void writeNodeData(MicroCache mc, RestrictionData viaWayRestrictions) throws IOException {
+     boolean valid = true;
+     if (mc instanceof MicroCache2) {
+-      valid = writeNodeData2((MicroCache2) mc);
++      valid = writeNodeData2((MicroCache2) mc, viaWayRestrictions);
+     } else
+       throw new IllegalArgumentException("unknown cache version: " + mc.getClass());
+     if (valid) {
+@@ -144,7 +144,7 @@ public class OsmNodeP extends OsmLinkP {
+     }
+   }
+ 
+-  public boolean writeNodeData2(MicroCache2 mc) throws IOException {
++  public boolean writeNodeData2(MicroCache2 mc, RestrictionData viaWayRestrictions) throws IOException {
+     boolean hasLinks = false;
+ 
+     // write turn restrictions
+@@ -163,6 +163,22 @@ public class OsmNodeP extends OsmLinkP {
+     }
+     mc.writeBoolean(false); // end restritions
+ 
++    for (RestrictionData vr = viaWayRestrictions; vr != null; vr = vr.next) {
++      mc.writeBoolean(true);
++      mc.writeShort(vr.exceptions);
++      mc.writeBoolean(vr.isPositive());
++      mc.writeInt(vr.fromLon);
++      mc.writeInt(vr.fromLat);
++      mc.writeVarLengthUnsigned(vr.viaLons.length);
++      for (int i = 0; i < vr.viaLons.length; i++) {
++        mc.writeInt(vr.viaLons[i]);
++        mc.writeInt(vr.viaLats[i]);
++      }
++      mc.writeInt(vr.toLon);
++      mc.writeInt(vr.toLat);
++    }
++    mc.writeBoolean(false);
++
+     mc.writeShort(getSElev());
+     mc.writeVarBytes(getNodeDecsription());
+ 
+diff --git a/brouter-map-creator/src/main/java/btools/mapcreator/OsmParser.java b/brouter-map-creator/src/main/java/btools/mapcreator/OsmParser.java
+index 32c9c737..7f6ad601 100644
+--- a/brouter-map-creator/src/main/java/btools/mapcreator/OsmParser.java
++++ b/brouter-map-creator/src/main/java/btools/mapcreator/OsmParser.java
+@@ -120,12 +120,18 @@ public class OsmParser extends MapCreatorBase {
+     }
+   }
+ 
+-  public void addRelation(long rid, Map<String, String> tags, LongList wayIds, LongList fromWid, LongList toWid, LongList viaNid) {
++  public void addRelation(long rid, Map<String, String> tags, LongList wayIds, LongList fromWid, LongList toWid, LongList viaNid, LongList viaWid) {
+     RelationData r = new RelationData(rid, wayIds);
+     r.setTags((HashMap<String, String>) tags);
+ 
+     try {
+       rListener.nextRelation(r);
++      if (viaWid != null && viaNid == null) {
++        if (fromWid != null && toWid != null && fromWid.size() == 1 && toWid.size() == 1) {
++          rListener.nextViaWayRestriction(r, fromWid.get(0), toWid.get(0), viaWid);
++        }
++        return;
++      }
+       if (fromWid == null || toWid == null || viaNid == null || viaNid.size() != 1) {
+         // dummy-TR for each viaNid
+         for (int vi = 0; vi < (viaNid == null ? 0 : viaNid.size()); vi++) {
+diff --git a/brouter-map-creator/src/main/java/btools/mapcreator/RelationListener.java b/brouter-map-creator/src/main/java/btools/mapcreator/RelationListener.java
+index 5709a7c5..8d17080c 100644
+--- a/brouter-map-creator/src/main/java/btools/mapcreator/RelationListener.java
++++ b/brouter-map-creator/src/main/java/btools/mapcreator/RelationListener.java
+@@ -1,5 +1,6 @@
+ package btools.mapcreator;
+ 
++import btools.util.LongList;
+ 
+ /**
+  * Callbacklistener for Relations
+@@ -10,4 +11,6 @@ public interface RelationListener {
+   void nextRelation(RelationData data) throws Exception;
+ 
+   void nextRestriction(RelationData data, long fromWid, long toWid, long viaNid) throws Exception;
++
++  void nextViaWayRestriction(RelationData data, long fromWid, long toWid, LongList viaWids) throws Exception;
+ }
+diff --git a/brouter-map-creator/src/main/java/btools/mapcreator/RestrictionData.java b/brouter-map-creator/src/main/java/btools/mapcreator/RestrictionData.java
+index 42474769..f76bf728 100644
+--- a/brouter-map-creator/src/main/java/btools/mapcreator/RestrictionData.java
++++ b/brouter-map-creator/src/main/java/btools/mapcreator/RestrictionData.java
+@@ -24,6 +24,7 @@ public class RestrictionData extends MapCreatorBase {
+   public long fromWid;
+   public long toWid;
+   public long viaNid;
++  public long[] viaWids;
+   public RestrictionData next;
+ 
+   public int viaLon;
+@@ -32,6 +33,9 @@ public class RestrictionData extends MapCreatorBase {
+   public int fromLon;
+   public int fromLat;
+ 
++  public int[] viaLons;
++  public int[] viaLats;
++
+   public int toLon;
+   public int toLat;
+ 
+@@ -58,6 +62,12 @@ public class RestrictionData extends MapCreatorBase {
+     return valid && "restriction".equals(restrictionKey);
+   }
+ 
++  public boolean isValidViaWayRestriction() {
++    return "restriction".equals(restrictionKey)
++      && (restriction.startsWith("only_") || restriction.startsWith("no_"))
++      && restriction.indexOf("on_red") < 0;
++  }
++
+   private boolean checkGeometry() {
+     double a = (new CheapAngleMeter()).calcAngle(fromLon, fromLat, viaLon, viaLat, toLon, toLat);
+     String t;
+@@ -117,6 +127,13 @@ public class RestrictionData extends MapCreatorBase {
+     fromWid = readId(di);
+     toWid = readId(di);
+     viaNid = readId(di);
++    int viaWayCount = di.readShort();
++    if (viaWayCount > 0) {
++      viaWids = new long[viaWayCount];
++      for (int i = 0; i < viaWayCount; i++) {
++        viaWids[i] = readId(di);
++      }
++    }
+   }
+ 
+   public void writeTo(DataOutputStream dos) throws Exception {
+@@ -126,5 +143,11 @@ public class RestrictionData extends MapCreatorBase {
+     writeId(dos, fromWid);
+     writeId(dos, toWid);
+     writeId(dos, viaNid);
++    dos.writeShort(viaWids == null ? 0 : viaWids.length);
++    if (viaWids != null) {
++      for (long wid : viaWids) {
++        writeId(dos, wid);
++      }
++    }
+   }
+ }
+diff --git a/brouter-map-creator/src/main/java/btools/mapcreator/ViaWayRestrictionIndex.java b/brouter-map-creator/src/main/java/btools/mapcreator/ViaWayRestrictionIndex.java
+new file mode 100644
+index 00000000..3d609932
+--- /dev/null
++++ b/brouter-map-creator/src/main/java/btools/mapcreator/ViaWayRestrictionIndex.java
+@@ -0,0 +1,304 @@
++package btools.mapcreator;
++
++import java.io.BufferedInputStream;
++import java.io.DataInputStream;
++import java.io.EOFException;
++import java.io.File;
++import java.io.FileInputStream;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.IdentityHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
++
++import btools.util.CompactLongMap;
++import btools.util.LongList;
++
++public class ViaWayRestrictionIndex extends MapCreatorBase {
++  private final Set<Long> memberWays = new HashSet<>();
++  private final Map<Long, LongList> wayNodes = new HashMap<>();
++  private final Map<Long, Set<String>> wayTiles = new HashMap<>();
++  private final Set<Long> wantedNodes = new HashSet<>();
++  private final Map<Long, int[]> positions = new HashMap<>();
++  private final Map<String, List<Chain>> chainsByTile = new HashMap<>();
++  private final Map<String, LongList> survivorsByTile = new HashMap<>();
++  private String currentTile;
++
++  private static final class Chain {
++    final RestrictionData restriction;
++    final long[] nodes;
++
++    Chain(RestrictionData restriction, long[] nodes) {
++      this.restriction = restriction;
++      this.nodes = nodes;
++    }
++  }
++
++  public void build(File restrictionsFile, File wayTilesIn, File nodeTilesIn) throws Exception {
++    List<RestrictionData> restrictions = readRestrictions(restrictionsFile);
++    if (restrictions.isEmpty()) {
++      return;
++    }
++    for (RestrictionData r : restrictions) {
++      memberWays.add(r.fromWid);
++      memberWays.add(r.toWid);
++      for (long wid : r.viaWids) {
++        memberWays.add(wid);
++      }
++    }
++    new WayIterator(this, false).processDir(wayTilesIn, ".wt5");
++
++    List<Chain> spanning = new ArrayList<>();
++    Set<String> spanningTiles = new TreeSet<>();
++    for (RestrictionData r : restrictions) {
++      long[] nodes = resolveChain(r);
++      if (nodes == null) {
++        continue;
++      }
++      Chain chain = new Chain(r, nodes);
++      Set<String> tiles = memberTiles(r);
++      if (tiles.size() == 1) {
++        String tile = tiles.iterator().next();
++        chainsForTile(tile).add(chain);
++        for (long nid : nodes) {
++          addSurvivor(tile, nid);
++        }
++      } else {
++        spanning.add(chain);
++        spanningTiles.addAll(tiles);
++        for (long nid : nodes) {
++          wantedNodes.add(nid);
++        }
++      }
++    }
++
++    for (String tile : spanningTiles) {
++      File nodeFile = nodeFile(nodeTilesIn, tile);
++      if (nodeFile != null) {
++        new NodeIterator(this, false).processFile(nodeFile);
++      }
++    }
++    for (Chain chain : spanning) {
++      int[] start = positions.get(chain.nodes[1]);
++      if (start == null) {
++        continue;
++      }
++      chainsForTile(tileName(start[0], start[1])).add(chain);
++      for (long nid : chain.nodes) {
++        int[] pos = positions.get(nid);
++        if (pos != null) {
++          addSurvivor(tileName(pos[0], pos[1]), nid);
++        }
++      }
++    }
++  }
++
++  public Map<OsmNodeP, RestrictionData> attach(File wayfile, CompactLongMap<OsmNodeP> nodes) {
++    Map<OsmNodeP, RestrictionData> byStartNode = new IdentityHashMap<>();
++    if (nodes == null) {
++      return byStartNode;
++    }
++    String tile = tileName(wayfile);
++    LongList survivors = survivorsByTile.get(tile);
++    for (int i = 0; survivors != null && i < survivors.size(); i++) {
++      OsmNodeP n = nodes.get(survivors.get(i));
++      if (n != null) {
++        n.bits |= OsmNodeP.DP_SURVIVOR_BIT;
++      }
++    }
++    List<Chain> chains = chainsByTile.get(tile);
++    if (chains != null) {
++      for (Chain chain : chains) {
++        OsmNodeP start = nodes.get(chain.nodes[1]);
++        RestrictionData res = start == null ? null : toRestriction(chain, nodes);
++        if (res != null) {
++          res.next = byStartNode.get(start);
++          byStartNode.put(start, res);
++        }
++      }
++    }
++    return byStartNode;
++  }
++
++  @Override
++  public boolean wayFileStart(File wayfile) {
++    currentTile = tileName(wayfile);
++    return true;
++  }
++
++  @Override
++  public void nextWay(WayData way) {
++    if (memberWays.contains(way.wid)) {
++      wayNodes.putIfAbsent(way.wid, way.nodes);
++      wayTiles.computeIfAbsent(way.wid, wid -> new TreeSet<>()).add(currentTile);
++    }
++  }
++
++  @Override
++  public void nextNode(NodeData n) {
++    if (wantedNodes.contains(n.nid)) {
++      positions.put(n.nid, new int[]{n.ilon, n.ilat});
++    }
++  }
++
++  private static List<RestrictionData> readRestrictions(File restrictionsFile) throws Exception {
++    List<RestrictionData> restrictions = new ArrayList<>();
++    if (restrictionsFile == null || !restrictionsFile.exists()) {
++      return restrictions;
++    }
++    try (DataInputStream di = new DataInputStream(new BufferedInputStream(new FileInputStream(restrictionsFile)))) {
++      for (; ; ) {
++        RestrictionData res = new RestrictionData(di);
++        if (res.viaWids != null && res.isValidViaWayRestriction()) {
++          restrictions.add(res);
++        }
++      }
++    } catch (EOFException eof) {
++      return restrictions;
++    }
++  }
++
++  private long[] resolveChain(RestrictionData r) {
++    LongList from = wayNodes.get(r.fromWid);
++    LongList to = wayNodes.get(r.toWid);
++    if (from == null || to == null || from.size() < 2 || to.size() < 2) {
++      return null;
++    }
++    List<LongList> vias = new ArrayList<>();
++    for (long wid : r.viaWids) {
++      LongList via = wayNodes.get(wid);
++      if (via == null) {
++        return null;
++      }
++      vias.add(via);
++    }
++    LongList chain = buildViaChain(from, vias, to);
++    if (chain == null) {
++      return null;
++    }
++    int size = chain.size();
++    long[] nodes = new long[size + 2];
++    nodes[0] = neighbour(from, chain.get(0));
++    for (int i = 0; i < size; i++) {
++      nodes[i + 1] = chain.get(i);
++    }
++    nodes[size + 1] = neighbour(to, chain.get(size - 1));
++    return nodes;
++  }
++
++  private Set<String> memberTiles(RestrictionData r) {
++    Set<String> tiles = new TreeSet<>(wayTiles.get(r.fromWid));
++    tiles.addAll(wayTiles.get(r.toWid));
++    for (long wid : r.viaWids) {
++      tiles.addAll(wayTiles.get(wid));
++    }
++    return tiles;
++  }
++
++  private static LongList buildViaChain(LongList from, List<LongList> vias, LongList to) {
++    long[] starts = {from.get(from.size() - 1), from.get(0)};
++    for (long start : starts) {
++      LongList chain = followViaWays(start, vias);
++      if (chain != null) {
++        long end = chain.get(chain.size() - 1);
++        if (end == to.get(0) || end == to.get(to.size() - 1)) {
++          return chain;
++        }
++      }
++    }
++    return null;
++  }
++
++  private static LongList followViaWays(long start, List<LongList> vias) {
++    List<LongList> remaining = new ArrayList<>(vias);
++    LongList chain = new LongList(16);
++    chain.add(start);
++    long current = start;
++    while (!remaining.isEmpty()) {
++      LongList next = null;
++      for (LongList via : remaining) {
++        if (via.get(0) == current || via.get(via.size() - 1) == current) {
++          next = via;
++          break;
++        }
++      }
++      if (next == null) {
++        return null;
++      }
++      remaining.remove(next);
++      boolean forward = next.get(0) == current;
++      int size = next.size();
++      for (int i = 1; i < size; i++) {
++        chain.add(next.get(forward ? i : size - 1 - i));
++      }
++      current = chain.get(chain.size() - 1);
++    }
++    return chain;
++  }
++
++  private static long neighbour(LongList way, long nid) {
++    return way.get(0) == nid ? way.get(1) : way.get(way.size() - 2);
++  }
++
++  private RestrictionData toRestriction(Chain chain, CompactLongMap<OsmNodeP> nodes) {
++    int count = chain.nodes.length;
++    int[] lons = new int[count];
++    int[] lats = new int[count];
++    for (int i = 0; i < count; i++) {
++      int[] pos = positions.get(chain.nodes[i]);
++      if (pos == null) {
++        OsmNodeP n = nodes.get(chain.nodes[i]);
++        if (n == null) {
++          return null;
++        }
++        pos = new int[]{n.ilon, n.ilat};
++      }
++      lons[i] = pos[0];
++      lats[i] = pos[1];
++    }
++    RestrictionData res = new RestrictionData();
++    res.restrictionKey = chain.restriction.restrictionKey;
++    res.restriction = chain.restriction.restriction;
++    res.exceptions = chain.restriction.exceptions;
++    res.fromLon = lons[0];
++    res.fromLat = lats[0];
++    res.viaLons = Arrays.copyOfRange(lons, 2, count - 1);
++    res.viaLats = Arrays.copyOfRange(lats, 2, count - 1);
++    res.toLon = lons[count - 1];
++    res.toLat = lats[count - 1];
++    return res;
++  }
++
++  private List<Chain> chainsForTile(String tile) {
++    return chainsByTile.computeIfAbsent(tile, t -> new ArrayList<>());
++  }
++
++  private void addSurvivor(String tile, long nid) {
++    survivorsByTile.computeIfAbsent(tile, t -> new LongList(16)).add(nid);
++  }
++
++  private static File nodeFile(File nodeTilesIn, String tile) {
++    for (String suffix : new String[]{"u5d_1", "u5d_3", "u5d"}) {
++      File file = new File(nodeTilesIn, tile + "." + suffix);
++      if (file.exists()) {
++        return file;
++      }
++    }
++    return null;
++  }
++
++  private static String tileName(File file) {
++    String name = file.getName();
++    return name.substring(0, name.lastIndexOf('.'));
++  }
++
++  private static String tileName(int ilon, int ilat) {
++    int lon = (ilon / 5000000) * 5 - 180;
++    int lat = (ilat / 5000000) * 5 - 90;
++    return (lon < 0 ? "W" + (-lon) : "E" + lon) + "_" + (lat < 0 ? "S" + (-lat) : "N" + lat);
++  }
++}
+diff --git a/brouter-map-creator/src/main/java/btools/mapcreator/WayCutter5.java b/brouter-map-creator/src/main/java/btools/mapcreator/WayCutter5.java
+index 25f92685..439c18de 100644
+--- a/brouter-map-creator/src/main/java/btools/mapcreator/WayCutter5.java
++++ b/brouter-map-creator/src/main/java/btools/mapcreator/WayCutter5.java
+@@ -68,7 +68,7 @@ public class WayCutter5 extends MapCreatorBase {
+ 
+     if (restrictionCutter5 != null) {
+       String resfilename = name.substring(0, name.length() - 3) + "rtl";
+-      File resfile = new File("restrictions", resfilename);
++      File resfile = new File(new File(nodeTilesIn.getParentFile(), "restrictions"), resfilename);
+ 
+       if (resfile.exists()) {
+         // read restrictions for nodes in nodesMap
+diff --git a/brouter-map-creator/src/main/java/btools/mapcreator/WayLinker.java b/brouter-map-creator/src/main/java/btools/mapcreator/WayLinker.java
+index 25921431..647f1b8b 100644
+--- a/brouter-map-creator/src/main/java/btools/mapcreator/WayLinker.java
++++ b/brouter-map-creator/src/main/java/btools/mapcreator/WayLinker.java
+@@ -68,6 +68,8 @@ public class WayLinker extends MapCreatorBase implements Runnable {
+   private boolean isSlave;
+   private ThreadController tc;
+ 
++  private ViaWayRestrictionIndex viaWayIndex;
++
+   public static final class ThreadController {
+     long maxFileSize = 0L;
+     long currentSlaveSize;
+@@ -138,6 +140,11 @@ public class WayLinker extends MapCreatorBase implements Runnable {
+     slave.tc = tc;
+     master.tc = tc;
+ 
++    ViaWayRestrictionIndex viaWayIndex = new ViaWayRestrictionIndex();
++    viaWayIndex.build(restrictionsFileIn, wayTilesIn, nodeTilesIn);
++    master.viaWayIndex = viaWayIndex;
++    slave.viaWayIndex = viaWayIndex;
++
+     master._process(nodeTilesIn, wayTilesIn, borderFileIn, restrictionsFileIn, lookupFile, profileFile, dataTilesOut, dataTilesSuffix);
+     slave._process(nodeTilesIn, wayTilesIn, borderFileIn, restrictionsFileIn, lookupFile, profileFile, dataTilesOut, dataTilesSuffix);
+ 
+@@ -392,6 +399,7 @@ public class WayLinker extends MapCreatorBase implements Runnable {
+     int ncaches = divisor * divisor;
+     int indexsize = ncaches * 4;
+ 
++    CompactLongMap<OsmNodeP> tileNodes = nodesMap;
+     nodesMap = null;
+     borderSet = null;
+ 
+@@ -408,6 +416,8 @@ public class WayLinker extends MapCreatorBase implements Runnable {
+       n.checkDuplicateTargets();
+     }
+ 
++    Map<OsmNodeP, RestrictionData> viaWayRestrictionsByNode = viaWayIndex.attach(wayfile, tileNodes);
++
+     // write segment data to individual files
+     {
+       int nLonSegs = (maxLon - minLon) / 1000000;
+@@ -483,7 +493,7 @@ public class WayLinker extends MapCreatorBase implements Runnable {
+                 }
+ 
+                 for (OsmNodeP n : sortedList.values()) {
+-                  n.writeNodeData(mc);
++                  n.writeNodeData(mc, viaWayRestrictionsByNode.get(n));
+                 }
+                 if (mc.getSize() > 0) {
+                   byte[] subBytes;
+diff --git a/brouter-mapaccess/src/main/java/btools/mapaccess/DirectWeaver.java b/brouter-mapaccess/src/main/java/btools/mapaccess/DirectWeaver.java
+index f3dd84bf..c80cafe5 100644
+--- a/brouter-mapaccess/src/main/java/btools/mapaccess/DirectWeaver.java
++++ b/brouter-mapaccess/src/main/java/btools/mapaccess/DirectWeaver.java
+@@ -79,6 +79,23 @@ public final class DirectWeaver extends ByteDataWriter {
+           tr.toLon = ilon + bc.decodeNoisyDiff(10);
+           tr.toLat = ilat + bc.decodeNoisyDiff(10);
+           node.addTurnRestriction(tr);
++        } else if (featureId == 3) {
++          TurnRestriction tr = new TurnRestriction();
++          tr.exceptions = trExceptions;
++          trExceptions = 0;
++          tr.isPositive = bc.decodeBit();
++          tr.fromLon = ilon + bc.decodeNoisyDiff(10);
++          tr.fromLat = ilat + bc.decodeNoisyDiff(10);
++          int viaCount = bc.decodeVarBits() + 1;
++          tr.viaLons = new int[viaCount];
++          tr.viaLats = new int[viaCount];
++          for (int i = 0; i < viaCount; i++) {
++            tr.viaLons[i] = ilon + bc.decodeNoisyDiff(10);
++            tr.viaLats[i] = ilat + bc.decodeNoisyDiff(10);
++          }
++          tr.toLon = ilon + bc.decodeNoisyDiff(10);
++          tr.toLat = ilat + bc.decodeNoisyDiff(10);
++          node.addTurnRestriction(tr);
+         } else {
+           for (int i = 0; i < bitsize; i++) bc.decodeBit(); // unknown feature, just skip
+         }
+diff --git a/brouter-mapaccess/src/main/java/btools/mapaccess/OsmNode.java b/brouter-mapaccess/src/main/java/btools/mapaccess/OsmNode.java
+index 24827c56..c2252d75 100644
+--- a/brouter-mapaccess/src/main/java/btools/mapaccess/OsmNode.java
++++ b/brouter-mapaccess/src/main/java/btools/mapaccess/OsmNode.java
+@@ -128,6 +128,23 @@ public class OsmNode extends OsmLink implements OsmPos {
+       tr.toLat = mc.readInt();
+       addTurnRestriction(tr);
+     }
++    while (mc.readBoolean()) {
++      TurnRestriction tr = new TurnRestriction();
++      tr.exceptions = mc.readShort();
++      tr.isPositive = mc.readBoolean();
++      tr.fromLon = mc.readInt();
++      tr.fromLat = mc.readInt();
++      int viaCount = mc.readVarLengthUnsigned();
++      tr.viaLons = new int[viaCount];
++      tr.viaLats = new int[viaCount];
++      for (int i = 0; i < viaCount; i++) {
++        tr.viaLons[i] = mc.readInt();
++        tr.viaLats[i] = mc.readInt();
++      }
++      tr.toLon = mc.readInt();
++      tr.toLat = mc.readInt();
++      addTurnRestriction(tr);
++    }
+ 
+     selev = mc.readShort();
+     int nodeDescSize = mc.readVarLengthUnsigned();
+diff --git a/brouter-mapaccess/src/main/java/btools/mapaccess/TurnRestriction.java b/brouter-mapaccess/src/main/java/btools/mapaccess/TurnRestriction.java
+index c92de8e7..9610e59f 100644
+--- a/brouter-mapaccess/src/main/java/btools/mapaccess/TurnRestriction.java
++++ b/brouter-mapaccess/src/main/java/btools/mapaccess/TurnRestriction.java
+@@ -15,6 +15,9 @@ public final class TurnRestriction {
+   public int toLon;
+   public int toLat;
+ 
++  public int[] viaLons;
++  public int[] viaLats;
++
+   public TurnRestriction next;
+ 
+   public boolean exceptBikes() {
+@@ -25,13 +28,33 @@ public final class TurnRestriction {
+     return (exceptions & 2) != 0;
+   }
+ 
++  public boolean isViaWay() {
++    return viaLons != null;
++  }
++
++  public boolean appliesTo(boolean bikeMode, boolean carMode) {
++    return !((exceptBikes() && bikeMode) || (exceptMotorcars() && carMode));
++  }
++
++  public int followVia(int index, int lon, int lat, int targetLon, int targetLat) {
++    if (viaLons[index] != lon || viaLats[index] != lat) {
++      return -1;
++    }
++    for (int i = index; i < viaLons.length; i++) {
++      if (viaLons[i] == targetLon && viaLats[i] == targetLat) {
++        return i;
++      }
++    }
++    return -1;
++  }
++
+   public static boolean isTurnForbidden(TurnRestriction first, int fromLon, int fromLat, int toLon, int toLat, boolean bikeMode, boolean carMode) {
+     boolean hasAnyPositive = false;
+     boolean hasPositive = false;
+     boolean hasNegative = false;
+     TurnRestriction tr = first;
+     while (tr != null) {
+-      if ((tr.exceptBikes() && bikeMode) || (tr.exceptMotorcars() && carMode)) {
++      if (tr.isViaWay() || !tr.appliesTo(bikeMode, carMode)) {
+         tr = tr.next;
+         continue;
+       }

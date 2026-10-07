@@ -1,0 +1,823 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..9918659
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,73 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++export PATH="$PATH:/opt/cargo/bin:/root/.cargo/bin"
++export CARGO_INCREMENTAL=0
++export RUSTC_BOOTSTRAP=1
++
++MODE=""
++OUTPUT_PATH=""
++
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++
++MODE="${MODE:-base}"
++NEW_TEST=enumerate_e8a662
++
++JSON=$(mktemp)
++ERR=$(mktemp)
++
++if [ "$MODE" = new ]; then
++  cargo test --offline --test "$NEW_TEST" \
++    -- -Z unstable-options --format json --report-time > "$JSON" 2> "$ERR"
++else
++  # The crate's unit tests plus every integration test the repo already ships.
++  # Doc tests are left out on purpose: rustdoc names each one after the file and
++  # the line its example starts on, so adding a method to src/extract.rs renames
++  # the examples below it, and a regression check keyed on test names would read
++  # that rename as a failure whatever the code does. The new test target is also
++  # left out here so that base mode measures the repo's own suite alone.
++  cargo test --offline --lib \
++    --test datalog --test lambda --test math --test prop --test simple \
++    -- -Z unstable-options --format json --report-time > "$JSON" 2> "$ERR"
++fi
++STATUS=$?
++
++cat "$ERR" >&2
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  cargo2junit < "$JSON" > "$OUTPUT_PATH" 2>/dev/null || true
++
++  # A compilation failure produces no test events at all. Report one failing case
++  # per test function so the run still names the tests it could not execute, and
++  # carry the compiler output so the reason is visible.
++  if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++    DETAIL=$( { cat "$ERR"; cat "$JSON"; } | tail -c 4000 | sed -e 's/]]>/]]]]><![CDATA[>/g' )
++    {
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n'
++      printf '  <testsuite name="cargo-test" tests="%s" failures="%s" errors="0">\n' 1 1
++      if [ "$MODE" = new ] && [ -f "tests/$NEW_TEST.rs" ]; then
++        NAMES=$(awk '/^#\[test\]/ { want = 1; next } want && /^fn / { sub(/^fn /, ""); sub(/\(.*$/, ""); print; want = 0 }' "tests/$NEW_TEST.rs")
++      else
++        NAMES="compilation"
++      fi
++      for name in $NAMES; do
++        printf '    <testcase name="%s" classname="cargo-test"><failure message="build failed"><![CDATA[%s]]></failure></testcase>\n' "$name" "$DETAIL"
++      done
++      printf '  </testsuite>\n</testsuites>\n'
++    } > "$OUTPUT_PATH"
++    TOTAL=$(grep -c '<testcase' "$OUTPUT_PATH")
++    sed -i "s|<testsuite name=\"cargo-test\" tests=\"1\" failures=\"1\"|<testsuite name=\"cargo-test\" tests=\"$TOTAL\" failures=\"$TOTAL\"|" "$OUTPUT_PATH"
++    STATUS=1
++  fi
++fi
++
++rm -f "$JSON" "$ERR"
++exit $STATUS
+diff --git a/tests/enumerate_e8a662.rs b/tests/enumerate_e8a662.rs
+new file mode 100644
+index 0000000..bbc2d29
+--- /dev/null
++++ b/tests/enumerate_e8a662.rs
+@@ -0,0 +1,738 @@
++use egg::*;
++use std::time::Duration;
++
++type Graph = EGraph<SymbolLang, ()>;
++
++fn leaf(egraph: &mut Graph, name: &str) -> Id {
++    egraph.add(SymbolLang::leaf(name))
++}
++
++fn node(egraph: &mut Graph, op: &str, children: Vec<Id>) -> Id {
++    egraph.add(SymbolLang::new(op, children))
++}
++
++fn merged_leaves(names: &[&str]) -> (Graph, Id) {
++    let mut egraph = Graph::default();
++    let first = leaf(&mut egraph, names[0]);
++    for name in &names[1..] {
++        let other = leaf(&mut egraph, name);
++        egraph.union(first, other);
++    }
++    egraph.rebuild();
++    (egraph, first)
++}
++
++fn strings(egraph: &Graph, class: Id) -> Vec<String> {
++    let mut extractor = Extractor::new(egraph, AstSize);
++    extractor.exprs(class).map(|(_, e)| e.to_string()).collect()
++}
++
++fn costs(egraph: &Graph, class: Id) -> Vec<usize> {
++    let mut extractor = Extractor::new(egraph, AstSize);
++    extractor.exprs(class).map(|(c, _)| c).collect()
++}
++
++fn matching(egraph: &Graph, class: Id, pattern: &str) -> Vec<String> {
++    let pattern: Pattern<SymbolLang> = pattern.parse().unwrap();
++    let mut extractor = Extractor::new(egraph, AstSize);
++    extractor
++        .exprs_matching(class, &pattern)
++        .map(|(_, e)| e.to_string())
++        .collect()
++}
++
++fn is_sorted(values: &[usize]) -> bool {
++    values.windows(2).all(|w| w[0] <= w[1])
++}
++
++fn brute_force(egraph: &Graph, class: Id, path: &mut Vec<Id>) -> Vec<RecExpr<SymbolLang>> {
++    let class = egraph.find(class);
++    if path.contains(&class) {
++        return Vec::new();
++    }
++    path.push(class);
++    let mut out: Vec<RecExpr<SymbolLang>> = Vec::new();
++    for enode in egraph[class].nodes.iter() {
++        let children: Vec<Id> = enode.children().iter().map(|&c| egraph.find(c)).collect();
++        let mut per_child = Vec::new();
++        let mut usable = true;
++        for child in &children {
++            let terms = brute_force(egraph, *child, path);
++            if terms.is_empty() {
++                usable = false;
++                break;
++            }
++            per_child.push(terms);
++        }
++        if !usable {
++            continue;
++        }
++        let mut picks = vec![0usize; per_child.len()];
++        loop {
++            let mut nodes: Vec<SymbolLang> = Vec::new();
++            let mut roots: Vec<Id> = Vec::new();
++            for (slot, choices) in per_child.iter().enumerate() {
++                let chosen = &choices[picks[slot]];
++                let offset = nodes.len();
++                for sub in chosen.as_ref() {
++                    let mut copy = sub.clone();
++                    copy.update_children(|id| Id::from(usize::from(id) + offset));
++                    nodes.push(copy);
++                }
++                roots.push(Id::from(nodes.len() - 1));
++            }
++            let mut root = enode.clone();
++            let mut taken = 0;
++            root.update_children(|_| {
++                let id = roots[taken];
++                taken += 1;
++                id
++            });
++            nodes.push(root);
++            out.push(RecExpr::from(nodes));
++
++            let mut carried = per_child.len();
++            let mut done = true;
++            while carried > 0 {
++                carried -= 1;
++                picks[carried] += 1;
++                if picks[carried] < per_child[carried].len() {
++                    done = false;
++                    break;
++                }
++                picks[carried] = 0;
++            }
++            if done {
++                break;
++            }
++        }
++    }
++    path.pop();
++    out.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
++    out.dedup_by(|a, b| a.as_ref() == b.as_ref());
++    out
++}
++
++fn oracle(egraph: &Graph, class: Id) -> Vec<String> {
++    let mut path = Vec::new();
++    let mut terms = brute_force(egraph, class, &mut path);
++    terms.sort_by(|a, b| {
++        let ca = AstSize.cost_rec(a);
++        let cb = AstSize.cost_rec(b);
++        ca.cmp(&cb).then_with(|| a.as_ref().cmp(b.as_ref()))
++    });
++    terms.iter().map(|e| e.to_string()).collect()
++}
++
++#[test]
++fn single_node_class_yields_one_expression() {
++    let mut egraph = Graph::default();
++    let x = leaf(&mut egraph, "x");
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, x), vec!["x".to_string()]);
++}
++
++#[test]
++fn two_merged_leaves_yield_both() {
++    let (egraph, class) = merged_leaves(&["a", "b"]);
++    let mut found = strings(&egraph, class);
++    found.sort();
++    assert_eq!(found, vec!["a".to_string(), "b".to_string()]);
++}
++
++#[test]
++fn three_merged_leaves_yield_all() {
++    let (egraph, class) = merged_leaves(&["a", "b", "c"]);
++    assert_eq!(strings(&egraph, class).len(), 3);
++}
++
++#[test]
++fn merged_applications_yield_both() {
++    let mut egraph = Graph::default();
++    let f = egraph.add_expr(&"(f x)".parse().unwrap());
++    let g = egraph.add_expr(&"(g x)".parse().unwrap());
++    egraph.union(f, g);
++    egraph.rebuild();
++    let mut found = strings(&egraph, f);
++    found.sort();
++    assert_eq!(found, vec!["(f x)".to_string(), "(g x)".to_string()]);
++}
++
++#[test]
++fn nested_choices_multiply() {
++    let (mut egraph, inner) = merged_leaves(&["a", "b"]);
++    let outer = node(&mut egraph, "f", vec![inner]);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, outer).len(), 2);
++}
++
++#[test]
++fn a_non_canonical_id_is_accepted() {
++    let mut egraph = Graph::default();
++    let a = leaf(&mut egraph, "a");
++    let b = leaf(&mut egraph, "b");
++    egraph.union(a, b);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, b).len(), 2);
++}
++
++#[test]
++fn costs_are_nondecreasing() {
++    let mut egraph = Graph::default();
++    let big = egraph.add_expr(&"(h (f x) (g y))".parse().unwrap());
++    let small = leaf(&mut egraph, "z");
++    egraph.union(big, small);
++    egraph.rebuild();
++    assert!(is_sorted(&costs(&egraph, big)));
++}
++
++#[test]
++fn the_cheapest_expression_comes_first() {
++    let mut egraph = Graph::default();
++    let big = egraph.add_expr(&"(h (f x) (g y))".parse().unwrap());
++    let small = leaf(&mut egraph, "z");
++    egraph.union(big, small);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, big)[0], "z".to_string());
++}
++
++#[test]
++fn the_first_expression_matches_find_best() {
++    let mut egraph = Graph::default();
++    let big = egraph.add_expr(&"(h (f x) (g y))".parse().unwrap());
++    let small = leaf(&mut egraph, "z");
++    egraph.union(big, small);
++    egraph.rebuild();
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    let best = extractor.find_best(big).1;
++    let first = extractor.exprs(big).next().unwrap().1;
++    assert_eq!(first, best);
++}
++
++#[test]
++fn reported_cost_matches_cost_rec() {
++    let (mut egraph, inner) = merged_leaves(&["a", "b"]);
++    let outer = node(&mut egraph, "f", vec![inner]);
++    egraph.rebuild();
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    for (cost, expr) in extractor.exprs(outer) {
++        assert_eq!(cost, AstSize.cost_rec(&expr));
++    }
++}
++
++#[test]
++fn equal_cost_terms_all_appear() {
++    let (egraph, class) = merged_leaves(&["b", "a"]);
++    let found = costs(&egraph, class);
++    assert_eq!(found, vec![1, 1]);
++}
++
++#[test]
++fn ordering_is_stable_across_runs() {
++    let (mut egraph, inner) = merged_leaves(&["a", "b", "c"]);
++    let outer = node(&mut egraph, "f", vec![inner, inner]);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, outer), strings(&egraph, outer));
++}
++
++#[test]
++fn ordering_holds_past_the_first_child_boundary() {
++    let mut egraph = Graph::default();
++    let small = leaf(&mut egraph, "a");
++    let large = egraph.add_expr(&"(big u v)".parse().unwrap());
++    egraph.union(small, large);
++    egraph.rebuild();
++    let pair = node(&mut egraph, "pair", vec![small, small]);
++    egraph.rebuild();
++    assert!(is_sorted(&costs(&egraph, pair)));
++}
++
++#[test]
++fn sibling_positions_choose_independently() {
++    let (mut egraph, inner) = merged_leaves(&["x", "y"]);
++    let pair = node(&mut egraph, "+", vec![inner, inner]);
++    egraph.rebuild();
++    let mut found = strings(&egraph, pair);
++    found.sort();
++    assert_eq!(
++        found,
++        vec![
++            "(+ x x)".to_string(),
++            "(+ x y)".to_string(),
++            "(+ y x)".to_string(),
++            "(+ y y)".to_string(),
++        ]
++    );
++}
++
++#[test]
++fn repeated_sibling_class_is_not_a_cycle() {
++    let (mut egraph, inner) = merged_leaves(&["x", "y"]);
++    let pair = node(&mut egraph, "+", vec![inner, inner]);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, pair).len(), 4);
++}
++
++#[test]
++fn three_positions_of_one_class_give_all_combinations() {
++    let (mut egraph, inner) = merged_leaves(&["x", "y"]);
++    let triple = node(&mut egraph, "t", vec![inner, inner, inner]);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, triple).len(), 8);
++}
++
++#[test]
++fn independent_children_multiply_out() {
++    let (mut egraph, left) = merged_leaves(&["a", "b"]);
++    let right_one = leaf(&mut egraph, "p");
++    let right_two = leaf(&mut egraph, "q");
++    egraph.union(right_one, right_two);
++    egraph.rebuild();
++    let pair = node(&mut egraph, "pair", vec![left, right_one]);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, pair).len(), 4);
++}
++
++#[test]
++fn a_shared_child_still_reports_tree_cost() {
++    let (mut egraph, inner) = merged_leaves(&["x", "y"]);
++    let pair = node(&mut egraph, "+", vec![inner, inner]);
++    egraph.rebuild();
++    assert!(costs(&egraph, pair).iter().all(|&c| c == 3));
++}
++
++#[test]
++fn a_self_referential_class_drops_the_cyclic_term() {
++    let mut egraph = Graph::default();
++    let x = leaf(&mut egraph, "x");
++    let wrapped = node(&mut egraph, "s", vec![x]);
++    egraph.union(x, wrapped);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, x), vec!["x".to_string()]);
++}
++
++#[test]
++fn a_class_with_only_cyclic_terms_yields_nothing() {
++    let mut egraph = Graph::default();
++    let a = leaf(&mut egraph, "a");
++    let wrapped = node(&mut egraph, "s", vec![a]);
++    egraph.union(a, wrapped);
++    egraph.rebuild();
++    let outer = node(&mut egraph, "s", vec![a]);
++    egraph.rebuild();
++    assert!(!strings(&egraph, outer).is_empty());
++}
++
++#[test]
++fn a_two_step_cycle_terminates() {
++    let mut egraph = Graph::default();
++    let x = leaf(&mut egraph, "x");
++    let one = node(&mut egraph, "f", vec![x]);
++    let two = node(&mut egraph, "g", vec![one]);
++    egraph.union(x, two);
++    egraph.rebuild();
++    assert!(!strings(&egraph, x).is_empty());
++}
++
++#[test]
++fn a_cycle_does_not_hide_the_acyclic_terms() {
++    let mut egraph = Graph::default();
++    let x = leaf(&mut egraph, "x");
++    let y = leaf(&mut egraph, "y");
++    egraph.union(x, y);
++    let wrapped = node(&mut egraph, "s", vec![x]);
++    egraph.union(x, wrapped);
++    egraph.rebuild();
++    let found = strings(&egraph, x);
++    assert!(found.contains(&"x".to_string()));
++    assert!(found.contains(&"y".to_string()));
++}
++
++#[test]
++fn a_cyclic_child_is_skipped_but_siblings_survive() {
++    let mut egraph = Graph::default();
++    let loopy = leaf(&mut egraph, "l");
++    let wrapped = node(&mut egraph, "s", vec![loopy]);
++    egraph.union(loopy, wrapped);
++    egraph.rebuild();
++    let plain = leaf(&mut egraph, "p");
++    let pair = node(&mut egraph, "pair", vec![loopy, plain]);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, pair), vec!["(pair l p)".to_string()]);
++}
++
++#[test]
++fn enumeration_of_a_cyclic_graph_is_finite() {
++    let mut egraph = Graph::default();
++    let x = leaf(&mut egraph, "x");
++    let wrapped = node(&mut egraph, "s", vec![x]);
++    egraph.union(x, wrapped);
++    egraph.rebuild();
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    assert!(extractor.exprs(x).count() < 100);
++}
++
++#[test]
++fn merged_class_yields_each_expression_once() {
++    let mut egraph = Graph::default();
++    let one = egraph.add_expr(&"(f a)".parse().unwrap());
++    let two = egraph.add_expr(&"(f b)".parse().unwrap());
++    let a = leaf(&mut egraph, "a");
++    let b = leaf(&mut egraph, "b");
++    egraph.union(a, b);
++    egraph.union(one, two);
++    egraph.rebuild();
++    let found = strings(&egraph, one);
++    let mut unique = found.clone();
++    unique.sort();
++    unique.dedup();
++    assert_eq!(found.len(), unique.len());
++}
++
++#[test]
++fn duplicate_derivations_collapse_to_one_result() {
++    let mut egraph = Graph::default();
++    let one = egraph.add_expr(&"(f a)".parse().unwrap());
++    let two = egraph.add_expr(&"(f b)".parse().unwrap());
++    let a = leaf(&mut egraph, "a");
++    let b = leaf(&mut egraph, "b");
++    egraph.union(a, b);
++    egraph.union(one, two);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, one).len(), 2);
++}
++
++#[test]
++fn find_k_best_returns_the_first_k() {
++    let (egraph, class) = merged_leaves(&["a", "b", "c"]);
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    let picked = extractor.find_k_best(class, 2);
++    assert_eq!(picked.len(), 2);
++}
++
++#[test]
++fn find_k_best_agrees_with_the_iterator() {
++    let (egraph, class) = merged_leaves(&["a", "b", "c"]);
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    let picked: Vec<String> = extractor
++        .find_k_best(class, 2)
++        .into_iter()
++        .map(|(_, e)| e.to_string())
++        .collect();
++    assert_eq!(picked, strings(&egraph, class)[..2].to_vec());
++}
++
++#[test]
++fn find_k_best_of_zero_is_empty() {
++    let (egraph, class) = merged_leaves(&["a", "b"]);
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    assert!(extractor.find_k_best(class, 0).is_empty());
++}
++
++#[test]
++fn find_k_best_past_the_end_returns_everything() {
++    let (egraph, class) = merged_leaves(&["a", "b"]);
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    assert_eq!(extractor.find_k_best(class, 50).len(), 2);
++}
++
++#[test]
++fn find_k_best_of_a_cyclic_only_child_is_empty() {
++    let mut egraph = Graph::default();
++    let a = leaf(&mut egraph, "a");
++    let wrapped = node(&mut egraph, "s", vec![a]);
++    egraph.union(a, wrapped);
++    egraph.rebuild();
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    assert_eq!(extractor.find_k_best(a, 5).len(), 1);
++}
++
++#[test]
++fn find_k_best_costs_are_nondecreasing() {
++    let mut egraph = Graph::default();
++    let big = egraph.add_expr(&"(h (f x) (g y))".parse().unwrap());
++    let small = leaf(&mut egraph, "z");
++    egraph.union(big, small);
++    egraph.rebuild();
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    let found: Vec<usize> = extractor.find_k_best(big, 5).into_iter().map(|(c, _)| c).collect();
++    assert!(is_sorted(&found));
++}
++
++#[test]
++fn ast_depth_orders_by_depth() {
++    let mut egraph = Graph::default();
++    let deep = egraph.add_expr(&"(f (f (f x)))".parse().unwrap());
++    let shallow = egraph.add_expr(&"(g a b c)".parse().unwrap());
++    egraph.union(deep, shallow);
++    egraph.rebuild();
++    let mut extractor = Extractor::new(&egraph, AstDepth);
++    let found: Vec<usize> = extractor.exprs(deep).map(|(c, _)| c).collect();
++    assert!(is_sorted(&found));
++}
++
++#[test]
++fn ast_depth_picks_the_shallow_term_first() {
++    let mut egraph = Graph::default();
++    let deep = egraph.add_expr(&"(f (f (f x)))".parse().unwrap());
++    let shallow = egraph.add_expr(&"(g a b c)".parse().unwrap());
++    egraph.union(deep, shallow);
++    egraph.rebuild();
++    let mut extractor = Extractor::new(&egraph, AstDepth);
++    let first = extractor.exprs(deep).next().unwrap();
++    assert_eq!(first.1.to_string(), "(g a b c)".to_string());
++}
++
++#[test]
++fn ast_size_and_ast_depth_can_disagree() {
++    let mut egraph = Graph::default();
++    let deep = egraph.add_expr(&"(f (f (f x)))".parse().unwrap());
++    let shallow = egraph.add_expr(&"(g a b c)".parse().unwrap());
++    egraph.union(deep, shallow);
++    egraph.rebuild();
++    let mut by_size = Extractor::new(&egraph, AstSize);
++    let size_first = by_size.exprs(deep).next().unwrap().1.to_string();
++    let mut by_depth = Extractor::new(&egraph, AstDepth);
++    let depth_first = by_depth.exprs(deep).next().unwrap().1.to_string();
++    assert_ne!(size_first, depth_first);
++}
++
++#[test]
++fn ast_depth_reports_cost_rec() {
++    let (mut egraph, inner) = merged_leaves(&["a", "b"]);
++    let outer = node(&mut egraph, "f", vec![inner]);
++    egraph.rebuild();
++    let mut extractor = Extractor::new(&egraph, AstDepth);
++    for (cost, expr) in extractor.exprs(outer) {
++        assert_eq!(cost, AstDepth.cost_rec(&expr));
++    }
++}
++
++#[test]
++fn a_pattern_keeps_only_matching_terms() {
++    let mut egraph = Graph::default();
++    let f = egraph.add_expr(&"(f x)".parse().unwrap());
++    let g = egraph.add_expr(&"(g x)".parse().unwrap());
++    egraph.union(f, g);
++    egraph.rebuild();
++    assert_eq!(matching(&egraph, f, "(f ?v)"), vec!["(f x)".to_string()]);
++}
++
++#[test]
++fn a_pattern_that_matches_nothing_yields_nothing() {
++    let (egraph, class) = merged_leaves(&["a", "b"]);
++    assert!(matching(&egraph, class, "(nope ?v)").is_empty());
++}
++
++#[test]
++fn a_bare_variable_pattern_keeps_everything() {
++    let (egraph, class) = merged_leaves(&["a", "b"]);
++    assert_eq!(matching(&egraph, class, "?v").len(), 2);
++}
++
++#[test]
++fn a_repeated_pattern_variable_must_bind_consistently() {
++    let (mut egraph, inner) = merged_leaves(&["x", "y"]);
++    let pair = node(&mut egraph, "+", vec![inner, inner]);
++    egraph.rebuild();
++    let mut found = matching(&egraph, pair, "(+ ?v ?v)");
++    found.sort();
++    assert_eq!(found, vec!["(+ x x)".to_string(), "(+ y y)".to_string()]);
++}
++
++#[test]
++fn distinct_pattern_variables_may_bind_the_same_term() {
++    let (mut egraph, inner) = merged_leaves(&["x", "y"]);
++    let pair = node(&mut egraph, "+", vec![inner, inner]);
++    egraph.rebuild();
++    assert_eq!(matching(&egraph, pair, "(+ ?a ?b)").len(), 4);
++}
++
++#[test]
++fn a_ground_pattern_matches_exactly_one_term() {
++    let (mut egraph, inner) = merged_leaves(&["x", "y"]);
++    let pair = node(&mut egraph, "+", vec![inner, inner]);
++    egraph.rebuild();
++    assert_eq!(matching(&egraph, pair, "(+ x y)"), vec!["(+ x y)".to_string()]);
++}
++
++#[test]
++fn a_nested_pattern_matches_below_the_root() {
++    let mut egraph = Graph::default();
++    let inner = egraph.add_expr(&"(f x)".parse().unwrap());
++    let outer = node(&mut egraph, "h", vec![inner]);
++    egraph.rebuild();
++    assert_eq!(matching(&egraph, outer, "(h (f ?v))").len(), 1);
++}
++
++#[test]
++fn a_pattern_with_the_wrong_arity_matches_nothing() {
++    let mut egraph = Graph::default();
++    let f = egraph.add_expr(&"(f x)".parse().unwrap());
++    egraph.rebuild();
++    assert!(matching(&egraph, f, "(f ?a ?b)").is_empty());
++}
++
++#[test]
++fn matching_preserves_the_enumeration_order() {
++    let mut egraph = Graph::default();
++    let big = egraph.add_expr(&"(f (f x))".parse().unwrap());
++    let small = egraph.add_expr(&"(f y)".parse().unwrap());
++    egraph.union(big, small);
++    egraph.rebuild();
++    let pattern: Pattern<SymbolLang> = "(f ?v)".parse().unwrap();
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    let found: Vec<usize> = extractor.exprs_matching(big, &pattern).map(|(c, _)| c).collect();
++    assert!(is_sorted(&found));
++}
++
++#[test]
++fn matching_is_a_subset_of_enumeration() {
++    let mut egraph = Graph::default();
++    let f = egraph.add_expr(&"(f x)".parse().unwrap());
++    let g = egraph.add_expr(&"(g x)".parse().unwrap());
++    egraph.union(f, g);
++    egraph.rebuild();
++    let all = strings(&egraph, f);
++    for found in matching(&egraph, f, "(f ?v)") {
++        assert!(all.contains(&found));
++    }
++}
++
++#[test]
++fn matching_a_cyclic_class_still_terminates() {
++    let mut egraph = Graph::default();
++    let x = leaf(&mut egraph, "x");
++    let wrapped = node(&mut egraph, "s", vec![x]);
++    egraph.union(x, wrapped);
++    egraph.rebuild();
++    assert!(matching(&egraph, x, "?v").len() < 100);
++}
++
++#[test]
++fn oracle_agrees_on_merged_leaves() {
++    let (egraph, class) = merged_leaves(&["a", "b", "c"]);
++    assert_eq!(strings(&egraph, class), oracle(&egraph, class));
++}
++
++#[test]
++fn oracle_agrees_on_repeated_siblings() {
++    let (mut egraph, inner) = merged_leaves(&["x", "y"]);
++    let pair = node(&mut egraph, "+", vec![inner, inner]);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, pair), oracle(&egraph, pair));
++}
++
++#[test]
++fn oracle_agrees_on_a_cyclic_graph() {
++    let mut egraph = Graph::default();
++    let x = leaf(&mut egraph, "x");
++    let y = leaf(&mut egraph, "y");
++    egraph.union(x, y);
++    let wrapped = node(&mut egraph, "s", vec![x]);
++    egraph.union(x, wrapped);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, x), oracle(&egraph, x));
++}
++
++#[test]
++fn oracle_agrees_on_a_nested_graph() {
++    let (mut egraph, inner) = merged_leaves(&["a", "b"]);
++    let mid = node(&mut egraph, "f", vec![inner, inner]);
++    let top = node(&mut egraph, "h", vec![mid, inner]);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, top), oracle(&egraph, top));
++}
++
++#[test]
++fn oracle_agrees_after_saturation() {
++    let rules: &[Rewrite<SymbolLang, ()>] = &[
++        rewrite!("comm"; "(+ ?a ?b)" => "(+ ?b ?a)"),
++        rewrite!("zero"; "(+ ?a zero)" => "?a"),
++    ];
++    let start: RecExpr<SymbolLang> = "(+ x zero)".parse().unwrap();
++    let runner = Runner::default()
++        .with_time_limit(Duration::from_secs(3600))
++        .with_expr(&start)
++        .run(rules);
++    let root = runner.roots[0];
++    assert_eq!(strings(&runner.egraph, root), oracle(&runner.egraph, root));
++}
++
++#[test]
++fn an_empty_prefix_of_the_iterator_costs_nothing() {
++    let (egraph, class) = merged_leaves(&["a", "b"]);
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    let mut iter = extractor.exprs(class);
++    assert!(iter.next().is_some());
++}
++
++#[test]
++fn the_iterator_ends_after_the_last_term() {
++    let (egraph, class) = merged_leaves(&["a", "b"]);
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    let mut iter = extractor.exprs(class);
++    iter.next();
++    iter.next();
++    assert!(iter.next().is_none());
++}
++
++#[test]
++fn the_iterator_stays_ended() {
++    let (egraph, class) = merged_leaves(&["a"]);
++    let mut extractor = Extractor::new(&egraph, AstSize);
++    let mut iter = extractor.exprs(class);
++    iter.next();
++    assert!(iter.next().is_none());
++    assert!(iter.next().is_none());
++}
++
++#[test]
++fn a_deeply_nested_chain_enumerates() {
++    let mut egraph = Graph::default();
++    let mut current = leaf(&mut egraph, "x");
++    for _ in 0..6 {
++        current = node(&mut egraph, "f", vec![current]);
++    }
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, current).len(), 1);
++}
++
++#[test]
++fn a_wide_node_enumerates_every_combination() {
++    let (mut egraph, inner) = merged_leaves(&["a", "b"]);
++    let wide = node(&mut egraph, "w", vec![inner, inner, inner, inner]);
++    egraph.rebuild();
++    assert_eq!(strings(&egraph, wide).len(), 16);
++}
++
++#[test]
++fn enumeration_does_not_change_the_egraph() {
++    let (egraph, class) = merged_leaves(&["a", "b"]);
++    let before = egraph.total_size();
++    let _ = strings(&egraph, class);
++    assert_eq!(egraph.total_size(), before);
++}
++
++#[test]
++fn two_extractors_agree() {
++    let (mut egraph, inner) = merged_leaves(&["a", "b"]);
++    let outer = node(&mut egraph, "f", vec![inner, inner]);
++    egraph.rebuild();
++    let first = strings(&egraph, outer);
++    let second = strings(&egraph, outer);
++    assert_eq!(first, second);
++}
++
++#[test]
++fn a_saturated_graph_enumerates_its_root() {
++    let rules: &[Rewrite<SymbolLang, ()>] = &[rewrite!("comm"; "(+ ?a ?b)" => "(+ ?b ?a)")];
++    let start: RecExpr<SymbolLang> = "(+ x y)".parse().unwrap();
++    let runner = Runner::default()
++        .with_time_limit(Duration::from_secs(3600))
++        .with_expr(&start)
++        .run(rules);
++    let root = runner.roots[0];
++    let mut extractor = Extractor::new(&runner.egraph, AstSize);
++    assert_eq!(extractor.exprs(root).count(), 2);
++}

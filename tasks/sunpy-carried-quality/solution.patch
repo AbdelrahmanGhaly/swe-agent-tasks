@@ -1,0 +1,958 @@
+diff --git a/changelog/8763.feature.rst b/changelog/8763.feature.rst
+new file mode 100644
+index 0000000..c262afd
+--- /dev/null
++++ b/changelog/8763.feature.rst
+@@ -0,0 +1,2 @@
++The mask and the uncertainty of a `~sunpy.map.GenericMap` are now carried through the operations that build a new map from it: `~sunpy.map.GenericMap.submap`, `~sunpy.map.GenericMap.resample`, `~sunpy.map.GenericMap.rotate`, `~sunpy.map.GenericMap.superpixel`, `~sunpy.map.GenericMap.shift_reference_coord`, `~sunpy.map.GenericMap.reproject_to`, and arithmetic between a map and a number or a quantity.
++Masked pixels no longer take part in an interpolation, an uncertainty is propagated as a variance and keeps the kind it was stored in, and `~sunpy.map.MapSequence` has gained an ``uncertainty`` property alongside its existing ``mask``.
+diff --git a/sunpy/map/_propagation.py b/sunpy/map/_propagation.py
+new file mode 100644
+index 0000000..47bb3c5
+--- /dev/null
++++ b/sunpy/map/_propagation.py
+@@ -0,0 +1,608 @@
++"""
++Helpers for carrying the mask and the uncertainty of a map through the operations that
++build a new map from it.
++"""
++import numpy as np
++
++import astropy.units as u
++from astropy.nddata import InverseVariance, VarianceUncertainty
++
++__all__ = []
++
++# Interpolating a field of ones and zeros does not land exactly on zero where none of it
++# was there. A rotation leaves a residue a few multiples of the machine epsilon wide, and a
++# projection out to world coordinates and back leaves one of up to a few parts in ten
++# billion. The square root of the machine epsilon, about one part in seventy million, is
++# far above either, so a support under it is read as nothing rather than as a pixel worth
++# rescaling by.
++_NO_SUPPORT = np.sqrt(np.finfo(float).eps)
++
++# The values a reduction is read on are squares rather than a run of whole numbers, so
++# that a block's median is not its mean and the two cannot be confused.
++def _reduction_probe(block_shape):
++    rows, columns = int(block_shape[0]), int(block_shape[1])
++    count = 2 * rows * 2 * columns
++    return (np.arange(1.0, count + 1.0) ** 2).reshape(2, rows, 2, columns)
++
++
++def variance_of(uncertainty):
++    """
++    Return the variance held by an uncertainty, whatever kind of uncertainty it is.
++
++    Parameters
++    ----------
++    uncertainty : `~astropy.nddata.NDUncertainty`
++        The uncertainty to read.
++
++    Returns
++    -------
++    `numpy.ndarray`
++        The variance, as a float array.
++    """
++    array = np.asarray(uncertainty.array, dtype=float)
++    if isinstance(uncertainty, VarianceUncertainty):
++        return array
++    if isinstance(uncertainty, InverseVariance):
++        with np.errstate(divide='ignore'):
++            return 1 / array
++    return array ** 2
++
++
++def uncertainty_like(uncertainty, variance, unit=None):
++    """
++    Return an uncertainty of the same kind as ``uncertainty`` that holds ``variance``.
++
++    Parameters
++    ----------
++    uncertainty : `~astropy.nddata.NDUncertainty`
++        The uncertainty whose kind and unit are to be reused.
++    variance : `numpy.ndarray`
++        The variance the new uncertainty is to hold.
++    unit : `~astropy.units.Unit`, optional
++        The unit for the new uncertainty, when it differs from the old one.
++
++    Returns
++    -------
++    `~astropy.nddata.NDUncertainty`
++        An uncertainty of the same class as ``uncertainty``.
++    """
++    variance = np.asarray(variance, dtype=float)
++    if isinstance(uncertainty, VarianceUncertainty):
++        array = variance
++    elif isinstance(uncertainty, InverseVariance):
++        with np.errstate(divide='ignore'):
++            array = 1 / variance
++    else:
++        array = np.sqrt(variance)
++    return type(uncertainty)(array, unit=uncertainty.unit if unit is None else unit)
++
++
++def scaled_unit(uncertainty, value):
++    """
++    Return the unit an uncertainty takes once its data has been multiplied by ``value``.
++
++    An uncertainty that carries no unit of its own is read in the unit of the data it
++    belongs to, so it needs no adjusting and `None` comes back. One that carries its own
++    unit has to be moved along with the data.
++
++    Parameters
++    ----------
++    uncertainty : `~astropy.nddata.NDUncertainty`
++        The uncertainty whose unit is in question.
++    value : number, array-like or `~astropy.units.Quantity`
++        The other side of the multiplication.
++
++    Returns
++    -------
++    `~astropy.units.Unit` or `None`
++    """
++    if uncertainty.unit is None or not isinstance(value, u.Quantity):
++        return None
++    return uncertainty.unit * unit_in_kind_of(uncertainty, value.unit)
++
++
++def unit_in_kind_of(uncertainty, unit):
++    """
++    Return ``unit`` raised to the power the kind of ``uncertainty`` reports in.
++
++    A standard deviation is reported in the unit of the data it belongs to, a variance
++    in the square of that unit and an inverse variance in its inverse square.
++
++    Parameters
++    ----------
++    uncertainty : `~astropy.nddata.NDUncertainty`
++        The uncertainty whose kind sets the power.
++    unit : `~astropy.units.Unit`
++        The unit of the data.
++
++    Returns
++    -------
++    `~astropy.units.Unit`
++    """
++    if isinstance(uncertainty, VarianceUncertainty):
++        return unit ** 2
++    if isinstance(uncertainty, InverseVariance):
++        return unit ** -2
++    return unit
++
++
++def scaled_uncertainty(uncertainty, factor):
++    """
++    Return the uncertainty of a quantity that has been scaled by ``factor``.
++
++    The stored values are scaled in the form they are already held in: a standard
++    deviation by the size of the factor, a variance by its square and an inverse variance
++    by its inverse square. The uncertainty keeps its kind, a factor of one leaves the
++    values exactly as they were, and no value passes through a square it does not need,
++    so a large but representable standard deviation stays representable.
++
++    Parameters
++    ----------
++    uncertainty : `~astropy.nddata.NDUncertainty` or `None`
++        The uncertainty to scale. `None` is returned unchanged.
++    factor : float or array-like
++        The factor the quantity was scaled by.
++
++    Returns
++    -------
++    `~astropy.nddata.NDUncertainty` or `None`
++    """
++    if uncertainty is None:
++        return None
++    unit = scaled_unit(uncertainty, factor)
++    size = scale_factor_of(factor)
++    array = np.asarray(uncertainty.array, dtype=float)
++    if isinstance(uncertainty, VarianceUncertainty):
++        scaled = array * size ** 2
++    elif isinstance(uncertainty, InverseVariance):
++        with np.errstate(divide='ignore'):
++            scaled = array / size ** 2
++    else:
++        scaled = array * size
++    return type(uncertainty)(leading_2d(scaled), unit=uncertainty.unit if unit is None else unit)
++
++
++def leading_2d(array):
++    """
++    Return an array cut down to two dimensions the way a map cuts its data down.
++
++    Arithmetic with an operand that broadcasts wider than the map leaves a result of that
++    wider shape, and a map keeps the last two dimensions of it and drops the rest. An
++    uncertainty has to be cut down the same way round or it stops matching the data it
++    belongs to.
++
++    Parameters
++    ----------
++    array : `numpy.ndarray`
++        The array to cut down.
++
++    Returns
++    -------
++    `numpy.ndarray`
++    """
++    array = np.asarray(array)
++    if array.ndim <= 2:
++        return array
++    return array[(0,) * (array.ndim - 2)]
++
++
++def matched_2d(array, data):
++    """
++    Return an array spread over the two dimensions a map's data came out as.
++
++    An operand can widen a dimension the map holds a single pixel of, which leaves a
++    result that is still two dimensional but wider than the mask and the uncertainty that
++    went in, so those have to be spread over it to go on matching the data pixel for
++    pixel.
++
++    Parameters
++    ----------
++    array : array-like or `None`
++        The array to spread. `None` is returned unchanged.
++    data : array-like
++        The data the array has to match, before a map cuts it down to two dimensions.
++
++    Returns
++    -------
++    `numpy.ndarray` or `None`
++    """
++    if array is None:
++        return None
++    return np.broadcast_to(leading_2d(array), leading_2d(data).shape).copy()
++
++
++def matched_uncertainty(uncertainty, data):
++    """
++    Return an uncertainty spread over the two dimensions a map's data came out as.
++
++    Scaling by an array widens the values along with the data, but adding one leaves them
++    as they were, so an uncertainty can come out of arithmetic narrower than the result it
++    belongs to and has to be spread over it the way the mask is.
++
++    Parameters
++    ----------
++    uncertainty : `~astropy.nddata.NDUncertainty` or `None`
++        The uncertainty to spread. `None` is returned unchanged.
++    data : array-like
++        The data the uncertainty has to match, before a map cuts it down to two
++        dimensions.
++
++    Returns
++    -------
++    `~astropy.nddata.NDUncertainty` or `None`
++    """
++    if uncertainty is None:
++        return None
++    return type(uncertainty)(matched_2d(uncertainty.array, data), unit=uncertainty.unit)
++
++
++def scale_factor_of(value):
++    """
++    Return the size of the number a map's data was scaled by, dropping any unit it carried.
++
++    The uncertainty follows the size of the factor rather than its sign or its phase, so a
++    negative or a complex factor scales it by its magnitude.
++
++    Parameters
++    ----------
++    value : number, array-like or `~astropy.units.Quantity`
++        The other side of the multiplication.
++
++    Returns
++    -------
++    `numpy.ndarray`
++    """
++    return np.abs(np.asarray(getattr(value, 'value', value)))
++
++
++def sliced_uncertainty(uncertainty, item):
++    """
++    Return the part of an uncertainty that covers a slice of the data.
++
++    Parameters
++    ----------
++    uncertainty : `~astropy.nddata.NDUncertainty` or `None`
++        The uncertainty to cut down. `None` is returned unchanged.
++    item : tuple
++        The slice applied to the data.
++
++    Returns
++    -------
++    `~astropy.nddata.NDUncertainty` or `None`
++    """
++    if uncertainty is None:
++        return None
++    return type(uncertainty)(np.asarray(uncertainty.array)[item].copy(),
++                             unit=uncertainty.unit)
++
++
++def carried_uncertainty(uncertainty, interpolate, source_mask=None, mask=None,
++                        prepare=None):
++    """
++    Return an uncertainty carried onto a new grid by the same machinery as the data.
++
++    The variance is what travels, since that is what an interpolation of independent
++    pixels combines, and a variance that interpolation has pushed below zero is read as
++    zero rather than as a number no uncertainty can hold.
++
++    Parameters
++    ----------
++    uncertainty : `~astropy.nddata.NDUncertainty` or `None`
++        The uncertainty to carry over. `None` is returned unchanged.
++    interpolate : callable
++        Takes one float array and returns it on the new grid.
++    source_mask : `numpy.ndarray` or `None`
++        The pixels going in that are masked, and so take no part in the interpolation.
++    mask : `numpy.ndarray` or `None`
++        The pixels of the result that are masked, and so have no uncertainty.
++    prepare : callable, optional
++        Applied to the variance before it is interpolated, so that it reaches the
++        interpolation shaped exactly as the data did.
++
++    Returns
++    -------
++    `~astropy.nddata.NDUncertainty` or `None`
++    """
++    if uncertainty is None:
++        return None
++    variance = variance_of(uncertainty)
++    if prepare is not None:
++        variance = prepare(variance)
++    if source_mask is None:
++        carried = interpolate(variance)
++    else:
++        carried, _ = interpolate_around_mask(interpolate, variance, source_mask, np.nan)
++    carried = np.clip(carried, 0, None)
++    if mask is not None:
++        carried = np.where(mask, np.nan, carried)
++    return uncertainty_like(uncertainty, carried)
++
++
++def reduction_kind(func, block_shape):
++    """
++    Return whether a reduction sums the pixels of a block, averages them, or neither.
++
++    A superpixel takes any callable that reads an array and an ``axis``, so which of
++    them a reduction is has to be read from what it does rather than from which function
++    object it happens to be: `numpy.ma.sum` sums exactly as `numpy.sum` does. The
++    callable is applied to blocks of the size the caller asked for, along one axis and
++    then the other, exactly as `~sunpy.map.GenericMap.superpixel` applies it, and the
++    pair of passes together is compared with summing and with averaging the same blocks
++    the same way round. Both the block size and both passes matter. A callable that
++    behaves one way on an even axis and another way on an odd one turns a three by three
++    block into its mean while turning a two by four block into its sum, and a callable
++    that sums along one axis and takes the largest along the other is neither, so asking
++    about one shape or one axis alone would call both of them sums. The comparison is
++    exact rather than approximate, so a reduction that merely lands near a sum keeps no
++    uncertainty, which is what anything that is not a sum or a mean does.
++
++    Parameters
++    ----------
++    func : callable
++        The reduction applied to the data.
++    block_shape : tuple
++        The number of pixels making up a block, ordered as the data array is.
++
++    Returns
++    -------
++    str or `None`
++        ``'sum'``, ``'mean'``, or `None` for anything else.
++    """
++    probe = _reduction_probe(block_shape)
++    try:
++        reduced = np.asarray(func(func(probe, axis=3), axis=1), dtype=float)
++    except Exception:
++        return None
++    if reduced.shape != (probe.shape[0], probe.shape[2]):
++        return None
++    if np.array_equal(reduced, np.sum(np.sum(probe, axis=3), axis=1)):
++        return 'sum'
++    if np.array_equal(reduced, np.mean(np.mean(probe, axis=3), axis=1)):
++        return 'mean'
++    return None
++
++
++def shape_from_buffers(reproject_args):
++    """
++    Return the output shape a caller's own output buffers imply.
++
++    A reprojection may be told how large its output is by the target WCS, by an explicit
++    ``shape_out``, or by nothing more than a buffer handed in for it to fill. The passes
++    made for the support field and the variance cannot be given that buffer, so where it
++    is the only thing carrying the shape, the shape has to travel in its place.
++
++    Parameters
++    ----------
++    reproject_args : dict
++        The keyword arguments the caller passed for the reprojection.
++
++    Returns
++    -------
++    tuple or `None`
++        The shape of the first buffer that was passed, or `None` if none was.
++    """
++    for key in ('output_array', 'output_footprint'):
++        buffer = reproject_args.get(key)
++        if buffer is not None:
++            return np.shape(buffer)
++    return None
++
++
++def aggregated_variance(variance, counts, block_shape, offset, func):
++    """
++    Return the variance of blocks of pixels that have been reduced by ``func``.
++
++    Only summing and averaging have a variance that follows from the variance of the
++    pixels going in, so anything else returns `None`.
++
++    Parameters
++    ----------
++    variance : `numpy.ndarray`
++        The variance of each pixel, zero wherever the pixel is masked.
++    counts : `numpy.ndarray`
++        How many unmasked pixels each block holds.
++    block_shape : tuple
++        The number of pixels making up a block, ordered as the data array is.
++    offset : tuple
++        The pixel the first block starts at, ordered as the data array is.
++    func : callable
++        The reduction applied to the data.
++
++    Returns
++    -------
++    `numpy.ndarray` or `None`
++    """
++    kind = reduction_kind(func, block_shape)
++    if kind is None:
++        return None
++    total = np.sum(reshape_to_blocks(variance, block_shape, offset), axis=(3, 1))
++    if kind == 'sum':
++        return total
++    # The mean of N pixels divides their sum by N, so its variance divides by N squared,
++    # and N counts only the pixels that were actually averaged.
++    with np.errstate(divide='ignore', invalid='ignore'):
++        return total / np.asarray(counts, dtype=float) ** 2
++
++
++def reshape_to_blocks(array, block_shape, offset):
++    """
++    Cut an array into a four dimensional view of whole blocks of pixels.
++
++    Parameters
++    ----------
++    array : `numpy.ndarray`
++        The array to cut up.
++    block_shape : tuple
++        The number of pixels making up a block, ordered as the data array is.
++    offset : tuple
++        The pixel the first block starts at, ordered as the data array is.
++
++    Returns
++    -------
++    `numpy.ndarray`
++    """
++    from sunpy.map.mapbase import reshape_image_to_4d_superpixel
++    return reshape_image_to_4d_superpixel(array, [block_shape[0], block_shape[1]],
++                                          [offset[0], offset[1]])
++
++
++def support_of(interpolate, mask):
++    """
++    Return what fraction of each output pixel's support was really there.
++
++    An interpolation of a field that is one at the unmasked pixels and zero at the masked
++    ones says, for every output pixel, how much of what it was built from was a pixel
++    that counts. That is measured against the same interpolation of a field that is one
++    everywhere, so what comes back is a fraction rather than a weight. The difference
++    matters when the interpolation scales its output: a flux conserving reprojection
++    multiplies both passes by the same area factor, and dividing one by the other is what
++    keeps that factor in the result instead of cancelling it. It is what an interpolated
++    value has to be divided by, and where it is nothing, no unmasked pixel reached that
++    output pixel at all.
++
++    Parameters
++    ----------
++    interpolate : callable
++        The interpolation the data goes through.
++    mask : array-like
++        The mask of the data going in.
++
++    Returns
++    -------
++    `numpy.ndarray`
++    """
++    present = ~np.asarray(mask, dtype=bool)
++    support = interpolate(np.where(present, 1.0, 0.0))
++    whole = interpolate(np.ones(present.shape, dtype=float))
++    with np.errstate(divide='ignore', invalid='ignore'):
++        return support / whole
++
++
++def unsupported(support):
++    """
++    Return where an interpolation had no unmasked pixel behind it.
++
++    Interpolating a field of ones and zeros does not land exactly on zero, and outside
++    the region an interpolation covers it lands on nothing at all, so both are read as
++    no support rather than as a pixel worth rescaling by.
++
++    Parameters
++    ----------
++    support : `numpy.ndarray`
++        The support field.
++
++    Returns
++    -------
++    `numpy.ndarray`
++    """
++    return ~(support > _NO_SUPPORT)
++
++
++def interpolate_around_mask(interpolate, data, mask, missing):
++    """
++    Interpolate data so that the masked pixels contribute nothing to the result.
++
++    The unmasked pixels are interpolated as they would have been, and alongside them a
++    field of ones is interpolated the same way. Dividing one by the other rescales every
++    output pixel by however much of its support was actually there, so a masked pixel
++    neither adds a value nor dilutes its neighbours. A pixel whose support was masked
++    all the way through has nothing to rescale and comes out missing.
++
++    Parameters
++    ----------
++    interpolate : callable
++        Takes one float array and returns the interpolated array.
++    data : `numpy.ndarray`
++        The pixel values.
++    mask : `numpy.ndarray`
++        The pixels to leave out, as booleans.
++    missing : float
++        The value given to an output pixel with no unmasked support.
++
++    Returns
++    -------
++    tuple
++        The interpolated data and the mask that goes with it.
++    """
++    present = ~np.asarray(mask, dtype=bool)
++    interpolated = interpolate(np.where(present, np.asarray(data, dtype=float), 0.0))
++    support = support_of(interpolate, mask)
++    empty = unsupported(support)
++    with np.errstate(divide='ignore', invalid='ignore'):
++        rescaled = interpolated / support
++    return np.where(empty, missing, rescaled), empty
++
++
++def masked_variance_of(uncertainty, mask):
++    """
++    Return the variance of an uncertainty with the masked pixels taken out.
++
++    Parameters
++    ----------
++    uncertainty : `~astropy.nddata.NDUncertainty`
++        The uncertainty to read.
++    mask : `numpy.ndarray` or `None`
++        The pixels to leave out, as booleans.
++
++    Returns
++    -------
++    `numpy.ndarray`
++        The variance, zero wherever the pixel is masked.
++    """
++    variance = variance_of(uncertainty)
++    if mask is None:
++        return variance
++    return np.where(np.asarray(mask, dtype=bool), 0.0, variance)
++
++
++def counted_blocks(mask, block_shape, offset):
++    """
++    Return how many unmasked pixels each block of pixels holds.
++
++    Parameters
++    ----------
++    mask : `numpy.ndarray` or `None`
++        The pixels to leave out, as booleans.
++    block_shape : tuple
++        The number of pixels making up a block, ordered as the data array is.
++    offset : tuple
++        The pixel the first block starts at, ordered as the data array is.
++
++    Returns
++    -------
++    `numpy.ndarray`
++        The count for each block, as floats.
++    """
++    if mask is None:
++        counts = np.full(1, float(block_shape[0] * block_shape[1]))
++        return counts
++    present = np.where(np.asarray(mask, dtype=bool), 0.0, 1.0)
++    return np.sum(reshape_to_blocks(present, block_shape, offset), axis=(3, 1))
++
++
++def in_unit_of(uncertainty, header):
++    """
++    Return an uncertainty reporting the unit that the map built from ``header`` reports.
++
++    A map reads its unit from the header it is built with, so an uncertainty travelling
++    onto a header that names no unit must stop naming one too, or the pair disagree. One
++    travelling onto a header that does name a unit reports it in the power its kind
++    implies.
++
++    Parameters
++    ----------
++    uncertainty : `~astropy.nddata.NDUncertainty` or `None`
++        The uncertainty about to travel. `None` is returned unchanged.
++    header : dict-like
++        The header the new map is built from.
++
++    Returns
++    -------
++    `~astropy.nddata.NDUncertainty` or `None`
++    """
++    if uncertainty is None or uncertainty.unit is None:
++        return uncertainty
++    unit = header.get('bunit') or header.get('BUNIT')
++    if unit is not None:
++        unit = unit_in_kind_of(uncertainty, u.Unit(unit))
++    return type(uncertainty)(uncertainty.array, unit=unit)
+diff --git a/sunpy/map/mapbase.py b/sunpy/map/mapbase.py
+index 83a6d40..0dee9ac 100644
+--- a/sunpy/map/mapbase.py
++++ b/sunpy/map/mapbase.py
+@@ -47,6 +47,22 @@ from sunpy.image.resample import reshape_image_to_4d_superpixel
+ from sunpy.image.transform import _get_transform_method, _rotation_function_names, affine_transform
+ from sunpy.io._file_tools import write_file
+ from sunpy.io._fits import extract_waveunit, header_to_fits
++from sunpy.map._propagation import (
++    aggregated_variance,
++    carried_uncertainty,
++    counted_blocks,
++    in_unit_of,
++    interpolate_around_mask,
++    masked_variance_of,
++    matched_2d,
++    matched_uncertainty,
++    scaled_uncertainty,
++    shape_from_buffers,
++    sliced_uncertainty,
++    support_of,
++    uncertainty_like,
++    unsupported,
++)
+ from sunpy.map.maputils import _clip_interval, _handle_norm
+ from sunpy.sun import constants
+ from sunpy.time import is_time, parse_time
+@@ -554,22 +570,31 @@ class GenericMap(NDData):
+         """Unitful representation of the map data."""
+         return u.Quantity(self.data, self.unit, copy=_NUMPY_COPY_IF_NEEDED)
+ 
+-    def _new_instance_from_op(self, new_data):
++    def _new_instance_from_op(self, new_data, scale_factor=1, keep_uncertainty=True):
+         """
+         Helper function for creating new map instances after arithmetic
+         operations.
++
++        ``scale_factor`` is what the data was multiplied by, which is what the
++        uncertainty has to follow.
+         """
+         new_meta = copy.deepcopy(self.meta)
+         new_meta['bunit'] = new_data.unit.to_string()
+-        return self._new_instance(new_data.value, new_meta, plot_settings=self.plot_settings)
++        return self._new_instance(new_data.value, new_meta, plot_settings=self.plot_settings,
++                                  mask=matched_2d(self.mask, new_data.value),
++                                  uncertainty=matched_uncertainty(
++                                      scaled_uncertainty(self.uncertainty, scale_factor),
++                                      new_data.value)
++                                  if keep_uncertainty else None)
+ 
+     def __neg__(self):
+-        return self._new_instance(-self.data, self.meta, plot_settings=self.plot_settings)
++        return self._new_instance(-self.data, self.meta, plot_settings=self.plot_settings,
++                                  mask=self.mask, uncertainty=self.uncertainty)
+ 
+     @check_arithmetic_compatibility
+     def __pow__(self, value):
+         new_data = self.quantity ** value
+-        return self._new_instance_from_op(new_data)
++        return self._new_instance_from_op(new_data, keep_uncertainty=False)
+ 
+     @check_arithmetic_compatibility
+     def __add__(self, value):
+@@ -588,7 +613,7 @@ class GenericMap(NDData):
+     @check_arithmetic_compatibility
+     def __mul__(self, value):
+         new_data = self.quantity * value
+-        return self._new_instance_from_op(new_data)
++        return self._new_instance_from_op(new_data, scale_factor=value)
+ 
+     def __rmul__(self, value):
+         return self.__mul__(value)
+@@ -600,7 +625,7 @@ class GenericMap(NDData):
+     @check_arithmetic_compatibility
+     def __rtruediv__(self, value):
+         new_data = value / self.quantity
+-        return self._new_instance_from_op(new_data)
++        return self._new_instance_from_op(new_data, keep_uncertainty=False)
+ 
+     @property
+     def _meta_hash(self):
+@@ -1190,7 +1215,8 @@ class GenericMap(NDData):
+         new_meta['crval2'] = ((self._reference_latitude + axis2).to(self.spatial_units[1])).value
+ 
+         # Create new map with the modification
+-        new_map = self._new_instance(self.data, new_meta, self.plot_settings)
++        new_map = self._new_instance(self.data, new_meta, self.plot_settings,
++                                     mask=self.mask, uncertainty=self.uncertainty)
+ 
+         return new_map
+ 
+@@ -1725,10 +1751,16 @@ class GenericMap(NDData):
+         # Note: "center" defaults to True in this function because data
+         #   coordinates in a Map are at pixel centers
+ 
++        def resample_array(array):
++            return sunpy_image_resample(array.T, dimensions, method, center=True).T
++
+         # Make a copy of the original data and perform resample
+-        new_data = sunpy_image_resample(self.data.copy().T, dimensions,
+-                                        method, center=True)
+-        new_data = new_data.T
++        if self.mask is None:
++            new_data = resample_array(self.data.copy())
++            new_mask = None
++        else:
++            new_data, new_mask = interpolate_around_mask(resample_array, self.data,
++                                                         self.mask, np.nan)
+ 
+         scale_factor_x = float(self.dimensions[0] / dimensions[0])
+         scale_factor_y = float(self.dimensions[1] / dimensions[1])
+@@ -1751,7 +1783,11 @@ class GenericMap(NDData):
+         new_meta['naxis2'] = new_data.shape[0]
+ 
+         # Create new map instance
+-        new_map = self._new_instance(new_data, new_meta, self.plot_settings)
++        new_map = self._new_instance(new_data, new_meta, self.plot_settings,
++                                     mask=new_mask,
++                                     uncertainty=carried_uncertainty(self.uncertainty,
++                                                                     resample_array,
++                                                                     self.mask, new_mask))
+         return new_map
+ 
+     @add_common_docstring(rotation_function_names=_rotation_function_names)
+@@ -1889,14 +1925,42 @@ class GenericMap(NDData):
+         else:
+             pixel_center = pixel_array_center
+ 
+-        # Apply the rotation to the image data
+-        new_data = affine_transform(new_data,
+-                                    np.asarray(inv_rmatrix),
++        def pad_like_data(array, fill):
++            return np.pad(np.asarray(array, dtype=float),
++                          ((pad_y, pad_y), (pad_x, pad_x)),
++                          mode='constant', constant_values=(fill, fill))
++
++        def rotate_padded(array, fill):
++            return affine_transform(array, np.asarray(inv_rmatrix),
+                                     order=order, scale=scale,
+                                     image_center=pixel_center,
+-                                    recenter=recenter, missing=missing,
++                                    recenter=recenter, missing=fill,
+                                     method=method, clip=clip)
+ 
++        # A map carrying either attribute is rotated about its own frame, so a map with
++        # an uncertainty and no mask of its own still needs one to rotate against.
++        source_mask = self.mask
++        if source_mask is None and self.uncertainty is not None:
++            source_mask = np.zeros(self.data.shape, dtype=bool)
++
++        # Apply the rotation to the image data
++        if source_mask is None:
++            new_mask = None
++            new_data = rotate_padded(new_data, missing)
++            new_uncertainty = None
++        else:
++            # The padding counts as masked, so the area rotated in from outside the
++            # frame is masked for the same reason a masked pixel is. The uncertainty is
++            # padded before it is handed over rather than inside the rotation, so that it
++            # and the data reach the same rotation over the same array.
++            padded_mask = pad_like_data(source_mask, 1.0) > 0.5
++            new_data, new_mask = interpolate_around_mask(
++                lambda array: rotate_padded(array, 0.0), new_data, padded_mask, missing)
++            new_uncertainty = carried_uncertainty(
++                self.uncertainty, lambda array: rotate_padded(array, 0.0),
++                padded_mask, new_mask,
++                prepare=lambda array: pad_like_data(array, 0.0))
++
+         if recenter:
+             new_reference_pixel = pixel_array_center
+         else:
+@@ -1916,9 +1980,19 @@ class GenericMap(NDData):
+         # Unpad the array if necessary
+         if unpad_x > 0:
+             new_data = new_data[:, unpad_x:-unpad_x]
++            if new_mask is not None:
++                new_mask = new_mask[:, unpad_x:-unpad_x]
++            if new_uncertainty is not None:
++                new_uncertainty = sliced_uncertainty(
++                    new_uncertainty, (slice(None), slice(unpad_x, -unpad_x)))
+             new_meta['crpix1'] -= unpad_x
+         if unpad_y > 0:
+             new_data = new_data[unpad_y:-unpad_y, :]
++            if new_mask is not None:
++                new_mask = new_mask[unpad_y:-unpad_y, :]
++            if new_uncertainty is not None:
++                new_uncertainty = sliced_uncertainty(
++                    new_uncertainty, (slice(unpad_y, -unpad_y), slice(None)))
+             new_meta['crpix2'] -= unpad_y
+ 
+         # Calculate the new rotation matrix to store in the header by
+@@ -1946,7 +2020,9 @@ class GenericMap(NDData):
+         new_meta.pop('CD2_2', None)
+ 
+         # Create new map with the modification
+-        new_map = self._new_instance(new_data, new_meta, self.plot_settings)
++        new_map = self._new_instance(new_data, new_meta, self.plot_settings,
++                                     mask=new_mask,
++                                     uncertainty=new_uncertainty)
+ 
+         return new_map
+ 
+@@ -2130,13 +2206,10 @@ class GenericMap(NDData):
+         new_meta['naxis2'] = new_data.shape[0]
+ 
+         # Create new map instance
+-        if self.mask is not None:
+-            new_mask = self.mask[arr_slice].copy()
+-            # Create new map with the modification
+-            new_map = self._new_instance(new_data, new_meta, self.plot_settings, mask=new_mask)
+-            return new_map
+-        # Create new map with the modification
+-        new_map = self._new_instance(new_data, new_meta, self.plot_settings)
++        new_mask = self.mask[arr_slice].copy() if self.mask is not None else None
++        new_uncertainty = sliced_uncertainty(self.uncertainty, arr_slice)
++        new_map = self._new_instance(new_data, new_meta, self.plot_settings,
++                                     mask=new_mask, uncertainty=new_uncertainty)
+         return new_map
+ 
+     @seconddispatch
+@@ -2300,8 +2373,22 @@ class GenericMap(NDData):
+         else:
+             new_data = new_array
+ 
++        new_uncertainty = None
++        if self.uncertainty is not None:
++            block_shape = (dimensions[1], dimensions[0])
++            block_offset = (offset[1], offset[0])
++            new_variance = aggregated_variance(
++                masked_variance_of(self.uncertainty, self.mask),
++                counted_blocks(self.mask, block_shape, block_offset),
++                block_shape, block_offset, func)
++            if new_variance is not None:
++                if new_mask is not None:
++                    new_variance = np.where(new_mask, np.nan, new_variance)
++                new_uncertainty = uncertainty_like(self.uncertainty, new_variance)
++
+         # Create new map with the modified data
+-        new_map = self._new_instance(new_data, new_meta, self.plot_settings, mask=new_mask)
++        new_map = self._new_instance(new_data, new_meta, self.plot_settings,
++                                     mask=new_mask, uncertainty=new_uncertainty)
+         return new_map
+ 
+ # #### Visualization #### #
+@@ -3130,10 +3217,38 @@ class GenericMap(NDData):
+         if target_wcs.array_shape is not None:
+             reproject_args.setdefault('shape_out', target_wcs.array_shape)
+ 
+-        # Reproject the array
+-        output_array = func(self, target_wcs, return_footprint=return_footprint, **reproject_args)
+-        if return_footprint:
+-            output_array, footprint = output_array
++        # A caller may hand in its own output buffers, which only the result may be
++        # written into; the passes made for the support field and the variance need
++        # somewhere of their own to land. Where such a buffer is the only thing saying
++        # how large the output is, its shape travels in its place.
++        internal_args = {key: value for key, value in reproject_args.items()
++                         if key not in ('output_array', 'output_footprint')}
++        if 'shape_out' not in internal_args:
++            implied_shape = shape_from_buffers(reproject_args)
++            if implied_shape is not None:
++                internal_args['shape_out'] = implied_shape
++
++        def reproject_array(array):
++            source = self._new_instance(np.asarray(array, dtype=float), self.meta,
++                                        plot_settings=self.plot_settings)
++            return func(source, target_wcs, return_footprint=False, **internal_args)
++
++        # The footprint is what the caller is owed and reads the data as it stands, so a
++        # masked pixel counts towards it whatever value it holds. Which output pixels an
++        # unmasked pixel reached is a different question, and the support field is what
++        # answers it, so that is what the new mask is read from.
++        output_array, footprint = func(self, target_wcs, return_footprint=True,
++                                       **reproject_args)
++        new_mask = None
++        if self.mask is not None:
++            values, new_mask = interpolate_around_mask(reproject_array, self.data,
++                                                       self.mask, np.nan)
++            output_array[...] = np.where(new_mask, np.nan, values)
++        elif self.uncertainty is not None:
++            nothing_masked = np.zeros(self.data.shape, dtype=bool)
++            new_mask = unsupported(support_of(reproject_array, nothing_masked))
++        new_uncertainty = carried_uncertainty(self.uncertainty, reproject_array,
++                                              self.mask, new_mask)
+ 
+         target_header = target_wcs.to_header(relax=True)
+         if preserve_date_obs:
+@@ -3150,7 +3265,9 @@ class GenericMap(NDData):
+ 
+         # Create and return a new GenericMap
+         outmap = GenericMap(output_array, target_header,
+-                            plot_settings=self.plot_settings)
++                            plot_settings=self.plot_settings,
++                            mask=new_mask,
++                            uncertainty=in_unit_of(new_uncertainty, target_header))
+ 
+         # Check rsun mismatch
+         if self.rsun_meters != outmap.rsun_meters:
+diff --git a/sunpy/map/mapsequence.py b/sunpy/map/mapsequence.py
+index 8fa5082..b192d2e 100644
+--- a/sunpy/map/mapsequence.py
++++ b/sunpy/map/mapsequence.py
+@@ -12,6 +12,7 @@ import numpy as np
+ from astropy.visualization import ImageNormalize
+ 
+ from sunpy.map import GenericMap
++from sunpy.map._propagation import uncertainty_like, variance_of
+ from sunpy.map.maputils import _clip_interval, _handle_norm
+ from sunpy.util import expand_list
+ from sunpy.util.exceptions import warn_user
+@@ -455,6 +456,25 @@ class MapSequence:
+                 mask[..., i] = m.mask
+         return mask
+ 
++    @property
++    def uncertainty(self):
++        """
++        Combined uncertainty with same shape as `~sunpy.map.MapSequence.data` for all
++        maps in the sequence.
++
++        If no map in the sequence has an uncertainty, this returns None. If at least one
++        map does, the layers belonging to the maps without one are all not a number.
++        """
++        carried = [m.uncertainty for m in self.maps]
++        if not np.any([u is not None for u in carried]):
++            return None
++        first = next(u for u in carried if u is not None)
++        variance = np.full_like(self.data, np.nan, dtype=float)
++        for i, uncertainty in enumerate(carried):
++            if uncertainty is not None:
++                variance[..., i] = variance_of(uncertainty)
++        return uncertainty_like(first, variance)
++
+     @property
+     def meta(self):
+         """

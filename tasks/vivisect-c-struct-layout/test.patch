@@ -1,0 +1,3463 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..9037bf67
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,65 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() { echo "usage: $0 [--output_path <path>] base|new" >&2; exit 2; }
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new) MODE="$1"; MODE_COUNT=$((MODE_COUNT + 1)); shift ;;
++    --output_path) shift; [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }; OUTPUT_PATH="$1"; shift ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    *) echo "unknown argument: $1" >&2; usage ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++[ -n "$OUTPUT_PATH" ] || OUTPUT_PATH="$(pwd)/test-results-$MODE.xml"
++case "$OUTPUT_PATH" in /*) ;; *) OUTPUT_PATH="$(pwd)/$OUTPUT_PATH" ;; esac
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++rm -f "$OUTPUT_PATH"
++
++cd "$(dirname "$0")" || exit 1
++
++NEW_TESTS=(
++  vstruct/tests/test_clayout_403f6e.py
++  vivisect/tests/test_userstructs_39a869.py
++)
++
++PYTEST=(python3 -m pytest -p no:cacheprovider -o addopts= -o "python_files=test*.py" -v --junitxml="$OUTPUT_PATH")
++
++LOG="$(mktemp 2>/dev/null || echo "$OUTPUT_PATH.log")"
++
++if [ "$MODE" = "new" ]; then
++  timeout 1800 "${PYTEST[@]}" "${NEW_TESTS[@]}" 2>&1 | tee "$LOG"
++  STATUS=${PIPESTATUS[0]}
++else
++  IGNORES=()
++  for t in "${NEW_TESTS[@]}"; do
++    IGNORES+=("--ignore=$t")
++  done
++  # vtrace and vdb tests start child processes and attach to them with ptrace.
++  # cobra and testremote start localhost TCP servers on fixed ports from worker threads, so a socket
++  # that is still closing can make a later bind fail with "Address already in use" from run to run.
++  # testcconvs.py holds no tests and its TestCase subclass overrides __init__ without arguments, so it cannot be collected.
++  timeout 3000 "${PYTEST[@]}" "${IGNORES[@]}" \
++    --ignore=vtrace --ignore=vdb --ignore=cobra --ignore=vivisect/tests/testremote.py \
++    --ignore=vivisect/tests/testcconvs.py . 2>&1 | tee "$LOG"
++  STATUS=${PIPESTATUS[0]}
++fi
++
++if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  DETAIL="$(tail -n 200 "$LOG" 2>/dev/null | LC_ALL=C tr -cd '\11\12\15\40-\176' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++  cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="utf-8"?>
++<testsuites><testsuite name="pytest" tests="1" failures="1" errors="0" time="0">
++<testcase classname="test.sh" name="${MODE}_suite"><failure message="no test results">pytest exited with status ${STATUS} before reporting any test.
++${DETAIL}</failure></testcase>
++</testsuite></testsuites>
++XMLEOF
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++rm -f "$LOG"
++exit "$STATUS"
+diff --git a/vivisect/tests/test_userstructs_39a869.py b/vivisect/tests/test_userstructs_39a869.py
+new file mode 100644
+index 00000000..9ae4eac2
+--- /dev/null
++++ b/vivisect/tests/test_userstructs_39a869.py
+@@ -0,0 +1,182 @@
++import io
++import os
++import struct
++import tempfile
++import unittest
++
++import vivisect
++import vivisect.const as v_const
++
++BASE = 0x41410000
++
++SRC_REC = "struct rec { char tag; void *next; int count; };"
++
++SRC_NODE = """
++struct node {
++    char kind;
++    void *data;
++    union { void *ptr; long num; } u;
++    struct { short id; void *ref; } items[2];
++    void *tail;
++};
++"""
++
++SRC_BE = "struct be { short s; int i; void *p; long long q; };"
++
++SRC_SMALL = "struct small { char c; void *p; short h; };"
++
++SRC_PLAIN = "typedef struct { int a; char b; } plain_t;"
++
++SRC_ARMPAD = "struct armpad { char c; int i; short s; };"
++
++
++def workspace(arch, data, bigend=False):
++    vw = vivisect.VivWorkspace()
++    vw.setMeta("Architecture", arch)
++    vw.setMeta("Platform", "linux")
++    if bigend:
++        vw.setMeta("bigend", True)
++    vw.addMemoryMap(BASE, 7, "test", data)
++    vw.addSegment(BASE, len(data), "test", "test")
++    return vw
++
++
++def node_bytes(psize, offsets, targets):
++    fmt = "<Q" if psize == 8 else "<I"
++    data = bytearray(0x200)
++    data[0] = 3
++    for off, ptr in zip(offsets, targets):
++        struct.pack_into(fmt, data, off, ptr)
++    return bytes(data)
++
++
++class UserStructWorkspaceTest(unittest.TestCase):
++
++    def test_amd64_workspace_builds_user_structures_with_eight_byte_pointers(self):
++        data = struct.pack("<B7xQi4x", 1, BASE + 0x40, 7) + bytes(0x80)
++        vw = workspace("amd64", data)
++        self.assertEqual(vw.setUserStructSource(SRC_REC), "rec")
++        vs = vw.getStructure(BASE, "rec")
++        self.assertEqual(len(vs), 24)
++        self.assertEqual((vs.tag, vs.next, vs.count), (1, BASE + 0x40, 7))
++
++    def test_i386_workspace_pads_user_structures(self):
++        data = struct.pack("<B3xIi", 2, BASE + 0x20, -3) + bytes(0x40)
++        vw = workspace("i386", data)
++        vw.setUserStructSource(SRC_REC)
++        vs = vw.getStructure(BASE, "rec")
++        self.assertEqual(len(vs), 12)
++        self.assertEqual((vs.tag, vs.next, vs.count), (2, BASE + 0x20, -3))
++
++    def test_make_structure_xrefs_follow_true_pointer_offsets_amd64(self):
++        offsets = (8, 16, 32, 48, 56)
++        targets = [BASE + 0x100 + 8 * i for i in range(5)]
++        vw = workspace("amd64", node_bytes(8, offsets, targets))
++        vw.setUserStructSource(SRC_NODE)
++        vs = vw.makeStructure(BASE, "node")
++
++        loc = vw.getLocation(BASE)
++        self.assertEqual((loc[v_const.L_VA], loc[v_const.L_SIZE], loc[v_const.L_LTYPE]), (BASE, 64, v_const.LOC_STRUCT))
++        xrefs = sorted(
++            (x[v_const.XR_FROM] - BASE, x[v_const.XR_TO])
++            for x in vw.getXrefs(rtype=v_const.REF_PTR)
++            if BASE <= x[v_const.XR_FROM] < BASE + 64
++        )
++        self.assertEqual(xrefs, list(zip(offsets, targets)))
++        self.assertEqual(vs.items[1].ref, targets[3])
++        self.assertEqual(vs.u.num, targets[1])
++
++    def test_make_structure_xrefs_follow_true_pointer_offsets_i386(self):
++        offsets = (4, 8, 16, 24, 28)
++        targets = [BASE + 0x100 + 4 * i for i in range(5)]
++        vw = workspace("i386", node_bytes(4, offsets, targets))
++        vw.setUserStructSource(SRC_NODE)
++        vw.makeStructure(BASE, "node")
++
++        self.assertEqual(vw.getLocation(BASE)[v_const.L_SIZE], 32)
++        xrefs = sorted(
++            (x[v_const.XR_FROM] - BASE, x[v_const.XR_TO])
++            for x in vw.getXrefs(rtype=v_const.REF_PTR)
++            if BASE <= x[v_const.XR_FROM] < BASE + 32
++        )
++        self.assertEqual(xrefs, list(zip(offsets, targets)))
++
++    def test_bigend_workspace_builds_big_endian_user_structures(self):
++        data = struct.pack(">h2xiIq", -2, -70000, BASE + 0x30, -5) + bytes(0x40)
++        vw = workspace("arm", data, bigend=True)
++        vw.setUserStructSource(SRC_BE)
++        vs = vw.getStructure(BASE, "be")
++        self.assertEqual(len(vs), 20)
++        self.assertEqual((vs.s, vs.i, vs.p, vs.q), (-2, -70000, BASE + 0x30, -5))
++        self.assertEqual(vs.vsEmit(), data[:20])
++
++    def test_loaded_bigend_workspace_rebuilds_big_endian_user_structures(self):
++        data = struct.pack(">h2xiIq", -2, -70000, BASE + 0x30, -5) + bytes(0x40)
++        vw = vivisect.VivWorkspace()
++        vw.config.viv.parsers.blob.arch = "arm"
++        vw.config.viv.parsers.blob.bigend = True
++        vw.config.viv.parsers.blob.baseaddr = BASE
++        vw.loadFromFd(io.BytesIO(data), fmtname="blob")
++        vw.setUserStructSource(SRC_BE)
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "bigend.viv")
++            vw.setMeta("StorageName", path)
++            vw.saveWorkspace()
++            loaded = vivisect.VivWorkspace()
++            loaded.loadWorkspace(path)
++
++        vs = loaded.getStructure(BASE, "be")
++        self.assertEqual(len(vs), 20)
++        self.assertEqual((vs.s, vs.i, vs.p, vs.q), (-2, -70000, BASE + 0x30, -5))
++        self.assertEqual(vs.vsEmit(), data[:20])
++
++    def test_loaded_workspace_rebuilds_user_structures_with_its_pointer_size(self):
++        data = struct.pack("<B7xQi4x", 9, BASE + 0x48, 11) + bytes(0x80)
++        vw = vivisect.VivWorkspace()
++        vw.config.viv.parsers.blob.arch = "amd64"
++        vw.config.viv.parsers.blob.bigend = False
++        vw.config.viv.parsers.blob.baseaddr = BASE
++        vw.loadFromFd(io.BytesIO(data), fmtname="blob")
++        vw.setUserStructSource(SRC_REC)
++        with tempfile.TemporaryDirectory() as tmp:
++            path = os.path.join(tmp, "userstructs.viv")
++            vw.setMeta("StorageName", path)
++            vw.saveWorkspace()
++            loaded = vivisect.VivWorkspace()
++            loaded.loadWorkspace(path)
++
++        self.assertEqual(loaded.getUserStructNames(), ["rec"])
++        vs = loaded.getStructure(BASE, "rec")
++        self.assertEqual(len(vs), 24)
++        self.assertEqual((vs.tag, vs.next, vs.count), (9, BASE + 0x48, 11))
++
++    def test_workspace_without_architecture_uses_four_byte_pointers(self):
++        vw = vivisect.VivWorkspace()
++        vw.addMemoryMap(BASE, 7, "test", struct.pack("<B3xIh2x", 4, 0x1234, -6))
++        self.assertEqual(vw.setUserStructSource(SRC_SMALL), "small")
++        vs = vw.getStructure(BASE, "small")
++        self.assertEqual((len(vs), vs.vsGetOffset("p"), vs.vsGetOffset("h")), (12, 4, 8))
++        self.assertEqual((vs.c, vs.p, vs.h), (4, 0x1234, -6))
++
++    def test_user_structure_without_a_tag_is_named_by_its_typedef(self):
++        vw = workspace("amd64", struct.pack("<ib3x", -9, 5))
++        self.assertEqual(vw.setUserStructSource(SRC_PLAIN), "plain_t")
++        self.assertEqual(vw.getUserStructNames(), ["plain_t"])
++        vs = vw.getStructure(BASE, "plain_t")
++        self.assertEqual((len(vs), vs.a, vs.b), (8, -9, 5))
++
++    def test_arm_blob_keeps_existing_structures_and_pads_new_ones(self):
++        fd = io.BytesIO(b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\xfc\xfd\xfe\xff")
++        vw = vivisect.VivWorkspace()
++        vw.config.viv.parsers.blob.arch = "arm"
++        vw.config.viv.parsers.blob.bigend = False
++        vw.config.viv.parsers.blob.baseaddr = 0x22220000
++        vw.loadFromFd(fd, fmtname="blob")
++
++        vw.setUserStructSource("struct allint {int foo; int bar; int baz; int biz;};")
++        allint = vw.makeStructure(0x22220000, "allint")
++        self.assertEqual((allint.foo, allint.biz), (0x03020100, -0x010204))
++
++        vw.setUserStructSource(SRC_ARMPAD)
++        pad = vw.getStructure(0x22220000, "armpad")
++        self.assertEqual((len(pad), pad.c, pad.i, pad.s), (12, 0, 0x07060504, 0x0908))
+diff --git a/vstruct/tests/test_clayout_403f6e.py b/vstruct/tests/test_clayout_403f6e.py
+new file mode 100644
+index 00000000..744297a6
+--- /dev/null
++++ b/vstruct/tests/test_clayout_403f6e.py
+@@ -0,0 +1,3198 @@
++import unittest
++
++import vstruct
++import vstruct.cparse as vs_cparse
++import vstruct.primitives as vs_prims
++from vstruct.bitfield import VBitField, v_bits
++
++SRC_CHAR_INT_SHORT_PAD_TO_MEMBER_ALIGNMENT = "struct rec { char c; int i; short s; };"
++
++SRC_DOUBLE_AFTER_CHAR_IS_FOUR_ALIGNED_ON_I386_ONLY = "struct rec { char c; double d; char e; };"
++
++SRC_LONG_LONG_AFTER_CHAR_IS_FOUR_ALIGNED_ON_I386_ONLY = "struct rec { char c; long long q; };"
++
++SRC_LONG_FOLLOWS_POINTER_SIZE = "struct rec { short s; long l; char c; unsigned long ul; };"
++
++SRC_POINTERS_OF_EVERY_KIND_TAKE_POINTER_SIZE = (
++    "struct rec { char c; void *p; int (*fn)(int, char *); char *strs[2]; struct missing *m; };"
++)
++
++SRC_TAIL_PADDING_ROUNDS_SIZE_TO_ALIGNMENT = "struct rec { int i; char c; };"
++
++SRC_FLOAT_AND_DOUBLE_MEMBERS = "struct rec { char c; float f; double d; float g; };"
++
++SRC_BOOL_MEMBERS_ARE_ONE_BYTE = "struct rec { _Bool b; short s; _Bool t; };"
++
++SRC_CONST_AND_VOLATILE_QUALIFIERS_CHANGE_NOTHING = (
++    "struct rec { const char c; volatile long v; const char * const name; };"
++)
++
++SRC_NESTED_STRUCT_ALIGNED_BY_WIDEST_MEMBER_NOT_FIRST = (
++    "struct inner { char c; double d; }; struct outer { char a; struct inner n; char z; };"
++)
++
++SRC_ARRAY_OF_STRUCTS_USES_PADDED_STRIDE = (
++    "struct pt { int x; char tag; }; struct poly { char n; struct pt pts[3]; short last; };"
++)
++
++SRC_TWO_DIMENSIONAL_ARRAY_IS_ROW_MAJOR = "struct grid { char c; short cells[2][3]; int k; };"
++
++SRC_CHAR_ARRAYS_ARE_STRINGS_OTHER_ARRAYS_INDEX_BY_ELEMENT = (
++    "struct named { char name[5]; unsigned char raw[3]; signed char sig[2]; int n; };"
++)
++
++SRC_NESTED_DEFINITION_INSIDE_STRUCT_IS_LAID_OUT_IN_PLACE = (
++    "struct outer { char a; struct inner { short s; char c; } in; int k; };"
++)
++
++SRC_TAIL_PADDING_FOLLOWS_LARGEST_ALIGNMENT_NOT_LARGEST_MEMBER = (
++    "struct tail { short s; char buf[5]; }; struct pair { struct tail t[2]; char z; };"
++)
++
++SRC_INTEGER_SPELLINGS_IN_ANY_ORDER = """
++    struct spell {
++    unsigned u; signed s; long unsigned int lu; int long il;
++    long long unsigned llu; unsigned short int us; short signed ss;
++    signed char sc; char unsigned uc; long int signed lis; long signed long lsl;
++    };
++"""
++
++SRC_TYPEDEFS_OF_SCALARS_STRUCTS_ARRAYS_AND_POINTERS = """
++    typedef unsigned int u32;
++    typedef struct { u32 x, y; char z; } pair_t;
++    typedef pair_t pairs_t[2];
++    typedef void (*handler_t)(int);
++    struct holder { char c; pairs_t ps; u32 *next; handler_t cb; };
++"""
++
++SRC_ENUMS_ARE_FOUR_BYTE_INTS_AND_SIZE_ARRAYS = (
++    "enum mode { OFF, ON = 4, AUTO }; struct cfg { char c; enum mode m; short slots[AUTO]; enum { A, B } e; };"
++)
++
++SRC_ARRAY_SIZES_ARE_INTEGER_CONSTANT_EXPRESSIONS = """
++    enum { BASE = 0x10, NEXT };
++    struct buf {
++    char hdr[sizeof(int) * 2];
++    short words[(BASE >> 2) + 1];
++    char tail[010 | 1];
++    int big[1 << 2];
++    char last[NEXT - BASE + 2u];
++    };
++"""
++
++SRC_ARRAY_SIZES_USE_REMAINDER_CONDITIONAL_AND_LOGICAL_OPERATORS = """
++    enum { N = 13 };
++    struct expr {
++    char rem[N % 5];
++    char cond[(N > 10) ? 2 : 1];
++    char logic[(N > 1 && N < 20) + (N == 3 || !N) + 1];
++    int last;
++    };
++"""
++
++SRC_STANDALONE_TAG_AND_ENUM_DEFINITIONS_ADD_NO_MEMBERS = """
++    struct outer {
++    enum count { N = 2 };
++    struct inner { int x; };
++    union pick { short s; char c; };
++    char bytes[N];
++    struct inner value;
++    union pick p;
++    };
++"""
++
++SRC_RESTRICT_AND_POINTER_TO_ARRAY_DECLARATORS = (
++    "struct q { int * restrict p; int (*pa)[3]; const char *const names[2]; char c; };"
++)
++
++SRC_SIZEOF_COUNTS_TAIL_PADDING_AND_POINTER_SIZE = "struct hdr { int a; char b; }; struct msg { struct hdr h; char raw[sizeof(struct hdr) - 1]; void *slots[sizeof(void *) / 4 + 1]; };"
++
++SRC_EARLIER_TAGS_FORWARD_DECLARATIONS_AND_SELF_REFERENCE = """
++    struct node;
++    struct list { struct node *head; int count; };
++    struct node { int value; struct node *next; struct list owner; char flag; };
++"""
++
++SRC_FLEXIBLE_ARRAY_MEMBER_TAKES_NO_SPACE = "struct pkt { short len; char kind; int data[]; };"
++
++SRC_FLEXIBLE_CHAR_ARRAY_AFTER_CHAR = "struct text { char kind; char body[]; };"
++
++SRC_SIZEOF_ENUMERATION_AND_CHARACTER_CONSTANTS = "enum { N = 1, M = 70000 }; struct sized { char a[sizeof N]; char b[sizeof(N)]; char c[sizeof 'x']; char d[sizeof (N + 1L)]; char e[sizeof M * 2]; int last; };"
++
++SRC_SIZEOF_INTEGER_AND_FLOATING_LITERALS_FOLLOW_C_TYPING = "struct lits { char a[sizeof 1L]; char b[sizeof 1ULL]; char c[sizeof 7u]; char d[sizeof 1.5f]; char e[sizeof 2.0]; char f[sizeof (1 ? 1 : 2.0f)]; int last; };"
++
++SRC_SIZEOF_CASTS_PROMOTIONS_AND_NESTED_SIZEOF = "struct casts { char a[sizeof ((short)1)]; char b[sizeof ((char)1 + (char)1)]; char c[sizeof (char[sizeof(int)])]; char d[sizeof ((long)1 * 2)]; int last; };"
++
++SRC_SIZEOF_FLOATING_ARITHMETIC_TAKES_THE_WIDER_TYPE = "struct fl { char a[sizeof (1.0f + 1.0)]; char b[sizeof (2 * 1.5f)]; char c[sizeof ('a' + 0.5)]; char d[sizeof (1L + 1.0f)]; int last; };"
++
++SRC_SIZEOF_FILE_SCOPE_OBJECTS_AND_MEMBERS = """
++    extern short table[6];
++    struct hdr { int len; char tag[3]; };
++    extern struct hdr headers[2];
++    struct objs {
++    char a[sizeof table];
++    char b[sizeof table[0]];
++    char c[sizeof *headers];
++    char d[sizeof headers[1].tag];
++    char e[sizeof headers[0].len];
++    int last;
++    };
++"""
++
++SRC_DEFINITIONS_INSIDE_POINTER_DECLARATORS_ARE_REGISTERED = "struct inner { int x; short y; } *p; enum mode { LOW = 2, HIGH = 6 } *mp; struct holder { struct inner value; char tail[HIGH]; struct inner *again; };"
++
++SRC_POINTER_DECLARATION_ALONE_DEFINES_ITS_STRUCTURE = "struct inner { int x; short y; } *p;"
++
++SRC_TOP_LEVEL_ARRAY_DECLARATION_DEFINES_ITS_STRUCTURE = "struct cell { char c; int v; } cells[3];"
++
++SRC_FUNCTION_DECLARATION_DEFINES_ITS_RETURN_STRUCTURE = "struct ret { int a; char b; } make(void);"
++
++SRC_POINTER_MEMBER_DEFINES_A_REUSABLE_TAG = (
++    "struct outer { struct inner { short s; char t; } *ip; struct inner copy; char c; };"
++)
++
++SRC_EARLIER_UNION_TAG_USED_AS_MEMBER = (
++    "union num { int i; float f; unsigned char b[4]; }; struct holder { char c; union num n; char d; };"
++)
++
++SRC_UNION_SIZE_IS_WIDEST_MEMBER_ROUNDED_TO_ALIGNMENT = "union word { char c[5]; short s; };"
++
++SRC_UNION_INSIDE_STRUCT_ALIGNED_BY_WIDEST_MEMBER = (
++    "struct tagged { char tag; union { int i; double d; } v; char end; };"
++)
++
++SRC_STRUCT_INSIDE_UNION_INSIDE_STRUCT = (
++    "struct outer { short s; union { struct { char a; int b; } pair; long long q; } u; };"
++)
++
++SRC_BITFIELDS_SHARE_ONE_UNIT_AND_SIGN_EXTEND = "struct flags { unsigned a:3; int b:5; unsigned c:24; };"
++
++SRC_BITFIELD_THAT_WOULD_CROSS_ITS_UNIT_MOVES_TO_NEXT_UNIT = "struct flags { char a; int b:30; };"
++
++SRC_CHAR_BITFIELDS_MOVE_TO_NEXT_BYTE = "struct flags { char a:4; char b:6; unsigned char c:3; };"
++
++SRC_ZERO_WIDTH_BITFIELD_ALIGNS_WITHOUT_RAISING_ALIGNMENT = "struct flags { char a; int :0; char b; };"
++
++SRC_ZERO_WIDTH_BITFIELD_AT_A_BOUNDARY_CHANGES_NOTHING = (
++    "struct flags { char c; char :0; char d; int a:32; int :0; char b; };"
++)
++
++SRC_ZERO_WIDTH_LONG_LONG_BITFIELD_FOLLOWS_TARGET_ALIGNMENT = "struct flags { char a; long long :0; char b; };"
++
++SRC_UNNAMED_BITFIELD_DOES_NOT_RAISE_ALIGNMENT = "struct flags { char a; int :4; char b; };"
++
++SRC_NAMED_BITFIELD_RAISES_ALIGNMENT = "struct flags { char a; int b:1; };"
++
++SRC_PLAIN_MEMBERS_AFTER_BITFIELDS_START_ON_NEXT_BYTE = "struct flags { int a:3; char b; short c; unsigned d:2; };"
++
++SRC_LONG_LONG_BITFIELD_UNITS_FOLLOW_TARGET_ALIGNMENT = "struct flags { int a:31; long long b:34; };"
++
++SRC_LONG_LONG_BITFIELD_AFTER_CHAR = "struct flags { char c; long long b:60; };"
++
++SRC_MIXED_WIDTH_BITFIELDS_REUSE_WIDER_UNITS = "struct flags { short c; long long b:40; int d:20; };"
++
++SRC_SHORT_BITFIELDS_AND_TRAILING_CHAR = "struct flags { short a:9; short b:9; char c; };"
++
++SRC_BOOL_AND_UNSIGNED_BITFIELDS_PACK_TOGETHER = "struct flags { _Bool a:1; unsigned b:2; _Bool c:1; signed char d:4; };"
++
++SRC_BITFIELD_RUNS_SEPARATED_BY_PLAIN_MEMBER = "struct flags { unsigned a:4; char mid; unsigned b:4; unsigned c:12; };"
++
++SRC_BITFIELDS_INSIDE_NESTED_STRUCT_AND_ARRAY = (
++    "struct reg { unsigned lo:12, mid:8, hi:12; }; struct bank { char id; struct reg regs[2]; };"
++)
++
++SRC_BIGEND_SCALARS_KEEP_SIGN_AND_FLOAT_VALUES = (
++    "struct be { short s; int i; long long q; float f; double d; void *p; };"
++)
++
++SRC_UNION_REG = "union reg { unsigned int raw; struct { unsigned lo:12, mid:8, hi:12; } f; };"
++
++SRC_BE4 = "struct be4 { char c; short s; int i; long long q; double d; void *p; float f; };"
++
++SRC_LAST = """
++    struct first { char a; int b; };
++    typedef struct { char z; double y; } second_t;
++"""
++
++SRC_PACKED = "struct packed { unsigned char a; unsigned int b; };"
++
++SRC_TEXT = "struct msg { char tag[3]; int id; char text[5]; };"
++
++SRC_BITOFFS = "struct r { char tag; unsigned a:3; unsigned :0; unsigned b:5; unsigned c:30; unsigned d:4; };"
++
++SRC_GAPS = """
++    struct gaps {
++        unsigned a:3;
++        unsigned :5;
++        unsigned b:4;
++        char c;
++        int :0;
++        short d:7;
++        long long e:33;
++    };
++"""
++
++
++def build(src, psize=8, bigend=False):
++    return vs_cparse.vsFromCSource(src, psize=psize, bigend=bigend)
++
++
++def walk(vs, parts):
++    obj = vs
++    for part in parts:
++        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
++    return obj
++
++
++def getpath(vs, path):
++    obj = walk(vs, path.split("."))
++    if isinstance(obj, vs_prims.v_prim):
++        return obj.vsGetValue()
++    return obj
++
++
++def setpath(vs, path, value):
++    parts = path.split(".")
++    parent = walk(vs, parts[:-1])
++    if parts[-1].isdigit():
++        parent[int(parts[-1])].vsSetValue(value)
++    else:
++        setattr(parent, parts[-1], value)
++
++
++def pattern(size):
++    return bytes((i * 37 + 11) & 0x7F for i in range(size))
++
++
++class CLayoutTest(unittest.TestCase):
++
++    def checkLayout(self, src, psize, bigend, size, offsets, values, image):
++        vs = build(src, psize=psize, bigend=bigend)
++        self.assertEqual(len(vs), size)
++        self.assertEqual({path: vs.vsGetOffset(path) for path in offsets}, offsets)
++        for path, value in values.items():
++            setpath(vs, path, value)
++        self.assertEqual(vs.vsEmit().hex(), image)
++
++        parsed = build(src, psize=psize, bigend=bigend)
++        self.assertEqual(parsed.vsParse(bytes.fromhex(image)), size)
++        self.assertEqual({path: getpath(parsed, path) for path in values}, values)
++
++    def test_char_int_short_pad_to_member_alignment_x86_64(self):
++        self.checkLayout(
++            SRC_CHAR_INT_SHORT_PAD_TO_MEMBER_ALIGNMENT,
++            psize=8,
++            bigend=False,
++            size=12,
++            offsets={
++                "i": 4,
++                "s": 8,
++            },
++            values={
++                "c": 7,
++                "i": -2,
++                "s": 0x12C,
++            },
++            image="07000000feffffff2c010000",
++        )
++
++    def test_char_int_short_pad_to_member_alignment_i386(self):
++        self.checkLayout(
++            SRC_CHAR_INT_SHORT_PAD_TO_MEMBER_ALIGNMENT,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "i": 4,
++                "s": 8,
++            },
++            values={
++                "c": 7,
++                "i": -2,
++                "s": 0x12C,
++            },
++            image="07000000feffffff2c010000",
++        )
++
++    def test_double_after_char_is_four_aligned_on_i386_only_x86_64(self):
++        self.checkLayout(
++            SRC_DOUBLE_AFTER_CHAR_IS_FOUR_ALIGNED_ON_I386_ONLY,
++            psize=8,
++            bigend=False,
++            size=24,
++            offsets={
++                "d": 8,
++                "e": 16,
++            },
++            values={
++                "c": 1,
++                "d": 2.5,
++                "e": 3,
++            },
++            image="010000000000000000000000000004400300000000000000",
++        )
++
++    def test_double_after_char_is_four_aligned_on_i386_only_i386(self):
++        self.checkLayout(
++            SRC_DOUBLE_AFTER_CHAR_IS_FOUR_ALIGNED_ON_I386_ONLY,
++            psize=4,
++            bigend=False,
++            size=16,
++            offsets={
++                "d": 4,
++                "e": 12,
++            },
++            values={
++                "c": 1,
++                "d": 2.5,
++                "e": 3,
++            },
++            image="01000000000000000000044003000000",
++        )
++
++    def test_long_long_after_char_is_four_aligned_on_i386_only_x86_64(self):
++        self.checkLayout(
++            SRC_LONG_LONG_AFTER_CHAR_IS_FOUR_ALIGNED_ON_I386_ONLY,
++            psize=8,
++            bigend=False,
++            size=16,
++            offsets={
++                "q": 8,
++            },
++            values={
++                "c": 9,
++                "q": -0x1CBE991A14,
++            },
++            image="0900000000000000ece56641e3ffffff",
++        )
++
++    def test_long_long_after_char_is_four_aligned_on_i386_only_i386(self):
++        self.checkLayout(
++            SRC_LONG_LONG_AFTER_CHAR_IS_FOUR_ALIGNED_ON_I386_ONLY,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "q": 4,
++            },
++            values={
++                "c": 9,
++                "q": -0x1CBE991A14,
++            },
++            image="09000000ece56641e3ffffff",
++        )
++
++    def test_long_follows_pointer_size_x86_64(self):
++        self.checkLayout(
++            SRC_LONG_FOLLOWS_POINTER_SIZE,
++            psize=8,
++            bigend=False,
++            size=32,
++            offsets={
++                "l": 8,
++                "c": 16,
++                "ul": 24,
++            },
++            values={
++                "s": -5,
++                "l": -0x11170,
++                "c": 4,
++                "ul": 0xEE6B2800,
++            },
++            image="fbff00000000000090eefeffffffffff040000000000000000286bee00000000",
++        )
++
++    def test_long_follows_pointer_size_i386(self):
++        self.checkLayout(
++            SRC_LONG_FOLLOWS_POINTER_SIZE,
++            psize=4,
++            bigend=False,
++            size=16,
++            offsets={
++                "l": 4,
++                "c": 8,
++                "ul": 12,
++            },
++            values={
++                "s": -5,
++                "l": -0x11170,
++                "c": 4,
++                "ul": 0xEE6B2800,
++            },
++            image="fbff000090eefeff0400000000286bee",
++        )
++
++    def test_pointers_of_every_kind_take_pointer_size_x86_64(self):
++        self.checkLayout(
++            SRC_POINTERS_OF_EVERY_KIND_TAKE_POINTER_SIZE,
++            psize=8,
++            bigend=False,
++            size=48,
++            offsets={
++                "p": 8,
++                "fn": 16,
++                "strs": 24,
++                "strs.1": 32,
++                "m": 40,
++            },
++            values={
++                "c": 1,
++                "p": 0x1234,
++                "fn": 64,
++                "strs.0": 80,
++                "strs.1": 96,
++                "m": 112,
++            },
++            image="010000000000000034120000000000004000000000000000500000000000000060000000000000007000000000000000",
++        )
++
++    def test_pointers_of_every_kind_take_pointer_size_i386(self):
++        self.checkLayout(
++            SRC_POINTERS_OF_EVERY_KIND_TAKE_POINTER_SIZE,
++            psize=4,
++            bigend=False,
++            size=24,
++            offsets={
++                "p": 4,
++                "fn": 8,
++                "strs": 12,
++                "strs.1": 16,
++                "m": 20,
++            },
++            values={
++                "c": 1,
++                "p": 0x1234,
++                "fn": 64,
++                "strs.0": 80,
++                "strs.1": 96,
++                "m": 112,
++            },
++            image="010000003412000040000000500000006000000070000000",
++        )
++
++    def test_tail_padding_rounds_size_to_alignment_x86_64(self):
++        self.checkLayout(
++            SRC_TAIL_PADDING_ROUNDS_SIZE_TO_ALIGNMENT,
++            psize=8,
++            bigend=False,
++            size=8,
++            offsets={
++                "c": 4,
++            },
++            values={
++                "i": 0x1020304,
++                "c": 5,
++            },
++            image="0403020105000000",
++        )
++
++    def test_tail_padding_rounds_size_to_alignment_i386(self):
++        self.checkLayout(
++            SRC_TAIL_PADDING_ROUNDS_SIZE_TO_ALIGNMENT,
++            psize=4,
++            bigend=False,
++            size=8,
++            offsets={
++                "c": 4,
++            },
++            values={
++                "i": 0x1020304,
++                "c": 5,
++            },
++            image="0403020105000000",
++        )
++
++    def test_float_and_double_members_x86_64(self):
++        self.checkLayout(
++            SRC_FLOAT_AND_DOUBLE_MEMBERS,
++            psize=8,
++            bigend=False,
++            size=24,
++            offsets={
++                "f": 4,
++                "d": 8,
++                "g": 16,
++            },
++            values={
++                "c": 1,
++                "f": -1.5,
++                "d": 1024.25,
++                "g": 0.5,
++            },
++            image="010000000000c0bf00000000000190400000003f00000000",
++        )
++
++    def test_float_and_double_members_i386(self):
++        self.checkLayout(
++            SRC_FLOAT_AND_DOUBLE_MEMBERS,
++            psize=4,
++            bigend=False,
++            size=20,
++            offsets={
++                "f": 4,
++                "d": 8,
++                "g": 16,
++            },
++            values={
++                "c": 1,
++                "f": -1.5,
++                "d": 1024.25,
++                "g": 0.5,
++            },
++            image="010000000000c0bf00000000000190400000003f",
++        )
++
++    def test_bool_members_are_one_byte_x86_64(self):
++        self.checkLayout(
++            SRC_BOOL_MEMBERS_ARE_ONE_BYTE,
++            psize=8,
++            bigend=False,
++            size=6,
++            offsets={
++                "s": 2,
++                "t": 4,
++            },
++            values={
++                "b": 1,
++                "s": 2,
++                "t": 1,
++            },
++            image="010002000100",
++        )
++
++    def test_bool_members_are_one_byte_i386(self):
++        self.checkLayout(
++            SRC_BOOL_MEMBERS_ARE_ONE_BYTE,
++            psize=4,
++            bigend=False,
++            size=6,
++            offsets={
++                "s": 2,
++                "t": 4,
++            },
++            values={
++                "b": 1,
++                "s": 2,
++                "t": 1,
++            },
++            image="010002000100",
++        )
++
++    def test_const_and_volatile_qualifiers_change_nothing_x86_64(self):
++        self.checkLayout(
++            SRC_CONST_AND_VOLATILE_QUALIFIERS_CHANGE_NOTHING,
++            psize=8,
++            bigend=False,
++            size=24,
++            offsets={
++                "v": 8,
++                "name": 16,
++            },
++            values={
++                "c": 3,
++                "v": -9,
++                "name": 153,
++            },
++            image="0300000000000000f7ffffffffffffff9900000000000000",
++        )
++
++    def test_const_and_volatile_qualifiers_change_nothing_i386(self):
++        self.checkLayout(
++            SRC_CONST_AND_VOLATILE_QUALIFIERS_CHANGE_NOTHING,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "v": 4,
++                "name": 8,
++            },
++            values={
++                "c": 3,
++                "v": -9,
++                "name": 153,
++            },
++            image="03000000f7ffffff99000000",
++        )
++
++    def test_nested_struct_aligned_by_widest_member_not_first_x86_64(self):
++        self.checkLayout(
++            SRC_NESTED_STRUCT_ALIGNED_BY_WIDEST_MEMBER_NOT_FIRST,
++            psize=8,
++            bigend=False,
++            size=32,
++            offsets={
++                "n": 8,
++                "n.d": 16,
++                "z": 24,
++            },
++            values={
++                "a": 1,
++                "n.c": 2,
++                "n.d": 3.0,
++                "z": 4,
++            },
++            image="0100000000000000020000000000000000000000000008400400000000000000",
++        )
++
++    def test_nested_struct_aligned_by_widest_member_not_first_i386(self):
++        self.checkLayout(
++            SRC_NESTED_STRUCT_ALIGNED_BY_WIDEST_MEMBER_NOT_FIRST,
++            psize=4,
++            bigend=False,
++            size=20,
++            offsets={
++                "n": 4,
++                "n.d": 8,
++                "z": 16,
++            },
++            values={
++                "a": 1,
++                "n.c": 2,
++                "n.d": 3.0,
++                "z": 4,
++            },
++            image="0100000002000000000000000000084004000000",
++        )
++
++    def test_array_of_structs_uses_padded_stride_x86_64(self):
++        self.checkLayout(
++            SRC_ARRAY_OF_STRUCTS_USES_PADDED_STRIDE,
++            psize=8,
++            bigend=False,
++            size=32,
++            offsets={
++                "pts": 4,
++                "pts.1": 12,
++                "pts.2.tag": 24,
++                "last": 28,
++            },
++            values={
++                "n": 3,
++                "pts.0.x": 10,
++                "pts.0.tag": 1,
++                "pts.1.x": 20,
++                "pts.1.tag": 2,
++                "pts.2.x": 30,
++                "pts.2.tag": 3,
++                "last": -1,
++            },
++            image="030000000a0000000100000014000000020000001e00000003000000ffff0000",
++        )
++
++    def test_array_of_structs_uses_padded_stride_i386(self):
++        self.checkLayout(
++            SRC_ARRAY_OF_STRUCTS_USES_PADDED_STRIDE,
++            psize=4,
++            bigend=False,
++            size=32,
++            offsets={
++                "pts": 4,
++                "pts.1": 12,
++                "pts.2.tag": 24,
++                "last": 28,
++            },
++            values={
++                "n": 3,
++                "pts.0.x": 10,
++                "pts.0.tag": 1,
++                "pts.1.x": 20,
++                "pts.1.tag": 2,
++                "pts.2.x": 30,
++                "pts.2.tag": 3,
++                "last": -1,
++            },
++            image="030000000a0000000100000014000000020000001e00000003000000ffff0000",
++        )
++
++    def test_two_dimensional_array_is_row_major_x86_64(self):
++        self.checkLayout(
++            SRC_TWO_DIMENSIONAL_ARRAY_IS_ROW_MAJOR,
++            psize=8,
++            bigend=False,
++            size=20,
++            offsets={
++                "cells": 2,
++                "cells.1.2": 12,
++                "k": 16,
++            },
++            values={
++                "c": 1,
++                "cells.0.0": 1,
++                "cells.0.2": 3,
++                "cells.1.0": 4,
++                "cells.1.2": 6,
++                "cells.0.1": 2,
++                "cells.1.1": 5,
++                "k": 7,
++            },
++            image="0100010002000300040005000600000007000000",
++        )
++
++    def test_two_dimensional_array_is_row_major_i386(self):
++        self.checkLayout(
++            SRC_TWO_DIMENSIONAL_ARRAY_IS_ROW_MAJOR,
++            psize=4,
++            bigend=False,
++            size=20,
++            offsets={
++                "cells": 2,
++                "cells.1.2": 12,
++                "k": 16,
++            },
++            values={
++                "c": 1,
++                "cells.0.0": 1,
++                "cells.0.2": 3,
++                "cells.1.0": 4,
++                "cells.1.2": 6,
++                "cells.0.1": 2,
++                "cells.1.1": 5,
++                "k": 7,
++            },
++            image="0100010002000300040005000600000007000000",
++        )
++
++    def test_char_arrays_are_strings_other_arrays_index_by_element_x86_64(self):
++        self.checkLayout(
++            SRC_CHAR_ARRAYS_ARE_STRINGS_OTHER_ARRAYS_INDEX_BY_ELEMENT,
++            psize=8,
++            bigend=False,
++            size=16,
++            offsets={
++                "raw": 5,
++                "sig": 8,
++                "n": 12,
++            },
++            values={
++                "name": "abcd",
++                "raw.0": 1,
++                "raw.1": 2,
++                "raw.2": 250,
++                "sig.0": -1,
++                "sig.1": 5,
++                "n": 77,
++            },
++            image="61626364000102faff0500004d000000",
++        )
++
++    def test_char_arrays_are_strings_other_arrays_index_by_element_i386(self):
++        self.checkLayout(
++            SRC_CHAR_ARRAYS_ARE_STRINGS_OTHER_ARRAYS_INDEX_BY_ELEMENT,
++            psize=4,
++            bigend=False,
++            size=16,
++            offsets={
++                "raw": 5,
++                "sig": 8,
++                "n": 12,
++            },
++            values={
++                "name": "abcd",
++                "raw.0": 1,
++                "raw.1": 2,
++                "raw.2": 250,
++                "sig.0": -1,
++                "sig.1": 5,
++                "n": 77,
++            },
++            image="61626364000102faff0500004d000000",
++        )
++
++    def test_nested_definition_inside_struct_is_laid_out_in_place_x86_64(self):
++        self.checkLayout(
++            SRC_NESTED_DEFINITION_INSIDE_STRUCT_IS_LAID_OUT_IN_PLACE,
++            psize=8,
++            bigend=False,
++            size=12,
++            offsets={
++                "in": 2,
++                "in.c": 4,
++                "k": 8,
++            },
++            values={
++                "a": 1,
++                "in.s": 2,
++                "in.c": 3,
++                "k": 4,
++            },
++            image="010002000300000004000000",
++        )
++
++    def test_nested_definition_inside_struct_is_laid_out_in_place_i386(self):
++        self.checkLayout(
++            SRC_NESTED_DEFINITION_INSIDE_STRUCT_IS_LAID_OUT_IN_PLACE,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "in": 2,
++                "in.c": 4,
++                "k": 8,
++            },
++            values={
++                "a": 1,
++                "in.s": 2,
++                "in.c": 3,
++                "k": 4,
++            },
++            image="010002000300000004000000",
++        )
++
++    def test_tail_padding_follows_largest_alignment_not_largest_member_x86_64(self):
++        self.checkLayout(
++            SRC_TAIL_PADDING_FOLLOWS_LARGEST_ALIGNMENT_NOT_LARGEST_MEMBER,
++            psize=8,
++            bigend=False,
++            size=18,
++            offsets={
++                "t.1": 8,
++                "t.1.buf": 10,
++                "z": 16,
++            },
++            values={
++                "t.0.s": 1,
++                "t.0.buf": "abcd",
++                "t.1.s": 2,
++                "t.1.buf": "efgh",
++                "z": 3,
++            },
++            image="010061626364000002006566676800000300",
++        )
++
++    def test_tail_padding_follows_largest_alignment_not_largest_member_i386(self):
++        self.checkLayout(
++            SRC_TAIL_PADDING_FOLLOWS_LARGEST_ALIGNMENT_NOT_LARGEST_MEMBER,
++            psize=4,
++            bigend=False,
++            size=18,
++            offsets={
++                "t.1": 8,
++                "t.1.buf": 10,
++                "z": 16,
++            },
++            values={
++                "t.0.s": 1,
++                "t.0.buf": "abcd",
++                "t.1.s": 2,
++                "t.1.buf": "efgh",
++                "z": 3,
++            },
++            image="010061626364000002006566676800000300",
++        )
++
++    def test_integer_spellings_in_any_order_x86_64(self):
++        self.checkLayout(
++            SRC_INTEGER_SPELLINGS_IN_ANY_ORDER,
++            psize=8,
++            bigend=False,
++            size=56,
++            offsets={
++                "s": 4,
++                "lu": 8,
++                "il": 16,
++                "llu": 24,
++                "us": 32,
++                "ss": 34,
++                "sc": 36,
++                "uc": 37,
++                "lis": 40,
++                "lsl": 48,
++            },
++            values={
++                "u": 0xEE6B2800,
++                "s": -3,
++                "lu": 7,
++                "il": -8,
++                "llu": 9,
++                "us": 0xFDE8,
++                "ss": -0x12C,
++                "sc": -2,
++                "uc": 250,
++                "lis": -11,
++                "lsl": -12,
++            },
++            image="00286beefdffffff0700000000000000f8ffffffffffffff0900000000000000e8fdd4fefefa0000f5fffffffffffffff4ffffffffffffff",
++        )
++
++    def test_integer_spellings_in_any_order_i386(self):
++        self.checkLayout(
++            SRC_INTEGER_SPELLINGS_IN_ANY_ORDER,
++            psize=4,
++            bigend=False,
++            size=44,
++            offsets={
++                "s": 4,
++                "lu": 8,
++                "il": 12,
++                "llu": 16,
++                "us": 24,
++                "ss": 26,
++                "sc": 28,
++                "uc": 29,
++                "lis": 32,
++                "lsl": 36,
++            },
++            values={
++                "u": 0xEE6B2800,
++                "s": -3,
++                "lu": 7,
++                "il": -8,
++                "llu": 9,
++                "us": 0xFDE8,
++                "ss": -0x12C,
++                "sc": -2,
++                "uc": 250,
++                "lis": -11,
++                "lsl": -12,
++            },
++            image="00286beefdffffff07000000f8ffffff0900000000000000e8fdd4fefefa0000f5fffffff4ffffffffffffff",
++        )
++
++    def test_typedefs_of_scalars_structs_arrays_and_pointers_x86_64(self):
++        self.checkLayout(
++            SRC_TYPEDEFS_OF_SCALARS_STRUCTS_ARRAYS_AND_POINTERS,
++            psize=8,
++            bigend=False,
++            size=48,
++            offsets={
++                "ps": 4,
++                "ps.1.z": 24,
++                "next": 32,
++                "cb": 40,
++            },
++            values={
++                "c": 1,
++                "ps.0.x": 2,
++                "ps.0.y": 3,
++                "ps.0.z": 4,
++                "ps.1.x": 5,
++                "ps.1.y": 6,
++                "ps.1.z": 7,
++                "next": 136,
++                "cb": 153,
++            },
++            image="010000000200000003000000040000000500000006000000070000000000000088000000000000009900000000000000",
++        )
++
++    def test_typedefs_of_scalars_structs_arrays_and_pointers_i386(self):
++        self.checkLayout(
++            SRC_TYPEDEFS_OF_SCALARS_STRUCTS_ARRAYS_AND_POINTERS,
++            psize=4,
++            bigend=False,
++            size=36,
++            offsets={
++                "ps": 4,
++                "ps.1.z": 24,
++                "next": 28,
++                "cb": 32,
++            },
++            values={
++                "c": 1,
++                "ps.0.x": 2,
++                "ps.0.y": 3,
++                "ps.0.z": 4,
++                "ps.1.x": 5,
++                "ps.1.y": 6,
++                "ps.1.z": 7,
++                "next": 136,
++                "cb": 153,
++            },
++            image="010000000200000003000000040000000500000006000000070000008800000099000000",
++        )
++
++    def test_enums_are_four_byte_ints_and_size_arrays_x86_64(self):
++        self.checkLayout(
++            SRC_ENUMS_ARE_FOUR_BYTE_INTS_AND_SIZE_ARRAYS,
++            psize=8,
++            bigend=False,
++            size=24,
++            offsets={
++                "m": 4,
++                "slots": 8,
++                "e": 20,
++            },
++            values={
++                "c": 1,
++                "m": 5,
++                "slots.0": 1,
++                "slots.4": 5,
++                "slots.1": 2,
++                "slots.2": 3,
++                "slots.3": 4,
++                "e": 1,
++            },
++            image="010000000500000001000200030004000500000001000000",
++        )
++
++    def test_enums_are_four_byte_ints_and_size_arrays_i386(self):
++        self.checkLayout(
++            SRC_ENUMS_ARE_FOUR_BYTE_INTS_AND_SIZE_ARRAYS,
++            psize=4,
++            bigend=False,
++            size=24,
++            offsets={
++                "m": 4,
++                "slots": 8,
++                "e": 20,
++            },
++            values={
++                "c": 1,
++                "m": 5,
++                "slots.0": 1,
++                "slots.4": 5,
++                "slots.1": 2,
++                "slots.2": 3,
++                "slots.3": 4,
++                "e": 1,
++            },
++            image="010000000500000001000200030004000500000001000000",
++        )
++
++    def test_array_sizes_are_integer_constant_expressions_x86_64(self):
++        self.checkLayout(
++            SRC_ARRAY_SIZES_ARE_INTEGER_CONSTANT_EXPRESSIONS,
++            psize=8,
++            bigend=False,
++            size=48,
++            offsets={
++                "words": 8,
++                "tail": 18,
++                "big": 28,
++                "last": 44,
++            },
++            values={
++                "hdr": "h",
++                "words.0": 1,
++                "words.4": 5,
++                "words.1": 2,
++                "words.2": 3,
++                "words.3": 4,
++                "tail": "t",
++                "big.0": 6,
++                "big.3": 9,
++                "big.1": 7,
++                "big.2": 8,
++                "last": "x",
++            },
++            image="680000000000000001000200030004000500740000000000000000000600000007000000080000000900000078000000",
++        )
++
++    def test_array_sizes_are_integer_constant_expressions_i386(self):
++        self.checkLayout(
++            SRC_ARRAY_SIZES_ARE_INTEGER_CONSTANT_EXPRESSIONS,
++            psize=4,
++            bigend=False,
++            size=48,
++            offsets={
++                "words": 8,
++                "tail": 18,
++                "big": 28,
++                "last": 44,
++            },
++            values={
++                "hdr": "h",
++                "words.0": 1,
++                "words.4": 5,
++                "words.1": 2,
++                "words.2": 3,
++                "words.3": 4,
++                "tail": "t",
++                "big.0": 6,
++                "big.3": 9,
++                "big.1": 7,
++                "big.2": 8,
++                "last": "x",
++            },
++            image="680000000000000001000200030004000500740000000000000000000600000007000000080000000900000078000000",
++        )
++
++    def test_array_sizes_use_remainder_conditional_and_logical_operators_x86_64(self):
++        self.checkLayout(
++            SRC_ARRAY_SIZES_USE_REMAINDER_CONDITIONAL_AND_LOGICAL_OPERATORS,
++            psize=8,
++            bigend=False,
++            size=12,
++            offsets={
++                "cond": 3,
++                "logic": 5,
++                "last": 8,
++            },
++            values={
++                "rem": "ab",
++                "cond": "c",
++                "logic": "d",
++                "last": -9,
++            },
++            image="6162006300640000f7ffffff",
++        )
++
++    def test_array_sizes_use_remainder_conditional_and_logical_operators_i386(self):
++        self.checkLayout(
++            SRC_ARRAY_SIZES_USE_REMAINDER_CONDITIONAL_AND_LOGICAL_OPERATORS,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "cond": 3,
++                "logic": 5,
++                "last": 8,
++            },
++            values={
++                "rem": "ab",
++                "cond": "c",
++                "logic": "d",
++                "last": -9,
++            },
++            image="6162006300640000f7ffffff",
++        )
++
++    def test_standalone_tag_and_enum_definitions_add_no_members_x86_64(self):
++        self.checkLayout(
++            SRC_STANDALONE_TAG_AND_ENUM_DEFINITIONS_ADD_NO_MEMBERS,
++            psize=8,
++            bigend=False,
++            size=12,
++            offsets={
++                "bytes": 0,
++                "value": 4,
++                "p": 8,
++            },
++            values={
++                "bytes": "a",
++                "value.x": -3,
++                "p.s": 7,
++            },
++            image="61000000fdffffff07000000",
++        )
++
++    def test_standalone_tag_and_enum_definitions_add_no_members_i386(self):
++        self.checkLayout(
++            SRC_STANDALONE_TAG_AND_ENUM_DEFINITIONS_ADD_NO_MEMBERS,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "bytes": 0,
++                "value": 4,
++                "p": 8,
++            },
++            values={
++                "bytes": "a",
++                "value.x": -3,
++                "p.s": 7,
++            },
++            image="61000000fdffffff07000000",
++        )
++
++    def test_restrict_and_pointer_to_array_declarators_x86_64(self):
++        self.checkLayout(
++            SRC_RESTRICT_AND_POINTER_TO_ARRAY_DECLARATORS,
++            psize=8,
++            bigend=False,
++            size=40,
++            offsets={
++                "pa": 8,
++                "names": 16,
++                "c": 32,
++            },
++            values={
++                "p": 16,
++                "pa": 32,
++                "names.0": 48,
++                "names.1": 64,
++                "c": 5,
++            },
++            image="10000000000000002000000000000000300000000000000040000000000000000500000000000000",
++        )
++
++    def test_restrict_and_pointer_to_array_declarators_i386(self):
++        self.checkLayout(
++            SRC_RESTRICT_AND_POINTER_TO_ARRAY_DECLARATORS,
++            psize=4,
++            bigend=False,
++            size=20,
++            offsets={
++                "pa": 4,
++                "names": 8,
++                "c": 16,
++            },
++            values={
++                "p": 16,
++                "pa": 32,
++                "names.0": 48,
++                "names.1": 64,
++                "c": 5,
++            },
++            image="1000000020000000300000004000000005000000",
++        )
++
++    def test_sizeof_counts_tail_padding_and_pointer_size_x86_64(self):
++        self.checkLayout(
++            SRC_SIZEOF_COUNTS_TAIL_PADDING_AND_POINTER_SIZE,
++            psize=8,
++            bigend=False,
++            size=40,
++            offsets={
++                "raw": 8,
++                "slots": 16,
++            },
++            values={
++                "h.a": 1,
++                "h.b": 2,
++                "raw": "raw",
++                "slots.0": 16,
++                "slots.1": 32,
++            },
++            image="01000000020000007261770000000000100000000000000020000000000000000000000000000000",
++        )
++
++    def test_sizeof_counts_tail_padding_and_pointer_size_i386(self):
++        self.checkLayout(
++            SRC_SIZEOF_COUNTS_TAIL_PADDING_AND_POINTER_SIZE,
++            psize=4,
++            bigend=False,
++            size=24,
++            offsets={
++                "raw": 8,
++                "slots": 16,
++            },
++            values={
++                "h.a": 1,
++                "h.b": 2,
++                "raw": "raw",
++                "slots.0": 16,
++                "slots.1": 32,
++            },
++            image="010000000200000072617700000000001000000020000000",
++        )
++
++    def test_earlier_tags_forward_declarations_and_self_reference_x86_64(self):
++        self.checkLayout(
++            SRC_EARLIER_TAGS_FORWARD_DECLARATIONS_AND_SELF_REFERENCE,
++            psize=8,
++            bigend=False,
++            size=40,
++            offsets={
++                "next": 8,
++                "owner": 16,
++                "owner.count": 24,
++                "flag": 32,
++            },
++            values={
++                "value": 5,
++                "next": 48,
++                "owner.head": 64,
++                "owner.count": 2,
++                "flag": 1,
++            },
++            image="05000000000000003000000000000000400000000000000002000000000000000100000000000000",
++        )
++
++    def test_earlier_tags_forward_declarations_and_self_reference_i386(self):
++        self.checkLayout(
++            SRC_EARLIER_TAGS_FORWARD_DECLARATIONS_AND_SELF_REFERENCE,
++            psize=4,
++            bigend=False,
++            size=20,
++            offsets={
++                "next": 4,
++                "owner": 8,
++                "owner.count": 12,
++                "flag": 16,
++            },
++            values={
++                "value": 5,
++                "next": 48,
++                "owner.head": 64,
++                "owner.count": 2,
++                "flag": 1,
++            },
++            image="0500000030000000400000000200000001000000",
++        )
++
++    def test_flexible_array_member_takes_no_space_x86_64(self):
++        self.checkLayout(
++            SRC_FLEXIBLE_ARRAY_MEMBER_TAKES_NO_SPACE,
++            psize=8,
++            bigend=False,
++            size=4,
++            offsets={
++                "kind": 2,
++                "data": 4,
++            },
++            values={
++                "len": 9,
++                "kind": 3,
++            },
++            image="09000300",
++        )
++
++    def test_flexible_array_member_takes_no_space_i386(self):
++        self.checkLayout(
++            SRC_FLEXIBLE_ARRAY_MEMBER_TAKES_NO_SPACE,
++            psize=4,
++            bigend=False,
++            size=4,
++            offsets={
++                "kind": 2,
++                "data": 4,
++            },
++            values={
++                "len": 9,
++                "kind": 3,
++            },
++            image="09000300",
++        )
++
++    def test_flexible_char_array_after_char_x86_64(self):
++        self.checkLayout(
++            SRC_FLEXIBLE_CHAR_ARRAY_AFTER_CHAR,
++            psize=8,
++            bigend=False,
++            size=1,
++            offsets={
++                "body": 1,
++            },
++            values={
++                "kind": 4,
++            },
++            image="04",
++        )
++
++    def test_flexible_char_array_after_char_i386(self):
++        self.checkLayout(
++            SRC_FLEXIBLE_CHAR_ARRAY_AFTER_CHAR,
++            psize=4,
++            bigend=False,
++            size=1,
++            offsets={
++                "body": 1,
++            },
++            values={
++                "kind": 4,
++            },
++            image="04",
++        )
++
++    def test_sizeof_enumeration_and_character_constants_x86_64(self):
++        self.checkLayout(
++            SRC_SIZEOF_ENUMERATION_AND_CHARACTER_CONSTANTS,
++            psize=8,
++            bigend=False,
++            size=32,
++            offsets={
++                "b": 4,
++                "c": 8,
++                "d": 12,
++                "e": 20,
++                "last": 28,
++            },
++            values={
++                "a": "ab",
++                "b": "c",
++                "c": "d",
++                "d": "e",
++                "e": "f",
++                "last": -7,
++            },
++            image="61620000630000006400000065000000000000006600000000000000f9ffffff",
++        )
++
++    def test_sizeof_enumeration_and_character_constants_i386(self):
++        self.checkLayout(
++            SRC_SIZEOF_ENUMERATION_AND_CHARACTER_CONSTANTS,
++            psize=4,
++            bigend=False,
++            size=28,
++            offsets={
++                "b": 4,
++                "c": 8,
++                "d": 12,
++                "e": 16,
++                "last": 24,
++            },
++            values={
++                "a": "ab",
++                "b": "c",
++                "c": "d",
++                "d": "e",
++                "e": "f",
++                "last": -7,
++            },
++            image="616200006300000064000000650000006600000000000000f9ffffff",
++        )
++
++    def test_sizeof_integer_and_floating_literals_follow_c_typing_x86_64(self):
++        self.checkLayout(
++            SRC_SIZEOF_INTEGER_AND_FLOATING_LITERALS_FOLLOW_C_TYPING,
++            psize=8,
++            bigend=False,
++            size=40,
++            offsets={
++                "b": 8,
++                "c": 16,
++                "d": 20,
++                "e": 24,
++                "f": 32,
++                "last": 36,
++            },
++            values={
++                "a": "a",
++                "b": "b",
++                "c": "c",
++                "d": "d",
++                "e": "e",
++                "f": "f",
++                "last": 9,
++            },
++            image="61000000000000006200000000000000630000006400000065000000000000006600000009000000",
++        )
++
++    def test_sizeof_integer_and_floating_literals_follow_c_typing_i386(self):
++        self.checkLayout(
++            SRC_SIZEOF_INTEGER_AND_FLOATING_LITERALS_FOLLOW_C_TYPING,
++            psize=4,
++            bigend=False,
++            size=36,
++            offsets={
++                "b": 4,
++                "c": 12,
++                "d": 16,
++                "e": 20,
++                "f": 28,
++                "last": 32,
++            },
++            values={
++                "a": "a",
++                "b": "b",
++                "c": "c",
++                "d": "d",
++                "e": "e",
++                "f": "f",
++                "last": 9,
++            },
++            image="610000006200000000000000630000006400000065000000000000006600000009000000",
++        )
++
++    def test_sizeof_casts_promotions_and_nested_sizeof_x86_64(self):
++        self.checkLayout(
++            SRC_SIZEOF_CASTS_PROMOTIONS_AND_NESTED_SIZEOF,
++            psize=8,
++            bigend=False,
++            size=24,
++            offsets={
++                "b": 2,
++                "c": 6,
++                "d": 10,
++                "last": 20,
++            },
++            values={
++                "a": "a",
++                "b": "b",
++                "c": "c",
++                "d": "d",
++                "last": 3,
++            },
++            image="610062000000630000006400000000000000000003000000",
++        )
++
++    def test_sizeof_casts_promotions_and_nested_sizeof_i386(self):
++        self.checkLayout(
++            SRC_SIZEOF_CASTS_PROMOTIONS_AND_NESTED_SIZEOF,
++            psize=4,
++            bigend=False,
++            size=20,
++            offsets={
++                "b": 2,
++                "c": 6,
++                "d": 10,
++                "last": 16,
++            },
++            values={
++                "a": "a",
++                "b": "b",
++                "c": "c",
++                "d": "d",
++                "last": 3,
++            },
++            image="6100620000006300000064000000000003000000",
++        )
++
++    def test_sizeof_floating_arithmetic_takes_the_wider_type_x86_64(self):
++        self.checkLayout(
++            SRC_SIZEOF_FLOATING_ARITHMETIC_TAKES_THE_WIDER_TYPE,
++            psize=8,
++            bigend=False,
++            size=28,
++            offsets={
++                "b": 8,
++                "c": 12,
++                "d": 20,
++                "last": 24,
++            },
++            values={
++                "a": "a",
++                "b": "b",
++                "c": "c",
++                "d": "d",
++                "last": 6,
++            },
++            image="61000000000000006200000063000000000000006400000006000000",
++        )
++
++    def test_sizeof_floating_arithmetic_takes_the_wider_type_i386(self):
++        self.checkLayout(
++            SRC_SIZEOF_FLOATING_ARITHMETIC_TAKES_THE_WIDER_TYPE,
++            psize=4,
++            bigend=False,
++            size=28,
++            offsets={
++                "b": 8,
++                "c": 12,
++                "d": 20,
++                "last": 24,
++            },
++            values={
++                "a": "a",
++                "b": "b",
++                "c": "c",
++                "d": "d",
++                "last": 6,
++            },
++            image="61000000000000006200000063000000000000006400000006000000",
++        )
++
++    def test_sizeof_file_scope_objects_and_members_x86_64(self):
++        self.checkLayout(
++            SRC_SIZEOF_FILE_SCOPE_OBJECTS_AND_MEMBERS,
++            psize=8,
++            bigend=False,
++            size=36,
++            offsets={
++                "b": 12,
++                "c": 14,
++                "d": 22,
++                "e": 25,
++                "last": 32,
++            },
++            values={
++                "a": "a",
++                "b": "b",
++                "c": "c",
++                "d": "d",
++                "e": "e",
++                "last": 5,
++            },
++            image="610000000000000000000000620063000000000000006400006500000000000005000000",
++        )
++
++    def test_sizeof_file_scope_objects_and_members_i386(self):
++        self.checkLayout(
++            SRC_SIZEOF_FILE_SCOPE_OBJECTS_AND_MEMBERS,
++            psize=4,
++            bigend=False,
++            size=36,
++            offsets={
++                "b": 12,
++                "c": 14,
++                "d": 22,
++                "e": 25,
++                "last": 32,
++            },
++            values={
++                "a": "a",
++                "b": "b",
++                "c": "c",
++                "d": "d",
++                "e": "e",
++                "last": 5,
++            },
++            image="610000000000000000000000620063000000000000006400006500000000000005000000",
++        )
++
++    def test_definitions_inside_pointer_declarators_are_registered_x86_64(self):
++        self.checkLayout(
++            SRC_DEFINITIONS_INSIDE_POINTER_DECLARATORS_ARE_REGISTERED,
++            psize=8,
++            bigend=False,
++            size=24,
++            offsets={
++                "tail": 8,
++                "again": 16,
++            },
++            values={
++                "value.x": -3,
++                "value.y": 4,
++                "tail": "tail",
++                "again": 64,
++            },
++            image="fdffffff040000007461696c000000004000000000000000",
++        )
++
++    def test_definitions_inside_pointer_declarators_are_registered_i386(self):
++        self.checkLayout(
++            SRC_DEFINITIONS_INSIDE_POINTER_DECLARATORS_ARE_REGISTERED,
++            psize=4,
++            bigend=False,
++            size=20,
++            offsets={
++                "tail": 8,
++                "again": 16,
++            },
++            values={
++                "value.x": -3,
++                "value.y": 4,
++                "tail": "tail",
++                "again": 64,
++            },
++            image="fdffffff040000007461696c0000000040000000",
++        )
++
++    def test_pointer_declaration_alone_defines_its_structure_x86_64(self):
++        self.checkLayout(
++            SRC_POINTER_DECLARATION_ALONE_DEFINES_ITS_STRUCTURE,
++            psize=8,
++            bigend=False,
++            size=8,
++            offsets={
++                "y": 4,
++            },
++            values={
++                "x": 7,
++                "y": -8,
++            },
++            image="07000000f8ff0000",
++        )
++
++    def test_pointer_declaration_alone_defines_its_structure_i386(self):
++        self.checkLayout(
++            SRC_POINTER_DECLARATION_ALONE_DEFINES_ITS_STRUCTURE,
++            psize=4,
++            bigend=False,
++            size=8,
++            offsets={
++                "y": 4,
++            },
++            values={
++                "x": 7,
++                "y": -8,
++            },
++            image="07000000f8ff0000",
++        )
++
++    def test_top_level_array_declaration_defines_its_structure_x86_64(self):
++        self.checkLayout(
++            SRC_TOP_LEVEL_ARRAY_DECLARATION_DEFINES_ITS_STRUCTURE,
++            psize=8,
++            bigend=False,
++            size=8,
++            offsets={
++                "v": 4,
++            },
++            values={
++                "c": 1,
++                "v": -2,
++            },
++            image="01000000feffffff",
++        )
++
++    def test_top_level_array_declaration_defines_its_structure_i386(self):
++        self.checkLayout(
++            SRC_TOP_LEVEL_ARRAY_DECLARATION_DEFINES_ITS_STRUCTURE,
++            psize=4,
++            bigend=False,
++            size=8,
++            offsets={
++                "v": 4,
++            },
++            values={
++                "c": 1,
++                "v": -2,
++            },
++            image="01000000feffffff",
++        )
++
++    def test_function_declaration_defines_its_return_structure_x86_64(self):
++        self.checkLayout(
++            SRC_FUNCTION_DECLARATION_DEFINES_ITS_RETURN_STRUCTURE,
++            psize=8,
++            bigend=False,
++            size=8,
++            offsets={
++                "b": 4,
++            },
++            values={
++                "a": 5,
++                "b": 6,
++            },
++            image="0500000006000000",
++        )
++
++    def test_function_declaration_defines_its_return_structure_i386(self):
++        self.checkLayout(
++            SRC_FUNCTION_DECLARATION_DEFINES_ITS_RETURN_STRUCTURE,
++            psize=4,
++            bigend=False,
++            size=8,
++            offsets={
++                "b": 4,
++            },
++            values={
++                "a": 5,
++                "b": 6,
++            },
++            image="0500000006000000",
++        )
++
++    def test_pointer_member_defines_a_reusable_tag_x86_64(self):
++        self.checkLayout(
++            SRC_POINTER_MEMBER_DEFINES_A_REUSABLE_TAG,
++            psize=8,
++            bigend=False,
++            size=16,
++            offsets={
++                "copy": 8,
++                "copy.t": 10,
++                "c": 12,
++            },
++            values={
++                "ip": 16,
++                "copy.s": -1,
++                "copy.t": 2,
++                "c": 3,
++            },
++            image="1000000000000000ffff020003000000",
++        )
++
++    def test_pointer_member_defines_a_reusable_tag_i386(self):
++        self.checkLayout(
++            SRC_POINTER_MEMBER_DEFINES_A_REUSABLE_TAG,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "copy": 4,
++                "copy.t": 6,
++                "c": 8,
++            },
++            values={
++                "ip": 16,
++                "copy.s": -1,
++                "copy.t": 2,
++                "c": 3,
++            },
++            image="10000000ffff020003000000",
++        )
++
++    def test_earlier_union_tag_used_as_member_x86_64(self):
++        self.checkLayout(
++            SRC_EARLIER_UNION_TAG_USED_AS_MEMBER,
++            psize=8,
++            bigend=False,
++            size=12,
++            offsets={
++                "n": 4,
++                "n.f": 4,
++                "n.b.3": 7,
++                "d": 8,
++            },
++            values={
++                "c": 1,
++                "n.i": 0x3F800000,
++                "d": 2,
++            },
++            image="010000000000803f02000000",
++        )
++
++    def test_earlier_union_tag_used_as_member_i386(self):
++        self.checkLayout(
++            SRC_EARLIER_UNION_TAG_USED_AS_MEMBER,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "n": 4,
++                "n.f": 4,
++                "n.b.3": 7,
++                "d": 8,
++            },
++            values={
++                "c": 1,
++                "n.i": 0x3F800000,
++                "d": 2,
++            },
++            image="010000000000803f02000000",
++        )
++
++    def test_union_size_is_widest_member_rounded_to_alignment_x86_64(self):
++        self.checkLayout(
++            SRC_UNION_SIZE_IS_WIDEST_MEMBER_ROUNDED_TO_ALIGNMENT,
++            psize=8,
++            bigend=False,
++            size=6,
++            offsets={
++                "c": 0,
++                "s": 0,
++            },
++            values={
++                "s": -2,
++            },
++            image="feff00000000",
++        )
++
++    def test_union_size_is_widest_member_rounded_to_alignment_i386(self):
++        self.checkLayout(
++            SRC_UNION_SIZE_IS_WIDEST_MEMBER_ROUNDED_TO_ALIGNMENT,
++            psize=4,
++            bigend=False,
++            size=6,
++            offsets={
++                "c": 0,
++                "s": 0,
++            },
++            values={
++                "s": -2,
++            },
++            image="feff00000000",
++        )
++
++    def test_union_inside_struct_aligned_by_widest_member_x86_64(self):
++        self.checkLayout(
++            SRC_UNION_INSIDE_STRUCT_ALIGNED_BY_WIDEST_MEMBER,
++            psize=8,
++            bigend=False,
++            size=24,
++            offsets={
++                "v": 8,
++                "v.i": 8,
++                "v.d": 8,
++                "end": 16,
++            },
++            values={
++                "tag": 1,
++                "v.d": -0.75,
++                "end": 2,
++            },
++            image="0100000000000000000000000000e8bf0200000000000000",
++        )
++
++    def test_union_inside_struct_aligned_by_widest_member_i386(self):
++        self.checkLayout(
++            SRC_UNION_INSIDE_STRUCT_ALIGNED_BY_WIDEST_MEMBER,
++            psize=4,
++            bigend=False,
++            size=16,
++            offsets={
++                "v": 4,
++                "v.i": 4,
++                "v.d": 4,
++                "end": 12,
++            },
++            values={
++                "tag": 1,
++                "v.d": -0.75,
++                "end": 2,
++            },
++            image="01000000000000000000e8bf02000000",
++        )
++
++    def test_struct_inside_union_inside_struct_x86_64(self):
++        self.checkLayout(
++            SRC_STRUCT_INSIDE_UNION_INSIDE_STRUCT,
++            psize=8,
++            bigend=False,
++            size=16,
++            offsets={
++                "u": 8,
++                "u.pair.b": 12,
++                "u.q": 8,
++            },
++            values={
++                "s": 3,
++                "u.pair.a": 4,
++                "u.pair.b": -5,
++            },
++            image="030000000000000004000000fbffffff",
++        )
++
++    def test_struct_inside_union_inside_struct_i386(self):
++        self.checkLayout(
++            SRC_STRUCT_INSIDE_UNION_INSIDE_STRUCT,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "u": 4,
++                "u.pair.b": 8,
++                "u.q": 4,
++            },
++            values={
++                "s": 3,
++                "u.pair.a": 4,
++                "u.pair.b": -5,
++            },
++            image="0300000004000000fbffffff",
++        )
++
++    def test_bitfields_share_one_unit_and_sign_extend_x86_64(self):
++        self.checkLayout(
++            SRC_BITFIELDS_SHARE_ONE_UNIT_AND_SIGN_EXTEND,
++            psize=8,
++            bigend=False,
++            size=4,
++            offsets={},
++            values={
++                "a": 5,
++                "b": -7,
++                "c": 0xABCDEF,
++            },
++            image="cdefcdab",
++        )
++
++    def test_bitfields_share_one_unit_and_sign_extend_i386(self):
++        self.checkLayout(
++            SRC_BITFIELDS_SHARE_ONE_UNIT_AND_SIGN_EXTEND,
++            psize=4,
++            bigend=False,
++            size=4,
++            offsets={},
++            values={
++                "a": 5,
++                "b": -7,
++                "c": 0xABCDEF,
++            },
++            image="cdefcdab",
++        )
++
++    def test_bitfields_share_one_unit_and_sign_extend_bigend(self):
++        self.checkLayout(
++            SRC_BITFIELDS_SHARE_ONE_UNIT_AND_SIGN_EXTEND,
++            psize=8,
++            bigend=True,
++            size=4,
++            offsets={},
++            values={
++                "a": 5,
++                "b": -7,
++                "c": 0xABCDEF,
++            },
++            image="b9abcdef",
++        )
++
++    def test_bitfield_that_would_cross_its_unit_moves_to_next_unit_x86_64(self):
++        self.checkLayout(
++            SRC_BITFIELD_THAT_WOULD_CROSS_ITS_UNIT_MOVES_TO_NEXT_UNIT,
++            psize=8,
++            bigend=False,
++            size=8,
++            offsets={
++                "a": 0,
++            },
++            values={
++                "a": 1,
++                "b": -0x186A0,
++            },
++            image="010000006079fe3f",
++        )
++
++    def test_bitfield_that_would_cross_its_unit_moves_to_next_unit_i386(self):
++        self.checkLayout(
++            SRC_BITFIELD_THAT_WOULD_CROSS_ITS_UNIT_MOVES_TO_NEXT_UNIT,
++            psize=4,
++            bigend=False,
++            size=8,
++            offsets={
++                "a": 0,
++            },
++            values={
++                "a": 1,
++                "b": -0x186A0,
++            },
++            image="010000006079fe3f",
++        )
++
++    def test_bitfield_that_would_cross_its_unit_moves_to_next_unit_bigend(self):
++        self.checkLayout(
++            SRC_BITFIELD_THAT_WOULD_CROSS_ITS_UNIT_MOVES_TO_NEXT_UNIT,
++            psize=8,
++            bigend=True,
++            size=8,
++            offsets={
++                "a": 0,
++            },
++            values={
++                "a": 1,
++                "b": -0x186A0,
++            },
++            image="01000000fff9e580",
++        )
++
++    def test_char_bitfields_move_to_next_byte_x86_64(self):
++        self.checkLayout(
++            SRC_CHAR_BITFIELDS_MOVE_TO_NEXT_BYTE,
++            psize=8,
++            bigend=False,
++            size=3,
++            offsets={},
++            values={
++                "a": -3,
++                "b": 21,
++                "c": 6,
++            },
++            image="0d1506",
++        )
++
++    def test_char_bitfields_move_to_next_byte_i386(self):
++        self.checkLayout(
++            SRC_CHAR_BITFIELDS_MOVE_TO_NEXT_BYTE,
++            psize=4,
++            bigend=False,
++            size=3,
++            offsets={},
++            values={
++                "a": -3,
++                "b": 21,
++                "c": 6,
++            },
++            image="0d1506",
++        )
++
++    def test_char_bitfields_move_to_next_byte_bigend(self):
++        self.checkLayout(
++            SRC_CHAR_BITFIELDS_MOVE_TO_NEXT_BYTE,
++            psize=8,
++            bigend=True,
++            size=3,
++            offsets={},
++            values={
++                "a": -3,
++                "b": 21,
++                "c": 6,
++            },
++            image="d054c0",
++        )
++
++    def test_zero_width_bitfield_aligns_without_raising_alignment_x86_64(self):
++        self.checkLayout(
++            SRC_ZERO_WIDTH_BITFIELD_ALIGNS_WITHOUT_RAISING_ALIGNMENT,
++            psize=8,
++            bigend=False,
++            size=5,
++            offsets={
++                "b": 4,
++            },
++            values={
++                "a": 1,
++                "b": 2,
++            },
++            image="0100000002",
++        )
++
++    def test_zero_width_bitfield_aligns_without_raising_alignment_i386(self):
++        self.checkLayout(
++            SRC_ZERO_WIDTH_BITFIELD_ALIGNS_WITHOUT_RAISING_ALIGNMENT,
++            psize=4,
++            bigend=False,
++            size=5,
++            offsets={
++                "b": 4,
++            },
++            values={
++                "a": 1,
++                "b": 2,
++            },
++            image="0100000002",
++        )
++
++    def test_zero_width_bitfield_aligns_without_raising_alignment_bigend(self):
++        self.checkLayout(
++            SRC_ZERO_WIDTH_BITFIELD_ALIGNS_WITHOUT_RAISING_ALIGNMENT,
++            psize=8,
++            bigend=True,
++            size=5,
++            offsets={
++                "b": 4,
++            },
++            values={
++                "a": 1,
++                "b": 2,
++            },
++            image="0100000002",
++        )
++
++    def test_zero_width_bitfield_at_a_boundary_changes_nothing_x86_64(self):
++        self.checkLayout(
++            SRC_ZERO_WIDTH_BITFIELD_AT_A_BOUNDARY_CHANGES_NOTHING,
++            psize=8,
++            bigend=False,
++            size=12,
++            offsets={
++                "d": 1,
++                "b": 8,
++            },
++            values={
++                "c": 1,
++                "d": 2,
++                "a": -1,
++                "b": 3,
++            },
++            image="01020000ffffffff03000000",
++        )
++
++    def test_zero_width_bitfield_at_a_boundary_changes_nothing_i386(self):
++        self.checkLayout(
++            SRC_ZERO_WIDTH_BITFIELD_AT_A_BOUNDARY_CHANGES_NOTHING,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "d": 1,
++                "b": 8,
++            },
++            values={
++                "c": 1,
++                "d": 2,
++                "a": -1,
++                "b": 3,
++            },
++            image="01020000ffffffff03000000",
++        )
++
++    def test_zero_width_bitfield_at_a_boundary_changes_nothing_bigend(self):
++        self.checkLayout(
++            SRC_ZERO_WIDTH_BITFIELD_AT_A_BOUNDARY_CHANGES_NOTHING,
++            psize=8,
++            bigend=True,
++            size=12,
++            offsets={
++                "d": 1,
++                "b": 8,
++            },
++            values={
++                "c": 1,
++                "d": 2,
++                "a": -1,
++                "b": 3,
++            },
++            image="01020000ffffffff03000000",
++        )
++
++    def test_zero_width_long_long_bitfield_follows_target_alignment_x86_64(self):
++        self.checkLayout(
++            SRC_ZERO_WIDTH_LONG_LONG_BITFIELD_FOLLOWS_TARGET_ALIGNMENT,
++            psize=8,
++            bigend=False,
++            size=9,
++            offsets={
++                "b": 8,
++            },
++            values={
++                "a": 1,
++                "b": 2,
++            },
++            image="010000000000000002",
++        )
++
++    def test_zero_width_long_long_bitfield_follows_target_alignment_i386(self):
++        self.checkLayout(
++            SRC_ZERO_WIDTH_LONG_LONG_BITFIELD_FOLLOWS_TARGET_ALIGNMENT,
++            psize=4,
++            bigend=False,
++            size=5,
++            offsets={
++                "b": 4,
++            },
++            values={
++                "a": 1,
++                "b": 2,
++            },
++            image="0100000002",
++        )
++
++    def test_zero_width_long_long_bitfield_follows_target_alignment_bigend(self):
++        self.checkLayout(
++            SRC_ZERO_WIDTH_LONG_LONG_BITFIELD_FOLLOWS_TARGET_ALIGNMENT,
++            psize=8,
++            bigend=True,
++            size=9,
++            offsets={
++                "b": 8,
++            },
++            values={
++                "a": 1,
++                "b": 2,
++            },
++            image="010000000000000002",
++        )
++
++    def test_unnamed_bitfield_does_not_raise_alignment_x86_64(self):
++        self.checkLayout(
++            SRC_UNNAMED_BITFIELD_DOES_NOT_RAISE_ALIGNMENT,
++            psize=8,
++            bigend=False,
++            size=3,
++            offsets={
++                "b": 2,
++            },
++            values={
++                "a": 1,
++                "b": 2,
++            },
++            image="010002",
++        )
++
++    def test_unnamed_bitfield_does_not_raise_alignment_i386(self):
++        self.checkLayout(
++            SRC_UNNAMED_BITFIELD_DOES_NOT_RAISE_ALIGNMENT,
++            psize=4,
++            bigend=False,
++            size=3,
++            offsets={
++                "b": 2,
++            },
++            values={
++                "a": 1,
++                "b": 2,
++            },
++            image="010002",
++        )
++
++    def test_unnamed_bitfield_does_not_raise_alignment_bigend(self):
++        self.checkLayout(
++            SRC_UNNAMED_BITFIELD_DOES_NOT_RAISE_ALIGNMENT,
++            psize=8,
++            bigend=True,
++            size=3,
++            offsets={
++                "b": 2,
++            },
++            values={
++                "a": 1,
++                "b": 2,
++            },
++            image="010002",
++        )
++
++    def test_named_bitfield_raises_alignment_x86_64(self):
++        self.checkLayout(
++            SRC_NAMED_BITFIELD_RAISES_ALIGNMENT,
++            psize=8,
++            bigend=False,
++            size=4,
++            offsets={},
++            values={
++                "a": 1,
++                "b": -1,
++            },
++            image="01010000",
++        )
++
++    def test_named_bitfield_raises_alignment_i386(self):
++        self.checkLayout(
++            SRC_NAMED_BITFIELD_RAISES_ALIGNMENT,
++            psize=4,
++            bigend=False,
++            size=4,
++            offsets={},
++            values={
++                "a": 1,
++                "b": -1,
++            },
++            image="01010000",
++        )
++
++    def test_named_bitfield_raises_alignment_bigend(self):
++        self.checkLayout(
++            SRC_NAMED_BITFIELD_RAISES_ALIGNMENT,
++            psize=8,
++            bigend=True,
++            size=4,
++            offsets={},
++            values={
++                "a": 1,
++                "b": -1,
++            },
++            image="01800000",
++        )
++
++    def test_plain_members_after_bitfields_start_on_next_byte_x86_64(self):
++        self.checkLayout(
++            SRC_PLAIN_MEMBERS_AFTER_BITFIELDS_START_ON_NEXT_BYTE,
++            psize=8,
++            bigend=False,
++            size=8,
++            offsets={
++                "b": 1,
++                "c": 2,
++            },
++            values={
++                "a": 2,
++                "b": 9,
++                "c": -3,
++                "d": 3,
++            },
++            image="0209fdff03000000",
++        )
++
++    def test_plain_members_after_bitfields_start_on_next_byte_i386(self):
++        self.checkLayout(
++            SRC_PLAIN_MEMBERS_AFTER_BITFIELDS_START_ON_NEXT_BYTE,
++            psize=4,
++            bigend=False,
++            size=8,
++            offsets={
++                "b": 1,
++                "c": 2,
++            },
++            values={
++                "a": 2,
++                "b": 9,
++                "c": -3,
++                "d": 3,
++            },
++            image="0209fdff03000000",
++        )
++
++    def test_plain_members_after_bitfields_start_on_next_byte_bigend(self):
++        self.checkLayout(
++            SRC_PLAIN_MEMBERS_AFTER_BITFIELDS_START_ON_NEXT_BYTE,
++            psize=8,
++            bigend=True,
++            size=8,
++            offsets={
++                "b": 1,
++                "c": 2,
++            },
++            values={
++                "a": 2,
++                "b": 9,
++                "c": -3,
++                "d": 3,
++            },
++            image="4009fffdc0000000",
++        )
++
++    def test_long_long_bitfield_units_follow_target_alignment_x86_64(self):
++        self.checkLayout(
++            SRC_LONG_LONG_BITFIELD_UNITS_FOLLOW_TARGET_ALIGNMENT,
++            psize=8,
++            bigend=False,
++            size=16,
++            offsets={},
++            values={
++                "a": -1,
++                "b": -0x155555556,
++            },
++            image="ffffff7f00000000aaaaaaaa02000000",
++        )
++
++    def test_long_long_bitfield_units_follow_target_alignment_i386(self):
++        self.checkLayout(
++            SRC_LONG_LONG_BITFIELD_UNITS_FOLLOW_TARGET_ALIGNMENT,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={},
++            values={
++                "a": -1,
++                "b": -0x155555556,
++            },
++            image="ffffff7faaaaaaaa02000000",
++        )
++
++    def test_long_long_bitfield_units_follow_target_alignment_bigend(self):
++        self.checkLayout(
++            SRC_LONG_LONG_BITFIELD_UNITS_FOLLOW_TARGET_ALIGNMENT,
++            psize=8,
++            bigend=True,
++            size=16,
++            offsets={},
++            values={
++                "a": -1,
++                "b": -0x155555556,
++            },
++            image="fffffffe00000000aaaaaaaa80000000",
++        )
++
++    def test_long_long_bitfield_after_char_x86_64(self):
++        self.checkLayout(
++            SRC_LONG_LONG_BITFIELD_AFTER_CHAR,
++            psize=8,
++            bigend=False,
++            size=16,
++            offsets={
++                "c": 0,
++            },
++            values={
++                "c": 7,
++                "b": 0x123456789ABCDEF,
++            },
++            image="0700000000000000efcdab8967452301",
++        )
++
++    def test_long_long_bitfield_after_char_i386(self):
++        self.checkLayout(
++            SRC_LONG_LONG_BITFIELD_AFTER_CHAR,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "c": 0,
++            },
++            values={
++                "c": 7,
++                "b": 0x123456789ABCDEF,
++            },
++            image="07000000efcdab8967452301",
++        )
++
++    def test_long_long_bitfield_after_char_bigend(self):
++        self.checkLayout(
++            SRC_LONG_LONG_BITFIELD_AFTER_CHAR,
++            psize=8,
++            bigend=True,
++            size=16,
++            offsets={
++                "c": 0,
++            },
++            values={
++                "c": 7,
++                "b": 0x123456789ABCDEF,
++            },
++            image="0700000000000000123456789abcdef0",
++        )
++
++    def test_mixed_width_bitfields_reuse_wider_units_x86_64(self):
++        self.checkLayout(
++            SRC_MIXED_WIDTH_BITFIELDS_REUSE_WIDER_UNITS,
++            psize=8,
++            bigend=False,
++            size=16,
++            offsets={
++                "c": 0,
++            },
++            values={
++                "c": 7,
++                "b": 0x12345678AB,
++                "d": -5,
++            },
++            image="0700ab7856341200fbff0f0000000000",
++        )
++
++    def test_mixed_width_bitfields_reuse_wider_units_i386(self):
++        self.checkLayout(
++            SRC_MIXED_WIDTH_BITFIELDS_REUSE_WIDER_UNITS,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "c": 0,
++            },
++            values={
++                "c": 7,
++                "b": 0x12345678AB,
++                "d": -5,
++            },
++            image="0700ab7856341200fbff0f00",
++        )
++
++    def test_mixed_width_bitfields_reuse_wider_units_bigend(self):
++        self.checkLayout(
++            SRC_MIXED_WIDTH_BITFIELDS_REUSE_WIDER_UNITS,
++            psize=8,
++            bigend=True,
++            size=16,
++            offsets={
++                "c": 0,
++            },
++            values={
++                "c": 7,
++                "b": 0x12345678AB,
++                "d": -5,
++            },
++            image="000712345678ab00ffffb00000000000",
++        )
++
++    def test_short_bitfields_and_trailing_char_x86_64(self):
++        self.checkLayout(
++            SRC_SHORT_BITFIELDS_AND_TRAILING_CHAR,
++            psize=8,
++            bigend=False,
++            size=6,
++            offsets={
++                "c": 4,
++            },
++            values={
++                "a": -100,
++                "b": 200,
++                "c": 3,
++            },
++            image="9c01c8000300",
++        )
++
++    def test_short_bitfields_and_trailing_char_i386(self):
++        self.checkLayout(
++            SRC_SHORT_BITFIELDS_AND_TRAILING_CHAR,
++            psize=4,
++            bigend=False,
++            size=6,
++            offsets={
++                "c": 4,
++            },
++            values={
++                "a": -100,
++                "b": 200,
++                "c": 3,
++            },
++            image="9c01c8000300",
++        )
++
++    def test_short_bitfields_and_trailing_char_bigend(self):
++        self.checkLayout(
++            SRC_SHORT_BITFIELDS_AND_TRAILING_CHAR,
++            psize=8,
++            bigend=True,
++            size=6,
++            offsets={
++                "c": 4,
++            },
++            values={
++                "a": -100,
++                "b": 200,
++                "c": 3,
++            },
++            image="ce0064000300",
++        )
++
++    def test_bool_and_unsigned_bitfields_pack_together_x86_64(self):
++        self.checkLayout(
++            SRC_BOOL_AND_UNSIGNED_BITFIELDS_PACK_TOGETHER,
++            psize=8,
++            bigend=False,
++            size=4,
++            offsets={},
++            values={
++                "a": 1,
++                "b": 3,
++                "c": 1,
++                "d": -8,
++            },
++            image="8f000000",
++        )
++
++    def test_bool_and_unsigned_bitfields_pack_together_i386(self):
++        self.checkLayout(
++            SRC_BOOL_AND_UNSIGNED_BITFIELDS_PACK_TOGETHER,
++            psize=4,
++            bigend=False,
++            size=4,
++            offsets={},
++            values={
++                "a": 1,
++                "b": 3,
++                "c": 1,
++                "d": -8,
++            },
++            image="8f000000",
++        )
++
++    def test_bool_and_unsigned_bitfields_pack_together_bigend(self):
++        self.checkLayout(
++            SRC_BOOL_AND_UNSIGNED_BITFIELDS_PACK_TOGETHER,
++            psize=8,
++            bigend=True,
++            size=4,
++            offsets={},
++            values={
++                "a": 1,
++                "b": 3,
++                "c": 1,
++                "d": -8,
++            },
++            image="f8000000",
++        )
++
++    def test_bitfield_runs_separated_by_plain_member_x86_64(self):
++        self.checkLayout(
++            SRC_BITFIELD_RUNS_SEPARATED_BY_PLAIN_MEMBER,
++            psize=8,
++            bigend=False,
++            size=4,
++            offsets={
++                "mid": 1,
++            },
++            values={
++                "a": 9,
++                "mid": 5,
++                "b": 15,
++                "c": 0xABC,
++            },
++            image="0905cfab",
++        )
++
++    def test_bitfield_runs_separated_by_plain_member_i386(self):
++        self.checkLayout(
++            SRC_BITFIELD_RUNS_SEPARATED_BY_PLAIN_MEMBER,
++            psize=4,
++            bigend=False,
++            size=4,
++            offsets={
++                "mid": 1,
++            },
++            values={
++                "a": 9,
++                "mid": 5,
++                "b": 15,
++                "c": 0xABC,
++            },
++            image="0905cfab",
++        )
++
++    def test_bitfield_runs_separated_by_plain_member_bigend(self):
++        self.checkLayout(
++            SRC_BITFIELD_RUNS_SEPARATED_BY_PLAIN_MEMBER,
++            psize=8,
++            bigend=True,
++            size=4,
++            offsets={
++                "mid": 1,
++            },
++            values={
++                "a": 9,
++                "mid": 5,
++                "b": 15,
++                "c": 0xABC,
++            },
++            image="9005fabc",
++        )
++
++    def test_bitfields_inside_nested_struct_and_array_x86_64(self):
++        self.checkLayout(
++            SRC_BITFIELDS_INSIDE_NESTED_STRUCT_AND_ARRAY,
++            psize=8,
++            bigend=False,
++            size=12,
++            offsets={
++                "regs": 4,
++                "regs.1": 8,
++            },
++            values={
++                "id": 1,
++                "regs.0.lo": 0x123,
++                "regs.0.mid": 222,
++                "regs.0.hi": 0xABC,
++                "regs.1.lo": 1,
++                "regs.1.mid": 2,
++                "regs.1.hi": 3,
++            },
++            image="0100000023e1cdab01203000",
++        )
++
++    def test_bitfields_inside_nested_struct_and_array_i386(self):
++        self.checkLayout(
++            SRC_BITFIELDS_INSIDE_NESTED_STRUCT_AND_ARRAY,
++            psize=4,
++            bigend=False,
++            size=12,
++            offsets={
++                "regs": 4,
++                "regs.1": 8,
++            },
++            values={
++                "id": 1,
++                "regs.0.lo": 0x123,
++                "regs.0.mid": 222,
++                "regs.0.hi": 0xABC,
++                "regs.1.lo": 1,
++                "regs.1.mid": 2,
++                "regs.1.hi": 3,
++            },
++            image="0100000023e1cdab01203000",
++        )
++
++    def test_bitfields_inside_nested_struct_and_array_bigend(self):
++        self.checkLayout(
++            SRC_BITFIELDS_INSIDE_NESTED_STRUCT_AND_ARRAY,
++            psize=8,
++            bigend=True,
++            size=12,
++            offsets={
++                "regs": 4,
++                "regs.1": 8,
++            },
++            values={
++                "id": 1,
++                "regs.0.lo": 0x123,
++                "regs.0.mid": 222,
++                "regs.0.hi": 0xABC,
++                "regs.1.lo": 1,
++                "regs.1.mid": 2,
++                "regs.1.hi": 3,
++            },
++            image="01000000123deabc00102003",
++        )
++
++    def test_bigend_scalars_keep_sign_and_float_values_bigend(self):
++        self.checkLayout(
++            SRC_BIGEND_SCALARS_KEEP_SIGN_AND_FLOAT_VALUES,
++            psize=8,
++            bigend=True,
++            size=40,
++            offsets={
++                "i": 4,
++                "q": 8,
++                "f": 16,
++                "d": 24,
++                "p": 32,
++            },
++            values={
++                "s": -2,
++                "i": -0x11170,
++                "q": -5,
++                "f": -1.5,
++                "d": 0.25,
++                "p": 0x1122,
++            },
++            image="fffe0000fffeee90fffffffffffffffbbfc00000000000003fd00000000000000000000000001122",
++        )
++
++    def test_bigend_i386_layout_writes_big_endian_values(self):
++        self.checkLayout(
++            SRC_BE4,
++            psize=4,
++            bigend=True,
++            size=32,
++            offsets={
++                "c": 0,
++                "s": 2,
++                "i": 4,
++                "q": 8,
++                "d": 16,
++                "p": 24,
++                "f": 28,
++            },
++            values={
++                "c": -3,
++                "s": -0x12C,
++                "i": -0x11170,
++                "q": -5,
++                "d": 2.75,
++                "p": 0x11223344,
++                "f": -0.5,
++            },
++            image="fd00fed4fffeee90fffffffffffffffb400600000000000011223344bf000000",
++        )
++
++
++class UnionBytesTest(unittest.TestCase):
++
++    def test_assigning_a_member_changes_what_the_others_read(self):
++        u = build("union mix { unsigned int i; unsigned char b[4]; short s; };")
++        u.i = 0x11223344
++        self.assertEqual([u.b[x].vsGetValue() for x in range(4)], [0x44, 0x33, 0x22, 0x11])
++        self.assertEqual(u.s, 0x3344)
++        u.s = -1
++        self.assertEqual(u.i, 0x1122FFFF)
++        self.assertEqual(u.vsEmit().hex(), "ffff2211")
++
++    def test_changing_a_struct_inside_a_union_updates_the_union(self):
++        vs = build(SRC_STRUCT_INSIDE_UNION_INSIDE_STRUCT)
++        vs.u.pair.b = -5
++        self.assertEqual(vs.u.q, -0x500000000)
++        self.assertEqual(vs.vsEmit().hex(), "0000000000000000" + "00000000fbffffff")
++
++    def test_union_inside_struct_emits_the_last_change(self):
++        vs = build("struct box { char tag; union { char c; long long q; } v; };")
++        vs.v.q = -2
++        self.assertEqual(vs.vsEmit().hex(), "0000000000000000feffffffffffffff")
++        vs.v.c = 1
++        self.assertEqual(vs.v.q, -0xFF)
++        self.assertEqual(vs.vsEmit().hex(), "000000000000000001ffffffffffffff")
++
++    def test_parsed_union_reads_every_member_from_the_same_bytes(self):
++        u = build("union num { int i; float f; unsigned char b[2]; };", psize=4)
++        self.assertEqual(u.vsParse(bytes.fromhex("0000803f")), 4)
++        self.assertEqual(u.i, 0x3F800000)
++        self.assertEqual(u.f, 1.0)
++        self.assertEqual(u.b[1].vsGetValue(), 0)
++
++    def test_register_union_little_endian(self):
++        u = build(SRC_UNION_REG, psize=8)
++        u.raw = 0xABCDE123
++        self.assertEqual((u.f.lo, u.f.mid, u.f.hi), (0x123, 0xDE, 0xABC))
++        self.assertEqual(u.vsEmit().hex(), "23e1cdab")
++
++    def test_register_union_bigend(self):
++        u = build(SRC_UNION_REG, psize=8, bigend=True)
++        u.raw = 0x123DEABC
++        self.assertEqual((u.f.lo, u.f.mid, u.f.hi), (0x123, 0xDE, 0xABC))
++        self.assertEqual(u.vsEmit().hex(), "123deabc")
++
++    def test_earlier_union_tag_member_shares_its_bytes(self):
++        vs = build(SRC_EARLIER_UNION_TAG_USED_AS_MEMBER, psize=4)
++        vs.n.i = 0x3F800000
++        self.assertEqual(vs.n.f, 1.0)
++        self.assertEqual(vs.n.b[3].vsGetValue(), 0x3F)
++        vs.n.f = -2.0
++        self.assertEqual(vs.n.i, -0x40000000)
++
++    def test_register_union_bitfield_change_updates_raw(self):
++        u = build(SRC_UNION_REG, psize=8)
++        u.raw = 0xABCDE123
++        u.f.mid = 0x01
++        self.assertEqual(u.raw, (0xABCDE123 & ~0xFF000) | 0x01000)
++
++    def test_writes_through_retained_primitive_fields_keep_their_order(self):
++        u = build("union mix { struct { unsigned int a; } s; struct { unsigned short b; } t; };")
++        a = u.s.vsGetField("a")
++        b = u.t.vsGetField("b")
++        b.vsSetValue(0xFFFF)
++        a.vsSetValue(0x11223344)
++        self.assertEqual((u.s.a, u.t.b), (0x11223344, 0x3344))
++        b.vsSetValue(0xFFFF)
++        self.assertEqual((u.s.a, u.vsEmit().hex()), (0x1122FFFF, "ffff2211"))
++
++    def test_writes_through_held_members_keep_their_order(self):
++        u = build("union mix { struct { unsigned int a; } s; struct { unsigned char c; } t; };")
++        s = u.s
++        t = u.t
++        t.c = 0x99
++        s.a = 0x11223344
++        self.assertEqual((u.s.a, u.t.c), (0x11223344, 0x44))
++        t.c = 0x55
++        self.assertEqual((u.s.a, u.vsEmit().hex()), (0x11223355, "55332211"))
++
++    def test_later_member_write_wins_over_an_earlier_nested_change(self):
++        u = build("union mix { unsigned char c; struct { unsigned int a; } s; };")
++        u.s.a = 0x11223344
++        u.c = 0x55
++        self.assertEqual((u.c, u.s.a), (0x55, 0x11223355))
++        self.assertEqual(u.vsEmit().hex(), "55332211")
++        u.s.a = 0x01020304
++        self.assertEqual(u.c, 0x04)
++
++
++class RoundTripTest(unittest.TestCase):
++
++    def checkRoundTrip(self, src, size, psize=8, bigend=False):
++        vs = build(src, psize=psize, bigend=bigend)
++        self.assertEqual(len(vs), size)
++        data = pattern(size)
++        self.assertEqual(vs.vsParse(data), len(data))
++        self.assertEqual(vs.vsEmit(), data)
++        again = build(src, psize=psize, bigend=bigend)
++        again.vsParse(data, fast=True)
++        self.assertEqual(again.vsEmit(fast=True), data)
++
++    def test_padding_bytes_survive_parse_and_emit_x86_64(self):
++        self.checkRoundTrip(SRC_NESTED_STRUCT_ALIGNED_BY_WIDEST_MEMBER_NOT_FIRST, 32)
++
++    def test_padding_bytes_survive_parse_and_emit_i386(self):
++        self.checkRoundTrip(SRC_ARRAY_OF_STRUCTS_USES_PADDED_STRIDE, 32, psize=4)
++
++    def test_bitfield_gap_bits_survive_parse_and_emit(self):
++        self.checkRoundTrip(SRC_GAPS, 16)
++
++    def test_bitfield_gap_bits_survive_parse_and_emit_i386(self):
++        self.checkRoundTrip(SRC_GAPS, 12, psize=4)
++
++    def test_bitfield_gap_bits_survive_parse_and_emit_bigend(self):
++        self.checkRoundTrip(SRC_GAPS, 16, bigend=True)
++
++    def test_union_tail_bytes_survive_parse_and_emit(self):
++        self.checkRoundTrip(SRC_UNION_SIZE_IS_WIDEST_MEMBER_ROUNDED_TO_ALIGNMENT, 6)
++
++    def test_union_inside_struct_survives_parse_and_emit(self):
++        self.checkRoundTrip(SRC_STRUCT_INSIDE_UNION_INSIDE_STRUCT, 12, psize=4)
++
++    def test_char_array_bytes_survive_parse_and_emit(self):
++        self.checkRoundTrip(SRC_TEXT, 16)
++
++    def test_fast_char_array_keeps_bytes_after_its_nul(self):
++        image = bytes.fromhex("61620000f9ffffff4800ff5a00000000")
++        vs = build(SRC_TEXT)
++        self.assertEqual(vs.vsParse(image, fast=True), len(image))
++        self.assertEqual((vs.tag, vs.id, vs.text), ("ab", -7, "H"))
++        self.assertEqual(vs.vsEmit(fast=True), image)
++
++    def test_gap_bits_keep_values_readable(self):
++        vs = build(SRC_GAPS)
++        vs.vsParse(b"\xff" * len(vs))
++        self.assertEqual((vs.a, vs.b, vs.c, vs.d, vs.e), (7, 15, -1, -1, -1))
++        vs.b = 0
++        self.assertEqual(vs.vsEmit()[:2].hex(), "fff0")
++
++    def test_bitfield_offsets_follow_unit_boundaries(self):
++        for psize, image in ((8, "010700001f000000ffffff3f0f000000"), (4, "010700001f000000ffffff3f0f000000")):
++            vs = build(SRC_BITOFFS, psize=psize)
++            self.assertEqual(len(vs), 16)
++            vs.vsParse(bytes.fromhex(image))
++            self.assertEqual((vs.tag, vs.a, vs.b, vs.c, vs.d), (1, 7, 31, 0x3FFFFFFF, 15))
++            self.assertEqual(vs.vsEmit().hex(), image)
++
++    def test_parse_at_an_offset_reads_from_that_offset(self):
++        vs = build(SRC_CHAR_INT_SHORT_PAD_TO_MEMBER_ALIGNMENT)
++        data = b"xyz" + bytes.fromhex("07000000feffffff2c010000")
++        self.assertEqual(vs.vsParse(data, offset=3), 3 + len(vs))
++        self.assertEqual((vs.c, vs.i, vs.s), (7, -2, 300))
++
++
++class FastPathTest(unittest.TestCase):
++
++    def checkFast(self, src, psize, bigend, image, values):
++        vs = build(src, psize=psize, bigend=bigend)
++        self.assertEqual(vs.vsParse(bytes.fromhex(image), fast=True), len(vs))
++        self.assertEqual({path: getpath(vs, path) for path in values}, values)
++        self.assertEqual(vs.vsEmit(fast=True).hex(), image)
++
++    def test_fast_char_int_short_pad_to_member_alignment_x86_64(self):
++        self.checkFast(
++            SRC_CHAR_INT_SHORT_PAD_TO_MEMBER_ALIGNMENT,
++            psize=8,
++            bigend=False,
++            image="07000000feffffff2c010000",
++            values={
++                "c": 7,
++                "i": -2,
++                "s": 0x12C,
++            },
++        )
++
++    def test_fast_array_of_structs_uses_padded_stride_i386(self):
++        self.checkFast(
++            SRC_ARRAY_OF_STRUCTS_USES_PADDED_STRIDE,
++            psize=4,
++            bigend=False,
++            image="030000000a0000000100000014000000020000001e00000003000000ffff0000",
++            values={
++                "n": 3,
++                "pts.0.x": 10,
++                "pts.0.tag": 1,
++                "pts.1.x": 20,
++                "pts.1.tag": 2,
++                "pts.2.x": 30,
++                "pts.2.tag": 3,
++                "last": -1,
++            },
++        )
++
++    def test_fast_union_inside_struct_aligned_by_widest_member_x86_64(self):
++        self.checkFast(
++            SRC_UNION_INSIDE_STRUCT_ALIGNED_BY_WIDEST_MEMBER,
++            psize=8,
++            bigend=False,
++            image="0100000000000000000000000000e8bf0200000000000000",
++            values={
++                "tag": 1,
++                "v.d": -0.75,
++                "end": 2,
++            },
++        )
++
++    def test_fast_bitfields_inside_nested_struct_and_array_x86_64(self):
++        self.checkFast(
++            SRC_BITFIELDS_INSIDE_NESTED_STRUCT_AND_ARRAY,
++            psize=8,
++            bigend=False,
++            image="0100000023e1cdab01203000",
++            values={
++                "id": 1,
++                "regs.0.lo": 0x123,
++                "regs.0.mid": 222,
++                "regs.0.hi": 0xABC,
++                "regs.1.lo": 1,
++                "regs.1.mid": 2,
++                "regs.1.hi": 3,
++            },
++        )
++
++    def test_fast_long_long_bitfield_units_follow_target_alignment_i386(self):
++        self.checkFast(
++            SRC_LONG_LONG_BITFIELD_UNITS_FOLLOW_TARGET_ALIGNMENT,
++            psize=4,
++            bigend=False,
++            image="ffffff7faaaaaaaa02000000",
++            values={
++                "a": -1,
++                "b": -0x155555556,
++            },
++        )
++
++    def test_fast_bool_and_unsigned_bitfields_pack_together_bigend(self):
++        self.checkFast(
++            SRC_BOOL_AND_UNSIGNED_BITFIELDS_PACK_TOGETHER,
++            psize=8,
++            bigend=True,
++            image="f8000000",
++            values={
++                "a": 1,
++                "b": 3,
++                "c": 1,
++                "d": -8,
++            },
++        )
++
++    def test_fast_bigend_scalars_keep_sign_and_float_values_bigend(self):
++        self.checkFast(
++            SRC_BIGEND_SCALARS_KEEP_SIGN_AND_FLOAT_VALUES,
++            psize=8,
++            bigend=True,
++            image="fffe0000fffeee90fffffffffffffffbbfc00000000000003fd00000000000000000000000001122",
++            values={
++                "s": -2,
++                "i": -0x11170,
++                "q": -5,
++                "f": -1.5,
++                "d": 0.25,
++                "p": 0x1122,
++            },
++        )
++
++    def test_fast_typedefs_of_scalars_structs_arrays_and_pointers_i386(self):
++        self.checkFast(
++            SRC_TYPEDEFS_OF_SCALARS_STRUCTS_ARRAYS_AND_POINTERS,
++            psize=4,
++            bigend=False,
++            image="010000000200000003000000040000000500000006000000070000008800000099000000",
++            values={
++                "c": 1,
++                "ps.0.x": 2,
++                "ps.0.y": 3,
++                "ps.0.z": 4,
++                "ps.1.x": 5,
++                "ps.1.y": 6,
++                "ps.1.z": 7,
++                "next": 136,
++                "cb": 153,
++            },
++        )
++
++
++class DefinitionTest(unittest.TestCase):
++
++    def test_last_top_level_definition_is_built_and_named_by_typedef(self):
++        for psize, size, yoff in ((8, 16, 8), (4, 12, 4)):
++            vs = build(SRC_LAST, psize=psize)
++            self.assertEqual(vs.vsGetTypeName(), "second_t")
++            self.assertEqual(len(vs), size)
++            self.assertEqual(vs.vsGetOffset("y"), yoff)
++
++    def test_tags_name_structures_and_nested_definitions_are_reusable(self):
++        vs = build(SRC_NESTED_DEFINITION_INSIDE_STRUCT_IS_LAID_OUT_IN_PLACE)
++        self.assertEqual(vs.vsGetTypeName(), "outer")
++        user = build(
++            SRC_NESTED_DEFINITION_INSIDE_STRUCT_IS_LAID_OUT_IN_PLACE
++            + "struct user { struct inner a; struct outer b; };"
++        )
++        self.assertEqual(user.vsGetTypeName(), "user")
++        self.assertEqual(user.vsGetOffset("b.k"), 12)
++
++    def test_each_constructor_call_builds_a_fresh_structure(self):
++        ctor = vs_cparse.ctorFromCSource(SRC_UNION_REG, psize=8)
++        first = ctor()
++        second = ctor()
++        first.raw = 0x1234
++        self.assertEqual(second.raw, 0)
++        self.assertEqual(first.f.lo, 0x234)
++
++    def test_constructors_lay_out_both_abis(self):
++        for psize, image in ((4, "0100000022110000feff0000"), (8, "01000000000000002211000000000000feff000000000000")):
++            ctor = vs_cparse.ctorFromCSource("struct cv { char c; void *p; short s; };", psize=psize)
++            vs = ctor()
++            vs.c = 1
++            vs.p = 0x1122
++            vs.s = -2
++            self.assertEqual(vs.vsEmit().hex(), image)
++            self.assertEqual(ctor().vsParse(bytes.fromhex(image)), len(image) // 2)
++
++    def test_a_union_after_a_structure_is_the_one_built(self):
++        u = build("struct first { int x; }; union final { int i; unsigned char b[4]; };")
++        self.assertEqual((u.vsGetTypeName(), len(u)), ("final", 4))
++        u.i = 0x11223344
++        self.assertEqual(u.b[0].vsGetValue(), 0x44)
++
++    def test_unions_are_named_by_tag_or_typedef(self):
++        word = build("union word { int i; char c[4]; };")
++        self.assertEqual((word.vsGetTypeName(), len(word)), ("word", 4))
++        half = build("typedef union { int i; short s; } half_t;")
++        self.assertEqual((half.vsGetTypeName(), len(half)), ("half_t", 4))
++
++    def test_sizeof_enumeration_constant_sizes_an_array(self):
++        vs = build("enum { N = 1 }; struct s { char bytes[sizeof N]; };")
++        self.assertEqual((vs.vsGetTypeName(), len(vs)), ("s", 4))
++
++    def test_definitions_in_function_parameters_are_usable_afterwards(self):
++        src = (
++            "void f(struct inner { int x; } *p, enum count { N = 2 } c, int (*cb)(struct deep { short s; } d));"
++            "struct outer { struct inner value; char bytes[N]; struct deep d; };"
++        )
++        for psize in (4, 8):
++            vs = build(src, psize=psize)
++            self.assertEqual(vs.vsGetTypeName(), "outer")
++            self.assertEqual((len(vs), vs.vsGetOffset("bytes"), vs.vsGetOffset("d")), (8, 4, 6))
++
++    def test_cvstruct_uses_its_byte_order(self):
++
++        class BigWide(vs_cparse.CVStruct):
++            """
++            struct cv { char c; void *p; short s; };
++            """
++
++            psize = 8
++            bigend = True
++
++        vs = BigWide()
++        self.assertEqual(len(vs), 24)
++        vs.c = 1
++        vs.p = 0x1122334455667788
++        vs.s = -2
++        self.assertEqual(vs.vsEmit().hex(), "01000000000000001122334455667788fffe000000000000")
++        parsed = BigWide()
++        parsed.vsParse(bytes.fromhex("01000000000000001122334455667788fffe000000000000"))
++        self.assertEqual((parsed.c, parsed.p, parsed.s), (1, 0x1122334455667788, -2))
++
++    def test_cvstruct_uses_its_pointer_size(self):
++
++        class Wide(vs_cparse.CVStruct):
++            """
++            struct cv { char c; void *p; short s; };
++            """
++
++            psize = 8
++
++        class Narrow(vs_cparse.CVStruct):
++            """
++            struct cv { char c; void *p; short s; };
++            """
++
++        self.assertEqual((len(Wide()), Wide().vsGetOffset("s")), (24, 16))
++        self.assertEqual((len(Narrow()), Narrow().vsGetOffset("s")), (12, 8))
++
++
++class PreservationTest(unittest.TestCase):
++
++    def test_hand_written_vstruct_stays_packed_while_c_source_is_padded(self):
++        hand = vstruct.VStruct()
++        hand.a = vs_prims.v_uint8(1)
++        hand.b = vs_prims.v_uint32(2)
++        self.assertEqual(len(hand), 5)
++        self.assertEqual(hand.vsEmit().hex(), "0102000000")
++
++        csrc = build(SRC_PACKED)
++        csrc.a = 1
++        csrc.b = 2
++        self.assertEqual((len(csrc), csrc.vsGetOffset("b")), (8, 4))
++        self.assertEqual(csrc.vsEmit().hex(), "0100000002000000")
++
++    def test_vbitfield_keeps_msb_first_order_while_c_bitfields_fill_from_lsb(self):
++        bits = VBitField()
++        bits.vsAddField("a", v_bits(3))
++        bits.vsAddField("b", v_bits(5))
++        bits.a = 5
++        bits.b = 7
++        self.assertEqual(bits.vsEmit().hex(), "a7")
++
++        csrc = build("struct pair { unsigned a:3, b:5; };")
++        csrc.a = 5
++        csrc.b = 7
++        self.assertEqual(csrc.vsEmit().hex(), "3d000000")

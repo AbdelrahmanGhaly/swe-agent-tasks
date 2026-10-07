@@ -1,0 +1,1522 @@
+diff --git a/optiland/multiconfig/multi_configuration.py b/optiland/multiconfig/multi_configuration.py
+index fe4591eb..c8156742 100644
+--- a/optiland/multiconfig/multi_configuration.py
++++ b/optiland/multiconfig/multi_configuration.py
+@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
+ 
+ import matplotlib.pyplot as plt
+ 
++from optiland.resolution import order
+ from optiland.utils import set_attr_by_path
+ from optiland.visualization import OpticViewer
+ from optiland.visualization.themes import get_active_theme
+@@ -113,6 +114,46 @@ class MultiConfiguration:
+                     source_optic=source,
+                 )
+ 
++    def update_all(self) -> None:
++        """Updates every configuration, honouring the links between them.
++
++        A configuration whose pickups read from another configuration is
++        updated after that one, so a chain of derived configurations settles
++        in a single call.
++
++        Every configuration is ordered before any of them is touched, so a
++        prescription that cannot be resolved anywhere leaves the whole set as
++        it was rather than settling the configurations ahead of it.
++
++        Raises:
++            CircularDependencyError: If the configurations read from each
++                other in a circle, or if the pickups and solves of one
++                configuration cannot be ordered.
++        """
++        walk = self.configuration_order()
++        for optic in walk:
++            optic.updater.resolution_order()
++        for optic in walk:
++            optic.updater.update()
++
++    def configuration_order(self) -> list[Optic]:
++        """Returns the configurations in the order `update_all()` walks them.
++
++        Returns:
++            list[Optic]: The configurations, each one following every
++            configuration its pickups read from. Configurations that read from
++            none of the others keep the order they were added in.
++
++        Raises:
++            CircularDependencyError: If the configurations read from each
++                other in a circle.
++        """
++        links = [_ConfigurationLink(optic) for optic in self.configurations]
++        owners = {id(optic) for optic in self.configurations}
++        for link in links:
++            link.restrict(owners)
++        return [link.optic for link in order(links)]
++
+     def _resolve_configs(self, configurations) -> tuple[list[int], bool]:
+         """Expand "all" to explicit indices; report whether it was "all"."""
+         if configurations == "all":
+@@ -451,3 +492,44 @@ class MultiConfiguration:
+ 
+         plt.tight_layout()
+         return fig, axes
++
++
++class _ConfigurationLink:
++    """A single configuration, seen as one node of the configuration graph.
++
++    Args:
++        optic (Optic): The configuration.
++    """
++
++    def __init__(self, optic: Optic):
++        self.optic = optic
++        self.sources: set[int] = set()
++
++    def restrict(self, owners: set[int]) -> None:
++        """Records the other configurations this one reads from.
++
++        Args:
++            owners (set[int]): Identities of every configuration in the group.
++        """
++        mine = id(self.optic)
++        self.sources = {
++            id(pickup.source_optic)
++            for pickup in self.optic.pickups.pickups
++            if id(pickup.source_optic) in owners and id(pickup.source_optic) != mine
++        }
++
++    def reads(self) -> set:
++        """Returns the configurations this one reads from.
++
++        Returns:
++            set: Identities of the source configurations.
++        """
++        return set(self.sources)
++
++    def writes(self) -> set:
++        """Returns this configuration.
++
++        Returns:
++            set: The identity of this configuration.
++        """
++        return {id(self.optic)}
+diff --git a/optiland/optic/optic_updater.py b/optiland/optic/optic_updater.py
+index 358f4ded..fe3ab23d 100644
+--- a/optiland/optic/optic_updater.py
++++ b/optiland/optic/optic_updater.py
+@@ -16,6 +16,12 @@ from optiland._suggest import options_hint
+ from optiland.apodization import BaseApodization
+ from optiland.geometries import StandardGeometry
+ from optiland.materials import IdealMaterial
++from optiland.resolution import (
++    dependency_report,
++    driven_values,
++    resolution_order,
++    resolve,
++)
+ 
+ if TYPE_CHECKING:
+     from optiland.materials.base import BaseMaterial
+@@ -272,11 +278,17 @@ class OpticUpdater:
+ 
+     def update(self) -> None:
+         """Update the optical system by applying all defined pickups and solves.
+-        If certain surface types requiring paraxial updates are present,
+-        `update_paraxial()` is also called.
++
++        Every pickup and solve is applied once, in an order where each one runs
++        after everything it reads, so the values they link agree when the call
++        returns. If certain surface types requiring paraxial updates are
++        present, `update_paraxial()` is also called.
++
++        Raises:
++            CircularDependencyError: If the pickups and solves cannot be
++                ordered. Nothing is applied in that case.
+         """
+-        self.optic.pickups.apply()
+-        self.optic.solves.apply()
++        resolve(self.optic)
+ 
+         if any(
+             surface.surface_type
+@@ -285,6 +297,46 @@ class OpticUpdater:
+         ):
+             self.update_paraxial()
+ 
++    def resolution_order(self) -> list:
++        """Return the pickups and solves in the order `update()` applies them.
++
++        Returns:
++            list: The registered pickups and solves, ordered so that each one
++            follows everything it reads.
++
++        Raises:
++            CircularDependencyError: If the pickups and solves cannot be
++                ordered.
++        """
++        return resolution_order(self.optic)
++
++    def dependency_report(self) -> list:
++        """Return which pickups and solves each one waits for.
++
++        Returns:
++            list: One `(constraint, prerequisites)` pair per registered pickup
++            and solve, in resolution order.
++
++        Raises:
++            CircularDependencyError: If the pickups and solves cannot be
++                ordered.
++        """
++        return dependency_report(self.optic)
++
++    def driven_values(self) -> dict:
++        """Return the values the prescription of this optic sets for itself.
++
++        Returns:
++            dict: Value name mapped to the pickup or solve that settles it, in
++            resolution order. A value written more than once is reported
++            against its last writer.
++
++        Raises:
++            CircularDependencyError: If the pickups and solves cannot be
++                ordered.
++        """
++        return driven_values(self.optic)
++
+     def image_solve(self):
+         """Adjusts the position of the image surface (last surface) such that
+         the paraxial marginal ray crosses the optical axis at this new location.
+diff --git a/optiland/pickup.py b/optiland/pickup.py
+index 8c33615b..6787b379 100644
+--- a/optiland/pickup.py
++++ b/optiland/pickup.py
+@@ -13,6 +13,16 @@ Kramer Harrison, 2024
+ 
+ from __future__ import annotations
+ 
++from optiland.resolution import (
++    attribute_node,
++    attribute_values,
++    gap_path_index,
++    order,
++    position_path_index,
++    register,
++    restore,
++    set_axial_position,
++)
+ from optiland.utils import get_attr_by_path, set_attr_by_path
+ 
+ 
+@@ -56,8 +66,9 @@ class PickupManager:
+             source_surface_idx (int): The index of the source surface in the
+                 optic's surface group.
+             attr_type (str): The type of attribute to be picked up ('radius',
+-                'conic', or 'thickness'). Can also be a generic path, where `[i]`
+-                should be used to indicate the surface index (e.g.
++                'conic', 'thickness', or 'material', the glass filling the
++                space after the surface). Can also be a generic path, where
++                `[i]` should be used to indicate the surface index (e.g.
+                 `surfaces.surfaces[i].geometry.coefficients`).
+             target_surface_idx (int): The index of the target surface in the
+                 optic's surface group.
+@@ -78,12 +89,20 @@ class PickupManager:
+             offset,
+             source_optic,
+         )
++        register(pickup)
+         pickup.apply()
+         self.pickups.append(pickup)
+ 
+     def apply(self):
+-        """Applies all pickup operations in the manager."""
+-        for pickup in self.pickups:
++        """Applies all pickup operations in the manager.
++
++        The pickups are applied in dependency order, so a pickup that reads a
++        value another pickup writes runs after it.
++
++        Raises:
++            CircularDependencyError: If the pickups cannot be ordered.
++        """
++        for pickup in order(self.pickups):
+             pickup.apply()
+ 
+     def clear(self):
+@@ -126,7 +145,11 @@ class PickupManager:
+         """
+         manager = cls(optic)
+         for pickup_data in data:
+-            manager.add(**pickup_data)
++            pickup = Pickup.from_dict(optic, pickup_data)
++            stamp = pickup_data.get("registration_index")
++            if stamp is not None:
++                restore(pickup, stamp)
++            manager.pickups.append(pickup)
+         return manager
+ 
+ 
+@@ -139,8 +162,9 @@ class Pickup:
+         source_surface_idx (int): The index of the source surface in the
+             optic's surface group.
+         attr_type (str): The type of attribute to be picked up ('radius',
+-            'conic', or 'thickness'). Can also be a generic path, where `[i]`
+-            should be used to indicate the surface index (e.g.
++            'conic', 'thickness', or 'material', the glass filling the space
++            after the surface). Can also be a generic path, where `[i]` should
++            be used to indicate the surface index (e.g.
+             `surfaces.surfaces[i].geometry.coefficients`).
+         target_surface_idx (int): The index of the target surface in the
+             optic's surface group.
+@@ -196,6 +220,33 @@ class Pickup:
+         new_value = self.scale * old_value + self.offset
+         self._set_value(new_value)
+ 
++    def reads(self):
++        """Returns the value this pickup copies from.
++
++        Returns:
++            set: The single value identity of the source attribute.
++        """
++        source = self.source_optic
++        return {attribute_node(source, self.attr_type, self.source_surface_idx)}
++
++    def writes(self):
++        """Returns the value this pickup overwrites.
++
++        Returns:
++            set: The single value identity of the target attribute.
++        """
++        return {attribute_node(self.optic, self.attr_type, self.target_surface_idx)}
++
++    def moves(self):
++        """Returns the values this pickup changes besides its target.
++
++        Returns:
++            set: The value identities changed in passing.
++        """
++        return attribute_values(
++            self.optic, self.attr_type, self.target_surface_idx, True
++        )
++
+     def _get_value(self):
+         """Returns the value of the source surface attribute.
+ 
+@@ -211,6 +262,12 @@ class Pickup:
+             return surface.geometry.k
+         if self.attr_type == "thickness":
+             return self.source_optic.surfaces.get_thickness(self.source_surface_idx)
++        if self.attr_type == "material":
++            return surface.material_post
++
++        gap = gap_path_index(self.attr_type, self.source_surface_idx)
++        if gap is not None:
++            return self.source_optic.surfaces.get_thickness(gap)
+ 
+         # Generic path support
+         try:
+@@ -237,6 +294,19 @@ class Pickup:
+         elif self.attr_type == "thickness":
+             self.optic.updater.set_thickness(value, self.target_surface_idx)
+             return
++        elif self.attr_type == "material":
++            self.optic.updater.set_material(value, self.target_surface_idx)
++            return
++
++        gap = gap_path_index(self.attr_type, self.target_surface_idx)
++        if gap is not None:
++            self.optic.updater.set_thickness(value, gap)
++            return
++
++        position = position_path_index(self.attr_type, self.target_surface_idx)
++        if position is not None:
++            set_axial_position(self.optic, position, value)
++            return
+ 
+         # Generic path support
+         try:
+@@ -254,13 +324,17 @@ class Pickup:
+             dict: A dictionary representation of the pickup operation.
+ 
+         """
+-        return {
++        data = {
+             "source_surface_idx": self.source_surface_idx,
+             "attr_type": self.attr_type,
+             "target_surface_idx": self.target_surface_idx,
+             "scale": self.scale,
+             "offset": self.offset,
+         }
++        stamp = getattr(self, "registration_index", None)
++        if stamp is not None:
++            data["registration_index"] = stamp
++        return data
+ 
+     @classmethod
+     def from_dict(cls, optic, data):
+diff --git a/optiland/resolution.py b/optiland/resolution.py
+new file mode 100644
+index 00000000..9f83391b
+--- /dev/null
++++ b/optiland/resolution.py
+@@ -0,0 +1,793 @@
++"""Resolution Module
++
++A prescription can tie its own parameters together. A pickup copies a value
++from one place to another, and a solve drives a parameter until a paraxial
++condition holds. Either one may read a value that another one writes, so the
++order they run in decides whether the finished system satisfies all of them.
++
++This module names the values a prescription drives, collects the values each
++pickup and solve reads and writes, and orders them so that every one of them
++runs after everything it reads.
++"""
++
++from __future__ import annotations
++
++import re
++from typing import TYPE_CHECKING, Any
++
++import optiland.backend as be
++
++if TYPE_CHECKING:
++    from optiland.optic import Optic
++
++RADIUS = "radius"
++CONIC = "conic"
++GAP = "thickness"
++MATERIAL = "material"
++PATH = "path"
++
++_LEGACY_KINDS = {
++    "radius": RADIUS,
++    "conic": CONIC,
++    "thickness": GAP,
++    "material": MATERIAL,
++}
++
++_SHAPE_ATTRIBUTES = ("coefficients",)
++
++_GIVEN_PUPIL = "EPD"
++
++_SHORT_SURFACE = re.compile(r"^surfaces\[(\d+)\]")
++_POSITION = re.compile(r"^surfaces\.surfaces\[(\d+)\]\.geometry\.cs\.z$")
++
++_GAP_PATH = re.compile(r"^surfaces\.surfaces\[(\d+)\]\.thickness$")
++
++_PATH_KINDS = (
++    (re.compile(r"^surfaces\.surfaces\[(\d+)\]\.geometry\.radius$"), RADIUS),
++    (re.compile(r"^surfaces\.surfaces\[(\d+)\]\.geometry\.k$"), CONIC),
++    (re.compile(r"^surfaces\.surfaces\[(\d+)\]\.material_post$"), MATERIAL),
++    (_GAP_PATH, GAP),
++)
++
++
++class CircularDependencyError(ValueError):
++    """Raised when pickups and solves read values they transitively write."""
++
++
++_registrations = 0
++
++
++def register(constraint):
++    """Record when a pickup or solve was added, across every manager.
++
++    A pickup and a solve driving the same value are held by two different
++    managers, so the position of either one inside its own list says nothing
++    about which of the two was added first. Stamping both from one counter
++    keeps the answer available.
++
++    Args:
++        constraint: The pickup or solve being registered.
++
++    Returns:
++        The same constraint.
++    """
++    global _registrations
++    constraint.registration_index = _registrations
++    _registrations += 1
++    return constraint
++
++
++def restore(constraint, stamp):
++    """Put back the stamp a saved pickup or solve was carrying.
++
++    A prescription that is written out and read back in has to keep the
++    answer to which of two writers of one value was added later, so the
++    stamps are reloaded rather than handed out afresh. The counter is moved
++    past anything reloaded, so a constraint added after the load still sorts
++    after everything already there. Anything saved without a stamp is left
++    without one and falls back to the order of the list it sits in.
++
++    Args:
++        constraint: The pickup or solve being restored.
++        stamp (int): The stamp it was saved with.
++
++    Returns:
++        The same constraint.
++    """
++    global _registrations
++    constraint.registration_index = int(stamp)
++    if constraint.registration_index >= _registrations:
++        _registrations = constraint.registration_index + 1
++    return constraint
++
++
++def _precedence(constraints: list) -> list[int]:
++    """Return the value deciding which of two writers of a value runs last.
++
++    Args:
++        constraints (list): The pickups and solves being ordered.
++
++    A constraint carrying no stamp was read back from a saved prescription, so
++    it was there before anything added since, and it sorts ahead of everything
++    stamped rather than dragging the whole list back to plain positions.
++
++    Returns:
++        list[tuple]: A sortable key per constraint.
++    """
++    order = []
++    for position, item in enumerate(constraints):
++        stamp = getattr(item, "registration_index", None)
++        if stamp is None:
++            order.append((0, position))
++        else:
++            order.append((1, stamp))
++    return order
++
++
++def value_node(optic: Optic, kind: str, key: Any) -> tuple[int, str, Any]:
++    """Build the identity of a single driven value.
++
++    The owning optic is part of the identity, so the same surface attribute in
++    two configurations of a zoom lens is two different values.
++
++    Args:
++        optic (Optic): The optic the value belongs to.
++        kind (str): One of ``RADIUS``, ``CONIC``, ``GAP``, ``MATERIAL`` or
++            ``PATH``.
++        key: The surface index, or the canonical path for ``PATH``.
++
++    Returns:
++        tuple: The value identity.
++    """
++    return (id(optic), kind, key)
++
++
++def normalize_path(path: str) -> str:
++    """Rewrite the short surface spelling of an attribute path to the long one.
++
++    ``surfaces[2].geometry.radius`` and ``surfaces.surfaces[2].geometry.radius``
++    address the same attribute, because a surface group indexes into its own
++    surface list.
++
++    Args:
++        path (str): An attribute path with the surface index already filled in.
++
++    Returns:
++        str: The path in its long spelling.
++    """
++    return _SHORT_SURFACE.sub(r"surfaces.surfaces[\1]", path)
++
++
++def attribute_node(optic: Optic, attr_type: str, surface_idx: int):
++    """Resolve an attribute name on a surface to the value it addresses.
++
++    The short names understood by a pickup and the attribute paths that reach
++    the same attribute collapse onto one value, so a prescription that mixes
++    the two spellings still orders correctly.
++
++    Args:
++        optic (Optic): The optic the attribute belongs to.
++        attr_type (str): A short name or an attribute path containing ``[i]``.
++        surface_idx (int): The surface the name is resolved against.
++
++    Returns:
++        tuple: The value identity.
++    """
++    kind = _LEGACY_KINDS.get(attr_type)
++    if kind is not None:
++        return value_node(optic, kind, int(surface_idx))
++
++    path = normalize_path(str(attr_type).replace("[i]", f"[{surface_idx}]"))
++    for pattern, path_kind in _PATH_KINDS:
++        match = pattern.match(path)
++        if match:
++            return value_node(optic, path_kind, int(match.group(1)))
++    return value_node(optic, PATH, path)
++
++
++def gap_path_index(attr_type: str, surface_idx: int):
++    """The surface whose space an attribute path names, when it names one.
++
++    The space after a surface is one value however it is spelled, so a path
++    reaching the recorded size has to be read and written as the space itself
++    rather than as the field that records it.
++
++    Args:
++        attr_type (str): A short name or an attribute path containing ``[i]``.
++        surface_idx (int): The surface the name is resolved against.
++
++    Returns:
++        int | None: The surface the space belongs to, or None.
++    """
++    if attr_type in _LEGACY_KINDS:
++        return None
++    path = normalize_path(str(attr_type).replace("[i]", f"[{surface_idx}]"))
++    match = _GAP_PATH.match(path)
++    if match:
++        return int(match.group(1))
++    return None
++
++
++def _axial(value):
++    """Reduces an axial distance to a single element.
++
++    Args:
++        value: The distance, either a scalar or a one-element array.
++
++    Returns:
++        The same distance, without a leading axis.
++    """
++    if getattr(value, "ndim", 0) == 0:
++        return value
++    return be.ravel(value)[0]
++
++
++def position_path_index(attr_type: str, surface_idx: int):
++    """Returns the surface an axial coordinate path names, or None.
++
++    Args:
++        attr_type (str): The name or path a pickup was given.
++        surface_idx (int): The surface the name is resolved against.
++
++    Returns:
++        int | None: The surface whose coordinate the path names, or None.
++    """
++    if attr_type in _LEGACY_KINDS:
++        return None
++    path = normalize_path(str(attr_type).replace("[i]", f"[{surface_idx}]"))
++    match = _POSITION.match(path)
++    if match:
++        return int(match.group(1))
++    return None
++
++
++def set_axial_position(optic: Optic, surface_idx: int, value) -> None:
++    """Move a surface along the axis and record the spaces it now sits between.
++
++    A space is read as the distance between two surfaces, so moving one of
++    them resizes the space on either side of it. The sizes recorded for those
++    two spaces are refreshed here, because positions are rebuilt from the
++    records whenever any thickness is written and a record left behind would
++    put the surface back where it was.
++
++    Args:
++        optic (Optic): The optic holding the surface.
++        surface_idx (int): The surface being moved.
++        value: The axial coordinate to move it to.
++    """
++    surfaces = optic.surfaces
++    surfaces[surface_idx].geometry.cs.z = value
++    count = len(surfaces)
++    if surface_idx >= 1:
++        surfaces[surface_idx - 1].thickness = _axial(
++            surfaces.get_thickness(surface_idx - 1)
++        )
++    if surface_idx + 1 < count:
++        surfaces[surface_idx].thickness = _axial(
++            surfaces.get_thickness(surface_idx)
++        )
++
++
++def position_node(optic: Optic, surface_idx: int):
++    """The identity of a surface's own coordinate on the axis.
++
++    Args:
++        optic (Optic): The optic the surface belongs to.
++        surface_idx (int): The surface whose coordinate is named.
++
++    Returns:
++        tuple: The value identity.
++    """
++    path = f"surfaces.surfaces[{int(surface_idx)}].geometry.cs.z"
++    return value_node(optic, PATH, path)
++
++
++def position_values(optic: Optic, surface_idx: int, writing: bool) -> set:
++    """Spaces that change size when a surface coordinate is written.
++
++    Reading a coordinate reads that one attribute and nothing else. Moving a
++    surface changes how far it sits from its neighbours, so the space on each
++    side of it is a different size afterwards.
++
++    Args:
++        optic (Optic): The optic the surface belongs to.
++        surface_idx (int): The surface whose coordinate is named.
++        writing (bool): True when the coordinate is being written.
++
++    Returns:
++        set: The spaces the write resizes, empty when reading.
++    """
++    if not writing:
++        return set()
++    count = len(optic.surfaces)
++    index = max(0, min(int(surface_idx), count - 1))
++    values = set()
++    if index >= 1:
++        values.add(value_node(optic, GAP, index - 1))
++    if index < count - 1:
++        values.add(value_node(optic, GAP, index))
++    return values
++
++
++def attribute_values(optic: Optic, attr_type: str, surface_idx: int, writing: bool):
++    """Values an attribute changes besides the one it names.
++
++    Writing a surface coordinate leaves the spaces on each side of it a
++    different size, so those spaces change even though the name does not
++    stand for them.
++
++    Args:
++        optic (Optic): The optic the attribute belongs to.
++        attr_type (str): A short name or an attribute path containing ``[i]``.
++        surface_idx (int): The surface the name is resolved against.
++        writing (bool): True when the attribute is being written.
++
++    Returns:
++        set: The value identities changed in passing.
++    """
++    if not writing:
++        return set()
++    if attr_type not in _LEGACY_KINDS:
++        path = normalize_path(str(attr_type).replace("[i]", f"[{surface_idx}]"))
++        match = _POSITION.match(path)
++        if match:
++            return position_values(optic, int(match.group(1)), writing)
++    gap = _gap_index(attr_type, surface_idx)
++    if gap is not None:
++        return rebuilt_positions(optic, gap)
++    return set()
++
++
++def _gap_index(attr_type: str, surface_idx: int):
++    """The surface whose space a name denotes, by either spelling.
++
++    Args:
++        attr_type (str): A short name or an attribute path containing ``[i]``.
++        surface_idx (int): The surface the name is resolved against.
++
++    Returns:
++        int | None: The surface the space belongs to, or None.
++    """
++    if _LEGACY_KINDS.get(attr_type) == GAP:
++        return int(surface_idx)
++    return gap_path_index(attr_type, surface_idx)
++
++
++def rebuilt_positions(optic: Optic, surface_idx: int) -> set:
++    """Coordinates that move when a space is resized.
++
++    Writing a space puts the surfaces after it somewhere else, because where
++    each one sits is rebuilt from the sizes of the spaces in front of it. Only
++    those surfaces move: the first surface is the anchor the rebuild starts
++    from, and a surface ahead of the space is reached without crossing it. The
++    space in front of the first surface is the exception: it is held as the
++    object's own coordinate, so only the object moves.
++
++    Args:
++        optic (Optic): The optic the space belongs to.
++        surface_idx (int): The surface the space follows.
++
++    Returns:
++        set: The value identities of the coordinates that change.
++    """
++    count = len(optic.surfaces)
++    index = int(surface_idx)
++    if index < 1:
++        return {position_node(optic, 0)}
++    return {position_node(optic, i) for i in range(index + 1, count)}
++
++
++def incident_values(optic: Optic, surface_idx: int) -> set:
++    """Values a ray arriving at a surface has already passed through.
++
++    A paraxial ray reaching surface ``surface_idx`` has been bent by the radii
++    of every earlier surface and has crossed every earlier space, through
++    whatever fills it. Nothing further down the system takes part in where it
++    arrives. The object surface bends nothing, so its radius is not among the
++    values the arrival is settled by.
++
++    Args:
++        optic (Optic): The optic being traced.
++        surface_idx (int): The surface the ray arrives at.
++
++    Returns:
++        set: The value identities the arrival depends on.
++    """
++    count = len(optic.surfaces)
++    stop = max(0, min(int(surface_idx), count))
++    values = {value_node(optic, RADIUS, i) for i in range(1, stop)}
++    values |= {value_node(optic, GAP, i) for i in range(stop)}
++    values |= {value_node(optic, MATERIAL, i) for i in range(stop)}
++    return values
++
++
++def pupil_values(optic: Optic, surface_idx: int) -> set:
++    """Returns the values the width of the entrance pupil is settled by.
++
++    A marginal ray starts at the edge of the entrance pupil, so whatever
++    settles that width settles where the ray runs. A pupil given as a diameter
++    outright is settled by nothing. One read off the focal length is settled by
++    the whole system, since the light has to reach the focus before the number
++    means anything. Every other pupil is read off the stop, so it is settled by
++    what the ray crosses on the way in to the stop and by nothing past it. The
++    surface a solve is aimed at stays out, as it does everywhere else.
++
++    Args:
++        optic (Optic): The optic being traced.
++        surface_idx (int): The surface the solve is aimed at.
++
++    Returns:
++        set: The value identities the pupil width depends on.
++    """
++    aperture = getattr(optic, "aperture", None)
++    if aperture is None or getattr(aperture, "ap_type", None) == _GIVEN_PUPIL:
++        return set()
++    count = len(optic.surfaces)
++    if getattr(aperture, "direct_fno", lambda: None)() is not None:
++        reach = count
++    else:
++        try:
++            reach = int(optic.surfaces.stop_index)
++        except (AttributeError, ValueError, TypeError):
++            reach = count
++    values = incident_values(optic, reach)
++    return values - own_surface_values(optic, surface_idx)
++
++
++def own_surface_values(optic: Optic, surface_idx: int) -> set:
++    """Returns the radius a surface carries and the space and glass it opens.
++
++    A ray solve aimed at a surface is never settled by these, however far its
++    reach runs, so a height solve and an angle solve on one surface stay
++    acyclic even when a chief ray carries the reach past them to the stop.
++
++    Args:
++        optic (Optic): The optic being traced.
++        surface_idx (int): The surface the values belong to.
++
++    Returns:
++        set: The value identities the surface itself carries.
++    """
++    index = int(surface_idx)
++    return {
++        value_node(optic, RADIUS, index),
++        value_node(optic, GAP, index),
++        value_node(optic, MATERIAL, index),
++    }
++
++
++def aimed_values(optic: Optic, surface_idx: int) -> set:
++    """Values a chief ray arriving at a surface has already passed through.
++
++    A chief ray is aimed at the centre of the aperture stop, so where it runs
++    before the stop is decided by the stop as well: everything up to the stop
++    takes part even when the stop sits further down than the surface asked
++    about. Arriving at the stop is where it ends. The space the stop opens and
++    the glass filling it sit beyond the aim and take no part, so the reach is
++    the arrival at the stop rather than the arrival at the surface after it.
++
++    Args:
++        optic (Optic): The optic being traced.
++        surface_idx (int): The surface the ray arrives at.
++
++    Returns:
++        set: The value identities the arrival depends on.
++    """
++    try:
++        stop = int(optic.surfaces.stop_index)
++    except (AttributeError, ValueError, TypeError):
++        stop = int(surface_idx)
++    reach = incident_values(optic, max(int(surface_idx), stop))
++    return reach - own_surface_values(optic, surface_idx)
++
++
++def traced_values(optic: Optic) -> set:
++    """Values a real ray traced to the image surface passes through.
++
++    The space in front of the image surface is left out: a solve that places
++    the image surface reads the system that forms the image, not the position
++    it is about to overwrite.
++
++    Args:
++        optic (Optic): The optic being traced.
++
++    Returns:
++        set: The value identities the trace depends on.
++    """
++    count = len(optic.surfaces)
++    values = {value_node(optic, RADIUS, i) for i in range(count)}
++    values |= {value_node(optic, CONIC, i) for i in range(count)}
++    values |= {value_node(optic, MATERIAL, i) for i in range(count)}
++    values |= {value_node(optic, GAP, i) for i in range(max(0, count - 2))}
++    values |= _traced_shape_values(optic, count)
++    return values
++
++
++def _traced_shape_values(optic: Optic, count: int) -> set:
++    """Values of a surface shape a real ray reads beyond the named properties.
++
++    A real ray meets the whole shape of a surface, not only the radius and the
++    conic constant, so a shape a pickup can address by path is read as well.
++
++    Args:
++        optic (Optic): The optic being traced.
++        count (int): The number of surfaces.
++
++    Returns:
++        set: The value identities of the shapes the trace reads.
++    """
++    values = set()
++    for index in range(count):
++        geometry = getattr(optic.surfaces[index], "geometry", None)
++        for name in _SHAPE_ATTRIBUTES:
++            if hasattr(geometry, name):
++                path = f"surfaces.surfaces[{index}].geometry.{name}"
++                values.add(value_node(optic, PATH, path))
++    return values
++
++
++def _edges(constraints: list) -> tuple[list[set], list[int]]:
++    """Build the successor sets and in-degrees of the dependency graph.
++
++    Two constraints writing one value are ordered by when they were added, so
++    the later one runs last whether the pair is two pickups, two solves, or a
++    pickup and a solve. A constraint that only shifts a value in passing runs
++    before one that writes that value outright, so the authored write is the
++    one left standing. When two of them each shift something the other writes,
++    neither is the author of the other's value and there is nothing to put
++    first, so they fall back to the order they were added in.
++
++    Args:
++        constraints (list): The pickups and solves, in registration order.
++
++    Returns:
++        tuple: Successor index sets and in-degree counts.
++
++    Raises:
++        CircularDependencyError: If a constraint reads a value it writes.
++    """
++    reads = [set(item.reads()) for item in constraints]
++    writes = [set(item.writes()) for item in constraints]
++    moved = [moved_nodes(item) for item in constraints]
++    effects = [writes[i] | moved[i] for i in range(len(constraints))]
++    added = _precedence(constraints)
++    count = len(constraints)
++    successors = [set() for _ in range(count)]
++    indegree = [0] * count
++
++    for i in range(count):
++        if reads[i] & writes[i]:
++            raise CircularDependencyError(
++                f"{_describe(constraints[i])} reads a value it also writes."
++            )
++        for j in range(count):
++            if i == j or j in successors[i]:
++                continue
++            shares_read = bool(effects[i] & reads[j])
++            shares_write = added[i] < added[j] and bool(writes[i] & writes[j])
++            displaces = bool(moved[i] & writes[j])
++            if displaces and moved[j] & writes[i]:
++                displaces = added[i] < added[j]
++            if shares_read or shares_write or displaces:
++                successors[i].add(j)
++                indegree[j] += 1
++
++    return successors, indegree
++
++
++def _describe(constraint: Any) -> str:
++    """Name a pickup or solve for an error message.
++
++    Args:
++        constraint: A pickup or solve.
++
++    Returns:
++        str: A short description.
++    """
++    name = type(constraint).__name__
++    index = getattr(constraint, "target_surface_idx", None)
++    if index is None:
++        index = getattr(constraint, "surface_idx", None)
++    if index is None:
++        return name
++    return f"{name} on surface {index}"
++
++
++def order(constraints: list) -> list:
++    """Order pickups and solves so each runs after everything it reads.
++
++    Constraints that do not depend on one another keep the order of the list
++    they arrive in, and of two constraints writing the same value the one
++    added later runs last, whichever manager holds it.
++
++    Args:
++        constraints (list): The pickups and solves, in registration order.
++
++    Returns:
++        list: The same constraints, in the order they should be applied.
++
++    Raises:
++        CircularDependencyError: If no such order exists.
++    """
++    successors, indegree = _edges(constraints)
++    ready = sorted(i for i, degree in enumerate(indegree) if degree == 0)
++    ordered = []
++
++    while ready:
++        current = ready.pop(0)
++        ordered.append(current)
++        for successor in sorted(successors[current]):
++            indegree[successor] -= 1
++            if indegree[successor] == 0:
++                ready.append(successor)
++        ready.sort()
++
++    if len(ordered) != len(constraints):
++        stuck = [
++            _describe(constraints[i])
++            for i in range(len(constraints))
++            if i not in ordered
++        ]
++        raise CircularDependencyError(
++            "Pickups and solves form a circular dependency: " + ", ".join(stuck)
++        )
++
++    return [constraints[i] for i in ordered]
++
++
++def registered(optic: Optic) -> list:
++    """Collect every pickup and solve registered on an optic.
++
++    The pickups come first, which settles the order of constraints that do
++    not depend on one another. It does not settle which of two writers of one
++    value runs last: that is decided by the stamp each one carries.
++
++    Args:
++        optic (Optic): The optic to collect from.
++
++    Returns:
++        list: The pickups followed by the solves, each list in the order it
++        was added in.
++    """
++    return list(optic.pickups.pickups) + list(optic.solves.solves)
++
++
++def resolution_order(optic: Optic) -> list:
++    """Order every pickup and solve registered on an optic.
++
++    Args:
++        optic (Optic): The optic to order.
++
++    Returns:
++        list: The constraints in the order they are applied.
++
++    Raises:
++        CircularDependencyError: If no such order exists.
++    """
++    return order(registered(optic))
++
++
++def dependency_report(optic: Optic) -> list[tuple[Any, list]]:
++    """Report which constraints each pickup or solve waits for.
++
++    A constraint waits on everything ahead of it that writes a value it reads,
++    and on everything ahead of it that writes a value it writes, since the
++    value it is about to settle has to be settled last.
++
++    Args:
++        optic (Optic): The optic to report on.
++
++    Returns:
++        list: One ``(constraint, prerequisites)`` pair per constraint, in
++        resolution order. The prerequisites are also in resolution order.
++
++    Raises:
++        CircularDependencyError: If no resolution order exists.
++    """
++    ordered = resolution_order(optic)
++    writes = [set(item.writes()) | moved_nodes(item) for item in ordered]
++    report = []
++    for position, item in enumerate(ordered):
++        needed = set(item.reads()) | set(item.writes())
++        report.append(
++            (item, [ordered[i] for i in range(position) if writes[i] & needed])
++        )
++    return report
++
++
++def value_name(node) -> str:
++    """Name a driven value the way a prescription spells it.
++
++    Args:
++        node: A value identity.
++
++    Returns:
++        str: ``"radius[2]"``, ``"conic[2]"``, ``"thickness[2]"`` or
++        ``"material[2]"`` for the named surface properties, and the attribute
++        path itself for anything else.
++    """
++    _, kind, key = node
++    if kind == PATH:
++        return str(key)
++    return f"{kind}[{key}]"
++
++
++def moved_nodes(constraint) -> set:
++    """Values a pickup or solve changes without being their author.
++
++    Moving a surface leaves every later one where it was in relation to it,
++    so the shift is not a value another constraint competes to own. It still
++    has to be seen, because anything reading one of those values has to run
++    afterwards.
++
++    Args:
++        constraint: A pickup or solve.
++
++    Returns:
++        set: The value identities changed in passing.
++    """
++    moves = getattr(constraint, "moves", None)
++    if moves is None:
++        return set()
++    return set(moves())
++
++
++def driven_nodes(constraint) -> set:
++    """The values a pickup or solve is reported as settling.
++
++    A name can pull in more values than it stands for. A surface position is
++    settled through the spaces around it, but what the prescription set is the
++    position, so the report names that and keeps the spaces to itself.
++
++    Args:
++        constraint: A pickup or solve.
++
++    Returns:
++        set: The value identities to report.
++    """
++    driven = getattr(constraint, "driven", None)
++    if driven is None:
++        return set(constraint.writes())
++    return set(driven())
++
++
++def driven_values(optic: Optic) -> dict:
++    """Report every value the prescription of an optic sets for itself.
++
++    A value written by more than one pickup or solve is reported against the
++    one that writes it last, which is the one that decides it, and sits where
++    that last writer settles it rather than where the first one found it.
++
++    Args:
++        optic (Optic): The optic to report on.
++
++    Returns:
++        dict: Value name mapped to the pickup or solve that settles it, in
++        resolution order.
++
++    Raises:
++        CircularDependencyError: If no resolution order exists.
++    """
++    driven = {}
++    for constraint in resolution_order(optic):
++        for node in sorted(driven_nodes(constraint), key=value_name):
++            name = value_name(node)
++            driven.pop(name, None)
++            driven[name] = constraint
++    return driven
++
++
++def resolve(optic: Optic) -> None:
++    """Apply every pickup and solve on an optic in dependency order.
++
++    Nothing is applied when the constraints cannot be ordered, so a circular
++    prescription leaves the system as it was.
++
++    Args:
++        optic (Optic): The optic to resolve.
++
++    Raises:
++        CircularDependencyError: If no resolution order exists.
++    """
++    for constraint in resolution_order(optic):
++        constraint.apply()
+diff --git a/optiland/solves/base.py b/optiland/solves/base.py
+index f0cb6a19..555a20e5 100644
+--- a/optiland/solves/base.py
++++ b/optiland/solves/base.py
+@@ -9,6 +9,27 @@ from __future__ import annotations
+ 
+ from abc import ABC, abstractmethod
+ 
++import optiland.backend as be
++
++
++def axial_scalar(value):
++    """Reduces an axial distance to a single element.
++
++    Ray data carries one element per ray, so a distance derived from it
++    arrives with a leading axis of length one. A recorded thickness is a
++    single number, and indexing rather than converting keeps the value inside
++    whatever the active backend uses to track gradients.
++
++    Args:
++        value: The distance, either a scalar or a one-element array.
++
++    Returns:
++        The same distance, without a leading axis.
++    """
++    if getattr(value, "ndim", 0) == 0:
++        return value
++    return be.ravel(value)[0]
++
+ 
+ class BaseSolve(ABC):
+     """Applies a solve operation.
+@@ -33,6 +54,23 @@ class BaseSolve(ABC):
+         """Applies the solve operation to the optic."""
+         pass  # pragma: no cover
+ 
++    def reads(self):
++        """Returns the values this solve looks at.
++
++        Returns:
++            set: The value identities read, empty when the solve declares none.
++        """
++        return set()
++
++    def writes(self):
++        """Returns the values this solve drives.
++
++        Returns:
++            set: The value identities written, empty when the solve declares
++            none.
++        """
++        return set()
++
+     def to_dict(self):
+         """Returns a dictionary representation of the solve.
+ 
+@@ -40,9 +78,13 @@ class BaseSolve(ABC):
+             dict: A dictionary representation of the solve.
+ 
+         """
+-        return {
++        data = {
+             "type": self.__class__.__name__,
+         }
++        stamp = getattr(self, "registration_index", None)
++        if stamp is not None:
++            data["registration_index"] = stamp
++        return data
+ 
+     @classmethod
+     def from_dict(cls, optic, data):
+diff --git a/optiland/solves/curvature.py b/optiland/solves/curvature.py
+index 919749f3..310e7d4d 100644
+--- a/optiland/solves/curvature.py
++++ b/optiland/solves/curvature.py
+@@ -10,6 +10,14 @@ from __future__ import annotations
+ 
+ from abc import ABC, abstractmethod
+ 
++from optiland.resolution import (
++    MATERIAL,
++    RADIUS,
++    aimed_values,
++    incident_values,
++    pupil_values,
++    value_node,
++)
+ from optiland.solves.base import BaseSolve
+ 
+ 
+@@ -38,6 +46,30 @@ class CurvatureSolve(BaseSolve, ABC):
+         self.optic = optic
+         self.surface_idx = surface_idx
+ 
++    def reads(self):
++        """Returns the values that decide the curvature of this surface.
++
++        The bending this solve asks for follows from the height and slope the
++        ray arrives with and from the glass it refracts into, which is the one
++        filling the space this surface opens. The radius being driven does not
++        take part.
++
++        Returns:
++            set: The value identities read.
++        """
++        values = incident_values(self.optic, self.surface_idx)
++        values |= pupil_values(self.optic, self.surface_idx)
++        values.add(value_node(self.optic, MATERIAL, self.surface_idx))
++        return values - self.writes()
++
++    def writes(self):
++        """Returns the radius this solve drives.
++
++        Returns:
++            set: The value identity written.
++        """
++        return {value_node(self.optic, RADIUS, self.surface_idx)}
++
+     @abstractmethod
+     def apply(self):
+         """Applies the curvature solve to the optic."""
+@@ -253,3 +285,13 @@ class ChiefRayAngleCurvatureSolve(CurvatureSolve):
+             }
+         )
+         return solve_dict
++
++    def reads(self):
++        """Returns the values that decide the curvature of this surface.
++
++        Returns:
++            set: The value identities read.
++        """
++        values = aimed_values(self.optic, self.surface_idx)
++        values.add(value_node(self.optic, MATERIAL, self.surface_idx))
++        return values - self.writes()
+diff --git a/optiland/solves/quick_focus.py b/optiland/solves/quick_focus.py
+index 58110f0d..8a8fd1f0 100644
+--- a/optiland/solves/quick_focus.py
++++ b/optiland/solves/quick_focus.py
+@@ -8,7 +8,8 @@ Seçkin Berkay Öztürk, 2025
+ from __future__ import annotations
+ 
+ import optiland.backend as be
+-from optiland.solves.base import BaseSolve
++from optiland.resolution import GAP, position_node, traced_values, value_node
++from optiland.solves.base import BaseSolve, axial_scalar
+ 
+ 
+ class QuickFocusSolve(BaseSolve):
+@@ -27,6 +28,36 @@ class QuickFocusSolve(BaseSolve):
+         if self.num_surfaces <= 2:
+             raise ValueError("Can not optimize for an empty optical system")
+ 
++    def reads(self):
++        """Returns the values the traced rays pass through.
++
++        Returns:
++            set: The value identities read.
++        """
++        return traced_values(self.optic)
++
++    def writes(self):
++        """Returns the space in front of the image surface.
++
++        Returns:
++            set: The value identity written.
++        """
++        count = len(self.optic.surfaces)
++        if count < 2:
++            return set()
++        return {value_node(self.optic, GAP, count - 2)}
++
++    def moves(self):
++        """Returns the image coordinate this solve shifts.
++
++        Returns:
++            set: The value identity of the coordinate that changes.
++        """
++        count = len(self.optic.surfaces)
++        if count < 2:
++            return set()
++        return {position_node(self.optic, count - 1)}
++
+     def optimal_focus_distance(
+         self,
+         Hx=0,
+@@ -100,4 +131,18 @@ class QuickFocusSolve(BaseSolve):
+             wavelength=self.optic.wavelengths.primary_wavelength.value,
+         )
+ 
++        count = len(self.optic.surfaces)
+         self.optic.surfaces[-1].geometry.cs.z = z_focus
++
++        if count >= 2:
++            # Record the space in front of the image surface from where the two
++            # surfaces now sit. Adding the shift to the old record would carry
++            # over any difference the caller had already introduced by moving
++            # the image plane itself.
++            previous = self.optic.surfaces[count - 2]
++            previous.thickness = axial_scalar(z_focus - previous.geometry.cs.z)
++
++    @classmethod
++    def from_dict(cls, optic, data):
++        """Creates a solve instance from a dictionary representation."""
++        return cls(optic)
+diff --git a/optiland/solves/solve_manager.py b/optiland/solves/solve_manager.py
+index 8f80e874..b50a4b69 100644
+--- a/optiland/solves/solve_manager.py
++++ b/optiland/solves/solve_manager.py
+@@ -7,6 +7,7 @@ Kramer Harrison, 2025
+ 
+ from __future__ import annotations
+ 
++from optiland.resolution import order, register, restore
+ from optiland.solves.base import BaseSolve
+ from optiland.solves.factory import SolveFactory
+ 
+@@ -51,12 +52,20 @@ class SolveManager:
+             *args,
+             **kwargs,
+         )
++        register(solve)
+         solve.apply()
+         self.solves.append(solve)
+ 
+     def apply(self):
+-        """Applies all solves in the list."""
+-        for solve in self.solves:
++        """Applies all solves in the list.
++
++        The solves are applied in dependency order, so a solve that reads a
++        surface or space another solve drives runs after it.
++
++        Raises:
++            CircularDependencyError: If the solves cannot be ordered.
++        """
++        for solve in order(self.solves):
+             solve.apply()
+ 
+     def clear(self):
+@@ -98,5 +107,8 @@ class SolveManager:
+         solve_manager = cls(optic)
+         for solve_data in data["solves"]:
+             solve = BaseSolve.from_dict(optic, solve_data)
++            stamp = solve_data.get("registration_index")
++            if stamp is not None:
++                restore(solve, stamp)
+             solve_manager.solves.append(solve)
+         return solve_manager
+diff --git a/optiland/solves/thickness.py b/optiland/solves/thickness.py
+index 5e3a3bff..81c180b6 100644
+--- a/optiland/solves/thickness.py
++++ b/optiland/solves/thickness.py
+@@ -11,7 +11,15 @@ from __future__ import annotations
+ from abc import ABC, abstractmethod
+ 
+ from optiland.paraxial_path import require_global_z_geometry
+-from optiland.solves.base import BaseSolve
++from optiland.resolution import (
++    GAP,
++    aimed_values,
++    incident_values,
++    pupil_values,
++    position_node,
++    value_node,
++)
++from optiland.solves.base import BaseSolve, axial_scalar
+ 
+ 
+ class ThicknessSolve(BaseSolve, ABC):
+@@ -43,6 +51,49 @@ class ThicknessSolve(BaseSolve, ABC):
+         self.surface_idx = surface_idx
+         self.height = height
+ 
++    def reads(self):
++        """Returns the values that decide where this solve puts the surface.
++
++        The ray enters the space being resized at a height and a slope set by
++        everything before that space, and the offset that lands it on the
++        target height follows from those two alone. The size the space happens
++        to have on the way in does not take part.
++
++        Returns:
++            set: The value identities read.
++        """
++        values = incident_values(self.optic, self.surface_idx)
++        values |= pupil_values(self.optic, self.surface_idx)
++        return values - self.writes()
++
++    def writes(self):
++        """Returns the space this solve resizes.
++
++        Shifting the target surface and everything after it by one offset
++        leaves every later space the size it already was, so the space in
++        front of the target surface is the only one that changes.
++
++        Returns:
++            set: The value identity written.
++        """
++        if self.surface_idx < 1:
++            return set()
++        return {value_node(self.optic, GAP, self.surface_idx - 1)}
++
++    def moves(self) -> set:
++        """Returns the surface coordinates this solve shifts.
++
++        Returns:
++            set: The value identities of the coordinates that change.
++        """
++        if self.surface_idx < 1:
++            return set()
++        count = len(self.optic.surfaces)
++        if self.surface_idx == 1:
++            return {position_node(self.optic, 0)}
++        moved = range(self.surface_idx, count)
++        return {position_node(self.optic, i) for i in moved}
++
+     @abstractmethod
+     def _get_ray_y_u(self):
+         """Gets the ray height (y) and slope (u) arrays for the relevant ray.
+@@ -99,12 +150,33 @@ class ThicknessSolve(BaseSolve, ABC):
+                 f"of length {num_surfaces_in_group}."
+             )
+ 
++        if self.surface_idx == 1:
++            # The space after the object is kept as the object's own
++            # coordinate, with surface 1 sitting at zero. Resizing it moves the
++            # object; shifting the lens instead would leave the two disagreeing
++            # and the next thickness write would rebuild from the coordinate
++            # and undo the solve.
++            new_gap = axial_scalar(self.optic.surfaces.get_thickness(0) + offset)
++            self.optic.updater.set_thickness(new_gap, 0)
++            return
++
+         for i in range(self.surface_idx, num_surfaces_in_group):
+             surface = self.optic.surfaces[i]
+             current_z = surface.geometry.cs.z
+             new_z = current_z + offset
+             surface.geometry.cs.z = new_z
+ 
++        if self.surface_idx > 0:
++            # The space in front of the target surface is the one that changed
++            # size. Record the new size on the surface that owns it: positions
++            # are rebuilt from the recorded thicknesses whenever any thickness
++            # is written, so a recorded size left behind here is a solve that
++            # silently comes undone later.
++            previous = self.optic.surfaces[self.surface_idx - 1]
++            previous.thickness = axial_scalar(
++                self.optic.surfaces.get_thickness(self.surface_idx - 1)
++            )
++
+     def to_dict(self):
+         """Returns a dictionary representation of the solve."""
+         solve_dict = super().to_dict()
+@@ -141,3 +213,11 @@ class ChiefRayHeightThicknessSolve(ThicknessSolve):
+     def _get_ray_y_u(self):
+         """Gets the chief ray height (y) and slope (u) arrays."""
+         return self.optic.paraxial.chief_ray()
++
++    def reads(self):
++        """Returns the values that decide where this solve puts the surface.
++
++        Returns:
++            set: The value identities read.
++        """
++        return aimed_values(self.optic, self.surface_idx) - self.writes()

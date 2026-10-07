@@ -1,0 +1,945 @@
+diff --git a/wfdb/io/_header.py b/wfdb/io/_header.py
+index 72e0aee..6a2cff4 100644
+--- a/wfdb/io/_header.py
++++ b/wfdb/io/_header.py
+@@ -775,9 +775,16 @@ def wr_header_file(self, write_fields, write_dir):
+         # to the appropriate line
+         for field in SEGMENT_SPECS.index:
+             for seg_num in range(self.n_seg):
++                item = getattr(self, field)[seg_num]
++                if (
++                    field == "seg_name"
++                    and self.segments is not None
++                    and self.segments[seg_num] is None
++                ):
++                    item = "~"
+                 segment_lines[seg_num] += SEGMENT_SPECS.loc[
+                     field, "delimiter"
+-                ] + str(getattr(self, field)[seg_num])
++                ] + str(item)
+ 
+         header_lines = header_lines + segment_lines
+ 
+diff --git a/wfdb/io/convert/edf.py b/wfdb/io/convert/edf.py
+index f6f4941..ddd2f7a 100644
+--- a/wfdb/io/convert/edf.py
++++ b/wfdb/io/convert/edf.py
+@@ -1,4 +1,5 @@
+ import datetime
++import fractions
+ import functools
+ import math
+ import os
+@@ -9,7 +10,7 @@
+ import pandas as pd
+ 
+ from wfdb.io.annotation import Annotation, format_ann_from_df, wrann
+-from wfdb.io.record import Record, rdrecord, SIG_UNITS
++from wfdb.io.record import MultiRecord, Record, rdrecord, SIG_UNITS
+ from wfdb.io import _url
+ from wfdb.io import download
+ 
+@@ -53,26 +54,27 @@ def read_edf(
+     header_only : bool, optional
+         Whether to only return the header information (True) or not (False).
+         If true, this function will only return `['fs', 'sig_len', 'n_sig',
+-        'base_date', 'base_time', 'units', 'sig_name', 'comments']`.
++        'base_date', 'base_time', 'units', 'sig_name', 'comments']`. An EDF+
++        file whose only signals are annotation signals gives no signals, a
++        zero length and an `fs` of None.
+     verbose : bool, optional
+         Whether to print all the information read about the file (True) or
+         not (False).
+     rdedfann_flag : bool, optional
+         Whether the function is being called by `rdedfann` or the user. If it
+-        is being called by the user and the file has annotations, then warn
+-        them that the EDF file has annotations and that they should use
+-        `rdedfann` instead.
++        is being called by `rdedfann`, return the annotations, the frame
++        frequency and the onset of the first data record instead of the
++        record.
+     encoding : str, optional
+         The encoding to use for strings in the header. Although the edf
+         specification requires ascii strings, some files do not adhere to it.
+ 
+     Returns
+     -------
+-    record : dict, optional
+-        All of the record information needed to generate MIT formatted files.
+-        Only returns if 'record_only' is set to True, else generates the
+-        corresponding .dat and .hea files. This record file will not match the
+-        `rdrecord` output since it will only give us the digital signal for now.
++    record : Record, MultiRecord, dict
++        The record read from the file. EDF and EDF+C files give a Record and
++        EDF+D files give a variable layout MultiRecord whose gaps are null
++        segments. If `header_only` is True, a dict of header information.
+ 
+     Notes
+     -----
+@@ -198,17 +200,13 @@ def read_edf(
+     reserved_notes = (
+         struct.unpack("<44s", edf_file.read(44))[0].decode(encoding).strip()
+     )
+-    if reserved_notes[:5] == "EDF+C":
++    if reserved_notes[:5] in {"EDF+C", "EDF+D"}:
+         # The file is EDF compatible and will work without issue
+         # See: Bob Kemp, Jesus Olivan, European data format ‘plus’ (EDF+), an
+         #      EDF alike standard format for the exchange of physiological
+         #      data, Clinical Neurophysiology, Volume 114, Issue 9, 2003,
+         #      Pages 1755-1761, ISSN 1388-2457
+         pass
+-    elif reserved_notes[:5] == "EDF+D":
+-        raise Exception(
+-            "EDF+ File: interrupted data records (not currently supported)"
+-        )
+     else:
+         if verbose:
+             print("Free Space: {}".format(reserved_notes))
+@@ -217,21 +215,19 @@ def read_edf(
+     num_blocks = int(struct.unpack("<8s", edf_file.read(8))[0].decode(encoding))
+     if verbose:
+         print("Number of data records: {}".format(num_blocks))
+-    if num_blocks == -1:
+-        raise Exception(
+-            "Number of data records in unknown (not currently supported)"
+-        )
+ 
+     # Duration of a block, in seconds (8 bytes)
+-    block_duration = float(
++    block_duration = fractions.Fraction(
+         struct.unpack("<8s", edf_file.read(8))[0].decode(encoding)
+     )
+     if verbose:
+         print(
+-            "Duration of each data record in seconds: {}".format(block_duration)
++            "Duration of each data record in seconds: {}".format(
++                float(block_duration)
++            )
+         )
+-    if block_duration <= 0.0:
+-        block_duration = 1.0
++    if block_duration <= 0:
++        block_duration = fractions.Fraction(1)
+ 
+     # Number of signals (4 bytes)
+     n_sig = int(struct.unpack("<4s", edf_file.read(4))[0].decode(encoding))
+@@ -246,11 +242,6 @@ def read_edf(
+         temp_sig = (
+             struct.unpack("<16s", edf_file.read(16))[0].decode(encoding).strip()
+         )
+-        if temp_sig == "EDF Annotations" and not rdedfann_flag:
+-            print(
+-                "*** This may be an EDF+ Annotation file instead, please see "
+-                "the `rdedfann` function. ***"
+-            )
+         sig_name.append(temp_sig)
+     if verbose:
+         print("Signal Labels: {}".format(sig_name))
+@@ -335,42 +326,67 @@ def read_edf(
+     for _ in range(n_sig):
+         struct.unpack("<32s", edf_file.read(32))[0].decode(encoding)
+ 
+-    # Pre-process the acquired data before creating the record
++    if num_blocks == -1:
++        num_blocks, extra_bytes = divmod(
++            os.path.getsize(record_name) - header_bytes,
++            2 * sum(samps_per_block),
++        )
++        if extra_bytes:
++            raise Exception(
++                "The EDF file does not hold a whole number of data records"
++            )
++
++    edf_plus = reserved_notes[:5] in {"EDF+C", "EDF+D"}
++    discontinuous = reserved_notes[:5] == "EDF+D"
++    ann_channels = [
++        i
++        for i, name in enumerate(sig_name)
++        if edf_plus and name == "EDF Annotations"
++    ]
++    channels = [i for i in range(n_sig) if i not in ann_channels]
++
+     record_name_out = (
+         record_name.split(os.sep)[-1].replace("-", "_").replace(".edf", "")
+     )
+-    sample_rate = [int(i / block_duration) for i in samps_per_block]
+-    fs = functools.reduce(math.gcd, sample_rate)
+-    samps_per_frame = [int(s / min(samps_per_block)) for s in samps_per_block]
+-    sig_len = int(fs * num_blocks * block_duration)
+-    base_time = datetime.time(start_hour, start_minute, start_second)
+-    base_date = datetime.date(start_year, start_month, start_day)
+-    file_name = n_sig * [record_name_out + ".dat"]
+-    fmt = n_sig * ["16"]
+-    skew = n_sig * [None]
+-    byte_offset = n_sig * [None]
+-    adc_gain_all = (digital_max - digital_min) / (physical_max - physical_min)
+-    adc_gain = [float(format(a, ".12g")) for a in adc_gain_all]
+-    baseline = (digital_max - (physical_max * adc_gain_all) + 1).astype("int64")
+ 
+-    units = n_sig * [""]
+-    for i, f in enumerate(physical_dims):
+-        if f == "n/a":
+-            label = sig_name[i].lower().split()[0]
+-            if label in list(SIG_UNITS.keys()):
+-                units[i] = SIG_UNITS[label]
+-            else:
+-                units[i] = "n/a"
++    if ann_channels:
++        annotations, block_onsets = _read_edf_annotations(
++            edf_file, header_bytes, samps_per_block, ann_channels, num_blocks
++        )
++    else:
++        annotations = []
++        block_onsets = [k * block_duration for k in range(num_blocks)]
++    edf_file.close()
++
++    if channels:
++        frames_per_block = functools.reduce(
++            math.gcd, [samps_per_block[i] for i in channels]
++        )
++        frame_rate = frames_per_block / block_duration
++        fs = _frame_frequency(frame_rate)
++    else:
++        frame_rate = None
++        fs = None
++
++    if rdedfann_flag:
++        return annotations, frame_rate, block_onsets[0]
++    if not channels:
++        if not header_only:
++            raise Exception("The EDF file does not contain any signals")
++        sig_len = 0
++    else:
++        start_frames = [
++            _nearest_frame(onset - block_onsets[0], frame_rate)
++            for onset in block_onsets
++        ]
++        if discontinuous:
++            runs = _contiguous_runs(
++                block_onsets, block_duration, start_frames, frames_per_block
++            )
+         else:
+-            f = f.replace("µ", "u")  # Maybe more weird symbols to check for?
+-            if f == "":
+-                units[i] = "mV"
+-            else:
+-                units[i] = f
++            runs = [[0, num_blocks]]
++        sig_len = start_frames[runs[-1][0]] + runs[-1][1] * frames_per_block
+ 
+-    adc_res = [int(math.log2(f)) for f in (digital_max - digital_min)]
+-    adc_zero = [int(f) for f in ((digital_max + 1 + digital_min) / 2)]
+-    block_size = n_sig * [0]
+     base_datetime = datetime.datetime(
+         start_year,
+         start_month,
+@@ -378,104 +394,321 @@ def read_edf(
+         start_hour,
+         start_minute,
+         start_second,
+-    )
+-    base_time = datetime.time(
+-        base_datetime.hour, base_datetime.minute, base_datetime.second
+-    )
+-    base_date = datetime.date(
+-        base_datetime.year, base_datetime.month, base_datetime.day
+-    )
++    ) + datetime.timedelta(seconds=float(block_onsets[0]))
++
++    units = []
++    for i in channels:
++        if physical_dims[i] == "n/a":
++            label = sig_name[i].lower().split()[0]
++            units.append(SIG_UNITS.get(label, "n/a"))
++        else:
++            units.append(physical_dims[i].replace("µ", "u") or "mV")
+ 
+     if header_only:
+         return {
+             "fs": fs,
+             "sig_len": sig_len,
+-            "n_sig": n_sig,
+-            "base_date": base_date,
+-            "base_time": base_time,
++            "n_sig": len(channels),
++            "base_date": base_datetime.date(),
++            "base_time": base_datetime.time(),
+             "units": units,
+-            "sig_name": sig_name,
++            "sig_name": [sig_name[i] for i in channels],
+             "comments": [],
+         }
+ 
+-    sig_data = np.empty((sig_len, n_sig))
+-    temp_sig_data = np.fromfile(edf_file, dtype=np.int16)
+-    temp_sig_data = temp_sig_data.reshape((-1, sum(samps_per_block)))
+-    temp_all_sigs = np.hsplit(temp_sig_data, np.cumsum(samps_per_block)[:-1])
+-
+-    for i in range(n_sig):
+-        # Check if `samps_per_frame` has all equal values
+-        if samps_per_frame.count(samps_per_frame[0]) == len(samps_per_frame):
+-            sig_data[:, i] = (
+-                temp_all_sigs[i].flatten().astype(np.int64) - baseline[i]
+-            ) / adc_gain_all[i]
+-        else:
+-            temp_sig_data = temp_all_sigs[i].flatten()
++    data_blocks = np.fromfile(record_name, dtype="<i2", offset=header_bytes)
++    data_blocks = data_blocks.reshape((-1, sum(samps_per_block)))
++    block_sigs = np.hsplit(data_blocks, np.cumsum(samps_per_block)[:-1])
+ 
+-            if samps_per_frame[i] == 1:
+-                sig_data[:, i] = (
+-                    temp_sig_data.astype(np.int64) - baseline[i]
+-                ) / adc_gain_all[i]
+-            else:
+-                for j in range(sig_len):
+-                    start_ind = j * samps_per_frame[i]
+-                    stop_ind = start_ind + samps_per_frame[i]
+-                    sig_data[j, i] = np.mean(
+-                        temp_sig_data[start_ind:stop_ind].astype(np.int64)
+-                        - baseline[i] / adc_gain_all[i]
+-                    )
+-
+-    # This is the closest I can get to the original implementation
+-    # NOTE: This is done using `np.testing.assert_array_equal()`
+-    # Mismatched elements: 15085545 / 15400000 (98%)
+-    # Max absolute difference: 3.75166564e-12
+-    # Max relative difference: 5.41846079e-15
+-    #  x: array([[  -3.580728,   42.835293, -102.818048,   54.978632,  -52.354247],
+-    #        [  -8.340205,   43.079939, -102.106351,   56.402027,  -44.992626],
+-    #        [  -5.004123,   43.546991,  -99.481966,   51.64255 ,  -43.079939],...
+-    #  y: array([[  -3.580728,   42.835293, -102.818048,   54.978632,  -52.354247],
+-    #        [  -8.340205,   43.079939, -102.106351,   56.402027,  -44.992626],
+-    #        [  -5.004123,   43.546991,  -99.481966,   51.64255 ,  -43.079939],...
+-
+-    init_value = [int(s[0, 0]) for s in temp_all_sigs]
+-    checksum = [
+-        int(np.sum(v) % 65536) for v in np.transpose(sig_data)
+-    ]  # not all values correct?
+-
+-    edf_file.close()
++    fmt = "24" if min(digital_min[i] for i in channels) <= -32768 else "16"
++    adc_gain_all = (digital_max - digital_min) / (physical_max - physical_min)
++    baseline = (digital_max - (physical_max * adc_gain_all) + 1).astype("int64")
++    signal_fields = {
++        "n_sig": len(channels),
++        "fs": fs,
++        "sig_name": [sig_name[i] for i in channels],
++        "units": units,
++        "fmt": len(channels) * [fmt],
++        "samps_per_frame": [
++            samps_per_block[i] // frames_per_block for i in channels
++        ],
++        "skew": len(channels) * [None],
++        "byte_offset": len(channels) * [None],
++        "adc_gain": [float(format(adc_gain_all[i], ".12g")) for i in channels],
++        "baseline": [int(baseline[i]) for i in channels],
++        "adc_res": [
++            int(math.log2(digital_max[i] - digital_min[i])) for i in channels
++        ],
++        "adc_zero": [
++            int((digital_max[i] + 1 + digital_min[i]) / 2) for i in channels
++        ],
++        "block_size": len(channels) * [0],
++        "comments": [],
++    }
++    conversion = [(baseline[i], adc_gain_all[i]) for i in channels]
++
++    if not discontinuous:
++        record = _edf_signal_record(
++            record_name_out,
++            [block_sigs[i] for i in channels],
++            conversion,
++            signal_fields,
++        )
++        record.base_datetime = base_datetime
++        return record
++
++    segments = [
++        Record(
++            record_name=record_name_out + "_layout",
++            sig_len=0,
++            file_name=len(channels) * ["~"],
++            init_value=len(channels) * [0],
++            checksum=len(channels) * [0],
++            **{**signal_fields, "fmt": len(channels) * ["0"]},
++        )
++    ]
++    seg_name = [record_name_out + "_layout"]
++    seg_len = [0]
++    for first, count in runs:
++        gap = start_frames[first] - sum(seg_len)
++        if gap > 0:
++            segments.append(None)
++            seg_name.append("~")
++            seg_len.append(gap)
++        seg_name.append(
++            f"{record_name_out}_{len(seg_name) - seg_name.count('~'):04d}"
++        )
++        seg_len.append(count * frames_per_block)
++        segments.append(
++            _edf_signal_record(
++                seg_name[-1],
++                [block_sigs[i][first : first + count] for i in channels],
++                conversion,
++                signal_fields,
++            )
++        )
+ 
+-    record = Record(
++    return MultiRecord(
++        segments=segments,
++        layout="variable",
+         record_name=record_name_out,
+-        n_sig=n_sig,
++        n_sig=len(channels),
+         fs=fs,
+-        samps_per_frame=samps_per_frame,
+-        counter_freq=None,
+-        base_counter=None,
+         sig_len=sig_len,
+-        base_time=base_time,
+-        base_date=base_date,
++        base_datetime=base_datetime,
++        seg_name=seg_name,
++        seg_len=seg_len,
+         comments=[],
+-        sig_name=sig_name,  # Remove whitespace to make compatible later?
+-        p_signal=sig_data,
+-        d_signal=None,
+-        e_p_signal=None,
+-        e_d_signal=None,
+-        file_name=n_sig * [record_name_out + ".dat"],
+-        fmt=n_sig * ["16"],
+-        skew=n_sig * [None],
+-        byte_offset=n_sig * [None],
+-        adc_gain=adc_gain,
+-        baseline=baseline,
+-        units=units,
+-        adc_res=[int(math.log2(f)) for f in (digital_max - digital_min)],
+-        adc_zero=[int(f) for f in ((digital_max + 1 + digital_min) / 2)],
+-        init_value=init_value,
+-        checksum=checksum,
+-        block_size=n_sig * [0],
++        sig_name=signal_fields["sig_name"],
+     )
+ 
+-    record.base_datetime = base_datetime
+ 
++def _parse_tals(raw):
++    """
++    Split the bytes of one 'EDF Annotations' signal of one data record into
++    its time-stamped annotation lists.
++
++    Parameters
++    ----------
++    raw : bytes
++        The raw bytes of the annotation signal in the data record.
++
++    Returns
++    -------
++    tals : list
++        A list of `(onset, duration, texts)` tuples, where `duration` is None
++        when the list does not give one.
++
++    """
++    tals = []
++    for tal in raw.split(b"\x00"):
++        if not tal:
++            continue
++        fields = tal.split(b"\x14")
++        onset, _, duration = fields[0].decode("utf-8").partition("\x15")
++        texts = [text.decode("utf-8") for text in fields[1:] if text]
++        tals.append(
++            (
++                fractions.Fraction(onset),
++                fractions.Fraction(duration) if duration else None,
++                texts,
++            )
++        )
++    return tals
++
++
++def _read_edf_annotations(
++    edf_file, header_bytes, samps_per_block, ann_channels, num_blocks
++):
++    """
++    Read the annotations and the data record onsets of an EDF+ file,
++    without loading the samples of the other signals.
++
++    Parameters
++    ----------
++    edf_file : file
++        The open EDF file.
++    header_bytes : int
++        The number of bytes in the header record.
++    samps_per_block : list
++        The number of samples of each signal in a data record.
++    ann_channels : list
++        The indices of the 'EDF Annotations' signals.
++    num_blocks : int
++        The number of data records.
++
++    Returns
++    -------
++    annotations : list
++        The `(onset, duration, text)` of each annotation in file order.
++    block_onsets : list
++        The onset of each data record, in seconds.
++
++    """
++    block_bytes = 2 * sum(samps_per_block)
++    annotations = []
++    block_onsets = []
++    for block in range(num_blocks):
++        for ch in ann_channels:
++            edf_file.seek(
++                header_bytes
++                + block * block_bytes
++                + 2 * sum(samps_per_block[:ch])
++            )
++            tals = _parse_tals(edf_file.read(2 * samps_per_block[ch]))
++            if ch == ann_channels[0]:
++                if not tals:
++                    raise Exception(
++                        f"EDF+ data record {block} has no time-keeping "
++                        "annotation"
++                    )
++                block_onsets.append(tals[0][0])
++                tals = tals[1:]
++            for onset, duration, texts in tals:
++                annotations.extend((onset, duration, text) for text in texts)
++    return annotations, block_onsets
++
++
++def _nearest_frame(seconds, frame_rate):
++    """
++    Convert a time in seconds to the nearest frame number, rounding halves up.
++
++    Parameters
++    ----------
++    seconds : Fraction
++        The exact time, in seconds.
++    frame_rate : Fraction
++        The exact frame frequency.
++
++    Returns
++    -------
++    frame : int
++        The frame number.
++
++    """
++    return math.floor(seconds * frame_rate + fractions.Fraction(1, 2))
++
++
++def _frame_frequency(frame_rate):
++    """
++    Express an exact frame frequency as a record sampling frequency.
++
++    Parameters
++    ----------
++    frame_rate : Fraction
++        The exact frame frequency.
++
++    Returns
++    -------
++    fs : int, float
++        The frequency, as an int when it is a whole number.
++
++    """
++    if frame_rate.denominator == 1:
++        return int(frame_rate)
++    return float(frame_rate)
++
++
++def _contiguous_runs(
++    block_onsets, block_duration, start_frames, frames_per_block
++):
++    """
++    Group consecutive data records that follow each other without a gap.
++
++    Parameters
++    ----------
++    block_onsets : list
++        The exact onset of each data record, in seconds.
++    block_duration : Fraction
++        The duration of each data record, in seconds.
++    start_frames : list
++        The frame at which each data record starts.
++    frames_per_block : int
++        The number of frames in each data record.
++
++    Returns
++    -------
++    runs : list
++        A list of `[first, count]` pairs, one for each run of data records.
++
++    """
++    runs = []
++    for block, start in enumerate(start_frames):
++        if block:
++            if block_onsets[block] < block_onsets[block - 1] + block_duration:
++                raise Exception(
++                    f"EDF+D data record {block} overlaps the previous one"
++                )
++            if start == start_frames[block - 1] + frames_per_block:
++                runs[-1][1] += 1
++                continue
++        runs.append([block, 1])
++    return runs
++
++
++def _edf_signal_record(record_name, block_sigs, conversion, signal_fields):
++    """
++    Build a single segment record from consecutive EDF data records.
++
++    Parameters
++    ----------
++    record_name : str
++        The name of the record.
++    block_sigs : list
++        The raw samples of each signal, one row per data record.
++    conversion : list
++        The `(baseline, adc_gain)` used to convert each signal.
++    signal_fields : dict
++        The record fields shared by every segment.
++
++    Returns
++    -------
++    record : Record
++        The record holding the samples.
++
++    """
++    e_d_signal = [sig.flatten().astype(np.int64) for sig in block_sigs]
++    e_p_signal = [
++        (sig - base) / gain for sig, (base, gain) in zip(e_d_signal, conversion)
++    ]
++    record = Record(
++        record_name=record_name,
++        sig_len=len(e_d_signal[0]) // signal_fields["samps_per_frame"][0],
++        file_name=signal_fields["n_sig"] * [record_name + ".dat"],
++        init_value=[int(sig[0]) for sig in e_d_signal],
++        e_d_signal=e_d_signal,
++        e_p_signal=e_p_signal,
++        **signal_fields,
++    )
++    if all(spf == 1 for spf in signal_fields["samps_per_frame"]):
++        record.d_signal = np.transpose(e_d_signal)
++        record.p_signal = np.transpose(e_p_signal)
++        record.e_d_signal = None
++        record.e_p_signal = None
++        record.checksum = record.calc_checksum()
++    else:
++        record.p_signal = record.smooth_frames("physical")
++        record.checksum = record.calc_checksum(expanded=True)
+     return record
+ 
+ 
+@@ -1015,16 +1248,21 @@ def rdedfann(
+     encoding="iso8859-1",
+ ):
+     """
+-    This program returns the annotation information from an EDF+ file
+-    containing annotations (with the signal name given as 'EDF Annotations').
+-    The information that is returned if `info_only` is set to True is:
++    This program returns the annotation information from an EDF+ file,
++    including an interrupted (EDF+D) one, read from every signal named
++    'EDF Annotations'. The time-keeping annotation list that starts each data
++    record is not an annotation. The information that is returned if
++    `info_only` is set to True is, in file order:
+         {
+             'onset_time': list of %H:%M:%S.fff strings denoting the annotation
+-                          onset times,
++                          onset times, rounded to the nearest millisecond,
+             'sample_num': list of integers denoting the annotation onset
+-                          sample numbers,
++                          frame numbers, counted from the onset of the first
++                          data record, or None for every annotation when the
++                          file has no signals other than annotation signals,
+             'comment': list of comments (`aux_note`) for the annotations,
+-            'duration': list of floats denoting the duration of the event
++            'duration': list of floats denoting the duration of the event,
++                        or None when the annotation gives no duration
+         }
+     Else, this function will return either the WFDB Annotation format of the
+     information of the file if `record_only` is set to True, or nothing if
+@@ -1065,7 +1303,12 @@ def rdedfann(
+         information needed to generate WFDB-formatted annotation files.
+         If 'record_only' is set to True, return the WFDB-formatted annotation
+         object generated by the `rdann` output. If none are set to True, write
+-        the WFDB-formatted annotation file.
++        the WFDB-formatted annotation file, whose notes hold the UTF-8 bytes
++        of the annotation texts. Both of these raise an exception when the
++        file has no signals other than annotation signals, and writing also
++        raises when there are no annotations to write or an annotation falls
++        before the first data record, since annotation files cannot hold
++        negative sample numbers.
+ 
+     Notes
+     -----
+@@ -1108,64 +1351,44 @@ def rdedfann(
+             "can be set at a time."
+         )
+ 
+-    # According to the EDF+ docs:
+-    #   "The coding is EDF compatible in the sense that old EDF software would
+-    #    simply treat this 'EDF Annotations' signal as if it were a (strange-
+-    #    looking) ordinary signal"
+-    rec = read_edf(
+-        record_name,
+-        pn_dir=pn_dir,
+-        delete_file=delete_file,
+-        record_only=True,
+-        rdedfann_flag=True,
+-    )
+-
+-    # Convert from array of integers to ASCII strings
+-    annotation_string = ""
+-    for chunk in rec.p_signal.flatten().astype(np.int64):
+-        if chunk + 1 == 0:
+-            continue
+-        else:
+-            adjusted_hex = hex(
+-                struct.unpack("<H", struct.pack(">H", chunk + 1))[0]
+-            )
+-            annotation_string += bytes.fromhex(adjusted_hex[2:]).decode(
+-                encoding
+-            )
+-            # Remove all of the whitespace
+-            for rep in ["\x00", "\x14", "\x15"]:
+-                annotation_string = annotation_string.replace(rep, " ")
++    downloads = pn_dir is not None and not os.path.exists(record_name)
++    try:
++        annotations, frame_rate, origin = read_edf(
++            record_name,
++            pn_dir=pn_dir,
++            rdedfann_flag=True,
++            encoding=encoding,
++        )
++    finally:
++        if downloads and delete_file and os.path.exists(record_name):
++            os.remove(record_name)
++    onsets = [onset for onset, _, _ in annotations]
++    durations = [
++        None if duration is None else float(duration)
++        for _, duration, _ in annotations
++    ]
++    comments = [comment for _, _, comment in annotations]
++    sample_nums = [
++        (
++            None
++            if frame_rate is None
++            else _nearest_frame(onset - origin, frame_rate)
++        )
++        for onset in onsets
++    ]
+ 
+-    # Parse the resulting annotation string
+-    onsets = []
+     onset_times = []
+-    sample_nums = []
+-    comments = []
+-    durations = []
+-    all_anns = annotation_string.split("+")
+-    for ann in all_anns:
+-        if ann == "":
+-            continue
+-        try:
+-            ann_split = ann.strip().split(" ")
+-            onset = float(ann_split[0])
+-            hours, rem = divmod(onset, 3600)
+-            minutes, seconds = divmod(rem, 60)
+-            onset_time = f"{hours:02.0f}:{minutes:02.0f}:{seconds:06.3f}"
+-            sample_num = int(onset * rec.sig_len)
+-            duration = float(ann_split[1])
+-            comment = " ".join(ann_split[2:])
+-            if verbose:
+-                print(
+-                    f"{onset_time}\t{sample_num}\t{comment}\t\tduration: {duration}"
+-                )
+-            onsets.append(onset)
+-            onset_times.append(onset_time)
+-            sample_nums.append(sample_num)
+-            comments.append(comment)
+-            durations.append(duration)
+-        except IndexError:
+-            continue
++    for onset, sample_num, comment, duration in zip(
++        onsets, sample_nums, comments, durations
++    ):
++        minutes, milliseconds = divmod(round(onset * 1000), 60000)
++        hours, minutes = divmod(minutes, 60)
++        onset_time = f"{hours:02d}:{minutes:02d}:{milliseconds / 1000:06.3f}"
++        if verbose:
++            print(
++                f"{onset_time}\t{sample_num}\t{comment}\t\tduration: {duration}"
++            )
++        onset_times.append(onset_time)
+ 
+     if info_only:
+         return {
+@@ -1174,49 +1397,74 @@ def rdedfann(
+             "comment": comments,
+             "duration": durations,
+         }
+-    else:
+-        df_in = pd.DataFrame(
+-            data={
+-                "onset": onsets,
+-                "duration": durations,
+-                "description": comments,
+-            }
++
++    if frame_rate is None:
++        raise Exception(
++            "The EDF file does not contain any signals to place its "
++            "annotations on"
+         )
+-        df_out = format_ann_from_df(df_in)
+-        # Remove extension from input file name
+-        record_name = record_name.split(os.sep)[-1].split(".")[0]
+-        extension = "atr"
+-        fs = rec.fs
+-        sample = (df_out["onset"].to_numpy() * fs).astype(np.int64)
+-        # Assume each annotation is a comment
+-        symbol = ['"'] * len(df_out.index)
+-        subtype = np.array([22] * len(df_out.index))
+-        # Assume each annotation belongs with the 1st channel
+-        chan = np.array([0] * len(df_out.index))
+-        num = np.array([0] * len(df_out.index))
+-        aux_note = df_out["description"].tolist()
+-
+-        if record_only:
+-            return Annotation(
+-                record_name=record_name,
+-                extension=extension,
+-                sample=sample,
+-                symbol=symbol,
+-                subtype=subtype,
+-                chan=chan,
+-                num=num,
+-                aux_note=aux_note,
+-                fs=fs,
++    fs = _frame_frequency(frame_rate)
++    df_in = pd.DataFrame(
++        data={
++            "onset": onsets,
++            "duration": [
++                duration if duration and duration > 0 else 0
++                for _, duration, _ in annotations
++            ],
++            "description": comments,
++        }
++    )
++    df_out = format_ann_from_df(df_in)
++    # Remove extension from input file name
++    record_name = record_name.split(os.sep)[-1].split(".")[0]
++    extension = "atr"
++    sample = np.array(
++        [
++            _nearest_frame(onset - origin, frame_rate)
++            for onset in df_out["onset"]
++        ],
++        dtype=np.int64,
++    )
++    # Assume each annotation is a comment
++    symbol = ['"'] * len(df_out.index)
++    subtype = np.array([22] * len(df_out.index))
++    # Assume each annotation belongs with the 1st channel
++    chan = np.array([0] * len(df_out.index))
++    num = np.array([0] * len(df_out.index))
++    aux_note = df_out["description"].tolist()
++
++    if record_only:
++        return Annotation(
++            record_name=record_name,
++            extension=extension,
++            sample=sample,
++            symbol=symbol,
++            subtype=subtype,
++            chan=chan,
++            num=num,
++            aux_note=aux_note,
++            fs=fs,
++        )
++    else:
++        if not len(sample):
++            raise Exception(
++                "The EDF file has no annotations to write to an annotation file"
+             )
+-        else:
+-            wrann(
+-                record_name,
+-                extension,
+-                sample=sample,
+-                symbol=symbol,
+-                subtype=subtype,
+-                chan=chan,
+-                num=num,
+-                aux_note=aux_note,
+-                fs=fs,
++        if sample.min() < 0:
++            raise Exception(
++                "An annotation starts before the first data record and cannot "
++                "be written to an annotation file"
+             )
++        wrann(
++            record_name,
++            extension,
++            sample=sample,
++            symbol=symbol,
++            subtype=subtype,
++            chan=chan,
++            num=num,
++            aux_note=[
++                text.encode("utf-8").decode("latin-1") for text in aux_note
++            ],
++            fs=fs,
++        )
+diff --git a/wfdb/io/record.py b/wfdb/io/record.py
+index 1743b30..e0a4462 100644
+--- a/wfdb/io/record.py
++++ b/wfdb/io/record.py
+@@ -1,3 +1,4 @@
++import copy
+ import datetime
+ import multiprocessing.dummy
+ import posixpath
+@@ -461,6 +462,8 @@ def check_field(self, field, required_channels="all"):
+                         continue
+ 
+                 if field == "file_name":
++                    if item[ch] == "~" and self.sig_len == 0:
++                        continue
+                     # Check for file_name characters
+                     accepted_string = re.match(r"[-\w]+\.?[\w]+", item[ch])
+                     if (
+@@ -476,6 +479,8 @@ def check_field(self, field, required_channels="all"):
+                             "Signals in a record that share a given file must be consecutive."
+                         )
+                 elif field == "fmt":
++                    if item[ch] == "0" and self.sig_len == 0:
++                        continue
+                     if item[ch] not in _signal.DAT_FMTS:
+                         raise ValueError(
+                             "File formats must be valid WFDB dat formats:",
+@@ -1181,7 +1186,18 @@ def wrsamp(self, expanded=False, write_dir=""):
+         self.wrheader(write_dir=write_dir)
+         # Perform record validity and cohesion checks, and write the
+         # associated segments.
+-        for seg in self.segments:
++        for seg_num, seg in enumerate(self.segments):
++            if seg is None:
++                continue
++            if seg_num == 0 and self.seg_len[0] == 0:
++                seg.wrheader(write_dir=write_dir, expanded=expanded)
++                continue
++            if expanded and seg.e_d_signal is None:
++                seg = copy.copy(seg)
++                seg.e_d_signal = seg.adc(expanded=True)
++            elif not expanded and seg.d_signal is None:
++                seg = copy.copy(seg)
++                seg.d_signal = seg.adc()
+             seg.wrsamp(expanded=expanded, write_dir=write_dir)
+ 
+     def _check_segment_cohesion(self):

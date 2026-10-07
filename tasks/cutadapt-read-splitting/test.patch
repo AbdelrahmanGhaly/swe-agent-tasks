@@ -1,0 +1,1294 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..189c1ca
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,50 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++cd /app
++
++NEW_TESTS="tests/test_split_051aa9.py"
++
++JUNIT_ARG=""
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  JUNIT_ARG="--junitxml=$OUTPUT_PATH"
++fi
++
++BASETEMP="$(mktemp -d)"
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "$NEW_TESTS" -p no:cacheprovider --basetemp="$BASETEMP" $JUNIT_ARG
++else
++  python -m pytest tests --ignore="$NEW_TESTS" -p no:cacheprovider --basetemp="$BASETEMP" $JUNIT_ARG
++fi
++EXIT_CODE=$?
++
++rm -rf "$BASETEMP"
++
++if [ -n "$OUTPUT_PATH" ] && ! grep -q "<testcase" "$OUTPUT_PATH" 2>/dev/null; then
++  cat > "$OUTPUT_PATH" <<'XMLEOF'
++<?xml version="1.0" encoding="utf-8"?>
++<testsuites><testsuite name="pytest" errors="1" failures="0" tests="1" time="0">
++<testcase classname="cutadapt.tests" name="collection" time="0">
++<error message="pytest collected no tests">The test run produced no results; see the standard error output for the build or collection diagnostic.</error>
++</testcase></testsuite></testsuites>
++XMLEOF
++  if [ "$EXIT_CODE" -eq 0 ]; then
++    EXIT_CODE=1
++  fi
++fi
++
++exit $EXIT_CODE
+diff --git a/tests/test_split_051aa9.py b/tests/test_split_051aa9.py
+new file mode 100644
+index 0000000..aa26f07
+--- /dev/null
++++ b/tests/test_split_051aa9.py
+@@ -0,0 +1,1232 @@
++import gzip
++import json
++import os
++
++import dnaio
++import pytest
++
++from cutadapt.cli import main
++
++ADAPTER = "TGCAGGTACT"
++ADAPTER_1MM = "TGCATGTACT"
++ADAPTER_2MM = "TGCTGGAACT"
++ADAPTER2 = "CATTCGAATC"
++ADAPTER_DEL = "TGCAGTACT"
++ADAPTER_WILDCARD = "TGCAGGTACN"
++SHORT = "TTAGCCGA"
++LONG = "CATTCGAATCGA"
++HEAD = "AAAAAAAA"
++MID = "CCCCCCCC"
++TAIL = "GGGGGGGG"
++
++
++def write_fastq(tmp_path, reads, name="in.fastq"):
++    path = tmp_path / name
++    lines = []
++    for read in reads:
++        if len(read) == 3:
++            header, sequence, qualities = read
++        else:
++            header, sequence = read
++            qualities = "I" * len(sequence)
++        lines.append(f"@{header}\n{sequence}\n+\n{qualities}\n")
++    path.write_text("".join(lines))
++    return path
++
++
++def write_fasta(tmp_path, reads, name="in.fasta"):
++    path = tmp_path / name
++    path.write_text("".join(f">{header}\n{sequence}\n" for header, sequence in reads))
++    return path
++
++
++def records(path):
++    with dnaio.open(os.fspath(path)) as reader:
++        return [(record.name, record.sequence, record.qualities) for record in reader]
++
++
++def sequences(path):
++    return [sequence for _, sequence, _ in records(path)]
++
++
++def names(path):
++    return [name for name, _, _ in records(path)]
++
++
++def run_split(tmp_path, reads, extra=(), adapter=ADAPTER, out="out.fastq"):
++    inpath = write_fastq(tmp_path, reads)
++    outpath = tmp_path / out
++    args = ["--action=split", "-a", adapter, "-o", os.fspath(outpath)]
++    args += [str(argument) for argument in extra]
++    args += [os.fspath(inpath)]
++    stats = main(args)
++    return stats, outpath
++
++
++def read_counts(stats):
++    return stats.as_json()["read_counts"]
++
++
++def run_split_adapters(tmp_path, reads, adapters, extra=(), out="out.fastq"):
++    inpath = write_fastq(tmp_path, reads)
++    outpath = tmp_path / out
++    args = ["--action=split"]
++    for adapter in adapters:
++        args += ["-a", adapter]
++    args += ["-o", os.fspath(outpath)]
++    args += [str(argument) for argument in extra]
++    args += [os.fspath(inpath)]
++    stats = main(args)
++    return stats, outpath
++
++
++def run_split_paired(tmp_path, reads1, reads2, extra=()):
++    in1 = write_fastq(tmp_path, reads1, name="in1.fastq")
++    in2 = write_fastq(tmp_path, reads2, name="in2.fastq")
++    out1 = tmp_path / "out1.fastq"
++    out2 = tmp_path / "out2.fastq"
++    args = [
++        "--action=split",
++        "-a",
++        ADAPTER,
++        "-A",
++        ADAPTER2,
++        "-o",
++        os.fspath(out1),
++        "-p",
++        os.fspath(out2),
++    ]
++    args += [str(argument) for argument in extra]
++    args += [os.fspath(in1), os.fspath(in2)]
++    stats = main(args)
++    return stats, out1, out2
++
++
++def assert_split_action_works(tmp_path):
++    _, outpath = run_split(
++        tmp_path, [("control", HEAD + ADAPTER + TAIL)], out="control.fastq"
++    )
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_one_internal_occurrence_gives_two_pieces(tmp_path):
++    _, outpath = run_split(tmp_path, [("r", HEAD + ADAPTER + TAIL)])
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_two_internal_occurrences_give_three_pieces(tmp_path):
++    _, outpath = run_split(tmp_path, [("r", HEAD + ADAPTER + MID + ADAPTER + TAIL)])
++    assert sequences(outpath) == [HEAD, MID, TAIL]
++
++
++def test_pieces_are_written_in_read_order(tmp_path):
++    read = "AAA" + ADAPTER + "CC" + ADAPTER + "GGGG"
++    _, outpath = run_split(tmp_path, [("r", read)])
++    assert sequences(outpath) == ["AAA", "CC", "GGGG"]
++
++
++def test_read_without_occurrence_is_written_unchanged(tmp_path):
++    _, outpath = run_split(tmp_path, [("r", HEAD + MID)])
++    assert records(outpath) == [("r", HEAD + MID, "I" * 16)]
++
++
++def test_qualities_are_cut_with_the_sequence(tmp_path):
++    read = HEAD + ADAPTER + TAIL
++    qualities = "A" * len(HEAD) + "#" * len(ADAPTER) + "J" * len(TAIL)
++    _, outpath = run_split(tmp_path, [("r", read, qualities)])
++    assert [quality for _, _, quality in records(outpath)] == ["A" * 8, "J" * 8]
++
++
++def test_several_reads_are_split_independently(tmp_path):
++    reads = [
++        ("r1", HEAD + ADAPTER + TAIL),
++        ("r2", MID),
++        ("r3", HEAD + ADAPTER + MID + ADAPTER + TAIL),
++    ]
++    _, outpath = run_split(tmp_path, reads)
++    assert sequences(outpath) == [HEAD, TAIL, MID, HEAD, MID, TAIL]
++
++
++def test_fasta_input_is_split(tmp_path):
++    inpath = write_fasta(tmp_path, [("r", HEAD + ADAPTER + TAIL)])
++    outpath = tmp_path / "out.fasta"
++    main(
++        [
++            "--action=split",
++            "-a",
++            ADAPTER,
++            "-o",
++            os.fspath(outpath),
++            os.fspath(inpath),
++        ]
++    )
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_weaker_occurrence_before_the_best_one_is_also_removed(tmp_path):
++    read = HEAD + SHORT + MID + LONG + TAIL
++    _, outpath = run_split_adapters(tmp_path, [("r", read)], [SHORT, LONG])
++    assert sequences(outpath) == [HEAD, MID, TAIL]
++
++
++def test_weaker_occurrence_between_two_best_ones_is_also_removed(tmp_path):
++    read = HEAD + LONG + MID + SHORT + MID + LONG + TAIL
++    _, outpath = run_split_adapters(tmp_path, [("r", read)], [SHORT, LONG])
++    assert sequences(outpath) == [HEAD, MID, MID, TAIL]
++
++
++def test_no_written_piece_still_contains_an_occurrence(tmp_path):
++    read = HEAD + SHORT + MID + LONG + MID + SHORT + TAIL
++    _, outpath = run_split_adapters(tmp_path, [("r", read)], [SHORT, LONG])
++    for sequence in sequences(outpath):
++        assert SHORT not in sequence
++        assert LONG not in sequence
++
++
++def test_inexact_occurrence_is_removed_like_an_exact_one(tmp_path):
++    read = HEAD + ADAPTER_1MM + MID + ADAPTER + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)])
++    assert sequences(outpath) == [HEAD, MID, TAIL]
++
++
++def test_piece_carries_the_occurrence_next_to_it(tmp_path):
++    read = HEAD + SHORT + MID + LONG + TAIL
++    _, outpath = run_split_adapters(
++        tmp_path,
++        [("r", read)],
++        [f"short={SHORT}", f"long={LONG}"],
++        extra=["--rename", "{id} {adapter_name}"],
++    )
++    written = names(outpath)
++    assert written[0] == "r_1 short"
++    assert written[-1] == "r_3 long"
++
++
++def test_four_occurrences_give_five_pieces(tmp_path):
++    read = "AA" + ADAPTER + "CC" + ADAPTER + "GG" + ADAPTER + "TT" + ADAPTER + "AC"
++    _, outpath = run_split(tmp_path, [("r", read)])
++    assert sequences(outpath) == ["AA", "CC", "GG", "TT", "AC"]
++
++
++def test_occurrence_at_the_start_gives_an_empty_first_piece(tmp_path):
++    _, outpath = run_split(tmp_path, [("r", ADAPTER + TAIL)])
++    assert sequences(outpath) == ["", TAIL]
++
++
++def test_occurrence_at_the_end_gives_an_empty_last_piece(tmp_path):
++    _, outpath = run_split(tmp_path, [("r", HEAD + ADAPTER)])
++    assert sequences(outpath) == [HEAD, ""]
++
++
++def test_adjacent_occurrences_give_an_empty_piece_between_them(tmp_path):
++    _, outpath = run_split(tmp_path, [("r", HEAD + ADAPTER + ADAPTER + TAIL)])
++    assert sequences(outpath) == [HEAD, "", TAIL]
++
++
++def test_read_that_is_only_an_adapter_gives_two_empty_pieces(tmp_path):
++    _, outpath = run_split(tmp_path, [("r", ADAPTER)])
++    assert sequences(outpath) == ["", ""]
++
++
++def test_minimum_length_removes_empty_pieces(tmp_path):
++    _, outpath = run_split(tmp_path, [("r", ADAPTER + TAIL)], extra=["-m", "1"])
++    assert sequences(outpath) == [TAIL]
++
++
++def test_pieces_are_numbered_when_the_read_is_cut(tmp_path):
++    _, outpath = run_split(tmp_path, [("r", HEAD + ADAPTER + MID + ADAPTER + TAIL)])
++    assert names(outpath) == ["r_1", "r_2", "r_3"]
++
++
++def test_read_that_is_not_cut_keeps_its_name(tmp_path):
++    _, outpath = run_split(tmp_path, [("r", HEAD + MID)])
++    assert names(outpath) == ["r"]
++
++
++def test_numbering_keeps_the_rest_of_the_header(tmp_path):
++    _, outpath = run_split(tmp_path, [("r some comment", HEAD + ADAPTER + TAIL)])
++    assert names(outpath) == ["r_1 some comment", "r_2 some comment"]
++
++
++def test_empty_pieces_are_numbered_like_any_other(tmp_path):
++    _, outpath = run_split(tmp_path, [("r", ADAPTER + TAIL)])
++    assert names(outpath) == ["r_1", "r_2"]
++
++
++def test_split_suffix_template_is_used(tmp_path):
++    _, outpath = run_split(
++        tmp_path,
++        [("r", HEAD + ADAPTER + MID + ADAPTER + TAIL)],
++        extra=["--split-suffix", ".{piece}"],
++    )
++    assert names(outpath) == ["r.1", "r.2", "r.3"]
++
++
++def test_split_suffix_knows_how_many_pieces_there_are(tmp_path):
++    _, outpath = run_split(
++        tmp_path,
++        [("r", HEAD + ADAPTER + MID + ADAPTER + TAIL)],
++        extra=["--split-suffix", "_{piece}of{pieces}"],
++    )
++    assert names(outpath) == ["r_1of3", "r_2of3", "r_3of3"]
++
++
++def test_split_suffix_is_not_applied_to_an_uncut_read(tmp_path):
++    _, outpath = run_split(
++        tmp_path, [("r", HEAD + MID)], extra=["--split-suffix", "_{piece}"]
++    )
++    assert names(outpath) == ["r"]
++
++
++def test_split_suffix_without_piece_variable_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(tmp_path, [("r", HEAD)], extra=["--split-suffix", "_{pieces}"])
++    assert exception.value.args[0] == 2
++
++
++def test_split_suffix_with_unknown_variable_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(tmp_path, [("r", HEAD)], extra=["--split-suffix", "_{id}"])
++    assert exception.value.args[0] == 2
++
++
++def test_split_suffix_needs_the_split_action(tmp_path):
++    assert_split_action_works(tmp_path)
++    inpath = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)])
++    with pytest.raises(SystemExit) as exception:
++        main(
++            [
++                "-a",
++                ADAPTER,
++                "--split-suffix",
++                "_{piece}",
++                "-o",
++                os.fspath(tmp_path / "out.fastq"),
++                os.fspath(inpath),
++            ]
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_minimum_length_applies_to_each_piece(tmp_path):
++    read = "AA" + ADAPTER + MID + ADAPTER + "GGG"
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["-m", "4"])
++    assert sequences(outpath) == [MID]
++
++
++def test_maximum_length_applies_to_each_piece(tmp_path):
++    read = "AA" + ADAPTER + MID + ADAPTER + "GGG"
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["-M", "3"])
++    assert sequences(outpath) == ["AA", "GGG"]
++
++
++def test_too_short_output_receives_the_short_pieces(tmp_path):
++    read = "AA" + ADAPTER + MID
++    short = tmp_path / "short.fastq"
++    _, outpath = run_split(
++        tmp_path, [("r", read)], extra=["-m", "4", "--too-short-output", short]
++    )
++    assert sequences(outpath) == [MID]
++    assert sequences(short) == ["AA"]
++
++
++def test_length_shortening_applies_to_each_piece(tmp_path):
++    read = HEAD + ADAPTER + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["--length", "3"])
++    assert sequences(outpath) == ["AAA", "GGG"]
++
++
++def test_expected_error_filter_applies_to_each_piece(tmp_path):
++    read = "AAAA" + ADAPTER + "GGGG"
++    qualities = "IIII" + "I" * len(ADAPTER) + "####"
++    _, outpath = run_split(
++        tmp_path, [("r", read, qualities)], extra=["--max-expected-errors", "1"]
++    )
++    assert sequences(outpath) == ["AAAA"]
++
++
++def test_too_long_output_receives_the_long_pieces(tmp_path):
++    read = "AAAA" + ADAPTER + "GG"
++    long_path = tmp_path / "long.fastq"
++    _, outpath = run_split(
++        tmp_path, [("r", read)], extra=["-M", "3", "--too-long-output", long_path]
++    )
++    assert sequences(outpath) == ["GG"]
++    assert sequences(long_path) == ["AAAA"]
++
++
++def test_n_trimming_applies_to_each_piece(tmp_path):
++    read = "NNAAAA" + ADAPTER + "GGGGNN"
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["--trim-n"])
++    assert sequences(outpath) == ["AAAA", "GGGG"]
++
++
++def test_max_n_filter_applies_to_each_piece(tmp_path):
++    read = "AAAA" + ADAPTER + "GNNG"
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["--max-n", "1"])
++    assert sequences(outpath) == ["AAAA"]
++
++
++def test_name_suffix_option_applies_to_each_piece(tmp_path):
++    read = HEAD + ADAPTER + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["-y", "_done"])
++    assert names(outpath) == ["r_1_done", "r_2_done"]
++
++
++def test_poly_a_trimming_applies_to_each_piece(tmp_path):
++    read = "CCCCAAAAAA" + ADAPTER + "GGGGAAAAAA"
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["--poly-a"])
++    assert sequences(outpath) == ["CCCC", "GGGG"]
++
++
++def test_prefix_option_applies_to_each_piece(tmp_path):
++    read = HEAD + ADAPTER + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["-x", "pre_"])
++    assert names(outpath) == ["pre_r_1", "pre_r_2"]
++
++
++def test_length_tag_applies_to_each_piece(tmp_path):
++    read = HEAD + ADAPTER + TAIL
++    _, outpath = run_split(
++        tmp_path, [("r length=26", read)], extra=["--length-tag", "length="]
++    )
++    assert names(outpath) == ["r_1 length=8", "r_2 length=8"]
++
++
++def test_strip_suffix_applies_to_each_piece(tmp_path):
++    reads = [("r1.gone", HEAD + ADAPTER + TAIL), ("r2.gone", MID)]
++    _, outpath = run_split(tmp_path, reads, extra=["--strip-suffix", ".gone"])
++    assert names(outpath) == ["r1.gone_1", "r1.gone_2", "r2"]
++
++
++def test_shortening_from_the_end_applies_to_each_piece(tmp_path):
++    read = "ACGTACGT" + ADAPTER + "TTTTGGGG"
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["--length", "-3"])
++    assert sequences(outpath) == ["CGT", "GGG"]
++
++
++def test_casava_filter_applies_to_each_piece(tmp_path):
++    reads = [
++        ("kept 1:N:0:ATC", HEAD + ADAPTER + TAIL),
++        ("dropped 1:Y:0:ATC", MID + ADAPTER + TAIL),
++    ]
++    _, outpath = run_split(tmp_path, reads, extra=["--discard-casava"])
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_average_error_rate_filter_applies_to_each_piece(tmp_path):
++    read = "AAAA" + ADAPTER + "GGGG"
++    qualities = "IIII" + "I" * len(ADAPTER) + "####"
++    _, outpath = run_split(
++        tmp_path, [("r", read, qualities)], extra=["--max-average-error-rate", "0.1"]
++    )
++    assert sequences(outpath) == ["AAAA"]
++
++
++def test_unconditional_cut_happens_before_splitting(tmp_path):
++    read = "TTT" + HEAD + ADAPTER + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["-u", "3"])
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_zero_capping_applies_to_each_piece(tmp_path):
++    read = HEAD + ADAPTER + TAIL
++    qualities = "5" * len(read)
++    _, outpath = run_split(
++        tmp_path, [("r", read, qualities)], extra=["--quality-base", "64", "--zero-cap"]
++    )
++    assert [quality for _, _, quality in records(outpath)] == ["@" * 8, "@" * 8]
++
++
++def test_nextseq_trimming_happens_before_splitting(tmp_path):
++    read = HEAD + ADAPTER + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["--nextseq-trim", "20"])
++    assert sequences(outpath) == [HEAD, ""]
++
++
++def test_quality_trimming_happens_before_splitting(tmp_path):
++    read = HEAD + ADAPTER + TAIL
++    qualities = "I" * (len(HEAD) + len(ADAPTER)) + "I" * 4 + "#" * 4
++    _, outpath = run_split(tmp_path, [("r", read, qualities)], extra=["-q", "20"])
++    assert sequences(outpath) == [HEAD, "GGGG"]
++
++
++def test_discard_untrimmed_keeps_every_piece_of_a_cut_read(tmp_path):
++    reads = [("r1", HEAD + ADAPTER + TAIL), ("r2", MID)]
++    _, outpath = run_split(tmp_path, reads, extra=["--discard-untrimmed"])
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_discard_untrimmed_keeps_the_middle_piece_as_well(tmp_path):
++    read = HEAD + ADAPTER + MID + ADAPTER + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["--discard-untrimmed"])
++    assert sequences(outpath) == [HEAD, MID, TAIL]
++
++
++def test_discard_trimmed_keeps_only_reads_without_an_occurrence(tmp_path):
++    reads = [("r1", HEAD + ADAPTER + TAIL), ("r2", MID)]
++    _, outpath = run_split(tmp_path, reads, extra=["--discard-trimmed"])
++    assert sequences(outpath) == [MID]
++
++
++def test_untrimmed_output_receives_reads_without_an_occurrence(tmp_path):
++    reads = [("r1", HEAD + ADAPTER + TAIL), ("r2", MID)]
++    untrimmed = tmp_path / "untrimmed.fastq"
++    _, outpath = run_split(
++        tmp_path, reads, extra=["--untrimmed-output", os.fspath(untrimmed)]
++    )
++    assert sequences(outpath) == [HEAD, TAIL]
++    assert records(untrimmed) == [("r2", MID, "I" * len(MID))]
++
++
++def test_json_reports_pieces_and_split_reads(tmp_path):
++    reads = [("r1", HEAD + ADAPTER + MID + ADAPTER + TAIL), ("r2", MID)]
++    stats, _ = run_split(tmp_path, reads)
++    counts = read_counts(stats)
++    assert counts["input"] == 2
++    assert counts["split"] == 1
++    assert counts["pieces"] == 4
++    assert counts["output"] == 4
++
++
++def test_json_pieces_equal_written_plus_filtered(tmp_path):
++    reads = [("r1", "AA" + ADAPTER + MID), ("r2", MID)]
++    stats, _ = run_split(tmp_path, reads, extra=["-m", "4"])
++    counts = read_counts(stats)
++    filtered = sum(value for value in counts["filtered"].values() if value)
++    assert counts["pieces"] == 3
++    assert counts["output"] + filtered == counts["pieces"]
++
++
++def test_json_pieces_equal_input_without_splitting(tmp_path):
++    inpath = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)])
++    stats = main(
++        [
++            "-a",
++            ADAPTER,
++            "-o",
++            os.fspath(tmp_path / "out.fastq"),
++            os.fspath(inpath),
++        ]
++    )
++    counts = read_counts(stats)
++    assert counts["input"] == 1
++    assert counts["split"] == 0
++    assert counts["pieces"] == 1
++    assert counts["unequal_pairs"] == 0
++
++
++def test_json_split_counts_reads_not_pieces(tmp_path):
++    reads = [
++        ("r1", HEAD + ADAPTER + MID + ADAPTER + TAIL),
++        ("r2", HEAD + ADAPTER + TAIL),
++        ("r3", MID),
++    ]
++    stats, _ = run_split(tmp_path, reads)
++    counts = read_counts(stats)
++    assert counts["split"] == 2
++    assert counts["pieces"] == 6
++
++
++def test_json_counts_reads_with_adapter_not_occurrences(tmp_path):
++    reads = [("r1", HEAD + ADAPTER + MID + ADAPTER + TAIL), ("r2", MID)]
++    stats, _ = run_split(tmp_path, reads)
++    assert read_counts(stats)["read1_with_adapter"] == 1
++
++
++def test_json_still_written_when_every_piece_is_filtered(tmp_path):
++    stats, _ = run_split(tmp_path, [("r", ADAPTER)], extra=["-m", "1"])
++    counts = read_counts(stats)
++    assert counts["pieces"] == 2
++    assert counts["output"] == 0
++    assert counts["filtered"]["too_short"] == 2
++
++
++def test_adapter_statistics_record_a_partial_occurrence_length(tmp_path):
++    read = HEAD + ADAPTER[:6]
++    stats, outpath = run_split(tmp_path, [("r", read)], extra=["-O", "6"])
++    assert sequences(outpath) == [HEAD, ""]
++    end = stats.as_json()["adapters_read1"][0]["three_prime_end"]
++    assert [entry["len"] for entry in end["trimmed_lengths"]] == [6]
++
++
++def test_public_json_report_declares_the_new_schema(tmp_path):
++    inpath = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)])
++    report = tmp_path / "report.json"
++    main(
++        [
++            "--action=split",
++            "-a",
++            ADAPTER,
++            "--json",
++            os.fspath(report),
++            "-o",
++            os.fspath(tmp_path / "out.fastq"),
++            os.fspath(inpath),
++        ]
++    )
++    written = json.loads(report.read_text())
++    assert written["schema_version"] == [0, 4]
++    counts = written["read_counts"]
++    assert counts["split"] == 1
++    assert counts["pieces"] == 2
++    assert counts["unequal_pairs"] == 0
++
++
++def test_adapter_statistics_record_the_removed_occurrence_length(tmp_path):
++    read = "AAAA" + ADAPTER + "CCCC"
++    inpath = write_fastq(tmp_path, [("r", read)])
++    outpath = tmp_path / "out.fastq"
++    stats = main(
++        [
++            "--action=split",
++            "-b",
++            ADAPTER,
++            "-o",
++            os.fspath(outpath),
++            os.fspath(inpath),
++        ]
++    )
++    assert sequences(outpath) == ["AAAA", "CCCC"]
++    end = stats.as_json()["adapters_read1"][0]["three_prime_end"]
++    assert [entry["len"] for entry in end["trimmed_lengths"]] == [len(ADAPTER)]
++
++
++def test_adapter_statistics_count_every_occurrence(tmp_path):
++    reads = [("r1", HEAD + ADAPTER + MID + ADAPTER + TAIL)]
++    stats, _ = run_split(tmp_path, reads)
++    adapter_stats = stats.as_json()["adapters_read1"]
++    assert len(adapter_stats) == 1
++    assert adapter_stats[0]["total_matches"] == 2
++
++
++def test_occurrences_count_towards_their_own_adapter(tmp_path):
++    read = HEAD + SHORT + MID + LONG + TAIL + SHORT + MID
++    stats, _ = run_split_adapters(
++        tmp_path, [("r", read)], [f"short={SHORT}", f"long={LONG}"]
++    )
++    totals = {
++        entry["name"]: entry["total_matches"]
++        for entry in stats.as_json()["adapters_read1"]
++    }
++    assert totals == {"short": 2, "long": 1}
++
++
++def test_front_adapter_splits_the_read(tmp_path):
++    read = HEAD + ADAPTER + TAIL
++    inpath = write_fastq(tmp_path, [("r", read)])
++    outpath = tmp_path / "out.fastq"
++    main(
++        [
++            "--action=split",
++            "-g",
++            ADAPTER,
++            "-o",
++            os.fspath(outpath),
++            os.fspath(inpath),
++        ]
++    )
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_anywhere_adapter_splits_the_read(tmp_path):
++    read = HEAD + ADAPTER + TAIL
++    inpath = write_fastq(tmp_path, [("r", read)])
++    outpath = tmp_path / "out.fastq"
++    main(
++        [
++            "--action=split",
++            "-b",
++            ADAPTER,
++            "-o",
++            os.fspath(outpath),
++            os.fspath(inpath),
++        ]
++    )
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_two_adapters_both_cut_the_read(tmp_path):
++    other = "CATTCGAATC"
++    read = HEAD + ADAPTER + MID + other + TAIL
++    inpath = write_fastq(tmp_path, [("r", read)])
++    outpath = tmp_path / "out.fastq"
++    main(
++        [
++            "--action=split",
++            "-a",
++            ADAPTER,
++            "-a",
++            other,
++            "-o",
++            os.fspath(outpath),
++            os.fspath(inpath),
++        ]
++    )
++    assert sequences(outpath) == [HEAD, MID, TAIL]
++
++
++def test_error_rate_zero_keeps_the_inexact_occurrence(tmp_path):
++    read = HEAD + ADAPTER_1MM + MID + ADAPTER + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["-e", "0"])
++    assert sequences(outpath) == [HEAD + ADAPTER_1MM + MID, TAIL]
++
++
++def test_higher_error_rate_finds_a_two_error_occurrence(tmp_path):
++    read = HEAD + ADAPTER_2MM + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["-e", "0.2"])
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_default_error_rate_keeps_a_two_error_occurrence(tmp_path):
++    read = HEAD + ADAPTER_2MM + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)])
++    assert sequences(outpath) == [read]
++
++
++def test_occurrence_with_a_deletion_is_removed(tmp_path):
++    read = HEAD + ADAPTER_DEL + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)])
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_occurrence_with_a_deletion_needs_indels(tmp_path):
++    read = HEAD + ADAPTER_DEL + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["--no-indels"])
++    assert sequences(outpath) == [read]
++
++
++def test_wildcard_in_the_adapter_matches_any_base(tmp_path):
++    read = HEAD + ADAPTER + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)], adapter=ADAPTER_WILDCARD)
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_overlap_at_the_threshold_still_splits(tmp_path):
++    read = HEAD + ADAPTER[:6]
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["-O", "6"])
++    assert sequences(outpath) == [HEAD, ""]
++
++
++def test_overlap_option_still_applies(tmp_path):
++    read = HEAD + ADAPTER[:4] + TAIL
++    _, outpath = run_split(tmp_path, [("r", read)], extra=["-O", "6"])
++    assert sequences(outpath) == [read]
++
++
++def test_two_cores_give_the_same_pieces(tmp_path):
++    reads = [
++        ("r1", HEAD + ADAPTER + MID + ADAPTER + TAIL),
++        ("r2", MID),
++        ("r3", HEAD + ADAPTER + TAIL),
++    ]
++    stats, outpath = run_split(
++        tmp_path, reads, extra=["--cores", "2", "--buffer-size", "512"]
++    )
++    assert sequences(outpath) == [HEAD, MID, TAIL, MID, HEAD, TAIL]
++    counts = read_counts(stats)
++    assert counts["input"] == 3
++    assert counts["split"] == 2
++    assert counts["pieces"] == 6
++
++
++def test_paired_reads_are_both_cut(tmp_path):
++    _, out1, out2 = run_split_paired(
++        tmp_path,
++        [("r", HEAD + ADAPTER + TAIL)],
++        [("r", MID + ADAPTER2 + TAIL)],
++    )
++    assert sequences(out1) == [HEAD, TAIL]
++    assert sequences(out2) == [MID, TAIL]
++
++
++def test_paired_pieces_are_paired_by_position(tmp_path):
++    _, out1, out2 = run_split_paired(
++        tmp_path,
++        [("r", "AAA" + ADAPTER + "CC" + ADAPTER + "GGGG")],
++        [("r", "TTT" + ADAPTER2 + "AC" + ADAPTER2 + "GGGG")],
++    )
++    assert sequences(out1) == ["AAA", "CC", "GGGG"]
++    assert sequences(out2) == ["TTT", "AC", "GGGG"]
++
++
++def test_paired_pieces_are_numbered_on_both_reads(tmp_path):
++    _, out1, out2 = run_split_paired(
++        tmp_path,
++        [("r", HEAD + ADAPTER + TAIL)],
++        [("r", MID + ADAPTER2 + TAIL)],
++    )
++    assert names(out1) == ["r_1", "r_2"]
++    assert names(out2) == ["r_1", "r_2"]
++
++
++def test_paired_uncut_pair_keeps_its_names(tmp_path):
++    _, out1, out2 = run_split_paired(tmp_path, [("r", HEAD)], [("r", MID)])
++    assert names(out1) == ["r"]
++    assert names(out2) == ["r"]
++
++
++def test_paired_pair_with_unequal_piece_counts_is_dropped(tmp_path):
++    reads1 = [
++        ("r1", HEAD + ADAPTER + MID + ADAPTER + TAIL),
++        ("r2", HEAD + ADAPTER + TAIL),
++    ]
++    reads2 = [("r1", MID + ADAPTER2 + TAIL), ("r2", MID + ADAPTER2 + TAIL)]
++    _, out1, out2 = run_split_paired(tmp_path, reads1, reads2)
++    assert sequences(out1) == [HEAD, TAIL]
++    assert sequences(out2) == [MID, TAIL]
++
++
++def test_paired_rename_keeps_working_on_pieces(tmp_path):
++    _, out1, out2 = run_split_paired(
++        tmp_path,
++        [("read/1", HEAD + ADAPTER + TAIL)],
++        [("read/2", MID + ADAPTER2 + TAIL)],
++        extra=["--rename", "{id}_kept"],
++    )
++    assert names(out1) == ["read/1_1_kept", "read/1_2_kept"]
++    assert names(out2) == ["read/2_1_kept", "read/2_2_kept"]
++
++
++def test_paired_renaming_still_refuses_a_pair_pulled_apart_without_splitting(tmp_path):
++    assert_split_action_works(tmp_path)
++    inpath1 = write_fastq(tmp_path, [("sampleX/1", HEAD)], name="in1.fastq")
++    inpath2 = write_fastq(tmp_path, [("sampleX/2", MID)], name="in2.fastq")
++    with pytest.raises(ValueError):
++        main(
++            [
++                "-a",
++                ADAPTER,
++                "-A",
++                ADAPTER2,
++                "--strip-suffix",
++                "X/1",
++                "--rename",
++                "{id}",
++                "-o",
++                os.fspath(tmp_path / "out1.fastq"),
++                "-p",
++                os.fspath(tmp_path / "out2.fastq"),
++                os.fspath(inpath1),
++                os.fspath(inpath2),
++            ]
++        )
++
++
++def test_paired_pair_filter_both_applies_to_each_piece_pair(tmp_path):
++    reads1 = [("r", "AA" + ADAPTER + HEAD)]
++    reads2 = [("r", MID + ADAPTER2 + MID)]
++    _, out1, out2 = run_split_paired(
++        tmp_path, reads1, reads2, extra=["-m", "4", "--pair-filter=both"]
++    )
++    assert sequences(out1) == ["AA", HEAD]
++    assert sequences(out2) == [MID, MID]
++
++
++def test_paired_pair_filter_any_applies_to_each_piece_pair(tmp_path):
++    reads1 = [("r", "AA" + ADAPTER + HEAD)]
++    reads2 = [("r", MID + ADAPTER2 + MID)]
++    _, out1, out2 = run_split_paired(
++        tmp_path, reads1, reads2, extra=["-m", "4", "--pair-filter=any"]
++    )
++    assert sequences(out1) == [HEAD]
++    assert sequences(out2) == [MID]
++
++
++def test_interleaved_paired_input_is_split(tmp_path):
++    inpath = write_fastq(
++        tmp_path,
++        [("read/1", HEAD + ADAPTER + TAIL), ("read/2", MID + ADAPTER2 + TAIL)],
++        name="inter.fastq",
++    )
++    outpath = tmp_path / "inter_out.fastq"
++    main(
++        [
++            "--action=split",
++            "--interleaved",
++            "-a",
++            ADAPTER,
++            "-A",
++            ADAPTER2,
++            "-o",
++            os.fspath(outpath),
++            os.fspath(inpath),
++        ]
++    )
++    assert sequences(outpath) == [HEAD, MID, TAIL, TAIL]
++    assert names(outpath) == ["read/1_1", "read/2_1", "read/1_2", "read/2_2"]
++
++
++def test_fasta_output_is_written_for_each_piece(tmp_path):
++    inpath = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)])
++    outpath = tmp_path / "out.fasta"
++    main(
++        [
++            "--action=split",
++            "-a",
++            ADAPTER,
++            "--fasta",
++            "-o",
++            os.fspath(outpath),
++            os.fspath(inpath),
++        ]
++    )
++    assert sequences(outpath) == [HEAD, TAIL]
++    assert names(outpath) == ["r_1", "r_2"]
++
++
++def test_compressed_input_and_output_are_split(tmp_path):
++    plain = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)])
++    inpath = tmp_path / "in.fastq.gz"
++    with gzip.open(os.fspath(inpath), "wb") as f:
++        f.write(plain.read_bytes())
++    outpath = tmp_path / "out.fastq.gz"
++    main(
++        [
++            "--action=split",
++            "-a",
++            ADAPTER,
++            "-o",
++            os.fspath(outpath),
++            os.fspath(inpath),
++        ]
++    )
++    assert sequences(outpath) == [HEAD, TAIL]
++
++
++def test_paired_json_counts_pairs_and_pieces(tmp_path):
++    reads1 = [("r1", HEAD + ADAPTER + TAIL), ("r2", HEAD)]
++    reads2 = [("r1", MID + ADAPTER2 + TAIL), ("r2", MID)]
++    stats, _, _ = run_split_paired(tmp_path, reads1, reads2)
++    counts = read_counts(stats)
++    assert counts["input"] == 2
++    assert counts["split"] == 1
++    assert counts["pieces"] == 3
++    assert counts["unequal_pairs"] == 0
++    assert counts["output"] == 3
++
++
++def test_paired_json_counts_the_dropped_unequal_pair(tmp_path):
++    reads1 = [
++        ("r1", HEAD + ADAPTER + MID + ADAPTER + TAIL),
++        ("r2", HEAD + ADAPTER + TAIL),
++    ]
++    reads2 = [("r1", MID + ADAPTER2 + TAIL), ("r2", MID + ADAPTER2 + TAIL)]
++    stats, _, _ = run_split_paired(tmp_path, reads1, reads2)
++    counts = read_counts(stats)
++    assert counts["input"] == 2
++    assert counts["unequal_pairs"] == 1
++    assert counts["output"] == 2
++
++
++def test_paired_json_counts_reads_with_adapter_per_end(tmp_path):
++    reads1 = [("r", HEAD + ADAPTER + MID + ADAPTER + TAIL)]
++    reads2 = [("r", MID + ADAPTER2 + TAIL)]
++    stats, _, _ = run_split_paired(tmp_path, reads1, reads2)
++    counts = read_counts(stats)
++    assert counts["read1_with_adapter"] == 1
++    assert counts["read2_with_adapter"] == 1
++
++
++def test_paired_minimum_length_applies_to_each_piece_pair(tmp_path):
++    reads1 = [("r", "AA" + ADAPTER + MID)]
++    reads2 = [("r", MID + ADAPTER2 + TAIL)]
++    _, out1, out2 = run_split_paired(tmp_path, reads1, reads2, extra=["-m", "4"])
++    assert sequences(out1) == [MID]
++    assert sequences(out2) == [TAIL]
++
++
++def test_paired_unequal_pairs_is_zero_for_single_end(tmp_path):
++    stats, _ = run_split(tmp_path, [("r", HEAD + ADAPTER + TAIL)])
++    assert read_counts(stats)["unequal_pairs"] == 0
++
++
++def test_paired_split_without_an_adapter_for_read_two_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    inpath1 = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)], name="in1.fastq")
++    inpath2 = write_fastq(tmp_path, [("r", MID + ADAPTER2 + TAIL)], name="in2.fastq")
++    with pytest.raises(SystemExit) as exception:
++        main(
++            [
++                "--action=split",
++                "-a",
++                ADAPTER,
++                "-o",
++                os.fspath(tmp_path / "out1.fastq"),
++                "-p",
++                os.fspath(tmp_path / "out2.fastq"),
++                os.fspath(inpath1),
++                os.fspath(inpath2),
++            ]
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_paired_split_without_an_adapter_for_read_one_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    inpath1 = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)], name="in1.fastq")
++    inpath2 = write_fastq(tmp_path, [("r", MID + ADAPTER2 + TAIL)], name="in2.fastq")
++    with pytest.raises(SystemExit) as exception:
++        main(
++            [
++                "--action=split",
++                "-A",
++                ADAPTER2,
++                "-o",
++                os.fspath(tmp_path / "out1.fastq"),
++                "-p",
++                os.fspath(tmp_path / "out2.fastq"),
++                os.fspath(inpath1),
++                os.fspath(inpath2),
++            ]
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_paired_info_file_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    inpath1 = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)], name="in1.fastq")
++    inpath2 = write_fastq(tmp_path, [("r", MID + ADAPTER2 + TAIL)], name="in2.fastq")
++    with pytest.raises(SystemExit) as exception:
++        main(
++            [
++                "--action=split",
++                "-a",
++                ADAPTER,
++                "-A",
++                ADAPTER2,
++                "-o",
++                os.fspath(tmp_path / "out1.fastq"),
++                "-p",
++                os.fspath(tmp_path / "out2.fastq"),
++                "--info-file",
++                os.fspath(tmp_path / "info1.txt"),
++                "--info-file-paired",
++                os.fspath(tmp_path / "info2.txt"),
++                os.fspath(inpath1),
++                os.fspath(inpath2),
++            ]
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_info_file_paired_alone_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    inpath1 = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)], name="in1.fastq")
++    inpath2 = write_fastq(tmp_path, [("r", MID + ADAPTER2 + TAIL)], name="in2.fastq")
++    with pytest.raises(SystemExit) as exception:
++        main(
++            [
++                "--action=split",
++                "-a",
++                ADAPTER,
++                "-A",
++                ADAPTER2,
++                "-o",
++                os.fspath(tmp_path / "out1.fastq"),
++                "-p",
++                os.fspath(tmp_path / "out2.fastq"),
++                "--info-file-paired",
++                os.fspath(tmp_path / "info2.txt"),
++                os.fspath(inpath1),
++                os.fspath(inpath2),
++            ]
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_pair_adapters_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    inpath1 = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)], name="in1.fastq")
++    inpath2 = write_fastq(tmp_path, [("r", MID + ADAPTER2 + TAIL)], name="in2.fastq")
++    with pytest.raises(SystemExit) as exception:
++        main(
++            [
++                "--action=split",
++                "--pair-adapters",
++                "-a",
++                ADAPTER,
++                "-A",
++                ADAPTER2,
++                "-o",
++                os.fspath(tmp_path / "out1.fastq"),
++                "-p",
++                os.fspath(tmp_path / "out2.fastq"),
++                os.fspath(inpath1),
++                os.fspath(inpath2),
++            ]
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_times_other_than_one_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(tmp_path, [("r", HEAD + ADAPTER + TAIL)], extra=["-n", "2"])
++    assert exception.value.args[0] == 2
++
++
++def test_three_trimming_rounds_are_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(tmp_path, [("r", HEAD + ADAPTER + TAIL)], extra=["-n", "3"])
++    assert exception.value.args[0] == 2
++
++
++def test_zero_trimming_rounds_are_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(tmp_path, [("r", HEAD + ADAPTER + TAIL)], extra=["-n", "0"])
++    assert exception.value.args[0] == 2
++
++
++def test_negative_trimming_rounds_are_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(tmp_path, [("r", HEAD + ADAPTER + TAIL)], extra=["-n", "-1"])
++    assert exception.value.args[0] == 2
++
++
++def test_four_trimming_rounds_are_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(tmp_path, [("r", HEAD + ADAPTER + TAIL)], extra=["-n", "4"])
++    assert exception.value.args[0] == 2
++
++
++def test_split_suffix_with_a_second_unknown_variable_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(tmp_path, [("r", HEAD)], extra=["--split-suffix", "_{piece}_{foo}"])
++    assert exception.value.args[0] == 2
++
++
++def test_paired_demultiplexing_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    inpath1 = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)], name="in1.fastq")
++    inpath2 = write_fastq(tmp_path, [("r", MID + ADAPTER2 + TAIL)], name="in2.fastq")
++    with pytest.raises(SystemExit) as exception:
++        main(
++            [
++                "--action=split",
++                "-a",
++                f"first={ADAPTER}",
++                "-A",
++                ADAPTER2,
++                "-o",
++                os.fspath(tmp_path / "out1_{name}.fastq"),
++                "-p",
++                os.fspath(tmp_path / "out2_{name}.fastq"),
++                os.fspath(inpath1),
++                os.fspath(inpath2),
++            ]
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_combinatorial_demultiplexing_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    inpath1 = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)], name="in1.fastq")
++    inpath2 = write_fastq(tmp_path, [("r", MID + ADAPTER2 + TAIL)], name="in2.fastq")
++    with pytest.raises(SystemExit) as exception:
++        main(
++            [
++                "--action=split",
++                "-a",
++                f"first={ADAPTER}",
++                "-A",
++                f"second={ADAPTER2}",
++                "-o",
++                os.fspath(tmp_path / "out1_{name1}_{name2}.fastq"),
++                "-p",
++                os.fspath(tmp_path / "out2_{name1}_{name2}.fastq"),
++                os.fspath(inpath1),
++                os.fspath(inpath2),
++            ]
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_info_file_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(
++            tmp_path,
++            [("r", HEAD + ADAPTER + TAIL)],
++            extra=["--info-file", os.fspath(tmp_path / "info.txt")],
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_rest_file_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(
++            tmp_path,
++            [("r", HEAD + ADAPTER + TAIL)],
++            extra=["--rest-file", os.fspath(tmp_path / "rest.txt")],
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_wildcard_file_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(
++            tmp_path,
++            [("r", HEAD + ADAPTER + TAIL)],
++            extra=["--wildcard-file", os.fspath(tmp_path / "wild.txt")],
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_demultiplexing_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    inpath = write_fastq(tmp_path, [("r", HEAD + ADAPTER + TAIL)])
++    with pytest.raises(SystemExit) as exception:
++        main(
++            [
++                "--action=split",
++                "-a",
++                f"first={ADAPTER}",
++                "-o",
++                os.fspath(tmp_path / "out_{name}.fastq"),
++                os.fspath(inpath),
++            ]
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_revcomp_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(tmp_path, [("r", HEAD + ADAPTER + TAIL)], extra=["--revcomp"])
++    assert exception.value.args[0] == 2
++
++
++def test_linked_adapter_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    with pytest.raises(SystemExit) as exception:
++        run_split(
++            tmp_path,
++            [("r", HEAD + ADAPTER + TAIL)],
++            adapter=f"{ADAPTER}...{MID}",
++        )
++    assert exception.value.args[0] == 2
++
++
++def test_split_without_any_adapter_is_rejected(tmp_path):
++    assert_split_action_works(tmp_path)
++    inpath = write_fastq(tmp_path, [("r", HEAD + MID)])
++    with pytest.raises(SystemExit) as exception:
++        main(
++            [
++                "--action=split",
++                "-o",
++                os.fspath(tmp_path / "out.fastq"),
++                os.fspath(inpath),
++            ]
++        )
++    assert exception.value.args[0] == 2

@@ -1,0 +1,447 @@
+diff --git a/src/breakpoints.mjs b/src/breakpoints.mjs
+new file mode 100644
+index 0000000..047582c
+--- /dev/null
++++ b/src/breakpoints.mjs
+@@ -0,0 +1,191 @@
++"use strict";
++
++const SPACE = /\s*/y;
++const FOLLOWER = /\s*(?:==|!=|&&|\|\||\)|\[|$)/y;
++const LITERAL = /'b([01x]+)/y;
++const EDGE = /(rose|fell)\s*\(/y;
++const COMPARE = /==|!=/y;
++const INDEX = /[0-9]+/y;
++
++class Parser {
++    constructor(text, names) {
++        this.text = text;
++        this.names = names;
++        this.pos = 0;
++    }
++    error(what) {
++        return new Error(what + " in condition: " + this.text);
++    }
++    skip() {
++        SPACE.lastIndex = this.pos;
++        SPACE.exec(this.text);
++        this.pos = SPACE.lastIndex;
++    }
++    peek(token) {
++        this.skip();
++        return this.text.startsWith(token, this.pos);
++    }
++    take(token) {
++        if (!this.peek(token))
++            throw this.error("Expected " + token);
++        this.pos += token.length;
++    }
++    match(re) {
++        this.skip();
++        re.lastIndex = this.pos;
++        const m = re.exec(this.text);
++        if (m) this.pos = re.lastIndex;
++        return m;
++    }
++    parse() {
++        const node = this.parseOr();
++        this.skip();
++        if (this.pos != this.text.length)
++            throw this.error("Unexpected input");
++        return node;
++    }
++    parseOr() {
++        const args = [this.parseAnd()];
++        while (this.peek('||')) {
++            this.take('||');
++            args.push(this.parseAnd());
++        }
++        return args.length == 1 ? args[0] : { op: 'or', args };
++    }
++    parseAnd() {
++        const args = [this.parseUnary()];
++        while (this.peek('&&')) {
++            this.take('&&');
++            args.push(this.parseUnary());
++        }
++        return args.length == 1 ? args[0] : { op: 'and', args };
++    }
++    parseUnary() {
++        if (this.peek('!')) {
++            this.take('!');
++            return { op: 'not', arg: this.parseUnary() };
++        }
++        if (this.peek('(')) {
++            this.take('(');
++            const node = this.parseOr();
++            this.take(')');
++            return node;
++        }
++        const edge = this.match(EDGE);
++        if (edge) {
++            const ref = this.parseSignal();
++            this.take(')');
++            if (ref.hi != ref.lo)
++                throw this.error("Edge of a signal wider than one bit");
++            return { op: edge[1], ref };
++        }
++        return this.parseComparison();
++    }
++    parseComparison() {
++        let literal = this.match(LITERAL), ref;
++        if (!literal) ref = this.parseSignal();
++        const op = this.match(COMPARE);
++        if (!op) throw this.error("Expected == or !=");
++        if (literal) ref = this.parseSignal();
++        else literal = this.match(LITERAL);
++        if (!literal) throw this.error("Expected a binary literal");
++        if (literal[1].length != ref.hi - ref.lo + 1)
++            throw this.error("Literal width does not match");
++        return { op: op[0] == '==' ? 'eq' : 'ne', ref, literal: literal[1] };
++    }
++    parseSignal() {
++        this.skip();
++        const found = this.names(this.text, this.pos).filter(name => {
++            FOLLOWER.lastIndex = name.end;
++            return FOLLOWER.test(this.text);
++        });
++        if (found.length == 0)
++            throw this.error("Unknown device or port");
++        if (found.length > 1)
++            throw this.error("Ambiguous name");
++        this.pos = found[0].end;
++        const target = found[0].resolve();
++        let hi = target.bits - 1, lo = 0;
++        if (this.peek('[')) {
++            this.take('[');
++            hi = lo = this.parseIndex();
++            if (this.peek(':')) {
++                this.take(':');
++                lo = this.parseIndex();
++            }
++            this.take(']');
++            if (hi < lo || hi >= target.bits)
++                throw this.error("Bit selection out of range");
++        }
++        return { graph: target.graph, gate: target.gate, port: target.port, dir: target.dir, hi, lo };
++    }
++    parseIndex() {
++        const index = this.match(INDEX);
++        if (!index)
++            throw this.error("Bad bit index");
++        return Number(index[0]);
++    }
++}
++
++export function compileCondition(text, names) {
++    if (typeof text != 'string')
++        throw new Error("A breakpoint condition must be a string");
++    return new Parser(text, names).parse();
++}
++
++function edgeRefs(node, refs = []) {
++    if (node.op == 'rose' || node.op == 'fell') {
++        node.edge = refs.length;
++        refs.push(node.ref);
++    } else if (node.op == 'not') {
++        edgeRefs(node.arg, refs);
++    } else if (node.op == 'and' || node.op == 'or') {
++        for (const arg of node.args) edgeRefs(arg, refs);
++    }
++    return refs;
++}
++
++function evaluate(node, read, before, now) {
++    switch (node.op) {
++        case 'or': return node.args.some(arg => evaluate(arg, read, before, now));
++        case 'and': return node.args.every(arg => evaluate(arg, read, before, now));
++        case 'not': return !evaluate(node.arg, read, before, now);
++        case 'rose': return before !== undefined && before[node.edge] == -1 && now[node.edge] == 1;
++        case 'fell': return before !== undefined && before[node.edge] == 1 && now[node.edge] == -1;
++        default: {
++            const sig = read(node.ref);
++            const width = node.literal.length;
++            let equal = true;
++            for (let i = 0; i < width; i++) {
++                const expected = node.literal[width - 1 - i];
++                if (expected == 'x') continue;
++                if (sig.get(node.ref.lo + i) != (expected == '1' ? 1 : -1)) {
++                    equal = false;
++                    break;
++                }
++            }
++            return node.op == 'eq' ? equal : !equal;
++        }
++    }
++}
++
++export class Breakpoint {
++    constructor(id, tree, read) {
++        this.id = id;
++        this.tree = tree;
++        this.edges = edgeRefs(tree);
++        this.samples = undefined;
++        this.active = this.check(read);
++    }
++    check(read) {
++        const now = this.edges.map(ref => read(ref).get(ref.lo));
++        const value = evaluate(this.tree, read, this.samples, now);
++        this.samples = now;
++        return value;
++    }
++    fires(read) {
++        const wasActive = this.active;
++        this.active = this.check(read);
++        return this.active && !wasActive;
++    }
++}
+diff --git a/src/circuit.mjs b/src/circuit.mjs
+index 0692a9d..4582f09 100644
+--- a/src/circuit.mjs
++++ b/src/circuit.mjs
+@@ -8,6 +8,7 @@ import * as engines from './engines.mjs';
+ import * as tools from './tools.mjs';
+ import * as transform from './transform.mjs';
+ import { SynchEngine } from './engines/synch.mjs';
++import { compileCondition } from './breakpoints.mjs';
+ 
+ export { cells, tools, engines, transform };
+     
+@@ -82,6 +83,10 @@ export class HeadlessCircuit {
+         this.listenTo(this._engine, 'postUpdateGates', (tick, count) => {
+             this.trigger('postUpdateGates', tick, count);
+         });
++        this._lastBreakpoint = 0;
++        this.listenTo(this._engine, 'breakpoint', (id, tick) => {
++            this.trigger('breakpoint', id, tick);
++        });
+     }
+     addDisplay(display) {
+         this._display3vl.addDisplay(display);
+@@ -352,6 +357,50 @@ export class HeadlessCircuit {
+     unalarm(alarmId) {
+         this._engine.unalarm(alarmId);
+     }
++    addBreakpoint(condition) {
++        const tree = compileCondition(condition, (text, pos) => this._breakpointNames(text, pos));
++        const id = ++this._lastBreakpoint;
++        this._engine.addBreakpoint(id, tree);
++        return id;
++    }
++    removeBreakpoint(id) {
++        this._engine.removeBreakpoint(id);
++    }
++    _breakpointNames(text, pos) {
++        const names = [];
++        const walk = (graph, from) => {
++            for (const cell of graph.getElements()) {
++                if (!cell.has('label')) continue;
++                const label = String(cell.get('label'));
++                if (label == '' || !text.startsWith(label, from)) continue;
++                const end = from + label.length;
++                names.push({ end, resolve: () => this._breakpointTarget(cell) });
++                if (text[end] == ':')
++                    for (const port of cell.getPorts())
++                        if (text.startsWith(port.id, end + 1))
++                            names.push({ end: end + 1 + port.id.length, resolve: () => this._breakpointTarget(cell, port) });
++                if (text[end] == '.' && cell instanceof this._cells.Subcircuit)
++                    walk(cell.get('graph'), end + 1);
++            }
++        };
++        walk(this._graph, pos);
++        return names;
++    }
++    _breakpointTarget(cell, port) {
++        if (port === undefined) {
++            if (cell.isInput) {
++                port = cell.getPort('out');
++            } else if (cell.isOutput) {
++                port = cell.getPort('in');
++            } else {
++                const outputs = cell.getPorts().filter(p => p.dir == 'out');
++                if (outputs.length != 1)
++                    throw new Error("Device " + cell.get('label') + " has no single output in breakpoint condition");
++                port = outputs[0];
++            }
++        }
++        return { graph: cell.graph.cid, gate: cell.id, port: port.id, dir: port.dir, bits: port.bits };
++    }
+ };
+ 
+ joint.util.assign(HeadlessCircuit.prototype, joint.mvc.Events);
+diff --git a/src/engines/base.mjs b/src/engines/base.mjs
+index 2f954ff..e60771a 100644
+--- a/src/engines/base.mjs
++++ b/src/engines/base.mjs
+@@ -50,6 +50,10 @@ export class BaseEngine {
+     }
+     _changeLinkWarning(graph, link, warn, prevWarn) {
+     }
++    addBreakpoint(id, tree) {
++    }
++    removeBreakpoint(id) {
++    }
+ };
+ 
+ util.assign(BaseEngine.prototype, mvc.Events);
+diff --git a/src/engines/synch.mjs b/src/engines/synch.mjs
+index dfc502f..8ce5021 100644
+--- a/src/engines/synch.mjs
++++ b/src/engines/synch.mjs
+@@ -3,6 +3,7 @@ import * as joint from '@joint/core';
+ import FastPriorityQueue from 'fastpriorityqueue';
+ import * as help from '../help.mjs';
+ import { BaseEngine } from './base.mjs';
++import { Breakpoint } from '../breakpoints.mjs';
+ 
+ export class SynchEngine extends BaseEngine {
+     constructor(graph, {cells}) {
+@@ -14,6 +15,8 @@ export class SynchEngine extends BaseEngine {
+         this._monitorChecks = new Map();
+         this._alarms = new Map();
+         this._alarmQueue = new Map();
++        this._graphs = Object.create(null);
++        this._breakpoints = new Map();
+         this._addGraph(graph);
+     }
+     get hasPendingEvents() {
+@@ -42,6 +45,7 @@ export class SynchEngine extends BaseEngine {
+             this._updateSubcircuit(gate);
+     }
+     _addGraph(graph) {
++        this._graphs[graph.cid] = graph;
+         this.listenTo(graph, 'manualMemChange', (gate) => {
+             this._enqueue(gate);
+         });
+@@ -105,6 +109,7 @@ export class SynchEngine extends BaseEngine {
+         this._queue.delete(k);
+         this._tick = (k + 1) | 0;
+         this._checkMonitors();
++        this._checkBreakpoints(k);
+         this.trigger('postUpdateGates', k, count);
+         return Promise.resolve(count);
+     }
+@@ -114,10 +119,31 @@ export class SynchEngine extends BaseEngine {
+             const k = this._tick | 0;
+             this._tick = (k + 1) | 0;
+             this._checkMonitors();
++            this._checkBreakpoints(k);
+             this.trigger('postUpdateGates', k, 0);
+             return Promise.resolve(0);
+         }
+     }
++    _readPort(ref) {
++        const gate = this._graphs[ref.graph].getCell(ref.gate);
++        return gate.get(ref.dir == 'in' ? 'inputSignals' : 'outputSignals')[ref.port];
++    }
++    addBreakpoint(id, tree) {
++        this._breakpoints.set(id, new Breakpoint(id, tree, ref => this._readPort(ref)));
++    }
++    removeBreakpoint(id) {
++        this._breakpoints.delete(id);
++    }
++    _checkBreakpoints(tick) {
++        const hits = [];
++        for (const breakpoint of this._breakpoints.values())
++            if (breakpoint.fires(ref => this._readPort(ref)))
++                hits.push(breakpoint.id);
++        if (hits.length == 0) return;
++        if (this.running) this.stop();
++        for (const id of hits)
++            this.trigger('breakpoint', id, tick);
++    }
+     synchronize() {
+         return Promise.resolve();
+     }
+diff --git a/src/engines/worker-worker.mjs b/src/engines/worker-worker.mjs
+index ec31c21..1c9ee4c 100644
+--- a/src/engines/worker-worker.mjs
++++ b/src/engines/worker-worker.mjs
+@@ -2,6 +2,7 @@
+ import * as cells from '../cells.mjs';
+ import FastPriorityQueue from 'fastpriorityqueue';
+ import { Vector3vl } from '3vl';
++import { Breakpoint } from '../breakpoints.mjs';
+ 
+ const specialGates = new Set(['Subcircuit', 'Input', 'Output', 'Button', 'Lamp', 'NumEntry', 'NumDisplay']);
+ 
+@@ -157,6 +158,7 @@ class WorkerEngineWorker {
+         this._toUpdate = new Map();
+         this._toUpdateParam = new Map();
+         this._tick = 0;
++        this._breakpoints = new Map();
+         this._sender = setInterval(() => {
+             this._sendUpdates();
+         }, 25);
+@@ -176,9 +178,30 @@ class WorkerEngineWorker {
+         else {
+             const k = this._tick | 0;
+             this._tick = (k + 1) | 0;
++            this._checkBreakpoints(k);
+             return 0;
+         }
+     }
++    _readPort(ref) {
++        const gate = this._graphs[ref.graph].getGate(ref.gate);
++        return gate.get(ref.dir == 'in' ? 'inputSignals' : 'outputSignals')[ref.port];
++    }
++    addBreakpoint(id, tree) {
++        this._breakpoints.set(id, new Breakpoint(id, tree, ref => this._readPort(ref)));
++    }
++    removeBreakpoint(id) {
++        this._breakpoints.delete(id);
++    }
++    _checkBreakpoints(tick) {
++        const hits = [];
++        for (const breakpoint of this._breakpoints.values())
++            if (breakpoint.fires(ref => this._readPort(ref)))
++                hits.push(breakpoint.id);
++        if (hits.length == 0) return;
++        const stopped = this._updater !== null;
++        this._stop();
++        postMessage({ type: 'breakpoint', args: [hits, tick, stopped] });
++    }
+     updateGatesNext(reqid, sendUpdates) {
+         const count = this._updateGatesNext();
+         if (sendUpdates) this._sendUpdates();
+@@ -207,6 +230,7 @@ class WorkerEngineWorker {
+         }
+         this._queue.delete(k);
+         this._tick = (k + 1) | 0;
++        this._checkBreakpoints(k);
+         return count;
+     }
+     ping(reqid, sendUpdates) {
+diff --git a/src/engines/worker.mjs b/src/engines/worker.mjs
+index 35d0726..11218ea 100644
+--- a/src/engines/worker.mjs
++++ b/src/engines/worker.mjs
+@@ -195,6 +195,12 @@ export class WorkerEngine extends BaseEngine {
+         this._worker.postMessage({ type: 'alarm', args: [tick, alarmId, options] });
+         return alarmId;
+     }
++    addBreakpoint(id, tree) {
++        this._worker.postMessage({ type: 'addBreakpoint', args: [id, tree] });
++    }
++    removeBreakpoint(id) {
++        this._worker.postMessage({ type: 'removeBreakpoint', arg: id });
++    }
+     unalarm(alarmId) {
+         if (!(alarmId in this._alarms)) return;
+         this._worker.postMessage({ type: 'unalarm', arg: alarmId });
+@@ -231,6 +237,15 @@ export class WorkerEngine extends BaseEngine {
+         this._tickCache = tick;
+         this.trigger('changeRunning');
+     }
++    _handle_breakpoint(ids, tick, stopped) {
++        this._tickCache = (tick + 1) | 0;
++        if (stopped) {
++            this._running = false;
++            this.trigger('changeRunning');
++        }
++        for (const id of ids)
++            this.trigger('breakpoint', id, tick);
++    }
+     _handle_gateTrigger(graphId, gateId, event, args) {
+         if (event == "memChange")
+             args[1] = Vector3vl.fromClonable(args[1]);

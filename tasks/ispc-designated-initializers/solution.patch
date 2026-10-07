@@ -1,0 +1,724 @@
+diff --git a/src/expr.cpp b/src/expr.cpp
+index 8a61b5c..21e013c 100644
+--- a/src/expr.cpp
++++ b/src/expr.cpp
+@@ -816,6 +816,11 @@ void ispc::InitSymbol(AddressInfo *ptrInfo, const Type *symType, Expr *initExpr,
+ 
+     const ReferenceType *rt = CastType<ReferenceType>(symType);
+     if (rt) {
++        const ExprList *list = llvm::dyn_cast<ExprList>(initExpr);
++        if (list != nullptr && list->exprs.empty()) {
++            ctx->StoreInst(llvm::Constant::getNullValue(rt->LLVMStorageType(g->ctx)), ptrInfo, rt);
++            return;
++        }
+         const Type *initExprType = initExpr->GetType();
+         Assert(initExprType);
+         if (!Type::Equal(initExprType, rt)) {
+@@ -4662,6 +4667,9 @@ static std::pair<llvm::Constant *, bool> lGetExprListConstant(const Type *type,
+     SourcePos pos = eList->pos;
+     bool isVaryingInit = false;
+     bool isNotValidForMultiTargetGlobal = false;
++    if (exprs.empty() && CastType<ReferenceType>(type) != nullptr) {
++        return std::pair<llvm::Constant *, bool>(llvm::Constant::getNullValue(type->LLVMType(g->ctx)), false);
++    }
+     if (exprs.size() == 1 && (CastType<AtomicType>(type) != nullptr || CastType<EnumType>(type) != nullptr ||
+                               CastType<PointerType>(type) != nullptr)) {
+         if (exprs[0] == nullptr) {
+@@ -4826,15 +4834,41 @@ ExprList *ExprList::Instantiate(TemplateInstantiation &templInst) const {
+     for (auto e : exprs) {
+         inst->exprs.push_back(e->Instantiate(templInst));
+     }
++    for (const std::vector<Designator> &chain : designators) {
++        std::vector<Designator> instChain;
++        for (const Designator &designator : chain) {
++            if (designator.isIndex && designator.index != nullptr) {
++                instChain.push_back(Designator(designator.index->Instantiate(templInst), designator.pos));
++            } else {
++                instChain.push_back(designator);
++            }
++        }
++        inst->designators.push_back(instChain);
++    }
+     return inst;
+ }
+ 
++static std::string lDesignatorChainString(const std::vector<Designator> &designators) {
++    std::string ret;
++    for (const Designator &designator : designators) {
++        if (designator.isIndex) {
++            ret += "[" + (designator.index != nullptr ? designator.index->GetString() : std::string()) + "]";
++        } else {
++            ret += "." + designator.member;
++        }
++    }
++    return ret;
++}
++
+ std::string ExprList::GetString() const {
+     std::string ret;
+     for (unsigned int i = 0; i < exprs.size(); ++i) {
+         if (i > 0) {
+             ret += ", ";
+         }
++        if (i < designators.size() && !designators[i].empty()) {
++            ret += lDesignatorChainString(designators[i]) + " = ";
++        }
+         ret += exprs[i]->GetString();
+     }
+     return ret;
+@@ -4845,6 +4879,9 @@ void ExprList::Print(Indent &indent) const {
+ 
+     indent.pushList(exprs.size());
+     for (unsigned int i = 0; i < exprs.size(); ++i) {
++        if (i < designators.size() && !designators[i].empty()) {
++            indent.setNextLabel(lDesignatorChainString(designators[i]));
++        }
+         if (exprs[i] != nullptr) {
+             exprs[i]->Print(indent);
+         } else {
+@@ -4879,6 +4916,376 @@ bool ExprList::HasAtomicInitializerList(std::map<AtomicType::BasicType, std::vec
+     return isAtomicInit;
+ }
+ 
++bool ExprList::HasDesignators() const {
++    for (const std::vector<Designator> &chain : designators) {
++        if (!chain.empty()) {
++            return true;
++        }
++    }
++    for (const Expr *expr : exprs) {
++        const ExprList *nested = llvm::dyn_cast_or_null<ExprList>(expr);
++        if (nested != nullptr && nested->HasDesignators()) {
++            return true;
++        }
++    }
++    return false;
++}
++
++struct DesignatedInitNode {
++    Expr *expr = nullptr;
++    bool isAggregate = false;
++    std::vector<DesignatedInitNode> elements;
++};
++
++static int lIdentifierToVectorElement(char id);
++
++static bool lIsDesignatableType(const Type *type) {
++    return CastType<StructType>(type) != nullptr || CastType<ArrayType>(type) != nullptr ||
++           CastType<VectorType>(type) != nullptr;
++}
++
++static bool lIsPastEnd(const Type *type, int index) {
++    const ArrayType *arrayType = CastType<ArrayType>(type);
++    if (arrayType != nullptr && arrayType->GetElementCount() == 0) {
++        return index >= INT32_MAX;
++    }
++    return index >= CastType<CollectionType>(type)->GetElementCount();
++}
++
++static Expr *lZeroInitializer(const Type *type, SourcePos pos) {
++    if (type->IsSOAType()) {
++        return new ExprList(pos);
++    }
++    if (CastType<PointerType>(type) != nullptr) {
++        return new NullPointerExpr(pos);
++    }
++    const EnumType *enumType = CastType<EnumType>(type);
++    if (enumType != nullptr) {
++        return new ConstExpr(enumType->GetAsUniformType(), (uint32_t)0, pos);
++    }
++    if (CastType<AtomicType>(type) != nullptr) {
++        return new ConstExpr(AtomicType::UniformInt32, (int32_t)0, pos);
++    }
++    return new ExprList(pos);
++}
++
++static bool lGetDesignatorIndex(const Designator &designator, const CollectionType *type, int *index) {
++    Expr *indexExpr = designator.index != nullptr ? TypeCheckAndOptimize(designator.index) : nullptr;
++    if (indexExpr == nullptr) {
++        AssertPos(designator.pos, m->errorCount > 0);
++        return false;
++    }
++    const Type *indexType = indexExpr->GetType();
++    llvm::ConstantInt *ci = nullptr;
++    if (indexType != nullptr && indexType->IsUniformType() && !indexType->IsBoolType()) {
++        ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(indexExpr->GetConstant(indexType).first);
++    }
++    if (ci == nullptr) {
++        Error(designator.pos, "Array designator index must be a compile-time integer constant.");
++        return false;
++    }
++    int64_t value = indexType->IsUnsignedType() ? (int64_t)ci->getZExtValue() : ci->getSExtValue();
++    if (value < 0 || value > INT32_MAX || lIsPastEnd(type, (int)value)) {
++        Error(designator.pos, "Array designator index %lld is out of bounds for type \"%s\".", (long long)value,
++              type->GetString().c_str());
++        return false;
++    }
++    *index = (int)value;
++    return true;
++}
++
++static const Type *lApplyDesignator(const Type *type, const Designator &designator, int *index) {
++    if (designator.isIndex) {
++        if ((CastType<ArrayType>(type) == nullptr && CastType<VectorType>(type) == nullptr) ||
++            !lIsDesignatableType(type)) {
++            Error(designator.pos, "Array designator can't be used to initialize non-array type \"%s\".",
++                  type->GetString().c_str());
++            return nullptr;
++        }
++        const CollectionType *collectionType = CastType<CollectionType>(type);
++        if (!lGetDesignatorIndex(designator, collectionType, index)) {
++            return nullptr;
++        }
++        return collectionType->GetElementType(*index);
++    }
++
++    const VectorType *vectorType = CastType<VectorType>(type);
++    if (vectorType != nullptr && lIsDesignatableType(type)) {
++        *index = designator.member.size() == 1 ? lIdentifierToVectorElement(designator.member[0]) : -1;
++        if (*index == -1 || *index >= vectorType->GetElementCount()) {
++            Error(designator.pos, "Member designator \".%s\" doesn't name an element of vector type \"%s\".",
++                  designator.member.c_str(), type->GetString().c_str());
++            return nullptr;
++        }
++        return vectorType->GetElementType();
++    }
++
++    const StructType *structType = CastType<StructType>(type);
++    if (structType == nullptr || !lIsDesignatableType(type)) {
++        Error(designator.pos, "Member designator \".%s\" can't be used to initialize non-struct type \"%s\".",
++              designator.member.c_str(), type->GetString().c_str());
++        return nullptr;
++    }
++    *index = structType->GetElementNumber(designator.member);
++    if (*index == -1) {
++        Error(designator.pos, "Element name \"%s\" not present in struct type \"%s\".", designator.member.c_str(),
++              structType->GetString().c_str());
++        return nullptr;
++    }
++    return structType->GetElementType(*index);
++}
++
++static bool lResolveInitializerList(DesignatedInitNode &node, const Type *type, ExprList *list, bool requireConstant);
++
++static bool lHasExplicitInitializer(const DesignatedInitNode &node) {
++    if (node.expr != nullptr) {
++        return true;
++    }
++    for (const DesignatedInitNode &element : node.elements) {
++        if (lHasExplicitInitializer(element)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static bool lCheckOverriddenExpr(Expr *initExpr, const Type *type, bool requireConstant) {
++    if (initExpr == nullptr) {
++        Assert(m->errorCount > 0);
++        return false;
++    }
++    ExprList *list = llvm::dyn_cast<ExprList>(initExpr);
++    if (list != nullptr) {
++        const bool isBasic = !type->IsSOAType() && Type::IsBasicType(type);
++        if (isBasic && list->exprs.size() == 1) {
++            return lCheckOverriddenExpr(list->exprs[0], type, requireConstant);
++        }
++        if (isBasic && !type->IsVaryingType()) {
++            Error(list->pos, "Expression list initializers with multiple values can't be used with type \"%s\".",
++                  type->GetString().c_str());
++            return false;
++        }
++        if (!isBasic && !type->IsSOAType()) {
++            return true;
++        }
++        const int count = type->IsSOAType() ? type->GetSOAWidth() : g->target->getVectorWidth();
++        if ((int)list->exprs.size() > count || (isBasic && (int)list->exprs.size() < count)) {
++            Error(list->pos, "Initializer for type \"%s\" requires %d values; %d provided.", type->GetString().c_str(),
++                  count, (int)list->exprs.size());
++            return false;
++        }
++        for (Expr *element : list->exprs) {
++            if (!lCheckOverriddenExpr(element, type->GetAsUniformType(), requireConstant)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    Expr *expr = TypeCheck(initExpr);
++    if (expr == nullptr || !PossiblyResolveFunctionOverloads(expr, type)) {
++        return false;
++    }
++    const Type *exprType = expr->GetType();
++    if (exprType == nullptr) {
++        AssertPos(initExpr->pos, m->errorCount > 0);
++        return false;
++    }
++    if (exprType->IsDependent()) {
++        return true;
++    }
++    expr = TypeConvertExpr(expr, type, "initializer");
++    if (expr == nullptr) {
++        return false;
++    }
++    if (requireConstant) {
++        expr = TypeCheckAndOptimize(expr);
++        if (expr == nullptr) {
++            return false;
++        }
++        if (expr->GetStorageConstant(type).first == nullptr) {
++            Error(initExpr->pos, "Overridden initializer for a global or static variable must still be a constant.");
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool lCheckOverriddenInitializer(const DesignatedInitNode &node, const Type *type, bool requireConstant) {
++    if (node.isAggregate) {
++        const CollectionType *collectionType = CastType<CollectionType>(type);
++        for (size_t i = 0; i < node.elements.size(); ++i) {
++            if (!lCheckOverriddenInitializer(node.elements[i], collectionType->GetElementType(i), requireConstant)) {
++                return false;
++            }
++        }
++        return true;
++    }
++    return node.expr == nullptr || lCheckOverriddenExpr(node.expr, type, requireConstant);
++}
++
++static bool lStoreDesignatedInitializer(DesignatedInitNode &root, const Type *rootType, const std::vector<int> &path,
++                                        Expr *expr, bool requireConstant) {
++    DesignatedInitNode *node = &root;
++    const Type *type = rootType;
++    for (size_t depth = 0; depth < path.size(); ++depth) {
++        const Type *elementType = CastType<CollectionType>(type)->GetElementType(path[depth]);
++        if (node->elements.size() <= (size_t)path[depth]) {
++            node->elements.resize((size_t)path[depth] + 1);
++        }
++        DesignatedInitNode &child = node->elements[path[depth]];
++
++        if (depth + 1 == path.size()) {
++            if (lHasExplicitInitializer(child)) {
++                if (!lCheckOverriddenInitializer(child, elementType, requireConstant)) {
++                    return false;
++                }
++                Warning(expr->pos, "Initializer overrides an earlier initializer of the same element.");
++            }
++            DesignatedInitNode replacement;
++            ExprList *list = llvm::dyn_cast<ExprList>(expr);
++            if (list != nullptr && lIsDesignatableType(elementType)) {
++                if (!lResolveInitializerList(replacement, elementType, list, requireConstant)) {
++                    return false;
++                }
++            } else if (list != nullptr && list->HasDesignators()) {
++                Error(list->pos, "Designators can't be used to initialize type \"%s\".",
++                      elementType->GetString().c_str());
++                return false;
++            } else if (list == nullptr && lIsDesignatableType(elementType)) {
++                Error(expr->pos, "Initializer for type \"%s\" must be an initializer list.",
++                      elementType->GetString().c_str());
++                return false;
++            } else {
++                replacement.expr = expr;
++            }
++            child = std::move(replacement);
++            return true;
++        }
++
++        if (!child.isAggregate) {
++            child = DesignatedInitNode();
++            child.isAggregate = true;
++        }
++        node = &child;
++        type = elementType;
++    }
++    return true;
++}
++
++static bool lResolveInitializerList(DesignatedInitNode &node, const Type *type, ExprList *list, bool requireConstant) {
++    node.expr = nullptr;
++    node.isAggregate = true;
++    node.elements.clear();
++
++    std::vector<int> path;
++    std::vector<const Type *> pathTypes;
++    for (size_t i = 0; i < list->exprs.size(); ++i) {
++        if (list->exprs[i] == nullptr) {
++            AssertPos(list->pos, m->errorCount > 0);
++            return false;
++        }
++
++        if (i < list->designators.size() && !list->designators[i].empty()) {
++            path.clear();
++            pathTypes.clear();
++            const Type *current = type;
++            for (const Designator &designator : list->designators[i]) {
++                int index = 0;
++                const Type *elementType = lApplyDesignator(current, designator, &index);
++                if (elementType == nullptr) {
++                    return false;
++                }
++                pathTypes.push_back(current);
++                path.push_back(index);
++                current = elementType;
++            }
++        } else if (path.empty()) {
++            pathTypes.push_back(type);
++            path.push_back(0);
++        } else {
++            ++path.back();
++            while (path.size() > 1 && lIsPastEnd(pathTypes.back(), path.back())) {
++                path.pop_back();
++                pathTypes.pop_back();
++                ++path.back();
++            }
++        }
++
++        if (lIsPastEnd(pathTypes.back(), path.back())) {
++            Error(list->exprs[i]->pos, "Too many elements in initializer list for type \"%s\".",
++                  type->GetString().c_str());
++            return false;
++        }
++        if (!lStoreDesignatedInitializer(node, type, path, list->exprs[i], requireConstant)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static Expr *lDesignatedInitNodeToExpr(const DesignatedInitNode &node, const Type *type, SourcePos pos) {
++    if (!node.isAggregate) {
++        return node.expr != nullptr ? node.expr : lZeroInitializer(type, pos);
++    }
++
++    const CollectionType *collectionType = CastType<CollectionType>(type);
++    size_t count = node.elements.size();
++    while (count > 0 && !node.elements[count - 1].isAggregate && node.elements[count - 1].expr == nullptr) {
++        --count;
++    }
++    if (CastType<VectorType>(type) != nullptr) {
++        count = collectionType->GetElementCount();
++    }
++    ExprList *list = new ExprList(pos);
++    for (size_t i = 0; i < count; ++i) {
++        const Type *elementType = collectionType->GetElementType(i);
++        list->exprs.push_back(i < node.elements.size() ? lDesignatedInitNodeToExpr(node.elements[i], elementType, pos)
++                                                       : lZeroInitializer(elementType, pos));
++    }
++    return list;
++}
++
++Expr *ispc::ResolveDesignatedInitializer(const Type *type, Expr *initExpr, bool requireConstant) {
++    ExprList *list = llvm::dyn_cast_or_null<ExprList>(initExpr);
++    if (list == nullptr || type == nullptr || type->IsDependent() || !list->HasDesignators()) {
++        return initExpr;
++    }
++    if (!lIsDesignatableType(type)) {
++        Error(list->pos, "Designators can't be used to initialize type \"%s\".", type->GetString().c_str());
++        return nullptr;
++    }
++
++    DesignatedInitNode root;
++    if (!lResolveInitializerList(root, type, list, requireConstant)) {
++        return nullptr;
++    }
++    return TypeCheck(lDesignatedInitNodeToExpr(root, type, list->pos));
++}
++
++ConstExpr *ispc::GetSingleElementInitializerConstant(const Type *type, Expr *initExpr) {
++    ExprList *list = llvm::dyn_cast_or_null<ExprList>(initExpr);
++    if (list == nullptr || type == nullptr || !type->IsUniformType() ||
++        (CastType<AtomicType>(type) == nullptr && CastType<EnumType>(type) == nullptr)) {
++        return nullptr;
++    }
++    while (list != nullptr) {
++        if (list->exprs.size() != 1 || list->exprs[0] == nullptr) {
++            return nullptr;
++        }
++        initExpr = list->exprs[0];
++        list = llvm::dyn_cast<ExprList>(initExpr);
++    }
++
++    ConstExpr *value = llvm::dyn_cast_or_null<ConstExpr>(Optimize(initExpr));
++    if (value == nullptr || !value->GetType()->IsUniformType()) {
++        return nullptr;
++    }
++    TypeCastExpr *cast = new TypeCastExpr(type, value, value->pos);
++    cast->SetTypeChecked();
++    return llvm::dyn_cast_or_null<ConstExpr>(Optimize(cast));
++}
++
+ ///////////////////////////////////////////////////////////////////////////
+ // IndexExpr
+ 
+@@ -10395,6 +10802,13 @@ Expr *NewExpr::TypeCheck() {
+         return nullptr;
+     }
+ 
++    if (initExpr != nullptr) {
++        initExpr = ResolveDesignatedInitializer(allocType, initExpr, false);
++        if (initExpr == nullptr) {
++            return nullptr;
++        }
++    }
++
+     // Otherwise we only need to make sure that if we have an expression
+     // giving a number of elements to allocate that it can be converted to
+     // an integer of the appropriate variability.
+diff --git a/src/expr.h b/src/expr.h
+index 6572657..f39f1c1 100644
+--- a/src/expr.h
++++ b/src/expr.h
+@@ -1,5 +1,5 @@
+ /*
+-  Copyright (c) 2010-2025, Intel Corporation
++  Copyright (c) 2010-2026, Intel Corporation
+ 
+   SPDX-License-Identifier: BSD-3-Clause
+ */
+@@ -238,6 +238,19 @@ class SelectExpr : public Expr {
+     Expr *test, *expr1, *expr2;
+ };
+ 
++/** @brief A single designator of an initializer list element, either
++    ".member" or "[index]".
++ */
++struct Designator {
++    Designator(const std::string &name, SourcePos p) : isIndex(false), member(name), index(nullptr), pos(p) {}
++    Designator(Expr *i, SourcePos p) : isIndex(true), index(i), pos(p) {}
++
++    bool isIndex;
++    std::string member;
++    Expr *index;
++    SourcePos pos;
++};
++
+ /** @brief A list of expressions.
+ 
+     These are mostly used for representing curly-brace delimited
+@@ -264,8 +277,15 @@ class ExprList : public Expr {
+     ExprList *Instantiate(TemplateInstantiation &templInst) const;
+     bool HasAmbiguousVariability(std::vector<const Expr *> &warn) const;
+ 
++    /** Returns true if this list or any list nested inside it has designators. */
++    bool HasDesignators() const;
++
+     std::vector<Expr *> exprs;
+ 
++    /** Designators written before the expression with the same index in
++        exprs; positional elements have an empty entry or no entry at all. */
++    std::vector<std::vector<Designator>> designators;
++
+     // Utility structs to support initializers lists for vectors
+     struct ExprPosMapping {
+         Expr *expr;
+@@ -989,6 +1009,20 @@ Expr *TypeConvertExpr(Expr *expr, const Type *toType, const char *errorMsgBase);
+ */
+ void InitSymbol(AddressInfo *lvalue, const Type *symType, Expr *initExpr, FunctionEmitContext *ctx, SourcePos pos);
+ 
++/** Rewrites an initializer list that uses designators into the equivalent
++    positional initializer list for the given type.  Returns initExpr itself
++    when there is nothing to rewrite and nullptr after reporting an error.
++    Items that a later item overrides are still checked against the type they
++    initialize and, when requireConstant is set, for being constant.
++*/
++Expr *ResolveDesignatedInitializer(const Type *type, Expr *initExpr, bool requireConstant);
++
++/** Returns the value of an initializer list with a single element for a
++    uniform atomic or enum type, converted to that type, or nullptr when
++    that element isn't a compile-time constant.
++*/
++ConstExpr *GetSingleElementInitializerConstant(const Type *type, Expr *initExpr);
++
+ bool PossiblyResolveFunctionOverloads(Expr *expr, const Type *type);
+ 
+ /** This function encapsulates the common logic for looking up and calling
+diff --git a/src/ispc.h b/src/ispc.h
+index b6d12c9..b22d3a9 100644
+--- a/src/ispc.h
++++ b/src/ispc.h
+@@ -84,6 +84,7 @@ class AST;
+ class ASTNode;
+ class AtomicType;
+ class FunctionEmitContext;
++struct Designator;
+ class Expr;
+ class ExprList;
+ class Function;
+diff --git a/src/module.cpp b/src/module.cpp
+index e097f61..a425315 100644
+--- a/src/module.cpp
++++ b/src/module.cpp
+@@ -663,6 +663,13 @@ void Module::AddGlobalVariable(Declarator *decl, bool isConst) {
+         return;
+     }
+ 
++    if (initExpr != nullptr) {
++        initExpr = ResolveDesignatedInitializer(type, initExpr, true);
++        if (initExpr == nullptr) {
++            return;
++        }
++    }
++
+     type = ArrayType::SizeUnsizedArrays(type, initExpr);
+     if (type == nullptr) {
+         return;
+@@ -747,6 +754,9 @@ void Module::AddGlobalVariable(Declarator *decl, bool isConst) {
+                             // StructTypes where a ConstExpr can't
+                             // represent their values.
+                             constValue = llvm::dyn_cast<ConstExpr>(initExpr);
++                            if (constValue == nullptr) {
++                                constValue = GetSingleElementInitializerConstant(type, initExpr);
++                            }
+                         }
+                     } else {
+                         Error(initExpr->pos, "Initializer for global variable \"%s\" must be a constant.",
+diff --git a/src/parse.yy b/src/parse.yy
+index b325b91..a27edce 100644
+--- a/src/parse.yy
++++ b/src/parse.yy
+@@ -194,6 +194,7 @@ struct ForeachDimension {
+ 
+     Expr *expr;
+     ExprList *exprList;
++    std::vector<Designator> *designatorList;
+     const Type *type;
+     std::vector<std::pair<const Type *, SourcePos> > *typeList;
+     int typeQualifier;
+@@ -273,6 +274,7 @@ struct ForeachDimension {
+ %type <expr> conditional_expression assignment_expression expression
+ %type <expr> initializer constant_expression for_test
+ %type <exprList> argument_expression_list initializer_list
++%type <designatorList> designation designator_list
+ 
+ %type <stmt> attributed_statement labeled_statement compound_statement for_init_statement statement
+ %type <stmt> expression_statement selection_statement iteration_statement
+@@ -2329,6 +2331,13 @@ initializer
+ initializer_list
+     : initializer
+       { $$ = new ExprList($1, @1); }
++    | designation initializer
++      {
++          ExprList *exprList = new ExprList($2, Union(@1, @2));
++          exprList->designators.push_back(*$1);
++          delete $1;
++          $$ = exprList;
++      }
+     | initializer_list ',' initializer
+       {
+           ExprList *exprList = $1;
+@@ -2340,6 +2349,46 @@ initializer_list
+           exprList->pos = Union(exprList->pos, @3);
+           $$ = exprList;
+       }
++    | initializer_list ',' designation initializer
++      {
++          ExprList *exprList = $1;
++          if (exprList == nullptr) {
++              AssertPos(@1, m->errorCount > 0);
++              exprList = new ExprList(@4);
++          }
++          exprList->designators.resize(exprList->exprs.size());
++          exprList->designators.push_back(*$3);
++          delete $3;
++          exprList->exprs.push_back($4);
++          exprList->pos = Union(exprList->pos, @4);
++          $$ = exprList;
++      }
++    ;
++
++designation
++    : designator_list '='
++      { $$ = $1; }
++    ;
++
++designator_list
++    : '[' constant_expression ']'
++      { $$ = new std::vector<Designator>(1, Designator($2, Union(@1, @3))); }
++    | '.' TOKEN_IDENTIFIER
++      {
++          $$ = new std::vector<Designator>(1, Designator(*$2, Union(@1, @2)));
++          lCleanUpString($2);
++      }
++    | designator_list '[' constant_expression ']'
++      {
++          $1->push_back(Designator($3, Union(@2, @4)));
++          $$ = $1;
++      }
++    | designator_list '.' TOKEN_IDENTIFIER
++      {
++          $1->push_back(Designator(*$3, Union(@2, @3)));
++          lCleanUpString($3);
++          $$ = $1;
++      }
+     ;
+ 
+ pragma
+diff --git a/src/stmt.cpp b/src/stmt.cpp
+index c23de2b..ed0e8a9 100644
+--- a/src/stmt.cpp
++++ b/src/stmt.cpp
+@@ -1,5 +1,5 @@
+ /*
+-  Copyright (c) 2010-2025, Intel Corporation
++  Copyright (c) 2010-2026, Intel Corporation
+ 
+   SPDX-License-Identifier: BSD-3-Clause
+ */
+@@ -394,8 +394,30 @@ Stmt *DeclStmt::TypeCheck() {
+             continue;
+         }
+ 
++        Expr *init = ResolveDesignatedInitializer(type, vars[i].init, vars[i].sym->storageClass.IsStatic());
++        if (init == nullptr) {
++            encounteredError = true;
++            continue;
++        }
++        vars[i].init = init;
++
+         // Check an init.
+         encounteredError |= lCheckInit(type, &(vars[i].init), name);
++
++        if (vars[i].init != nullptr && type != nullptr && !type->IsDependent() && type->IsConstType() &&
++            type->IsUniformType() && (CastType<AtomicType>(type) != nullptr || CastType<EnumType>(type) != nullptr)) {
++            if (llvm::dyn_cast<ExprList>(vars[i].init) != nullptr) {
++                vars[i].sym->constValue = GetSingleElementInitializerConstant(type, vars[i].init);
++            } else {
++                Expr *constInit = ::Optimize(vars[i].init);
++                if (constInit != nullptr) {
++                    vars[i].init = constInit;
++                    if (Type::Equal(constInit->GetType(), type)) {
++                        vars[i].sym->constValue = llvm::dyn_cast<ConstExpr>(constInit);
++                    }
++                }
++            }
++        }
+     }
+     return encounteredError ? nullptr : this;
+ }
+diff --git a/src/type.cpp b/src/type.cpp
+index 6ccfdbd..7f02d39 100644
+--- a/src/type.cpp
++++ b/src/type.cpp
+@@ -1640,6 +1640,9 @@ const Type *ArrayType::SizeUnsizedArrays(const Type *type, Expr *initExpr) {
+     // (after checking below that it has the same length as all of the
+     // other ones.
+     ExprList *nextList = llvm::dyn_cast_or_null<ExprList>(exprList->exprs[0]);
++    for (unsigned int i = 1; nextList != nullptr && nextList->exprs.empty() && i < exprList->exprs.size(); ++i) {
++        nextList = llvm::dyn_cast_or_null<ExprList>(exprList->exprs[i]);
++    }
+     if (nextList == nullptr) {
+         return type;
+     }
+@@ -1662,6 +1665,9 @@ const Type *ArrayType::SizeUnsizedArrays(const Type *type, Expr *initExpr) {
+             }
+ 
+             ExprList *el = llvm::dyn_cast_or_null<ExprList>(exprList->exprs[i]);
++            if (el != nullptr && el->exprs.empty()) {
++                continue;
++            }
+             if (el == nullptr || el->exprs.size() != nextSize) {
+                 Error(Union(exprList->exprs[0]->pos, exprList->exprs[i]->pos),
+                       "Inconsistent initializer expression list lengths "

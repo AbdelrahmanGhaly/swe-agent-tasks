@@ -1,0 +1,995 @@
+diff --git a/highs/io/FilereaderLp.cpp b/highs/io/FilereaderLp.cpp
+index 0989022616..0ab154b7ab 100644
+--- a/highs/io/FilereaderLp.cpp
++++ b/highs/io/FilereaderLp.cpp
+@@ -356,6 +356,46 @@ void FilereaderLp::writeToFileMatrixRow(FILE* file, const HighsInt iRow,
+   }
+ }
+ 
++// A row that is bounded on both sides, or on neither, cannot be written as a
++// single one-sided constraint without changing the number of rows
++static bool rowIsTwoSided(const double lower, const double upper) {
++  const bool boxed = lower > -kHighsInf && upper < kHighsInf;
++  const bool free_row = lower <= -kHighsInf && upper >= kHighsInf;
++  return boxed || free_row;
++}
++
++// A semi-integer column is identified by appearing in both the general and the
++// semi-continuous section, so section membership is decided in one place
++static bool colInGeneralSection(const HighsVarType type, const double lower,
++                                const double upper) {
++  if (type == HighsVarType::kSemiInteger) return true;
++  if (type != HighsVarType::kInteger) return false;
++  return lower != 0.0 || upper != 1.0;
++}
++
++static bool colInBinarySection(const HighsVarType type, const double lower,
++                               const double upper) {
++  return type == HighsVarType::kInteger && lower == 0.0 && upper == 1.0;
++}
++
++static bool colInSemiSection(const HighsVarType type) {
++  return type == HighsVarType::kSemiContinuous ||
++         type == HighsVarType::kSemiInteger;
++}
++
++void FilereaderLp::writeToFileRangedRow(FILE* file, const HighsLp& lp,
++                                        const HighsInt iRow,
++                                        const HighsSparseMatrix& ar_matrix) {
++  this->writeToFileVar(file, lp.row_names_[iRow]);
++  this->writeToFile(file, ":");
++  this->writeToFileValue(file, lp.row_lower_[iRow], true);
++  this->writeToFile(file, " <=");
++  this->writeToFileMatrixRow(file, iRow, ar_matrix, lp.col_names_);
++  this->writeToFile(file, " <=");
++  this->writeToFileValue(file, lp.row_upper_[iRow], true);
++  this->writeToFileLineEnd(file);
++}
++
+ HighsStatus FilereaderLp::writeModelToFile(const HighsOptions& options,
+                                            const std::string filename,
+                                            const HighsModel& model) {
+@@ -379,13 +419,18 @@ HighsStatus FilereaderLp::writeModelToFile(const HighsOptions& options,
+   this->writeToFile(file, "%s",
+                     lp.sense_ == ObjSense::kMinimize ? "min" : "max");
+   this->writeToFileLineEnd(file);
+-  this->writeToFile(file, " obj:");
++  // The reader takes the objective name from this label, so writing a fixed
++  // one loses the name the model carries
++  const std::string lp_objective_name =
++      lp.objective_name_.empty() ? "obj" : lp.objective_name_;
++  this->writeToFile(file, " %s:", lp_objective_name.c_str());
++  // Every column is named here, in index order, even when its cost is zero.
++  // The reader creates a column when it first meets the name, so this is what
++  // keeps a column that appears in no row from being lost, and keeps the
++  // columns in the order the model has them
+   for (HighsInt iCol = 0; iCol < lp.num_col_; iCol++) {
+-    double coef = lp.col_cost_[iCol];
+-    if (coef != 0.0) {
+-      this->writeToFileValue(file, coef);
+-      this->writeToFileVar(file, lp.col_names_[iCol]);
+-    }
++    this->writeToFileValue(file, lp.col_cost_[iCol]);
++    this->writeToFileVar(file, lp.col_names_[iCol]);
+   }
+   this->writeToFile(file,
+                     " ");  // ToDo Unnecessary, but only to give empty diff
+@@ -427,19 +472,15 @@ HighsStatus FilereaderLp::writeModelToFile(const HighsOptions& options,
+       this->writeToFile(file, " =");
+       this->writeToFileValue(file, lp.row_lower_[iRow], true);
+       this->writeToFileLineEnd(file);
++    } else if (rowIsTwoSided(lp.row_lower_[iRow], lp.row_upper_[iRow])) {
++      // Boxed and free rows are written as a single two-sided constraint so
++      // that the row survives the round trip under its own name
++      this->writeToFileRangedRow(file, lp, iRow, ar_matrix);
+     } else {
+-      // Need to distinguish the names when writing out boxed
+-      // constraint row as two single-sided constraints
+-      const bool boxed =
+-          lp.row_lower_[iRow] > -kHighsInf && lp.row_upper_[iRow] < kHighsInf;
+       if (lp.row_lower_[iRow] > -kHighsInf) {
+         // Has a lower bound
+         this->writeToFileVar(file, lp.row_names_[iRow]);
+-        if (boxed) {
+-          this->writeToFile(file, "lo:");
+-        } else {
+-          this->writeToFile(file, ":");
+-        }
++        this->writeToFile(file, ":");
+         this->writeToFileMatrixRow(file, iRow, ar_matrix, lp.col_names_);
+         this->writeToFile(file, " >=");
+         this->writeToFileValue(file, lp.row_lower_[iRow], true);
+@@ -448,11 +489,7 @@ HighsStatus FilereaderLp::writeModelToFile(const HighsOptions& options,
+       if (lp.row_upper_[iRow] < kHighsInf) {
+         // Has an upper bound
+         this->writeToFileVar(file, lp.row_names_[iRow]);
+-        if (boxed) {
+-          this->writeToFile(file, "up:");
+-        } else {
+-          this->writeToFile(file, ":");
+-        }
++        this->writeToFile(file, ":");
+         this->writeToFileMatrixRow(file, iRow, ar_matrix, lp.col_names_);
+         this->writeToFile(file, " <=");
+         this->writeToFileValue(file, lp.row_upper_[iRow], true);
+@@ -499,11 +536,10 @@ HighsStatus FilereaderLp::writeModelToFile(const HighsOptions& options,
+     this->writeToFile(file, "bin");
+     this->writeToFileLineEnd(file);
+     for (HighsInt iCol = 0; iCol < lp.num_col_; iCol++) {
+-      if (lp.integrality_[iCol] == HighsVarType::kInteger) {
+-        if (lp.col_lower_[iCol] == 0.0 && lp.col_upper_[iCol] == 1.0) {
+-          this->writeToFileVar(file, lp.col_names_[iCol]);
+-          this->writeToFileLineEnd(file);
+-        }
++      if (colInBinarySection(lp.integrality_[iCol], lp.col_lower_[iCol],
++                             lp.col_upper_[iCol])) {
++        this->writeToFileVar(file, lp.col_names_[iCol]);
++        this->writeToFileLineEnd(file);
+       }
+     }
+ 
+@@ -511,11 +547,10 @@ HighsStatus FilereaderLp::writeModelToFile(const HighsOptions& options,
+     this->writeToFile(file, "gen");
+     this->writeToFileLineEnd(file);
+     for (HighsInt iCol = 0; iCol < lp.num_col_; iCol++) {
+-      if (lp.integrality_[iCol] == HighsVarType::kInteger) {
+-        if (lp.col_lower_[iCol] != 0.0 || lp.col_upper_[iCol] != 1.0) {
+-          this->writeToFileVar(file, lp.col_names_[iCol]);
+-          this->writeToFileLineEnd(file);
+-        }
++      if (colInGeneralSection(lp.integrality_[iCol], lp.col_lower_[iCol],
++                              lp.col_upper_[iCol])) {
++        this->writeToFileVar(file, lp.col_names_[iCol]);
++        this->writeToFileLineEnd(file);
+       }
+     }
+ 
+@@ -523,8 +558,7 @@ HighsStatus FilereaderLp::writeModelToFile(const HighsOptions& options,
+     this->writeToFile(file, "semi");
+     this->writeToFileLineEnd(file);
+     for (HighsInt iCol = 0; iCol < lp.num_col_; iCol++) {
+-      if (lp.integrality_[iCol] == HighsVarType::kSemiContinuous ||
+-          lp.integrality_[iCol] == HighsVarType::kSemiInteger) {
++      if (colInSemiSection(lp.integrality_[iCol])) {
+         this->writeToFileVar(file, lp.col_names_[iCol]);
+         this->writeToFileLineEnd(file);
+       }
+diff --git a/highs/io/FilereaderLp.h b/highs/io/FilereaderLp.h
+index 329bc7c1ca..8714fdd7a2 100644
+--- a/highs/io/FilereaderLp.h
++++ b/highs/io/FilereaderLp.h
+@@ -44,6 +44,8 @@ class FilereaderLp : public Filereader {
+   void writeToFileMatrixRow(FILE* file, const HighsInt iRow,
+                             const HighsSparseMatrix& ar_matrix,
+                             const std::vector<string>& col_names);
++  void writeToFileRangedRow(FILE* file, const HighsLp& lp, const HighsInt iRow,
++                            const HighsSparseMatrix& ar_matrix);
+ };
+ 
+ #endif
+diff --git a/highs/io/FilereaderMps.cpp b/highs/io/FilereaderMps.cpp
+index 585f8b3955..959b03bf3b 100644
+--- a/highs/io/FilereaderMps.cpp
++++ b/highs/io/FilereaderMps.cpp
+@@ -29,6 +29,7 @@ FilereaderRetcode FilereaderMps::readModelFromFile(const HighsOptions& options,
+     HMpsFF parser{};
+     if (options.time_limit < kHighsInf && options.time_limit > 0)
+       parser.time_limit_ = options.time_limit;
++    parser.keep_n_rows_ = options.keep_n_rows;
+ 
+     FreeFormatParserReturnCode result =
+         parser.loadProblem(options.log_options, filename, model);
+diff --git a/highs/io/HMPSIO.cpp b/highs/io/HMPSIO.cpp
+index 53c16561e8..4065aec97a 100644
+--- a/highs/io/HMPSIO.cpp
++++ b/highs/io/HMPSIO.cpp
+@@ -26,6 +26,58 @@
+ 
+ using std::map;
+ 
++// The whole two-character type is needed because the abbreviated symbol is
++// shared by MI, LI, UI and SI
++static const char* const kFixedFormatBoundTypes[] = {
++    "LO", "UP", "FX", "FR", "MI", "PL", "BV", "LI", "UI", "SC", "SI"};
++
++static bool knownFixedFormatBound(const char* bound_type) {
++  const std::string type(bound_type, 2);
++  for (const char* known : kFixedFormatBoundTypes) {
++    if (type == known) return true;
++  }
++  return false;
++}
++
++// Apply one BOUNDS entry of a type that knownFixedFormatBound has accepted
++static void applyFixedFormatBound(const char* bound_type, const double value,
++                                  double& lower, double& upper,
++                                  HighsVarType& integrality) {
++  const std::string type(bound_type, 2);
++  if (type == "LO") {
++    lower = value;
++  } else if (type == "UP") {
++    upper = value;
++    if (lower == 0 && value < 0) lower = -kHighsInf;
++  } else if (type == "FX") {
++    lower = value;
++    upper = value;
++  } else if (type == "FR") {
++    lower = -kHighsInf;
++    upper = kHighsInf;
++  } else if (type == "MI") {
++    lower = -kHighsInf;
++  } else if (type == "PL") {
++    upper = kHighsInf;
++  } else if (type == "BV") {
++    lower = 0;
++    upper = 1;
++    integrality = HighsVarType::kInteger;
++  } else if (type == "LI") {
++    lower = value;
++    integrality = HighsVarType::kInteger;
++  } else if (type == "UI") {
++    upper = value;
++    integrality = HighsVarType::kInteger;
++  } else if (type == "SC") {
++    upper = value;
++    integrality = HighsVarType::kSemiContinuous;
++  } else if (type == "SI") {
++    upper = value;
++    integrality = HighsVarType::kSemiInteger;
++  }
++}
++
+ //
+ // Read file called filename. Returns 0 if OK and 1 if file can't be opened
+ //
+@@ -79,20 +131,22 @@ FilereaderRetcode readMps(
+   // Input buffer
+   const HighsInt lmax = 128;
+   std::array<char, lmax> line;
+-  std::array<char, 2> flag = {0, 0};
++  // flag[2] and flag[3] hold the raw major symbol, which the abbreviated
++  // form in flag[0] cannot represent for the two-letter bound types
++  std::array<char, 4> flag = {0, 0, 0, 0};
+   std::array<double, 3> data;
+ 
+   HighsInt num_alien_entries = 0;
+   HighsVarType integerCol = HighsVarType::kContinuous;
+ 
+   // Load NAME
+-  load_mpsLine(file, integerCol, lmax, line.data(), flag.data(), data.data());
++  load_mpsLine(file, integerCol, lmax, line.data(), flag, data.data());
+   highsLogDev(log_options, HighsLogType::kInfo, "readMPS: Read NAME    OK\n");
+   // Load OBJSENSE or ROWS
+-  load_mpsLine(file, integerCol, lmax, line.data(), flag.data(), data.data());
++  load_mpsLine(file, integerCol, lmax, line.data(), flag, data.data());
+   if (flag[0] == 'O') {
+     // Found OBJSENSE
+-    load_mpsLine(file, integerCol, lmax, line.data(), flag.data(), data.data());
++    load_mpsLine(file, integerCol, lmax, line.data(), flag, data.data());
+     std::string sense(&line[2], &line[2] + 3);
+     // the sense must be "MAX" or "MIN"
+     if (sense.compare("MAX") == 0) {
+@@ -105,7 +159,7 @@ FilereaderRetcode readMps(
+     highsLogDev(log_options, HighsLogType::kInfo,
+                 "readMPS: Read OBJSENSE OK\n");
+     // Load ROWS
+-    load_mpsLine(file, integerCol, lmax, line.data(), flag.data(), data.data());
++    load_mpsLine(file, integerCol, lmax, line.data(), flag, data.data());
+   }
+ 
+   row_names.clear();
+@@ -113,7 +167,7 @@ FilereaderRetcode readMps(
+   vector<char> rowType;
+   map<double, int> rowIndex;
+   double objName = 0;
+-  while (load_mpsLine(file, integerCol, lmax, line.data(), flag.data(),
++  while (load_mpsLine(file, integerCol, lmax, line.data(), flag,
+                       data.data())) {
+     if (flag[0] == 'N' &&
+         (objName == 0 || keep_n_rows == kKeepNRowsDeleteRows)) {
+@@ -150,7 +204,7 @@ FilereaderRetcode readMps(
+   // line - field 5 non-empty. save_flag1 is used to deduce whether
+   // the row name and value are from fields 5 and 6, or 3 and 4
+   HighsInt save_flag1 = 0;
+-  while (load_mpsLine(file, integerCol, lmax, line.data(), flag.data(),
++  while (load_mpsLine(file, integerCol, lmax, line.data(), flag,
+                       data.data())) {
+     HighsInt iRow = rowIndex[data[2]] - 1;
+     std::string name = "";
+@@ -222,7 +276,7 @@ FilereaderRetcode readMps(
+   num_alien_entries = 0;
+   vector<double> RHS(numRow, 0);
+   save_flag1 = 0;
+-  while (load_mpsLine(file, integerCol, lmax, line.data(), flag.data(),
++  while (load_mpsLine(file, integerCol, lmax, line.data(), flag,
+                       data.data())) {
+     if (data[2] != objName) {
+       HighsInt iRow = rowIndex[data[2]] - 1;
+@@ -275,10 +329,13 @@ FilereaderRetcode readMps(
+   rowUpper.resize(numRow);
+   if (flag[0] == 'R') {
+     save_flag1 = 0;
+-    while (load_mpsLine(file, integerCol, lmax, line.data(), flag.data(),
++    while (load_mpsLine(file, integerCol, lmax, line.data(), flag,
+                         data.data())) {
+       HighsInt iRow = rowIndex[data[2]] - 1;
+-      if (iRow >= 0) {
++      if (iRow >= 0 && rowType[iRow] == 'N') {
++        // A retained N row constrains nothing, so a range for it is ignored
++        // rather than turning it into a bounded row
++      } else if (iRow >= 0) {
+         if (rowType[iRow] == 'L' || (rowType[iRow] == 'E' && data[0] < 0)) {
+           rowLower[iRow] = RHS[iRow] - fabs(data[0]);
+           rowUpper[iRow] = RHS[iRow];
+@@ -347,37 +404,30 @@ FilereaderRetcode readMps(
+   num_alien_entries = 0;
+   colLower.assign(numCol, 0);
+   colUpper.assign(numCol, kHighsInf);
++  // An integer column given any explicit bound keeps that bound rather than
++  // the default upper bound of one
++  std::vector<bool> bounded_integer(numCol, false);
+   if (flag[0] == 'B') {
+-    while (load_mpsLine(file, integerCol, lmax, line.data(), flag.data(),
++    while (load_mpsLine(file, integerCol, lmax, line.data(), flag,
+                         data.data())) {
+       // Find the column index associated with the name "data[2]". If
+       // the name is in colIndex then the value stored is the true
+       // column index plus one. Otherwise 0 will be returned.
++      // The bound type is checked before the column is looked up, so an
++      // unrecognised type is rejected whether or not the column is known
++      if (!knownFixedFormatBound(&flag[2])) {
++        highsLogUser(log_options, HighsLogType::kError,
++                     "Entry in BOUNDS section of MPS file is of type "
++                     "\"%c%c\"\n",
++                     flag[2], flag[3]);
++        file.close();
++        return FilereaderRetcode::kParserError;
++      }
+       HighsInt iCol = colIndex[data[2]] - 1;
+       if (iCol >= 0) {
+-        switch (flag[0]) {
+-          case 'O': /*LO*/
+-            colLower[iCol] = data[0];
+-            break;
+-          case 'I': /*MI*/
+-            colLower[iCol] = -kHighsInf;
+-            break;
+-          case 'L': /*PL*/
+-            colUpper[iCol] = kHighsInf;
+-            break;
+-          case 'X': /*FX*/
+-            colLower[iCol] = data[0];
+-            colUpper[iCol] = data[0];
+-            break;
+-          case 'R': /*FR*/
+-            colLower[iCol] = -kHighsInf;
+-            colUpper[iCol] = kHighsInf;
+-            break;
+-          case 'P': /*UP*/
+-            colUpper[iCol] = data[0];
+-            if (colLower[iCol] == 0 && data[0] < 0) colLower[iCol] = -kHighsInf;
+-            break;
+-        }
++        applyFixedFormatBound(&flag[2], data[0], colLower[iCol],
++                              colUpper[iCol], integerColumn[iCol]);
++        bounded_integer[iCol] = true;
+       } else {
+         std::string name(&line[field_3_start],
+                          &line[field_3_start] + field_3_width);
+@@ -401,7 +451,7 @@ FilereaderRetcode readMps(
+     HighsInt previous_col = -1;
+     bool has_diagonal = false;
+     Qstart.clear();
+-    while (load_mpsLine(file, integerCol, lmax, line.data(), flag.data(),
++    while (load_mpsLine(file, integerCol, lmax, line.data(), flag,
+                         data.data())) {
+       HighsInt iCol0 = colIndex[data[1]] - 1;
+       std::string name0 = "";
+@@ -447,10 +497,13 @@ FilereaderRetcode readMps(
+   // Determine the number of integer variables and set bounds of [0,1]
+   // for integer variables without bounds
+   HighsInt num_int = 0;
++  HighsInt num_non_continuous = 0;
+   for (HighsInt iCol = 0; iCol < numCol; iCol++) {
++    if (integerColumn[iCol] != HighsVarType::kContinuous) num_non_continuous++;
+     if (integerColumn[iCol] == HighsVarType::kInteger) {
+       num_int++;
+-      if (colUpper[iCol] >= kHighsInf) colUpper[iCol] = 1;
++      if (colUpper[iCol] >= kHighsInf && !bounded_integer[iCol])
++        colUpper[iCol] = 1;
+     }
+   }
+   if (num_alien_entries) {
+@@ -470,20 +523,43 @@ FilereaderRetcode readMps(
+               numRow, numCol, num_int);
+   // Load ENDATA and close file
+   file.close();
+-  // If there are no integer variables then clear the integrality vector
+-  if (!num_int) integerColumn.clear();
++  // If every column is continuous then clear the integrality vector
++  if (!num_non_continuous) integerColumn.clear();
+   return FilereaderRetcode::kOk;
+ }
+ 
++std::string mpsTextFromValue(const double value) {
++  if (value >= kHighsInf) return "inf";
++  if (value <= -kHighsInf) return "-inf";
++  std::array<char, 32> text;
++  snprintf(text.data(), text.size(), "%.15g", value);
++  return std::string(text.data());
++}
++
++double mpsValueFromText(const char* text) {
++  const char* symbol = text;
++  while (*symbol == ' ' || *symbol == '\t') symbol++;
++  double sign = 1;
++  if (*symbol == '+' || *symbol == '-') {
++    if (*symbol == '-') sign = -1;
++    symbol++;
++  }
++  if ((symbol[0] == 'i' || symbol[0] == 'I') &&
++      (symbol[1] == 'n' || symbol[1] == 'N') &&
++      (symbol[2] == 'f' || symbol[2] == 'F'))
++    return sign * kHighsInf;
++  return atof(text);
++}
++
+ bool load_mpsLine(std::istream& file, HighsVarType& integerVar, HighsInt lmax,
+-                  char* line, char* flag, double* data) {
++                  char* line, std::array<char, 4>& flag, double* data) {
+   HighsInt F1 = 1, F2 = 4, F3 = 14, F4 = 24, F5 = 39, F6 = 49;
+ 
+   // check the buffer
+   if (flag[1]) {
+     flag[1] = 0;
+     memcpy(&data[2], &line[F5], 8);
+-    data[0] = atof(&line[F6]);
++    data[0] = mpsValueFromText(&line[F6]);
+     return true;
+   }
+ 
+@@ -535,10 +611,12 @@ bool load_mpsLine(std::istream& file, HighsVarType& integerVar, HighsInt lmax,
+ 
+     // Read major symbol & name
+     flag[0] = line[F1 + 1] == ' ' ? line[F1] : line[F1 + 1];
++    flag[2] = line[F1];
++    flag[3] = line[F1 + 1];
+     memcpy(&data[1], &line[F2], 8);
+     // Read 1st minor name & value to output
+     memcpy(&data[2], &line[F3], 8);
+-    data[0] = atof(&line[F4]);
++    data[0] = mpsValueFromText(&line[F4]);
+ 
+     // Keep 2nd minor name & value for future
+     if (lcnt > F5) flag[1] = 1;
+@@ -586,7 +664,7 @@ HighsStatus writeModelAsMps(const HighsOptions& options,
+       lp.col_upper_, lp.row_lower_, lp.row_upper_, lp.a_matrix_.start_,
+       lp.a_matrix_.index_, lp.a_matrix_.value_, hessian.start_, hessian.index_,
+       hessian.value_, lp.integrality_, local_objective_name, lp.col_names_,
+-      lp.row_names_, use_free_format);
++      lp.row_names_, use_free_format, options.infinite_bound);
+   if (write_status == HighsStatus::kOk && warning_found)
+     return HighsStatus::kWarning;
+   return write_status;
+@@ -604,7 +682,7 @@ HighsStatus writeMps(
+     const vector<HighsInt>& q_index, const vector<double>& q_value,
+     const vector<HighsVarType>& integrality, const std::string& objective_name,
+     const vector<std::string>& col_names, const vector<std::string>& row_names,
+-    const bool use_free_format) {
++    const bool use_free_format, const double infinite_bound) {
+   HighsInt num_no_cost_zero_columns = 0;
+   HighsInt num_no_cost_zero_columns_in_bounds_section = 0;
+   highsLogDev(log_options, HighsLogType::kInfo,
+@@ -768,18 +846,8 @@ HighsStatus writeMps(
+   fprintf(file, "COLUMNS\n");
+   const bool write_no_cost_zero_columns = true;
+   for (HighsInt c_n = 0; c_n < num_col; c_n++) {
+-    const bool no_cost_zero_column =
+-        !col_cost[c_n] && a_start[c_n] == a_start[c_n + 1];
+-    if (no_cost_zero_column) {
+-      // Possibly skip this column as it's zero and has no cost
+-      num_no_cost_zero_columns++;
+-      if (write_no_cost_zero_columns) {
+-        // Give the column a presence by writing out a zero cost
+-        fprintf(file, "    %-8s  %-8s  %.15g\n", col_names[c_n].c_str(),
+-                objective_name.c_str(), 0.0);
+-      }
+-      continue;
+-    }
++    // The marker has to enclose the presence record of a zero column as well,
++    // since a bound entry on its own cannot say that the column is integer
+     if (have_int) {
+       if (integrality[c_n] == HighsVarType::kInteger && !integerFg) {
+         // Start an integer section
+@@ -797,6 +865,18 @@ HighsStatus writeMps(
+         integerFg = false;
+       }
+     }
++    const bool no_cost_zero_column =
++        !col_cost[c_n] && a_start[c_n] == a_start[c_n + 1];
++    if (no_cost_zero_column) {
++      // Possibly skip this column as it's zero and has no cost
++      num_no_cost_zero_columns++;
++      if (write_no_cost_zero_columns) {
++        // Give the column a presence by writing out a zero cost
++        fprintf(file, "    %-8s  %-8s  %.15g\n", col_names[c_n].c_str(),
++                objective_name.c_str(), 0.0);
++      }
++      continue;
++    }
+     if (col_cost[c_n] != 0) {
+       double v = use_sense * col_cost[c_n];
+       fprintf(file, "    %-8s  %-8s  %.15g\n", col_names[c_n].c_str(),
+@@ -849,6 +929,12 @@ HighsStatus writeMps(
+         discrete = integrality[c_n] == HighsVarType::kInteger ||
+                    integrality[c_n] == HighsVarType::kSemiContinuous ||
+                    integrality[c_n] == HighsVarType::kSemiInteger;
++      // A semi-variable carries its type in the bound entry alone, since it
++      // takes no integer marker, so the fixed and free forms would lose it
++      bool semi = false;
++      if (have_int)
++        semi = integrality[c_n] == HighsVarType::kSemiContinuous ||
++               integrality[c_n] == HighsVarType::kSemiInteger;
+       const bool no_cost_zero_column =
+           !col_cost[c_n] && a_start[c_n] == a_start[c_n + 1];
+       if (no_cost_zero_column) {
+@@ -859,11 +945,11 @@ HighsStatus writeMps(
+         }
+         if (!write_no_cost_zero_columns) continue;
+       }
+-      if (lb == ub) {
++      if (lb == ub && !semi) {
+         // Equal lower and upper bounds: Fixed
+         fprintf(file, " FX BOUND     %-8s  %.15g\n", col_names[c_n].c_str(),
+                 lb);
+-      } else if (highs_isInfinity(-lb) && highs_isInfinity(ub)) {
++      } else if (highs_isInfinity(-lb) && highs_isInfinity(ub) && !semi) {
+         // Infinite lower and upper bounds: Free
+         fprintf(file, " FR BOUND     %-8s\n", col_names[c_n].c_str());
+       } else {
+@@ -917,34 +1003,38 @@ HighsStatus writeMps(
+             // Have to use lb and ub to define semi-variables: lb is
+             // naturally finite, but what if ub is infinite?
+             //
+-            // writing "inf" is fine, except for with mingw, it
+-            // appears, so use something bigger than the infinite
+-            // bounds value - since options.infinite_bound is
+-            // unavailable
+-            const double infinite_bound = 1e30;
++            // The bound goes out as the value at or above which a reader
++            // treats a bound as infinite, so the record stays finite
++            // whenever that threshold is. When the threshold is itself
++            // infinite no finite value can stand in for the bound, and
++            // the infinity travels through mpsTextFromValue and
++            // mpsValueFromText, since printf and atof do not agree on a
++            // spelling for it on every platform this builds for
+             const bool inf_lb = lb <= -kHighsInf;
+             const double use_lb = inf_lb ? -infinite_bound : lb;
+             const bool inf_ub = ub >= kHighsInf;
+             const double use_ub = inf_ub ? infinite_bound : ub;
+-            if (inf_lb)
++            if (inf_lb && !highs_isInfinity(-use_lb))
+               highsLogUser(
+                   log_options, HighsLogType::kWarning,
+                   "Lower bound for semi-variable \"%s\" is %g but writing %g\n",
+                   col_names[c_n].c_str(), lb, use_lb);
+-            if (inf_ub)
++            if (inf_ub && !highs_isInfinity(use_ub))
+               highsLogUser(
+                   log_options, HighsLogType::kWarning,
+                   "Upper bound for semi-variable \"%s\" is %g but writing %g\n",
+                   col_names[c_n].c_str(), ub, use_ub);
+-            fprintf(file, " LO BOUND     %-8s  %.15g\n", col_names[c_n].c_str(),
+-                    use_lb);
++            fprintf(file, " LO BOUND     %-8s  %s\n", col_names[c_n].c_str(),
++                    mpsTextFromValue(use_lb).c_str());
+             if (integrality[c_n] == HighsVarType::kSemiInteger) {
+-              fprintf(file, " SI BOUND     %-8s  %.15g\n",
+-                      col_names[c_n].c_str(), use_ub);
++              fprintf(file, " SI BOUND     %-8s  %s\n",
++                      col_names[c_n].c_str(),
++                      mpsTextFromValue(use_ub).c_str());
+             } else {
+               // Semi-continuous
+-              fprintf(file, " SC BOUND     %-8s  %.15g\n",
+-                      col_names[c_n].c_str(), use_ub);
++              fprintf(file, " SC BOUND     %-8s  %s\n",
++                      col_names[c_n].c_str(),
++                      mpsTextFromValue(use_ub).c_str());
+             }
+           }
+         } else {
+diff --git a/highs/io/HMPSIO.h b/highs/io/HMPSIO.h
+index 58acffe6e8..d6d8391a64 100644
+--- a/highs/io/HMPSIO.h
++++ b/highs/io/HMPSIO.h
+@@ -11,6 +11,7 @@
+ #ifndef IO_HMPSIO_H_
+ #define IO_HMPSIO_H_
+ 
++#include <array>
+ #include <cmath>
+ #include <cstring>
+ #include <fstream>
+@@ -66,10 +67,19 @@ HighsStatus writeMps(
+     const vector<HighsInt>& q_index, const vector<double>& q_value,
+     const vector<HighsVarType>& integrality, const std::string& objective_name,
+     const vector<std::string>& col_names, const vector<std::string>& row_names,
+-    const bool use_free_format = true);
++    const bool use_free_format = true,
++    const double infinite_bound = kHighsInf);
+ 
++// An infinite bound has no spelling that every C library both writes and
++// reads back, so the MPS handlers format and recognise one here instead of
++// leaving it to printf and atof
++std::string mpsTextFromValue(const double value);
++double mpsValueFromText(const char* text);
++
++// flag receives the abbreviated major symbol in [0], the "more on this line"
++// marker in [1] and the raw two-character symbol in [2] and [3]
+ bool load_mpsLine(std::istream& file, HighsVarType& integerVar, HighsInt lmax,
+-                  char* line, char* flag, double* data);
++                  char* line, std::array<char, 4>& flag, double* data);
+ 
+ HighsStatus writeModelAsMps(const HighsOptions& options,
+                             const std::string& filename,
+diff --git a/highs/io/HMpsFF.cpp b/highs/io/HMpsFF.cpp
+index 643434cbfb..0fa980e9f5 100644
+--- a/highs/io/HMpsFF.cpp
++++ b/highs/io/HMpsFF.cpp
+@@ -8,7 +8,9 @@
+ 
+ #include "io/HMpsFF.h"
+ 
++#include "io/HMPSIO.h"
+ #include "lp_data/HighsModelUtils.h"
++#include "lp_data/HighsOptions.h"
+ 
+ #ifdef ZLIB_FOUND
+ #include "../extern/zstr/zstr.hpp"
+@@ -670,10 +672,16 @@ HMpsFF::Parsekey HMpsFF::parseRows(const HighsLogOptions& log_options,
+         return HMpsFF::Parsekey::kFixedFormat;
+     }
+ 
+-    // Do not add to matrix if row is free.
++    // A free row is discarded only when the option asks for that.
++    // Otherwise it becomes an ordinary row that constrains nothing
+     if (isFreeRow) {
+-      rowname2idx.emplace(rowname, HighsInt{-2});
+-      continue;
++      if (keep_n_rows_ == kKeepNRowsDeleteRows) {
++        rowname2idx.emplace(rowname, HighsInt{-2});
++        continue;
++      }
++      row_lower.push_back(-kHighsInf);
++      row_upper.push_back(kHighsInf);
++      row_type.push_back(Boundtype::kGe);
+     }
+ 
+     // so in rowname2idx -1 is the objective, -2 is all the free rows
+@@ -682,11 +690,12 @@ HMpsFF::Parsekey HMpsFF::parseRows(const HighsLogOptions& log_options,
+     // element (or the already-existing element if no insertion
+     // happened) and a bool denoting whether the insertion took place
+ 
+-    // Else is enough here because all free rows are ignored.
+-    if (!isobj)
++    if (!isobj) {
+       row_names.push_back(rowname);
+-    else
++      is_free_row.push_back(isFreeRow);
++    } else {
+       objective_name = rowname;
++    }
+ 
+     if (!ret.second) {
+       // Duplicate row name
+@@ -734,6 +743,12 @@ typename HMpsFF::Parsekey HMpsFF::parseCols(const HighsLogOptions& log_options,
+     assert(mit != rowname2idx.end());
+     rowidx = mit->second;
+ 
++    // A kept free row takes no matrix entries when the option asks for the
++    // row without its coefficients
++    if (rowidx >= 0 && this->keep_n_rows_ == kKeepNRowsDeleteEntries &&
++        this->is_free_row[rowidx])
++      rowidx = -2;
++
+     if (rowidx >= 0)
+       this->num_nz++;
+     else
+@@ -1056,14 +1071,22 @@ HMpsFF::Parsekey HMpsFF::parseRhs(const HighsLogOptions& log_options,
+ 
+     if (rowidx > -1) {
+       has_entry = has_row_entry_[rowidx];
+-    } else {
+-      assert(rowidx == -1);
++    } else if (rowidx == -1) {
+       has_entry = has_obj_entry_;
++    } else {
++      // A discarded free row: the entry has nowhere to go
++      has_entry = false;
+     }
+   };
+ 
+   auto addRhs = [this](double val, HighsInt rowidx) {
+     if (rowidx > -1) {
++      // A kept free row constrains nothing, so a right hand side for it is
++      // recorded but must not become a bound
++      if (is_free_row[rowidx]) {
++        has_row_entry_[rowidx] = true;
++        return;
++      }
+       if (row_type[rowidx] == Boundtype::kEq ||
+           row_type[rowidx] == Boundtype::kLe) {
+         assert(size_t(rowidx) < row_upper.size());
+@@ -1075,12 +1098,12 @@ HMpsFF::Parsekey HMpsFF::parseRhs(const HighsLogOptions& log_options,
+         row_lower[rowidx] = val;
+       }
+       has_row_entry_[rowidx] = true;
+-    } else {
++    } else if (rowidx == -1) {
+       // objective shift
+-      assert(rowidx == -1);
+       obj_offset = -val;
+       has_obj_entry_ = true;
+     }
++    // A discarded free row has index -2 and takes no right hand side
+   };
+ 
+   // Initialise tracking for duplicate entries
+@@ -1552,6 +1575,13 @@ HMpsFF::Parsekey HMpsFF::parseRanges(const HighsLogOptions& log_options,
+   };
+ 
+   auto addRhs = [this](double val, HighsInt& rowidx) {
++    // A discarded free row is not in the model, and a kept one constrains
++    // nothing, so neither takes a range
++    if (rowidx < 0) return;
++    if (is_free_row[rowidx]) {
++      has_row_entry_[rowidx] = true;
++      return;
++    }
+     if ((row_type[rowidx] == Boundtype::kEq && val < 0) ||
+         row_type[rowidx] == Boundtype::kLe) {
+       assert(row_upper.at(rowidx) < kHighsInf);
+@@ -2100,7 +2130,7 @@ double HMpsFF::getValue(const std::string& word, bool& is_nan,
+ 
+   std::string local_word = word;
+   dD2e(local_word);
+-  const double value = atof(local_word.c_str());
++  const double value = mpsValueFromText(local_word.c_str());
+   is_nan = false;
+   //  printf("value(%d) = %g\n", int(id), value);
+   //  if (std::isnan(value)) return true;
+diff --git a/highs/io/HMpsFF.h b/highs/io/HMpsFF.h
+index ebd5c3707f..01d0a31577 100644
+--- a/highs/io/HMpsFF.h
++++ b/highs/io/HMpsFF.h
+@@ -62,6 +62,9 @@ class HMpsFF {
+ 
+   double time_limit_ = kHighsInf;
+   bool warning_issued_ = false;
++  // Mirrors the option of the same name. The fixed format reader already
++  // honours it; the default discards free rows
++  HighsInt keep_n_rows_ = -1;
+ 
+  private:
+   double start_time;
+@@ -170,6 +173,7 @@ class HMpsFF {
+ 
+   std::string objective_name;
+   std::vector<Boundtype> row_type;
++  std::vector<bool> is_free_row;
+   std::vector<HighsInt> integer_column;
+ 
+   std::vector<Triplet> entries;
+diff --git a/highs/io/filereaderlp/reader.cpp b/highs/io/filereaderlp/reader.cpp
+index d54b885768..77f442a4ad 100644
+--- a/highs/io/filereaderlp/reader.cpp
++++ b/highs/io/filereaderlp/reader.cpp
+@@ -552,6 +552,36 @@ void Reader::processobjsec() {
+   }
+ }
+ 
++// A two-sided constraint opens with a constant and a comparison operator
++// ahead of the expression, which is what tells it apart from a term with a
++// leading coefficient
++static bool opensrange(std::vector<ProcessedToken>::iterator it,
++                       const std::vector<ProcessedToken>::iterator end) {
++  if (it == end || it->type != ProcessedTokenType::CONST) return false;
++  ++it;
++  return it != end && it->type == ProcessedTokenType::COMP;
++}
++
++// Both comparisons of a two-sided constraint must run the same way, so the
++// bounds are read off the orientation rather than the position
++static void applyrangebounds(const std::shared_ptr<Constraint>& con,
++                             const LpComparisonType opening_dir,
++                             const double opening_value,
++                             const LpComparisonType closing_dir,
++                             const double closing_value) {
++  lpassert(opening_dir == LpComparisonType::LEQ ||
++           opening_dir == LpComparisonType::GEQ);
++  lpassert(closing_dir == opening_dir);
++  if (opening_dir == LpComparisonType::LEQ) {
++    con->lowerbound = opening_value;
++    con->upperbound = closing_value;
++  } else {
++    con->lowerbound = closing_value;
++    con->upperbound = opening_value;
++  }
++  lpassert(con->lowerbound <= con->upperbound);
++}
++
+ void Reader::processconsec() {
+   if (!sectiontokens.count(LpSectionKeyword::CON)) return;
+   std::vector<ProcessedToken>::iterator& begin(
+@@ -561,7 +591,31 @@ void Reader::processconsec() {
+   while (begin != end) {
+     std::shared_ptr<Constraint> con =
+         std::shared_ptr<Constraint>(new Constraint);
++
++    // The name precedes the opening bound of a two-sided constraint, so it is
++    // taken here rather than by parseexpression
++    std::string con_name;
++    bool has_name = false;
++    if (begin->type == ProcessedTokenType::CONID) {
++      con_name = begin->name;
++      has_name = true;
++      ++begin;
++    }
++
++    bool two_sided = false;
++    double opening_value = 0;
++    LpComparisonType opening_dir = LpComparisonType::LEQ;
++    if (opensrange(begin, end)) {
++      two_sided = true;
++      opening_value = begin->value;
++      ++begin;
++      opening_dir = begin->dir;
++      ++begin;
++    }
++
+     parseexpression(begin, end, con->expr, false);
++    if (has_name) con->expr->name = con_name;
++
+     // should not be at end of section yet, but a comparison operator should be
+     // next
+     lpassert(begin != sectiontokens[LpSectionKeyword::CON].second);
+@@ -573,18 +627,22 @@ void Reader::processconsec() {
+     // should be next
+     lpassert(begin != sectiontokens[LpSectionKeyword::CON].second);
+     lpassert(begin->type == ProcessedTokenType::CONST);
+-    switch (dir) {
+-      case LpComparisonType::EQ:
+-        con->lowerbound = con->upperbound = begin->value;
+-        break;
+-      case LpComparisonType::LEQ:
+-        con->upperbound = begin->value;
+-        break;
+-      case LpComparisonType::GEQ:
+-        con->lowerbound = begin->value;
+-        break;
+-      default:
+-        lpassert(false);
++    if (two_sided) {
++      applyrangebounds(con, opening_dir, opening_value, dir, begin->value);
++    } else {
++      switch (dir) {
++        case LpComparisonType::EQ:
++          con->lowerbound = con->upperbound = begin->value;
++          break;
++        case LpComparisonType::LEQ:
++          con->upperbound = begin->value;
++          break;
++        case LpComparisonType::GEQ:
++          con->lowerbound = begin->value;
++          break;
++        default:
++          lpassert(false);
++      }
+     }
+     builder.model.constraints.push_back(con);
+     ++begin;
+@@ -912,7 +970,20 @@ void Reader::splittokens() {
+   lpassert(currentsection == LpSectionKeyword::NONE);
+ }
+ 
++static bool namefollowscoefficient(LpSectionKeyword section,
++                                   const RawToken& next) {
++  if (section == LpSectionKeyword::OBJMIN ||
++      section == LpSectionKeyword::OBJMAX)
++    return true;
++  // An unnamed row begins right after the previous row's right hand side, so
++  // in a constraint a spelling that a variable follows is that row's leading
++  // coefficient rather than a name
++  return section == LpSectionKeyword::CON &&
++         !next.istype(RawTokenType::STR) && !next.istype(RawTokenType::CONS);
++}
++
+ void Reader::processtokens() {
++  LpSectionKeyword current_section = LpSectionKeyword::NONE;
+   std::string svalue_lc;
+   while (!rawtokens[0].istype(RawTokenType::FLEND)) {
+     if (rawtokens[0].type == RawTokenType::STR) {
+@@ -947,6 +1018,7 @@ void Reader::processtokens() {
+       tolower(temp);
+       LpSectionKeyword keyword = parsesectionkeyword(svalue_lc + "-" + temp);
+       if (keyword != LpSectionKeyword::NONE) {
++        current_section = keyword;
+         processedtokens.emplace_back(keyword);
+         nextrawtoken(3);
+         continue;
+@@ -960,6 +1032,7 @@ void Reader::processtokens() {
+       tolower(temp);
+       LpSectionKeyword keyword = parsesectionkeyword(svalue_lc + " " + temp);
+       if (keyword != LpSectionKeyword::NONE) {
++        current_section = keyword;
+         processedtokens.emplace_back(keyword);
+         nextrawtoken(2);
+         continue;
+@@ -970,6 +1043,7 @@ void Reader::processtokens() {
+     if (rawtokens[0].istype(RawTokenType::STR)) {
+       LpSectionKeyword keyword = parsesectionkeyword(svalue_lc);
+       if (keyword != LpSectionKeyword::NONE) {
++        current_section = keyword;
+         processedtokens.emplace_back(keyword);
+         nextrawtoken();
+         continue;
+@@ -1007,8 +1081,13 @@ void Reader::processtokens() {
+       continue;
+     }
+ 
+-    // check if free
++    // check if free. The word only has its keyword meaning in the bounds
++    // section and only directly after the variable it frees, so a column that
++    // happens to be called free is still read as a name everywhere else
+     if (rawtokens[0].istype(RawTokenType::STR) &&
++        current_section == LpSectionKeyword::BOUNDS &&
++        !processedtokens.empty() &&
++        processedtokens.back().type == ProcessedTokenType::VARID &&
+         iskeyword(svalue_lc, LP_KEYWORD_FREE, LP_KEYWORD_FREE_N)) {
+       processedtokens.emplace_back(ProcessedTokenType::FREE);
+       nextrawtoken();
+@@ -1084,6 +1163,43 @@ void Reader::processtokens() {
+       lpassert(false);
+     }
+ 
++    // A column whose name is spelled like a value, 1 or inf say, arrives here
++    // as a constant. Every entry in the integrality sections is a column
++    // name, so the spelling is a name there whatever it looks like
++    if (rawtokens[0].istype(RawTokenType::CONS) &&
++        (current_section == LpSectionKeyword::GEN ||
++         current_section == LpSectionKeyword::BIN ||
++         current_section == LpSectionKeyword::SEMI)) {
++      processedtokens.emplace_back(ProcessedTokenType::VARID,
++                                   rawtokens[0].svalue);
++      nextrawtoken();
++      continue;
++    }
++
++    // Only a variable can follow the product operator, so a value-like
++    // spelling there is a name whatever it looks like. An exponent follows
++    // the power operator instead and stays a constant
++    if (rawtokens[0].istype(RawTokenType::CONS) && !processedtokens.empty() &&
++        processedtokens.back().type == ProcessedTokenType::ASTERISK) {
++      processedtokens.emplace_back(ProcessedTokenType::VARID,
++                                   rawtokens[0].svalue);
++      nextrawtoken();
++      continue;
++    }
++
++    // Elsewhere such a spelling is a name when it directly follows the
++    // coefficient that multiplies it, and the section says the position can
++    // hold a name at all
++    if (rawtokens[0].istype(RawTokenType::CONS) && !processedtokens.empty() &&
++        processedtokens.back().type == ProcessedTokenType::CONST &&
++        !rawtokens[1].istype(RawTokenType::COLON) &&
++        namefollowscoefficient(current_section, rawtokens[1])) {
++      processedtokens.emplace_back(ProcessedTokenType::VARID,
++                                   rawtokens[0].svalue);
++      nextrawtoken();
++      continue;
++    }
++
+     // constant
+     if (rawtokens[0].istype(RawTokenType::CONS)) {
+       processedtokens.emplace_back(rawtokens[0].dvalue);

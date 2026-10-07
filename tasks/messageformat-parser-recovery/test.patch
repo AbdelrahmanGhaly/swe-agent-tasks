@@ -1,0 +1,2337 @@
+diff --git a/mf1/packages/parser/src/recovery.a79142.test.ts b/mf1/packages/parser/src/recovery.a79142.test.ts
+new file mode 100644
+index 00000000..c8c2499f
+--- /dev/null
++++ b/mf1/packages/parser/src/recovery.a79142.test.ts
+@@ -0,0 +1,1982 @@
++import MessageFormat from '@messageformat/core';
++import { spawnSync } from 'node:child_process';
++import { createRequire } from 'node:module';
++import { dirname, join } from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { describe, expect, test } from 'vitest';
++import { ParseError, parse, type ParseOptions } from './parser.ts';
++
++const collect = (src: string, options = {}) => {
++  const errors: ParseError[] = [];
++  const tokens = parse(src, { ...options, onError: e => errors.push(e) });
++  return { errors, tokens: tokens as any[] };
++};
++
++const codes = (src: string, options = {}) =>
++  collect(src, options).errors.map(e => e.code);
++
++const firstSelect = (tokens: any[]) => tokens.find(t => 'cases' in t);
++
++describe('unchanged without onError', () => {
++  const bad: [string, string][] = [
++    ['Hello {name', 'missing-end'],
++    ['{m, select, =2{bad} other{y}}', 'invalid-select-key'],
++    ['{n, plural, xyzzy{a} other{b}}', 'invalid-plural-key'],
++    ['{n, select, offset:1 other{a}}', 'unexpected-offset'],
++    ['{n, plural, other{a} offset:1}', 'offset-after-cases']
++  ];
++
++  test.each(bad)('%s throws without onError and reports %s with it', (src, code) => {
++    expect(() => parse(src)).toThrow(ParseError);
++    expect(() => parse(src, { onError: () => {} })).not.toThrow();
++    expect(codes(src)).toContain(code);
++  });
++
++  test('a lexer error throws without onError and recovers with it', () => {
++    expect(() => parse('ok {b, } end')).toThrow();
++    expect(() => parse('ok {b, } end', { onError: () => {} })).not.toThrow();
++    expect(codes('ok {b, } end')).toEqual(['invalid-syntax']);
++  });
++
++  test('the new checks never throw without onError', () => {
++    expect(() => parse('{n, plural, one{a} one{b} other{c}}')).not.toThrow();
++    expect(() => parse('{n, plural, one{a}}')).not.toThrow();
++    expect(codes('{n, plural, one{a} one{b} other{c}}')).toEqual([
++      'duplicate-case'
++    ]);
++  });
++
++  test('valid input is unaffected in either mode', () => {
++    const plain = parse('a {b} c');
++    expect(plain).toMatchObject([
++      { type: 'content', value: 'a ' },
++      { type: 'argument', arg: 'b' },
++      { type: 'content', value: ' c' }
++    ]);
++    const { errors, tokens } = collect('a {b} c');
++    expect(errors).toHaveLength(0);
++    expect(tokens).toMatchObject(plain);
++    expect(codes('a {b, } c')).toEqual(['invalid-syntax']);
++  });
++});
++
++describe('missing end', () => {
++  test('unterminated argument is reported', () => {
++    expect(codes('Hello {name')).toEqual(['missing-end']);
++  });
++
++  test('content before an unterminated argument is kept', () => {
++    expect(collect('Hello {name').tokens[0]).toMatchObject({
++      type: 'content',
++      value: 'Hello '
++    });
++  });
++
++  test('the argument itself is kept', () => {
++    expect(collect('Hello {name').tokens[1]).toMatchObject({
++      type: 'argument',
++      arg: 'name'
++    });
++  });
++
++  test('unterminated select is reported', () => {
++    expect(codes('{n, plural, one{a} other{b}')).toContain('missing-end');
++  });
++
++  test('unterminated select keeps its cases', () => {
++    const sel = firstSelect(collect('{n, plural, one{a} other{b}').tokens);
++    expect(sel.cases.map((c: any) => c.key)).toEqual(['one', 'other']);
++  });
++
++  test('an unterminated argument produces no error token', () => {
++    const { errors, tokens } = collect('Hello {name');
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++  });
++
++  test('an unterminated select produces no error token', () => {
++    const { tokens } = collect('{n, plural, one{a} other{b}');
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++  });
++
++  test('the position is inside the unterminated placeholder', () => {
++    const src = 'Hello {name';
++    const [error] = collect(src).errors;
++    expect(error.offset).toBeGreaterThanOrEqual(src.indexOf('{'));
++    expect(error.offset).toBeLessThanOrEqual(src.length);
++  });
++});
++
++describe('key validation', () => {
++  test('exact key in a select is reported', () => {
++    expect(codes('{m, select, =2{bad} other{y}}')).toEqual([
++      'invalid-select-key'
++    ]);
++  });
++
++  test('an invalid select key keeps its case', () => {
++    const sel = firstSelect(collect('{m, select, =2{bad} other{y}}').tokens);
++    expect(sel.cases.map((c: any) => c.key)).toEqual(['=2', 'other']);
++  });
++
++  test('an invalid select key keeps its content', () => {
++    const sel = firstSelect(collect('{m, select, =2{bad} other{y}}').tokens);
++    expect(sel.cases[0].tokens).toMatchObject([
++      { type: 'content', value: 'bad' }
++    ]);
++  });
++
++  test('unknown plural key is reported', () => {
++    expect(codes('{n, plural, xyzzy{a} other{b}}')).toEqual([
++      'invalid-plural-key'
++    ]);
++  });
++
++  test('an invalid plural key keeps its case', () => {
++    const sel = firstSelect(collect('{n, plural, xyzzy{a} other{b}}').tokens);
++    expect(sel.cases.map((c: any) => c.key)).toEqual(['xyzzy', 'other']);
++  });
++
++  test('an invalid plural key keeps its own content, not just its key', () => {
++    const sel = firstSelect(collect('{n, plural, xyzzy{a} other{b}}').tokens);
++    expect(sel.cases.map((c: any) => c.tokens.map((t: any) => t.value).join(''))).toEqual(['a', 'b']);
++    const dup = firstSelect(collect('{n, plural, xyzzy{a} xyzzy{b} other{c}}').tokens);
++    expect(dup.cases.map((c: any) => c.tokens.map((t: any) => t.value).join(''))).toEqual(['a', 'b', 'c']);
++  });
++
++  test('several invalid keys are all reported', () => {
++    expect(codes('{n, plural, xyzzy{a} nope{b} other{c}}')).toEqual([
++      'invalid-plural-key',
++      'invalid-plural-key'
++    ]);
++  });
++
++  test('strictPluralKeys false suppresses the key error', () => {
++    expect(codes('{n, plural, xyzzy{a} other{b}}', {
++      strictPluralKeys: false
++    })).toEqual([]);
++    expect(codes('{n, plural, xyzzy{a}}', { strictPluralKeys: false })).toEqual([
++      'missing-other'
++    ]);
++  });
++
++  test('a custom cardinal list decides validity', () => {
++    expect(codes('{n, plural, one{a} other{b}}', { cardinal: ['other'] }))
++      .toEqual(['invalid-plural-key']);
++  });
++
++  test('an empty cardinal list disables the check', () => {
++    expect(codes('{n, plural, xyzzy{a} other{b}}', { cardinal: [] })).toEqual([]);
++    expect(codes('{n, plural, xyzzy{a} xyzzy{b} other{c}}', { cardinal: [] }))
++      .toEqual(['duplicate-case']);
++  });
++
++  test('selectordinal uses the ordinal list', () => {
++    expect(codes('{n, selectordinal, one{a} other{b}}', { ordinal: ['other'] }))
++      .toEqual(['invalid-plural-key']);
++  });
++
++  test('the key error points at the offending key', () => {
++    const src = '{n, plural, xyzzy{a} other{b}}';
++    const [error] = collect(src).errors;
++    expect(src.slice(error.offset).trimStart()).toMatch(/^xyzzy/);
++  });
++});
++
++describe('offset validation', () => {
++  test('offset in a select is reported', () => {
++    expect(codes('{n, select, offset:1 other{a}}')).toEqual([
++      'unexpected-offset'
++    ]);
++  });
++
++  test('a rejected offset is not applied', () => {
++    const sel = firstSelect(collect('{n, select, offset:1 other{a}}').tokens);
++    expect(sel.pluralOffset).toBeUndefined();
++  });
++
++  test('the select still parses its cases', () => {
++    const sel = firstSelect(collect('{n, select, offset:1 other{a}}').tokens);
++    expect(sel.cases.map((c: any) => c.key)).toEqual(['other']);
++  });
++
++  test('offset after cases is reported', () => {
++    expect(codes('{n, plural, other{a} offset:1}')).toEqual([
++      'offset-after-cases'
++    ]);
++  });
++
++  test('a late offset is not applied', () => {
++    const sel = firstSelect(collect('{n, plural, other{a} offset:1}').tokens);
++    expect(sel.pluralOffset).toBeUndefined();
++  });
++
++  test('a late offset keeps the cases around it', () => {
++    const { errors, tokens } = collect('{n, plural, one{a} offset:1 other{b}}');
++    expect(errors.map(e => e.code)).toEqual(['offset-after-cases']);
++    expect(firstSelect(tokens).cases.map((c: any) => c.key)).toEqual([
++      'one',
++      'other'
++    ]);
++  });
++
++  test('a valid offset is still applied', () => {
++    const sel = firstSelect(collect('{n, plural, offset:1 other{a}}').tokens);
++    expect(sel.pluralOffset).toBe(1);
++    const bad = collect('{n, plural, offset:1 one{a}}');
++    expect(bad.errors.map(e => e.code)).toEqual(['missing-other']);
++    expect(firstSelect(bad.tokens).pluralOffset).toBe(1);
++  });
++});
++
++describe('duplicate cases', () => {
++  test('a repeated key is reported', () => {
++    expect(codes('{n, plural, one{a} one{b} other{c}}')).toEqual([
++      'duplicate-case'
++    ]);
++  });
++
++  test('both cases are kept', () => {
++    const { errors, tokens } = collect('{n, plural, one{a} one{b} other{c}}');
++    expect(errors.map(e => e.code)).toEqual(['duplicate-case']);
++    const sel = firstSelect(tokens);
++    expect(sel.cases.map((c: any) => c.key)).toEqual(['one', 'one', 'other']);
++  });
++
++  test('the duplicate report carries a position inside the source', () => {
++    const src = '{n, plural, one{a} one{b} other{c}}';
++    const [error] = collect(src).errors;
++    expect(error.offset).toBeGreaterThanOrEqual(0);
++    expect(error.offset + error.length).toBeLessThanOrEqual(src.length);
++    expect(error.line).toBe(1);
++    expect(error.col).toBe(error.offset + 1);
++  });
++
++  test('both duplicate cases keep their own content', () => {
++    const { errors, tokens } = collect('{n, plural, one{a} one{b} other{c}}');
++    expect(errors.map(e => e.code)).toEqual(['duplicate-case']);
++    expect(firstSelect(tokens).cases.map((c: any) => c.tokens[0].value)).toEqual(
++      ['a', 'b', 'c']
++    );
++  });
++
++  test('a key repeated three times keeps every case and reports duplicates', () => {
++    const { errors, tokens } = collect(
++      '{n, plural, one{a} one{b} one{c} other{d}}'
++    );
++    expect(errors.length).toBeGreaterThan(0);
++    expect(errors.every(e => e.code === 'duplicate-case')).toBe(true);
++    const offsets = errors.map(e => e.offset);
++    expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
++    expect(firstSelect(tokens).cases.map((c: any) => c.key)).toEqual([
++      'one',
++      'one',
++      'one',
++      'other'
++    ]);
++  });
++
++  test('a repeated key in a select is reported', () => {
++    expect(codes('{c, select, a{x} a{y} other{z}}')).toEqual([
++      'duplicate-case'
++    ]);
++  });
++
++  test('distinct keys are not reported', () => {
++    expect(codes('{n, plural, one{a} two{b} other{c}}')).toEqual([]);
++    expect(codes('{n, plural, one{a} two{b} two{c} other{d}}')).toEqual([
++      'duplicate-case'
++    ]);
++  });
++});
++
++describe('missing other', () => {
++  test('a plural without other is reported', () => {
++    expect(codes('{n, plural, one{a}}')).toEqual(['missing-other']);
++  });
++
++  test('a select without other is reported', () => {
++    expect(codes('{c, select, a{x}}')).toEqual(['missing-other']);
++  });
++
++  test('a selectordinal without other is reported', () => {
++    expect(codes('{n, selectordinal, one{a}}')).toEqual(['missing-other']);
++  });
++
++  test('the cases are still returned', () => {
++    const { errors, tokens } = collect('{n, plural, one{a}}');
++    expect(errors.map(e => e.code)).toEqual(['missing-other']);
++    expect(firstSelect(tokens).cases.map((c: any) => c.key)).toEqual(['one']);
++  });
++
++  test('the missing-other report carries a position inside the source', () => {
++    const src = '{n, plural, one{a}}';
++    const [error] = collect(src).errors;
++    expect(error.offset).toBeGreaterThanOrEqual(0);
++    expect(error.offset + error.length).toBeLessThanOrEqual(src.length);
++    expect(error.col).toBe(error.offset + 1);
++  });
++
++  test('the missing-other report spans the closing brace of its select', () => {
++    const src = '{n, plural, one{a}}';
++    const [error] = collect(src).errors;
++    expect(error.code).toBe('missing-other');
++    expect(error.offset).toBe(src.lastIndexOf('}'));
++    expect(src.slice(error.offset, error.offset + error.length)).toBe('}');
++  });
++
++  test('a select closing brace anchors it wherever the select ends', () => {
++    const src = '{c, select, a{x} a{y}}';
++    const error = collect(src).errors.find(e => e.code === 'missing-other');
++    expect(error).toBeDefined();
++    expect(error!.offset).toBe(src.lastIndexOf('}'));
++    expect(src.slice(error!.offset, error!.offset + error!.length)).toBe('}');
++  });
++
++  test('a select with other is not reported', () => {
++    expect(codes('{c, select, a{x} other{y}}')).toEqual([]);
++    expect(codes('{c, select, a{x} b{y}}')).toEqual(['missing-other']);
++  });
++
++  test('a nested select is checked too', () => {
++    expect(codes('{c, select, other{{d, select, a{x}}}}')).toEqual([
++      'missing-other'
++    ]);
++  });
++
++  test('without onError the missing other still does not throw', () => {
++    expect(() => parse('{n, plural, one{a}}')).not.toThrow();
++    expect(codes('{n, plural, one{a}}')).toEqual(['missing-other']);
++  });
++});
++
++describe('syntax errors and recovery', () => {
++  test('a lexer error is reported as invalid-syntax', () => {
++    expect(codes('ok {a} then {b, } end {c}')).toEqual(['invalid-syntax']);
++  });
++
++  test('the offending placeholder becomes an error token', () => {
++    const { tokens } = collect('ok {a} then {b, } end {c}');
++    expect(tokens.find(t => t.type === 'error')).toMatchObject({
++      type: 'error',
++      value: '{b, }'
++    });
++  });
++
++  test('the error token carries the skipped source', () => {
++    const { tokens } = collect('ok {a} then {b, } end {c}');
++    const err = tokens.find(t => t.type === 'error');
++    expect(err.ctx.text).toBe('{b, }');
++  });
++
++  test('the error token starts at the placeholder', () => {
++    const { tokens } = collect('ok {a} then {b, } end {c}');
++    expect(tokens.find(t => t.type === 'error').ctx.offset).toBe(12);
++  });
++
++  test('content before the error is kept', () => {
++    const { tokens } = collect('ok {a} then {b, } end {c}');
++    expect(tokens[0]).toMatchObject({ type: 'content', value: 'ok ' });
++  });
++
++  test('the argument before the error is kept', () => {
++    const { tokens } = collect('ok {a} then {b, } end {c}');
++    expect(tokens[1]).toMatchObject({ type: 'argument', arg: 'a' });
++  });
++
++  test('parsing continues after the error', () => {
++    const { tokens } = collect('ok {a} then {b, } end {c}');
++    expect(tokens[tokens.length - 1]).toMatchObject({
++      type: 'argument',
++      arg: 'c'
++    });
++  });
++
++  test('content after the error is kept', () => {
++    const { tokens } = collect('ok {a} then {b, } end {c}');
++    expect(tokens.map(t => t.type)).toEqual([
++      'content',
++      'argument',
++      'content',
++      'error',
++      'content',
++      'argument'
++    ]);
++  });
++
++  test('an error inside a select skips the whole placeholder', () => {
++    const { tokens } = collect('{n, plural, other{inner {q, } tail}} after');
++    expect(tokens[0]).toMatchObject({
++      type: 'error',
++      value: '{n, plural, other{inner {q, } tail}}'
++    });
++  });
++
++  test('text after a skipped select is still parsed', () => {
++    const { tokens } = collect('{n, plural, other{inner {q, } tail}} after');
++    expect(tokens[1]).toMatchObject({ type: 'content', value: ' after' });
++  });
++
++  test('an unterminated placeholder still returns tokens', () => {
++    const { tokens } = collect('a {b, ');
++    expect(tokens.length).toBeGreaterThan(0);
++  });
++});
++
++describe('multiple errors and absolute positions', () => {
++  test('two syntax errors are both reported', () => {
++    expect(codes('x {b, } y {c, } z')).toEqual([
++      'invalid-syntax',
++      'invalid-syntax'
++    ]);
++  });
++
++  test('the second error offset is absolute', () => {
++    const { errors } = collect('x {b, } y {c, } z');
++    expect(errors[1].offset).toBe(12);
++  });
++
++  test('the second error column is absolute', () => {
++    const { errors } = collect('x {b, } y {c, } z');
++    expect(errors[1].col).toBe(13);
++  });
++
++  test('the second error token offset is absolute', () => {
++    const { tokens } = collect('x {b, } y {c, } z');
++    const errs = tokens.filter(t => t.type === 'error');
++    expect(errs.map(t => t.ctx.offset)).toEqual([2, 10]);
++  });
++
++  test('trailing content after two errors is kept', () => {
++    const { tokens } = collect('x {b, } y {c, } z');
++    expect(tokens[tokens.length - 1]).toMatchObject({
++      type: 'content',
++      value: ' z'
++    });
++  });
++
++  test('an argument after two errors keeps its offset', () => {
++    const { tokens } = collect('x {b, } y {c, } {z}');
++    const arg = tokens.find(t => t.type === 'argument');
++    expect(arg.ctx.offset).toBe(16);
++  });
++
++  test('errors are reported in source order', () => {
++    const { errors } = collect('{n, plural, xyzzy{a} other{b}} then {q, } end');
++    expect(errors.map(e => e.code)).toEqual([
++      'invalid-plural-key',
++      'invalid-syntax'
++    ]);
++    expect(errors[0].offset).toBeLessThan(errors[1].offset);
++  });
++
++  test('a mixed error set reports every code', () => {
++    expect(codes('{m, select, =2{a} other{b}} {n, plural, one{c}}')).toEqual([
++      'invalid-select-key',
++      'missing-other'
++    ]);
++  });
++});
++
++describe('positions across lines', () => {
++  const src = 'line one\nline two {b, } tail\nline three';
++
++  test('line is counted from the original source', () => {
++    expect(collect(src).errors[0].line).toBe(2);
++  });
++
++  test('column is counted from the line start', () => {
++    expect(collect(src).errors[0].col).toBe(12);
++  });
++
++  test('the error offset matches indexOf', () => {
++    expect(collect(src).errors[0].offset).toBe(src.indexOf(','));
++  });
++
++  test('a token after the error keeps its line', () => {
++    const { tokens } = collect(src + ' {z}');
++    const arg = tokens.find(t => t.type === 'argument');
++    expect(arg.ctx.line).toBe(3);
++  });
++
++  test('unicode before an error does not shift the offset', () => {
++    const u = 'ok \u{1f600} {b, } end';
++    expect(collect(u).errors[0].offset).toBe(u.indexOf(','));
++  });
++
++  test('two failures on different lines both stay absolute', () => {
++    const src = 'a {b, } x\ny {c, } z\n{d}';
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual([
++      'invalid-syntax',
++      'invalid-syntax'
++    ]);
++    expect(errors[1].line).toBe(2);
++    expect(errors[1].offset).toBeGreaterThan(src.indexOf('{c'));
++    const arg = tokens.find(t => t.type === 'argument');
++    expect([arg.ctx.offset, arg.ctx.line, arg.ctx.col]).toEqual([
++      src.indexOf('{d'),
++      3,
++      1
++    ]);
++  });
++
++  test('the second error token on a later line keeps its offset', () => {
++    const src = 'a {b, } x\ny {c, } z';
++    const { tokens } = collect(src);
++    const errs = tokens.filter(t => t.type === 'error');
++    expect(errs.map(t => t.ctx.offset)).toEqual([
++      src.indexOf('{b'),
++      src.indexOf('{c')
++    ]);
++  });
++
++  test('the error length covers the skipped span', () => {
++    const { errors } = collect('x {b, } y');
++    expect(errors[0].length).toBeGreaterThan(0);
++  });
++});
++
++describe('error shape', () => {
++  test('the reported value is a ParseError', () => {
++    expect(collect('Hello {name').errors[0]).toBeInstanceOf(ParseError);
++  });
++
++  test('a semantic error span covers the offending key', () => {
++    const src = '{n, plural, xyzzy{a} other{b}}';
++    const [error] = collect(src).errors;
++    expect(src.slice(error.offset, error.offset + error.length)).toContain(
++      'xyzzy'
++    );
++  });
++
++  test('a lexer error span lies inside the malformed placeholder', () => {
++    const src = 'ok {a} then {b, } end';
++    const [error] = collect(src).errors;
++    const slice = src.slice(error.offset, error.offset + error.length);
++    expect(error.offset).toBeGreaterThanOrEqual(src.indexOf('{b'));
++    expect(error.offset + error.length).toBeLessThanOrEqual(
++      src.indexOf('}', src.indexOf('{b')) + 1
++    );
++    expect(slice.length).toBe(error.length);
++  });
++
++  test('the span is inside the source', () => {
++    const [error] = collect('{n, plural, xyzzy{a} other{b}}').errors;
++    expect(error.offset + error.length).toBeLessThanOrEqual(
++      '{n, plural, xyzzy{a} other{b}}'.length
++    );
++  });
++
++  test('line and col agree with the offset', () => {
++    const [error] = collect('one\ntwo {b, } three').errors;
++    expect([error.line, error.col]).toEqual([2, 7]);
++  });
++});
++
++describe('compiler consumer', () => {
++  test('the caller callback receives the parse error', () => {
++    const errors: ParseError[] = [];
++    const mf = new MessageFormat('en', { onError: e => errors.push(e) });
++    mf.compile('ok {b, } end');
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++  });
++
++  test('the forwarded error carries its original-source position', () => {
++    const errors: ParseError[] = [];
++    const mf = new MessageFormat('en', { onError: e => errors.push(e) });
++    mf.compile('ok {b, } end');
++    expect(errors[0].offset).toBe('ok {b, } end'.indexOf(','));
++  });
++
++  test('a clean message reports nothing to the caller', () => {
++    const errors: ParseError[] = [];
++    const mf = new MessageFormat('en', { onError: e => errors.push(e) });
++    expect(mf.compile('all {good}')({ good: 'x' })).toBe('all x');
++    expect(errors).toHaveLength(0);
++    mf.compile('then {b, } end');
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++  });
++
++  test('a message with a skipped placeholder still compiles', () => {
++    const mf = new MessageFormat('en', { onError: () => {} });
++    const msg = mf.compile('ok {b, } end');
++    expect(typeof msg).toBe('function');
++  });
++
++  test('the skipped placeholder contributes no output', () => {
++    const mf = new MessageFormat('en', { onError: () => {} });
++    expect(mf.compile('ok {b, } end')({})).toBe('ok  end');
++  });
++
++  test('surrounding arguments still format', () => {
++    const mf = new MessageFormat('en', { onError: () => {} });
++    expect(mf.compile('{a} {b, } {c}')({ a: 'A', c: 'C' })).toBe('A  C');
++  });
++});
++
++describe('parser-level failures recover too', () => {
++  test('a strict-mode argument type is reported, not thrown', () => {
++    expect(() => parse('{n, nope, x}', { strict: true })).toThrow(ParseError);
++    expect(codes('{n, nope, x}', { strict: true })).toEqual(['invalid-syntax']);
++  });
++
++  test('a strict argument type is reported at the formatter, not the placeholder', () => {
++    for (const src of ['pre {b, x} post', '{n, nope, x}', 'a {n, nope, x} b']) {
++      const [error] = collect(src, { strict: true }).errors;
++      expect(error.code).toBe('invalid-syntax');
++      expect(error.offset).toBe(src.indexOf(','));
++      expect(error.line).toBe(1);
++      expect(error.col).toBe(src.indexOf(',') + 1);
++      expect(error.offset).toBeGreaterThan(src.indexOf('{'));
++    }
++  });
++
++  test('the rejected strict argument becomes an error token', () => {
++    const { tokens } = collect('{n, nope, x}', { strict: true });
++    expect(tokens[0]).toMatchObject({ type: 'error', value: '{n, nope, x}' });
++  });
++
++  test('a strict-mode argument style is reported, not thrown', () => {
++    const src = '{n, number, {m, select, other{x}}}';
++    expect(() => parse(src, { strict: true })).toThrow(ParseError);
++    expect(codes(src, { strict: true })).toEqual(['invalid-syntax']);
++  });
++
++  test('an unsupported escape pattern is reported, not thrown', () => {
++    const src = "a '#{' b";
++    expect(() => parse(src)).toThrow(ParseError);
++    expect(codes(src)).toEqual(['invalid-syntax']);
++  });
++
++  test('the text around an unsupported escape survives', () => {
++    const { tokens } = collect("a '#{' b");
++    expect(tokens.map(t => t.type)).toEqual(['content', 'error', 'content']);
++    expect(tokens.map(t => t.value)).toEqual(['a ', "'#{'", ' b']);
++  });
++
++  test('an unsupported escape inside a placeholder skips the placeholder', () => {
++    const src = "{n, number, '#{'}";
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens).toHaveLength(1);
++    expect(tokens[0]).toMatchObject({ type: 'error', value: src });
++  });
++
++  test('a valid select before a strict failure survives', () => {
++    const src = '{n, plural, other{x}} {m, nope, y}';
++    const { errors, tokens } = collect(src, { strict: true });
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.map(t => t.type)).toEqual(['plural', 'content', 'error']);
++  });
++});
++
++describe('every reachable failure recovers', () => {
++  test('a built-in select name used as a simple function recovers', () => {
++    expect(() => parse('{var,Select}')).toThrow(ParseError);
++    expect(codes('{var,Select}')).toEqual(['invalid-syntax']);
++  });
++
++  test('that failure yields one error token for the whole placeholder', () => {
++    const { tokens } = collect('{var,Select}');
++    expect(tokens).toHaveLength(1);
++    expect(tokens[0]).toMatchObject({ type: 'error', value: '{var,Select}' });
++  });
++
++  test('a strict argument style containing a select yields an error token', () => {
++    const src = '{n, number, {m, select, other{x}}}';
++    const { errors, tokens } = collect(src, { strict: true });
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens).toHaveLength(1);
++    expect(tokens[0]).toMatchObject({ type: 'error', value: src });
++  });
++
++  test('recovery always advances past the failure', () => {
++    const { errors, tokens } = collect('{var,Select} {other,Plural} tail');
++    expect(errors.map(e => e.code)).toEqual([
++      'invalid-syntax',
++      'invalid-syntax'
++    ]);
++    expect(tokens[tokens.length - 1]).toMatchObject({ type: 'content' });
++  });
++});
++
++describe('nested error token context', () => {
++  const src = '{n, plural, other{inner {q, } tail}} after';
++
++  test('value and ctx.text are both the whole outer placeholder', () => {
++    const { tokens } = collect(src);
++    const err = tokens.find(t => t.type === 'error');
++    expect(err.value).toBe('{n, plural, other{inner {q, } tail}}');
++    expect(err.ctx.text).toBe('{n, plural, other{inner {q, } tail}}');
++  });
++
++  test('its start offset is the outer opening brace', () => {
++    const { tokens } = collect(src);
++    expect(tokens.find(t => t.type === 'error').ctx.offset).toBe(0);
++  });
++});
++
++describe('multiline semantic diagnostics', () => {
++  const src = 'first line\n{n, plural, xyzzy{a} other{b}}';
++
++  test('an invalid key on a later line keeps absolute coordinates', () => {
++    const [error] = collect(src).errors;
++    expect(error.code).toBe('invalid-plural-key');
++    expect(error.line).toBe(2);
++    expect(src.slice(error.offset).trimStart()).toMatch(/^xyzzy/);
++  });
++
++  test('its column is measured from the line start', () => {
++    const [error] = collect(src).errors;
++    expect(error.col).toBe(error.offset - src.indexOf('\n'));
++  });
++
++  test('a duplicate on a later line keeps absolute coordinates', () => {
++    const dup = 'first line\n{n, plural, one{a} one{b} other{c}}';
++    const [error] = collect(dup).errors;
++    expect(error.code).toBe('duplicate-case');
++    expect(error.line).toBe(2);
++    expect(error.offset + error.length).toBeLessThanOrEqual(dup.length);
++  });
++});
++
++describe('exported type surface', () => {
++  test('the Token union includes the error token', () => {
++    const fixture = fileURLToPath(
++      new URL('./token-union.a79142.fixture.ts', import.meta.url)
++    );
++    const require = createRequire(import.meta.url);
++    const tsc = join(dirname(require.resolve('typescript')), '..', 'bin', 'tsc');
++    const res = spawnSync(
++      process.execPath,
++      [
++        tsc,
++        '--noEmit',
++        '--strict',
++        '--target',
++        'es2022',
++        '--module',
++        'preserve',
++        '--moduleResolution',
++        'bundler',
++        '--skipLibCheck',
++        fixture
++      ],
++      { encoding: 'utf8' }
++    );
++    const diagnostics = (res.stdout + res.stderr)
++      .split(/\r?\n/)
++      .filter(line => line.includes('token-union.a79142.fixture.ts'));
++    expect(diagnostics).toEqual([]);
++  }, 120000);
++});
++
++describe('diagnostic ordering within one select', () => {
++  test('a case-local error precedes the end-of-select check', () => {
++    const { errors } = collect('{n, plural, xyzzy{a}}');
++    expect(errors.map(e => e.code)).toEqual([
++      'invalid-plural-key',
++      'missing-other'
++    ]);
++    expect(errors[0].offset).toBeLessThan(errors[1].offset);
++  });
++
++  test('a duplicate precedes the end-of-select check', () => {
++    const { errors } = collect('{c, select, a{x} a{y}}');
++    expect(errors.map(e => e.code)).toEqual([
++      'duplicate-case',
++      'missing-other'
++    ]);
++    expect(errors[0].offset).toBeLessThan(errors[1].offset);
++  });
++});
++
++describe('callback payloads', () => {
++  test('each report carries its own code and position', () => {
++    const { errors } = collect('{n, plural, xyzzy{a} nope{b} other{c}}');
++    expect(errors).toHaveLength(2);
++    expect(errors.map(e => e.code)).toEqual([
++      'invalid-plural-key',
++      'invalid-plural-key'
++    ]);
++    expect(errors[0].offset).not.toBe(errors[1].offset);
++  });
++
++  test('mixed reports keep their own code and position', () => {
++    const { errors } = collect('{n, plural, xyzzy{a} other{b}} {q, }');
++    expect(errors).toHaveLength(2);
++    expect(errors.map(e => e.code)).toEqual([
++      'invalid-plural-key',
++      'invalid-syntax'
++    ]);
++    expect(errors[0].offset).toBeLessThan(errors[1].offset);
++  });
++});
++
++describe('recovery past quoted braces', () => {
++  const errorValue = (src: string) =>
++    collect(src).tokens.find(t => t.type === 'error')?.value;
++
++  const nested = "{n, plural, other{bad {q, } '{foo''bar}' tail}} after";
++
++  test('a quoted closing brace does not end the placeholder', () => {
++    expect(errorValue("ok {b, '}' } end")).toBe("{b, '}' }");
++  });
++
++  test('a quoted opening brace does not deepen the placeholder', () => {
++    expect(errorValue("ok {b, '{' } end")).toBe("{b, '{' }");
++  });
++
++  test('a doubled apostrophe does not open a quoted span', () => {
++    expect(errorValue("ok {b, '' } end")).toBe("{b, '' }");
++  });
++
++  test('a doubled apostrophe inside a quoted span keeps it open', () => {
++    expect(errorValue("ok {b, '{ '' }' } end")).toBe("{b, '{ '' }' }");
++  });
++
++  test('an apostrophe that never closes does not quote the brace', () => {
++    expect(errorValue("ok {b, '} end")).toBe("{b, '}");
++  });
++
++  test('the text after a quoted-brace recovery survives', () => {
++    const { tokens } = collect("ok {b, '}' } end");
++    expect(tokens.map(t => t.type)).toEqual(['content', 'error', 'content']);
++    expect(tokens[2].value).toBe(' end');
++  });
++
++  test('a nested failure still skips the whole outer select', () => {
++    const { errors, tokens } = collect(nested);
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens[0]).toMatchObject({
++      type: 'error',
++      value: "{n, plural, other{bad {q, } '{foo''bar}' tail}}"
++    });
++  });
++
++  test('a longer quoted span with an escaped apostrophe stays whole', () => {
++    expect(errorValue("ok {b, '{ a '' b }' } end")).toBe("{b, '{ a '' b }' }");
++  });
++
++  test('a nested failure past an escaped apostrophe skips the outer select', () => {
++    const src = "{n, plural, one {'{ '' }' a} other {x {b, } y}} after";
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens[0]).toMatchObject({
++      type: 'error',
++      value: "{n, plural, one {'{ '' }' a} other {x {b, } y}}"
++    });
++    expect(tokens[tokens.length - 1]).toMatchObject({
++      type: 'content',
++      value: ' after'
++    });
++  });
++
++  test('text after the nested quoted-brace recovery survives', () => {
++    const { tokens } = collect(nested);
++    expect(tokens[tokens.length - 1]).toMatchObject({
++      type: 'content',
++      value: ' after'
++    });
++  });
++});
++
++describe('missing end across lines', () => {
++  const lineOf = (src: string, offset: number) =>
++    src.slice(0, offset).split('\n').length;
++  const colOf = (src: string, offset: number) =>
++    offset - src.slice(0, offset).lastIndexOf('\n');
++
++  const arg = 'line one\nHello {name';
++  const select = 'a\nb {n, plural,\n  one {x}\n  other {y}';
++
++  test('an unterminated argument on a later line reports missing-end', () => {
++    expect(codes(arg)).toEqual(['missing-end']);
++  });
++
++  test('its line and column agree with its offset', () => {
++    const [error] = collect(arg).errors;
++    expect(error.line).toBe(lineOf(arg, error.offset));
++    expect(error.col).toBe(colOf(arg, error.offset));
++  });
++
++  test('its span stays inside the source', () => {
++    const [error] = collect(arg).errors;
++    expect(error.offset).toBeGreaterThanOrEqual(0);
++    expect(error.length).toBeGreaterThanOrEqual(0);
++    expect(error.offset + error.length).toBeLessThanOrEqual(arg.length);
++  });
++
++  test('the partial argument on a later line is kept', () => {
++    const { tokens } = collect(arg);
++    expect(tokens.map(t => t.type)).toEqual(['content', 'argument']);
++    expect(tokens[1]).toMatchObject({ arg: 'name' });
++  });
++
++  test('an unterminated select spanning lines agrees with its offset', () => {
++    const [error] = collect(select).errors;
++    expect(error.code).toBe('missing-end');
++    expect(error.line).toBe(lineOf(select, error.offset));
++    expect(error.col).toBe(colOf(select, error.offset));
++  });
++
++  test('the partial select spanning lines keeps its cases', () => {
++    const found = firstSelect(collect(select).tokens);
++    expect(found.cases.map((c: any) => c.key)).toEqual(['one', 'other']);
++  });
++
++  test('a nested unterminated select reports missing-end without a token', () => {
++    const src = '{n, plural,\n one {deep {inner';
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toContain('missing-end');
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++  });
++});
++
++describe('input that ends mid-placeholder', () => {
++  test('a placeholder that ends after its comma reports missing-end', () => {
++    expect(codes('{name, ')).toEqual(['missing-end']);
++  });
++
++  test('its partial argument is kept', () => {
++    const { tokens } = collect('{name, ');
++    expect(tokens).toHaveLength(1);
++    expect(tokens[0]).toMatchObject({ type: 'argument', arg: 'name' });
++  });
++
++  test('no error token stands in for it', () => {
++    expect(codes('a {b, ')).toEqual(['missing-end']);
++    expect(collect('a {b, ').tokens.map(t => t.type)).toEqual([
++      'content',
++      'argument'
++    ]);
++  });
++
++  test('a malformed placeholder that does close is still invalid-syntax', () => {
++    expect(codes('ok {b, } end')).toEqual(['invalid-syntax']);
++  });
++
++  test('an unterminated formatter keeps the formatter it already parsed', () => {
++    const { errors, tokens } = collect('{n, number');
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(tokens).toHaveLength(1);
++    expect(tokens[0]).toMatchObject({
++      type: 'function',
++      arg: 'n',
++      key: 'number'
++    });
++  });
++});
++
++describe('several skipped spans through the compiler', () => {
++  const two = 'A {b, } B {c, } C {d}';
++
++  test('both malformed placeholders are reported', () => {
++    expect(codes(two)).toEqual(['invalid-syntax', 'invalid-syntax']);
++  });
++
++  test('the tokens around both spans survive', () => {
++    expect(collect(two).tokens.map(t => t.type)).toEqual([
++      'content',
++      'error',
++      'content',
++      'error',
++      'content',
++      'argument'
++    ]);
++  });
++
++  test('the compiled message omits both spans', () => {
++    const mf = new MessageFormat('en', { onError: () => {} });
++    expect(mf.compile(two)({ d: 'D' })).toBe('A  B  C D');
++  });
++
++  test('content between three skipped spans survives', () => {
++    const src = '{a, }x{b, }y{c, }z';
++    expect(codes(src)).toEqual([
++      'invalid-syntax',
++      'invalid-syntax',
++      'invalid-syntax'
++    ]);
++    const mf = new MessageFormat('en', { onError: () => {} });
++    expect(mf.compile(src)({})).toBe('xyz');
++  });
++
++  test('adjacent skipped spans stay separate error tokens', () => {
++    expect(collect('{a, }{b, }x').tokens.map(t => t.type)).toEqual([
++      'error',
++      'error',
++      'content'
++    ]);
++  });
++
++  test('a message of nothing but skipped spans formats to empty', () => {
++    const mf = new MessageFormat('en', { onError: () => {} });
++    expect(mf.compile('{a, }{b, }')({})).toBe('');
++  });
++
++  test('the compiler callback receives one error per skipped span', () => {
++    const errors: ParseError[] = [];
++    const mf = new MessageFormat('en', { onError: e => errors.push(e) });
++    mf.compile(two);
++    expect(errors.map(e => e.code)).toEqual([
++      'invalid-syntax',
++      'invalid-syntax'
++    ]);
++    expect(errors.map(e => e.offset)).toEqual([4, 12]);
++  });
++});
++
++describe('diagnostics arrive in source order', () => {
++  test('a brace in a quoted literal is not a placeholder opener', () => {
++    const src = "'{' '#{' tail";
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.map(t => t.type)).toEqual(['content', 'error', 'content']);
++    expect(tokens[1].value).toBe("'#{'");
++    expect(tokens[2].value).toBe(' tail');
++  });
++
++  test('an outer failure found late is still reported first', () => {
++    const src = '{n, number, {m, plural, xyzzy{x} other{y}}}';
++    const { errors } = collect(src, { strict: true });
++    expect(errors.map(e => e.code)).toEqual([
++      'invalid-syntax',
++      'invalid-plural-key'
++    ]);
++    expect(errors[0].offset).toBeLessThan(errors[1].offset);
++  });
++
++  test('reported offsets never go backwards', () => {
++    const sources: [string, object][] = [
++      ['{n, number, {m, plural, xyzzy{x} other{y}}}', { strict: true }],
++      ['{n, plural, xyzzy{a} other{b}} {q, }', {}],
++      ['{var,Select} {other,Plural} tail', {}],
++      ['A {b, } B {c, } C {d}', {}],
++      ['{n, plural, xyzzy{a} nope{b} other{c}}', {}],
++      ['{n, plural, other{x}} {m, nope, y}', { strict: true }]
++    ];
++    for (const [src, options] of sources) {
++      const offsets = collect(src, options).errors.map(e => e.offset);
++      expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
++    }
++  });
++});
++
++describe('a literal brace is not a placeholder', () => {
++  test('a non-argument brace before a top-level failure is preserved', () => {
++    const { errors, tokens } = collect("{ '#{' } tail");
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.map(t => t.type)).toEqual(['content', 'error', 'content']);
++    expect(tokens.map(t => t.value)).toEqual(['{ ', "'#{'", ' } tail']);
++  });
++
++  test('the same failure inside a real placeholder skips the placeholder', () => {
++    const src = "{n, number, '#{'}";
++    const { tokens } = collect(src);
++    expect(tokens).toHaveLength(1);
++    expect(tokens[0]).toMatchObject({ type: 'error', value: src });
++  });
++});
++
++describe('MessageFormat forwards semantic diagnostics', () => {
++  const compileWith = (src: string) => {
++    const errors: ParseError[] = [];
++    const mf = new MessageFormat('en', { onError: e => errors.push(e) });
++    const fn = mf.compile(src);
++    return { errors, fn };
++  };
++
++  test('an invalid plural key is forwarded and the message still compiles', () => {
++    const { errors, fn } = compileWith('{n, plural, xyzzy{a} other{b}}');
++    expect(errors.map(e => e.code)).toEqual(['invalid-plural-key']);
++    expect(fn({ n: 1 })).toBe('b');
++  });
++
++  test('a duplicate case is forwarded and the message still compiles', () => {
++    const { errors, fn } = compileWith('{n, plural, one{a} one{b} other{c}}');
++    expect(errors.map(e => e.code)).toEqual(['duplicate-case']);
++    expect(fn({ n: 2 })).toBe('c');
++  });
++
++  test('a rejected select offset is forwarded and ignored', () => {
++    const { errors, fn } = compileWith('{n, select, offset:1 other{x}}');
++    expect(errors.map(e => e.code)).toEqual(['unexpected-offset']);
++    expect(fn({ n: 'z' })).toBe('x');
++  });
++
++  test('a rejected late offset is forwarded and ignored', () => {
++    const { errors, fn } = compileWith('{n, plural, one{a} offset:1 other{b}}');
++    expect(errors.map(e => e.code)).toEqual(['offset-after-cases']);
++    expect(fn({ n: 1 })).toBe('a');
++  });
++
++  test('a missing other case is forwarded and the compiler still rejects it', () => {
++    const errors: ParseError[] = [];
++    const mf = new MessageFormat('en', { onError: e => errors.push(e) });
++    expect(() => mf.compile('{n, plural, one{a}}')).toThrow(/No 'other' form found/);
++    expect(errors.map(e => e.code)).toEqual(['missing-other']);
++    errors.length = 0;
++    expect(() => mf.compile('{c, select, a{x}}')).toThrow(/No 'other' form found/);
++    expect(errors.map(e => e.code)).toEqual(['missing-other']);
++  });
++});
++
++describe('throwing without onError is unchanged', () => {
++  const legacy: [string, string, string][] = [
++    [
++      '{TEST, select, =0{a} other{b}}',
++      'The case =0 is not valid with select at line 1 col 16:\n\n1  {TEST, select, =0{a} other{b}}\n                  ^',
++      'invalid-select-key'
++    ],
++    [
++      '{NUM, plural, other{a} offset:4}',
++      'Plural offset must be set before cases at line 1 col 23:\n\n1  {NUM, plural, other{a} offset:4}\n                         ^',
++      'offset-after-cases'
++    ],
++    [
++      '{var,Select}',
++      'Invalid type identifier: Select at line 1 col 5:\n\n1  {var,Select}\n       ^',
++      'invalid-syntax'
++    ],
++    [
++      'Hello {name',
++      'Unexpected message end at line 1 col 12:\n\n1  Hello {name\n              ^',
++      'missing-end'
++    ],
++    [
++      'ok {b, } end',
++      'invalid syntax at line 1 col 6:\n\n1  ok {b, } end\n        ^',
++      'invalid-syntax'
++    ]
++  ];
++
++  test.each(legacy)('%s throws the identical message, reports %s', (src, message, code) => {
++    let caught: Error | null = null;
++    try {
++      parse(src);
++    } catch (error) {
++      caught = error as Error;
++    }
++    expect(caught).not.toBeNull();
++    expect(caught!.message).toBe(message);
++    expect(codes(src)).toEqual([code]);
++  });
++
++  test('the thrown error still quotes the offending line and column', () => {
++    let caught: ParseError | null = null;
++    try {
++      parse('Hello {name');
++    } catch (error) {
++      caught = error as ParseError;
++    }
++    expect(caught).toBeInstanceOf(ParseError);
++    expect(caught!.message).toContain('line 1 col 12');
++    expect(caught!.message).toContain('Hello {name');
++    const [reported] = collect('Hello {name').errors;
++    expect(reported.code).toBe('missing-end');
++    expect(reported.line).toBe(1);
++  });
++});
++describe('every remaining legacy failure keeps its exact message', () => {
++  const remaining: [string, ParseOptions, string, string][] = [
++    [
++      '{n, number {x',
++      {},
++      'invalid syntax at line 1 col 12:\n\n1  {n, number {x\n              ^',
++      'missing-end'
++    ],
++    [
++      '{n, number x}',
++      {},
++      'invalid syntax at line 1 col 12:\n\n1  {n, number x}\n              ^',
++      'invalid-syntax'
++    ],
++    [
++      '{n, plural x}',
++      {},
++      'invalid syntax at line 1 col 12:\n\n1  {n, plural x}\n              ^',
++      'invalid-syntax'
++    ],
++    [
++      '{n, date z}',
++      {},
++      'invalid syntax at line 1 col 10:\n\n1  {n, date z}\n            ^',
++      'invalid-syntax'
++    ],
++    [
++      '{a}{n, number q}',
++      {},
++      'invalid syntax at line 1 col 15:\n\n1  {a}{n, number q}\n                 ^',
++      'invalid-syntax'
++    ],
++    [
++      '{n, plural, xyzzy{a} other{b}}',
++      {},
++      'The plural case xyzzy is not valid in this locale at line 1 col 13:\n\n1  {n, plural, xyzzy{a} other{b}}\n               ^',
++      'invalid-plural-key'
++    ],
++    [
++      '{n, selectordinal, xyzzy{a} other{b}}',
++      {},
++      'The selectordinal case xyzzy is not valid in this locale at line 1 col 20:\n\n1  {n, selectordinal, xyzzy{a} other{b}}\n                      ^',
++      'invalid-plural-key'
++    ],
++    [
++      '{n, select, offset:1 other{a}}',
++      {},
++      'Unexpected plural offset for select at line 1 col 13:\n\n1  {n, select, offset:1 other{a}}\n               ^',
++      'unexpected-offset'
++    ],
++    [
++      '{n, nope, x}',
++      { strict: true },
++      'Invalid strict mode function arg type: nope at line 1 col 1:\n\n1  {n, nope, x}\n   ^',
++      'invalid-syntax'
++    ],
++    [
++      '{n, number, {m, select, other{x}}}',
++      { strict: true },
++      'Unsupported part in strict mode function arg style: {m, select,  at line 1 col 1:\n\n1  {n, number, {m, select, other{x}}}\n   ^',
++      'invalid-syntax'
++    ],
++    [
++      "a '#{' b",
++      {},
++      "Unsupported escape pattern: #{ at line 1 col 3:\n\n1  a '#{' b\n     ^",
++      'invalid-syntax'
++    ],
++    [
++      '{NUM, plural, offset:-4 other{x}}',
++      {},
++      'invalid syntax at line 1 col 15:\n\n1  {NUM, plural, offset:-4 other{x}}\n                 ^',
++      'invalid-syntax'
++    ],
++    [
++      '{NUM, plural, offset:x other{y}}',
++      {},
++      'invalid syntax at line 1 col 15:\n\n1  {NUM, plural, offset:x other{y}}\n                 ^',
++      'invalid-syntax'
++    ]
++  ];
++
++  test.each(remaining)('%s keeps the message it throws today', (src, options, message, code) => {
++    let caught: Error | null = null;
++    try {
++      parse(src, options);
++    } catch (error) {
++      caught = error as Error;
++    }
++    expect(caught).not.toBeNull();
++    expect(caught!.message).toBe(message);
++    expect(codes(src, options)).toEqual([code]);
++  });
++
++  test('every one of them still reports through the callback', () => {
++    for (const [src, options, , code] of remaining) {
++      expect(codes(src, options)).toEqual([code]);
++    }
++  });
++});
++
++
++describe('only invalid-syntax produces an error token', () => {
++  const semantic: [string, string][] = [
++    ['{n, select, =2{bad} other{ok}}', 'invalid-select-key'],
++    ['{n, plural, xyzzy{a} other{b}}', 'invalid-plural-key'],
++    ['{n, select, offset:1 other{x}}', 'unexpected-offset'],
++    ['{n, plural, one{a} offset:1 other{b}}', 'offset-after-cases'],
++    ['{n, plural, one{a} one{b} other{c}}', 'duplicate-case'],
++    ['{n, plural, one{a}}', 'missing-other'],
++    ['Hello {name', 'missing-end']
++  ];
++
++  test.each(semantic)('%s reports %s and adds no error token', (src, code) => {
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual([code]);
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++  });
++
++  test('a syntax failure is the one kind that does add a token', () => {
++    const { errors, tokens } = collect('ok {b, } end');
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.some(t => t.type === 'error')).toBe(true);
++  });
++});
++
++describe('diagnostic spans cover the offending text only', () => {
++  const span = (src: string) => {
++    const [error] = collect(src).errors;
++    return src.slice(error.offset, error.offset + error.length);
++  };
++
++  test('an invalid plural key spans the key, not the rest of the select', () => {
++    const src = '{n, plural, xyzzy{a} other{b}}';
++    expect(span(src)).toContain('xyzzy');
++    expect(span(src)).not.toContain('other');
++  });
++
++  test('an invalid select key spans the key', () => {
++    const src = '{n, select, =2{bad} other{ok}}';
++    expect(span(src)).toContain('=2');
++    expect(span(src)).not.toContain('other');
++  });
++
++  test('a rejected select offset spans the offset', () => {
++    const src = '{n, select, offset:1 other{x}}';
++    expect(span(src)).toContain('offset:1');
++    expect(span(src)).not.toContain('other');
++  });
++
++  test('a rejected late offset spans the offset, not the cases', () => {
++    const src = '{n, plural, one{a} offset:1 other{b}}';
++    expect(span(src)).toContain('offset:1');
++    expect(span(src)).not.toContain('one');
++    expect(span(src)).not.toContain('other');
++  });
++
++  test('a duplicate case spans a repeated key, not the whole select', () => {
++    const src = '{n, plural, one{a} one{b} other{c}}';
++    const [error] = collect(src).errors;
++    expect(span(src)).toContain('one');
++    expect(span(src)).not.toContain('other');
++    expect(error.length).toBeGreaterThan(0);
++    expect(error.offset + error.length).toBeLessThanOrEqual(src.length);
++  });
++
++  test('a syntax failure spans a non-empty part of its placeholder', () => {
++    const src = 'ok {b, } end';
++    const [error] = collect(src).errors;
++    expect(error.length).toBeGreaterThan(0);
++    expect(error.offset).toBeGreaterThanOrEqual(src.indexOf('{b'));
++    expect(error.offset + error.length).toBeLessThanOrEqual(src.indexOf('}') + 1);
++  });
++});
++
++describe('the compiler uses missing-end partial nodes', () => {
++  const compileWith = (src: string) => {
++    const errors: ParseError[] = [];
++    const mf = new MessageFormat('en', { onError: e => errors.push(e) });
++    return { errors, fn: mf.compile(src) };
++  };
++
++  test('an unterminated formatter still formats through that formatter', () => {
++    const { errors, fn } = compileWith('{n, number');
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(fn({ n: 3 })).toBe('3');
++  });
++
++  test('an unterminated select still chooses among its parsed cases', () => {
++    const { errors, fn } = compileWith('{n, plural, one{a} other{b}');
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(fn({ n: 1 })).toBe('a');
++    expect(fn({ n: 5 })).toBe('b');
++  });
++
++  test('an unterminated argument still formats its value', () => {
++    const { errors, fn } = compileWith('Hello {name');
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(fn({ name: 'x' })).toBe('Hello x');
++  });
++});
++
++describe('a skipped span contributes no part in values mode', () => {
++  const values = (src: string, params: object = {}) => {
++    const errors: ParseError[] = [];
++    const mf = new MessageFormat('en', {
++      returnType: 'values',
++      onError: e => errors.push(e)
++    });
++    const parts = (mf.compile(src) as any)(params) as unknown[];
++    return { errors, parts };
++  };
++
++  test('a message of nothing but a skipped span produces no output', () => {
++    const { errors, parts } = values('{b, }');
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(parts).toEqual([]);
++  });
++
++  test('a skipped span contributes nothing between the survivors', () => {
++    const { errors, parts } = values('A {b, } C');
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(parts).toEqual(['A ', ' C']);
++  });
++
++  test('a skipped span adds no element around surrounding text', () => {
++    const { errors, parts } = values('before {b, } after');
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(parts).toEqual(['before ', ' after']);
++  });
++
++  test('surviving arguments still format around a skipped span', () => {
++    const { errors, parts } = values('{a} {b, } {c}', { a: 'A', c: 'C' });
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(parts.join('')).toBe('A  C');
++  });
++});
++
++describe('literal braces inside a recovered placeholder', () => {
++  test('a brace the lexer reads as content does not extend the placeholder', () => {
++    const src = '{a, number, {, {b, } } tail';
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.map(t => t.type)).toEqual(['error', 'content']);
++    expect(tokens[0].value).toBe('{a, number, {, {b, } }');
++    expect(tokens[1].value).toBe(' tail');
++  });
++
++  test('the same source without a malformed placeholder parses cleanly', () => {
++    const clean = collect('{a, number, {, } tail');
++    expect(clean.errors).toHaveLength(0);
++    expect(clean.tokens.map(t => t.type)).toEqual(['function', 'content']);
++    const broken = collect('{a, number, {, {b, } } tail');
++    expect(broken.errors.map(e => e.code)).toEqual(['invalid-syntax']);
++  });
++
++  test('an empty case body does not move the recovery boundary', () => {
++    const src = '{n, plural, one{} other{x}} {b, } tail';
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.map(t => t.type)).toEqual([
++      'plural',
++      'content',
++      'error',
++      'content'
++    ]);
++    expect(tokens[2].value).toBe('{b, }');
++    expect(tokens[3].value).toBe(' tail');
++  });
++
++  test('a failure nested past a literal brace skips the whole outer select', () => {
++    const src = '{n, plural, one{ } other{x {q, } y}} tail';
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens[0]).toMatchObject({
++      type: 'error',
++      value: '{n, plural, one{ } other{x {q, } y}}'
++    });
++    expect(tokens[1].value).toBe(' tail');
++  });
++
++  test('a brace before any non-identifier opens nothing, not just before a comma', () => {
++    const cases: [string, string, string][] = [
++      ['{n, plural, {} AFTER } tail', '{n, plural, {}', ' AFTER } tail'],
++      ['{n, plural, {: } AFTER } tail', '{n, plural, {: }', ' AFTER } tail'],
++      ['{n, plural, { } AFTER } tail', '{n, plural, { }', ' AFTER } tail'],
++      ['{n, select, {! } AFTER } tail', '{n, select, {! }', ' AFTER } tail'],
++      ['before {n, plural, {: } KEEP } end', '{n, plural, {: }', ' KEEP } end']
++    ];
++    for (const [src, value, tail] of cases) {
++      const { errors, tokens } = collect(src);
++      expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++      const err = tokens.find(t => t.type === 'error');
++      expect(err).toMatchObject({ value });
++      expect(
++        tokens
++          .slice(tokens.indexOf(err) + 1)
++          .map(t => t.value)
++          .join('')
++      ).toBe(tail);
++    }
++  });
++
++  test('the text after such a brace survives through the compiler', () => {
++    const mf = new MessageFormat('en', { onError: () => {} });
++    expect(mf.compile('{n, plural, {} AFTER } tail')({})).toBe(' AFTER } tail');
++    expect(mf.compile('before {n, plural, {: } KEEP } end')({})).toBe(
++      'before  KEEP } end'
++    );
++    expect(mf.compile('{n, select, {! } AFTER } tail')({})).toBe(
++      ' AFTER } tail'
++    );
++  });
++});
++
++describe('coordinates with CRLF line endings', () => {
++  const lineOf = (src: string, offset: number) =>
++    src.slice(0, offset).split('\n').length;
++  const colOf = (src: string, offset: number) =>
++    offset - src.slice(0, offset).lastIndexOf('\n');
++
++  const syntax = 'one\r\ntwo {b, } three';
++
++  test('a syntax failure on a later CRLF line keeps absolute coordinates', () => {
++    const [error] = collect(syntax).errors;
++    expect(error.code).toBe('invalid-syntax');
++    expect(error.offset).toBe(syntax.indexOf(','));
++    expect(error.line).toBe(lineOf(syntax, error.offset));
++    expect(error.col).toBe(colOf(syntax, error.offset));
++  });
++
++  test('the CRLF error token still spans its own placeholder', () => {
++    const { tokens } = collect(syntax);
++    const errorToken = tokens.find(t => t.type === 'error');
++    expect(errorToken).toMatchObject({ value: '{b, }' });
++    expect(errorToken.ctx.offset).toBe(syntax.indexOf('{b'));
++    expect(tokens[tokens.length - 1].value).toBe(' three');
++  });
++
++  test('missing-end after CRLF lines reports consistent coordinates', () => {
++    const src = 'a\r\nb\r\nHello {name';
++    const [error] = collect(src).errors;
++    expect(error.code).toBe('missing-end');
++    expect(error.line).toBe(lineOf(src, error.offset));
++    expect(error.col).toBe(colOf(src, error.offset));
++    expect(error.offset).toBeLessThanOrEqual(src.length);
++  });
++
++  test('a semantic error after a CRLF break points at its key', () => {
++    const src = '{n, plural,\r\n xyzzy{a} other{b}}';
++    const [error] = collect(src).errors;
++    expect(error.code).toBe('invalid-plural-key');
++    expect(error.line).toBe(lineOf(src, error.offset));
++    expect(error.col).toBe(colOf(src, error.offset));
++    expect(src.slice(error.offset).trimStart()).toMatch(/^xyzzy/);
++  });
++});
++
++describe('a callback that returns normally', () => {
++  test('recovery completes and the problem is still reported', () => {
++    expect(codes('ok {b, } end')).toEqual(['invalid-syntax']);
++  });
++});
++
++describe('MessageFormat forwards mixed problems in source order', () => {
++  test('a semantic problem before a syntax problem keeps that order', () => {
++    const errors: ParseError[] = [];
++    const mf = new MessageFormat('en', { onError: e => errors.push(e) });
++    mf.compile('{n, plural, xyzzy{a} other{b}} {q, }');
++    expect(errors.map(e => e.code)).toEqual([
++      'invalid-plural-key',
++      'invalid-syntax'
++    ]);
++    expect(errors[0].offset).toBeLessThan(errors[1].offset);
++  });
++
++  test('a semantic problem between two syntax problems keeps its place', () => {
++    const errors: ParseError[] = [];
++    const mf = new MessageFormat('en', { onError: e => errors.push(e) });
++    expect(() => mf.compile('{a, } {n, plural, one{x}} {b, }')).toThrow(
++      /No 'other' form found/
++    );
++    expect(errors.map(e => e.code)).toEqual([
++      'invalid-syntax',
++      'missing-other',
++      'invalid-syntax'
++    ]);
++    const offsets = errors.map(e => e.offset);
++    expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
++  });
++});
++
++describe('several problems on one repeated key', () => {
++  const repeated = '{n, plural, xyzzy{a} xyzzy{b} one{c}}';
++
++  test('both key problems, the duplicate and the missing other are reported', () => {
++    const { errors } = collect(repeated);
++    const reported = errors.map(e => e.code);
++    expect(reported.filter(c => c === 'invalid-plural-key')).toHaveLength(2);
++    expect(reported).toContain('duplicate-case');
++    expect(reported[reported.length - 1]).toBe('missing-other');
++  });
++
++  test('those reports still arrive in source order', () => {
++    const offsets = collect(repeated).errors.map(e => e.offset);
++    expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
++  });
++
++  test('both copies of the repeated key are kept', () => {
++    const found = firstSelect(collect(repeated).tokens);
++    expect(found.cases.map((c: any) => c.key)).toEqual(['xyzzy', 'xyzzy', 'one']);
++  });
++
++  test('the same overlap in a select reports both key problems', () => {
++    const { errors } = collect('{n, select, =2{a} =2{b} x{c}}');
++    const reported = errors.map(e => e.code);
++    expect(reported.filter(c => c === 'invalid-select-key')).toHaveLength(2);
++    expect(reported).toContain('duplicate-case');
++    expect(reported[reported.length - 1]).toBe('missing-other');
++  });
++});
++
++describe('one callback across several parses', () => {
++  const first = 'ok {b, } end';
++  const second = '{q, } tail';
++
++  test('a second parse does not replay the first problems', () => {
++    const errors: ParseError[] = [];
++    const options = { onError: (e: ParseError) => errors.push(e) };
++    parse(first, options);
++    expect(errors).toHaveLength(1);
++    parse(second, options);
++    expect(errors).toHaveLength(2);
++    expect(errors.map(e => e.code)).toEqual([
++      'invalid-syntax',
++      'invalid-syntax'
++    ]);
++  });
++
++  test('the second parse reports its own coordinates', () => {
++    const errors: ParseError[] = [];
++    const options = { onError: (e: ParseError) => errors.push(e) };
++    parse(first, options);
++    const tokens = parse(second, options) as any[];
++    expect(errors[0].offset).toBe(first.indexOf(','));
++    expect(errors[1].offset).toBe(second.indexOf(','));
++    expect(tokens.find(t => t.type === 'error').ctx.offset).toBe(0);
++    expect(tokens[tokens.length - 1].value).toBe(' tail');
++  });
++
++  test('one MessageFormat compiles two recovered messages independently', () => {
++    const errors: ParseError[] = [];
++    const mf = new MessageFormat('en', { onError: e => errors.push(e) });
++    const a = mf.compile('A {b, } C');
++    expect(errors).toHaveLength(1);
++    const b = mf.compile('DD {q, } EE');
++    expect(errors.map(e => e.offset)).toEqual([
++      'A {b, } C'.indexOf(','),
++      'DD {q, } EE'.indexOf(',')
++    ]);
++    expect(a({})).toBe('A  C');
++    expect(b({})).toBe('DD  EE');
++  });
++});
++
++describe('malformed plural offsets recover', () => {
++  test('a negative offset is a syntax failure that skips its placeholder', () => {
++    const src = '{NUM, plural, offset:-4 other{x}} tail';
++    expect(() => parse(src)).toThrow();
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.map(t => t.type)).toEqual(['error', 'content']);
++    expect(tokens[0].value).toBe('{NUM, plural, offset:-4 other{x}}');
++    expect(tokens[1].value).toBe(' tail');
++  });
++
++  test('a non-numeric offset recovers the same way', () => {
++    const src = '{NUM, plural, offset:x other{y}} tail';
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens[0]).toMatchObject({
++      type: 'error',
++      value: '{NUM, plural, offset:x other{y}}'
++    });
++    expect(tokens[tokens.length - 1].value).toBe(' tail');
++  });
++
++  test('recovery still advances past an offset with no value', () => {
++    const { errors, tokens } = collect('{NUM, plural, offset: other{y}} tail');
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens[tokens.length - 1]).toMatchObject({
++      type: 'content',
++      value: ' tail'
++    });
++  });
++});
++
++describe('a select that never closes', () => {
++  test('reports only missing-end', () => {
++    expect(codes('{n, plural, one{a}')).toEqual(['missing-end']);
++    expect(codes('{c, select, a{x}')).toEqual(['missing-end']);
++  });
++
++  test('still returns the cases it parsed', () => {
++    const found = firstSelect(collect('{n, plural, one{a}').tokens);
++    expect(found.cases.map((c: any) => c.key)).toEqual(['one']);
++  });
++
++  test('adds no error token even though other is absent', () => {
++    const { tokens } = collect('{c, select, a{x}');
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++  });
++});
++
++describe('duplicate exact number keys', () => {
++  test('a repeated exact key is a duplicate', () => {
++    const src = '{n, plural, =1{a} =1{b} other{c}}';
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual(['duplicate-case']);
++    expect(firstSelect(tokens).cases.map((c: any) => c.key)).toEqual([
++      '=1',
++      '=1',
++      'other'
++    ]);
++  });
++
++  test('distinct exact keys are not duplicates', () => {
++    expect(codes('{n, plural, =1{a} =2{b} other{c}}')).toEqual([]);
++    expect(codes('{n, plural, =1{a} =1{b} other{c}}')).toEqual(['duplicate-case']);
++  });
++
++  test('selectordinal exact keys duplicate the same way', () => {
++    expect(codes('{n, selectordinal, =1{a} =1{b} other{c}}')).toEqual([
++      'duplicate-case'
++    ]);
++  });
++
++  test('the duplicate span covers the repeated exact key', () => {
++    const src = '{n, plural, =1{a} =1{b} other{c}}';
++    const [error] = collect(src).errors;
++    const span = src.slice(error.offset, error.offset + error.length);
++    expect(span).toContain('=1');
++    expect(span).not.toContain('other');
++    expect(error.offset).toBeGreaterThan(0);
++  });
++});
++
++describe('missing-other anchors on the brace even when it is indented', () => {
++  test('an indented closing brace is reported at the brace itself', () => {
++    const src = '{n, plural, one{a}\n }';
++    const [error] = collect(src).errors;
++    expect(error.code).toBe('missing-other');
++    expect(error.offset).toBe(src.lastIndexOf('}'));
++    expect(error.length).toBe(1);
++    expect(src.slice(error.offset, error.offset + error.length)).toBe('}');
++  });
++
++  test('its line and column follow the brace, not the whitespace', () => {
++    const src = '{n, plural, one{a}\n }';
++    const [error] = collect(src).errors;
++    expect(error.line).toBe(2);
++    expect(error.col).toBe(2);
++  });
++
++  test('a select closing on its own line anchors there too', () => {
++    const src = '{n, plural,\n  one{a}\n}';
++    const [error] = collect(src).errors;
++    expect(error.code).toBe('missing-other');
++    expect(error.offset).toBe(src.lastIndexOf('}'));
++    expect(error.length).toBe(1);
++    expect(error.line).toBe(3);
++    expect(error.col).toBe(1);
++  });
++
++  test('spaces before the brace are not part of the span', () => {
++    const src = '{c, select, a{x}   }';
++    const [error] = collect(src).errors;
++    expect(error.code).toBe('missing-other');
++    expect(error.offset).toBe(src.lastIndexOf('}'));
++    expect(error.length).toBe(1);
++  });
++});
++
++describe('an unterminated placeholder with more text before the end', () => {
++  test('a select left open after a later brace reports only missing-end', () => {
++    const src = '{n, plural, one {x} {y';
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++    expect(tokens.map(t => t.type)).toEqual(['plural']);
++  });
++
++  test('an argument left open mid-name reports only missing-end', () => {
++    const { errors, tokens } = collect('{a b');
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++    expect(tokens[0]).toMatchObject({ type: 'argument', arg: 'a' });
++  });
++
++  test('a formatter left open keeps the key it parsed', () => {
++    const { errors, tokens } = collect('{n, number {x');
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++    expect(tokens[0]).toMatchObject({
++      type: 'function',
++      arg: 'n',
++      key: 'number'
++    });
++  });
++
++  test('none of them is turned into a recovered span', () => {
++    for (const src of ['{n, plural, one {x} {y', '{a b', '{n, number {x']) {
++      const { errors, tokens } = collect(src);
++      expect(errors.map(e => e.code)).toEqual(['missing-end']);
++      expect(tokens.some(t => t.type === 'error')).toBe(false);
++    }
++  });
++});
++
++describe('an apostrophe only quotes before a brace or octothorpe', () => {
++  const src = "ok {b, x' } tail ' z} end";
++
++  test('a lone apostrophe does not begin a quoted span', () => {
++    const { errors, tokens } = collect(src);
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.find(t => t.type === 'error').value).toBe("{b, x' }");
++  });
++
++  test('the text after that placeholder is still parsed', () => {
++    const { tokens } = collect(src);
++    expect(tokens.map(t => t.value)).toEqual([
++      'ok ',
++      "{b, x' }",
++      " tail ' z} end"
++    ]);
++  });
++
++  test('an apostrophe that does precede a brace still quotes it', () => {
++    const { tokens } = collect("ok {b, '}' } end");
++    expect(tokens.find(t => t.type === 'error').value).toBe("{b, '}' }");
++  });
++
++  test('an apostrophe before an octothorpe also opens a quoted span', () => {
++    const { errors, tokens } = collect("ok {b, '# }' } end");
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.find(t => t.type === 'error').value).toBe("{b, '# }' }");
++    expect(tokens.map(t => t.type)).toEqual(['content', 'error', 'content']);
++    expect(tokens[tokens.length - 1].value).toBe(' end');
++  });
++
++  test('a brace inside an octothorpe-quoted span does not deepen it', () => {
++    const { errors, tokens } = collect("ok {b, '#{' } end");
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.find(t => t.type === 'error').value).toBe("{b, '#{' }");
++    expect(tokens[tokens.length - 1].value).toBe(' end');
++  });
++
++  test('an apostrophe that opens nothing is ordinary content', () => {
++    for (const src of ["the boys'", "a ' b", "don't", "x'"]) {
++      const { errors, tokens } = collect(src);
++      expect(errors).toHaveLength(0);
++      expect(tokens).toMatchObject([{ type: 'content', value: src }]);
++    }
++    const { errors, tokens } = collect("the boys' {b, } tail");
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.map(t => t.value)).toEqual([
++      "the boys' ",
++      '{b, }',
++      ' tail'
++    ]);
++  });
++
++  test('a trailing apostrophe survives compilation', () => {
++    const mf = new MessageFormat('en', { onError: () => {} });
++    expect(mf.compile("the boys'")({})).toBe("the boys'");
++    expect(mf.compile("the boys' {b, } tail")({})).toBe("the boys'  tail");
++  });
++});
++
++describe('an octothorpe outside a plural is ordinary text', () => {
++  test('a lone octothorpe parses the same with a callback', () => {
++    expect(parse('#')).toMatchObject([{ type: 'content', value: '#' }]);
++    const { errors, tokens } = collect('#');
++    expect(errors).toHaveLength(0);
++    expect(tokens).toMatchObject([{ type: 'content', value: '#' }]);
++    expect(codes('# {b, } #')).toEqual(['invalid-syntax']);
++  });
++
++  test('an octothorpe in surrounding text survives a recovery', () => {
++    const { errors, tokens } = collect('Item #5 {b, } tail');
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.map(t => t.value)).toEqual(['Item #5 ', '{b, }', ' tail']);
++  });
++
++  test('octothorpes on both sides of a skipped span are kept', () => {
++    const { errors, tokens } = collect('C# {q, } #3');
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.map(t => t.value)).toEqual(['C# ', '{q, }', ' #3']);
++  });
++
++  test('a compiled message keeps a top-level octothorpe', () => {
++    const mf = new MessageFormat('en', { onError: () => {} });
++    expect(mf.compile('Item #5 {b, } tail')({})).toBe('Item #5  tail');
++    expect(mf.compile('Item #5')({})).toBe('Item #5');
++    expect(mf.compile('#')({})).toBe('#');
++  });
++
++  test('an octothorpe after a plural is still ordinary text', () => {
++    const { errors, tokens } = collect('{n, plural, other{# x}} #y {b, } z');
++    expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++    expect(tokens.map(t => t.type)).toEqual([
++      'plural',
++      'content',
++      'error',
++      'content'
++    ]);
++    expect(tokens[tokens.length - 1].value).toBe(' z');
++  });
++});
++
++describe('a duplicate report points at the repeated case', () => {
++  const dup = (src: string) =>
++    collect(src).errors.filter(e => e.code === 'duplicate-case');
++
++  test('the report lies past the first occurrence of the key', () => {
++    const cases: [string, string][] = [
++      ['{n, plural, one{a} one{b} other{c}}', 'one'],
++      ['{n, plural, =1{a} =1{b} other{c}}', '=1'],
++      ['{c, select, a{x} a{y} other{z}}', 'a{']
++    ];
++    for (const [src, key] of cases) {
++      const [error] = dup(src);
++      const first = src.indexOf(key);
++      const second = src.indexOf(key, first + 1);
++      expect(error.offset).toBeGreaterThan(first);
++      expect(error.offset).toBeLessThanOrEqual(second);
++      expect(error.offset + error.length).toBeGreaterThan(second);
++    }
++  });
++
++  test('a key repeated three times reports each occurrence after the first', () => {
++    const src = '{n, plural, one{a} one{b} one{c} other{d}}';
++    const errors = dup(src);
++    expect(errors).toHaveLength(2);
++    const first = src.indexOf('one');
++    const second = src.indexOf('one', first + 1);
++    const third = src.indexOf('one', second + 1);
++    expect(errors[0].offset).toBeGreaterThan(first);
++    expect(errors[0].offset).toBeLessThanOrEqual(second);
++    expect(errors[1].offset).toBeGreaterThan(second);
++    expect(errors[1].offset).toBeLessThanOrEqual(third);
++  });
++});
++
++describe('a parser-level failure inside a placeholder that never closes', () => {
++  test('a strict argument type reports only missing-end', () => {
++    const { errors, tokens } = collect('{n, nope', { strict: true });
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++    expect(tokens[0]).toMatchObject({ type: 'function', arg: 'n', key: 'nope' });
++  });
++
++  test('a built-in select name used as a formatter reports only missing-end', () => {
++    const { errors, tokens } = collect('{var,Select');
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++    expect(tokens[0]).toMatchObject({ type: 'function', arg: 'var' });
++  });
++
++  test('an unsupported escape reports only missing-end', () => {
++    const { errors, tokens } = collect("{n, number, '#{'");
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++  });
++
++  test('a strict argument style reports only missing-end', () => {
++    const { errors, tokens } = collect('{n, number, {m, select, other{x}}', {
++      strict: true
++    });
++    expect(errors.map(e => e.code)).toEqual(['missing-end']);
++    expect(tokens.some(t => t.type === 'error')).toBe(false);
++  });
++
++  test('closing the same placeholders brings syntax recovery back', () => {
++    const closed: [string, object, string][] = [
++      ['{n, nope, x}', { strict: true }, '{n, nope, x}'],
++      ['{var,Select}', {}, '{var,Select}'],
++      ["{n, number, '#{'}", {}, "{n, number, '#{'}"],
++      [
++        '{n, number, {m, select, other{x}}}',
++        { strict: true },
++        '{n, number, {m, select, other{x}}}'
++      ]
++    ];
++    for (const [src, options, value] of closed) {
++      const { errors, tokens } = collect(src, options);
++      expect(errors.map(e => e.code)).toEqual(['invalid-syntax']);
++      expect(tokens.find(t => t.type === 'error')).toMatchObject({ value });
++    }
++  });
++});
+diff --git a/mf1/packages/parser/src/token-union.a79142.fixture.ts b/mf1/packages/parser/src/token-union.a79142.fixture.ts
+new file mode 100644
+index 00000000..50ae2f82
+--- /dev/null
++++ b/mf1/packages/parser/src/token-union.a79142.fixture.ts
+@@ -0,0 +1,57 @@
++import type { MessageFormatOptions } from '../../core/src/messageformat.js';
++import type { ParseError, ParseOptions, Token } from './parser.js';
++
++type ErrorMember = Extract<Token, { type: 'error' }>;
++
++const unionHasErrorMember: [ErrorMember] extends [never] ? never : true = true;
++export const errorMemberIsInTokenUnion = unionHasErrorMember;
++
++export function readErrorToken(token: Token): string {
++  if (token.type === 'error') {
++    const value: string = token.value;
++    const text: string = token.ctx.text;
++    const offset: number = token.ctx.offset;
++    const line: number = token.ctx.line;
++    const col: number = token.ctx.col;
++    return `${value}${text}${offset}${line}${col}`;
++  }
++  return '';
++}
++
++export function readParseError(error: ParseError): number {
++  const code: string = error.code;
++  const spans: number[] = [
++    error.offset,
++    error.line,
++    error.col,
++    error.length
++  ];
++  return code.length + spans.length;
++}
++
++export const options: ParseOptions = {
++  onError(error) {
++    readParseError(error);
++  }
++};
++
++type Code = ParseError['code'];
++
++const everyCode: Code[] = [
++  'missing-end',
++  'invalid-select-key',
++  'invalid-plural-key',
++  'unexpected-offset',
++  'offset-after-cases',
++  'invalid-syntax',
++  'duplicate-case',
++  'missing-other'
++];
++
++export const documentedCodeCount = everyCode.length;
++
++export const compilerOptions: MessageFormatOptions<'string'> = {
++  onError(error) {
++    readParseError(error);
++  }
++};
+diff --git a/mf2/icu-messageformat-1/src/mf1-recovery.a79142.test.ts b/mf2/icu-messageformat-1/src/mf1-recovery.a79142.test.ts
+new file mode 100644
+index 00000000..80c10974
+--- /dev/null
++++ b/mf2/icu-messageformat-1/src/mf1-recovery.a79142.test.ts
+@@ -0,0 +1,202 @@
++import { parse } from '@messageformat/parser';
++import { describe, expect, test } from 'vitest';
++import { mf1ToMessageData } from './mf1-to-message-data.ts';
++
++const recovered = (src: string) =>
++  parse(src, { onError: () => {} }) as Parameters<typeof mf1ToMessageData>[0];
++
++describe('data model conversion after recovery', () => {
++  test('a skipped placeholder does not throw', () => {
++    expect(() => mf1ToMessageData(recovered('ok {b, } end'))).not.toThrow();
++  });
++
++  test('the surrounding text survives', () => {
++    const msg = mf1ToMessageData(recovered('ok {b, } end')) as any;
++    expect(msg.pattern.join('')).toBe('ok  end');
++  });
++
++  test('a following argument still becomes an expression', () => {
++    const msg = mf1ToMessageData(recovered('{a} {b, } {c}')) as any;
++    const vars = msg.pattern
++      .filter((p: any) => p && p.type === 'expression')
++      .map((p: any) => p.arg.name);
++    expect(vars).toEqual(['a', 'c']);
++  });
++
++  test('a message with only an error yields an empty pattern', () => {
++    const msg = mf1ToMessageData(recovered('{b, }')) as any;
++    expect(msg.pattern.join('')).toBe('');
++  });
++
++  test('a recovered select still converts', () => {
++    const msg = mf1ToMessageData(
++      recovered('{n, plural, one{a} other{b}} {q, }')
++    ) as any;
++    expect(msg.type).toBe('select');
++  });
++
++  test('an invalid plural key is carried through as a variant key', () => {
++    const msg = mf1ToMessageData(
++      recovered('{n, plural, xyzzy{a} other{b}}')
++    ) as any;
++    const keys = msg.variants.map((v: any) =>
++      v.keys[0].type === '*' ? '*' : v.keys[0].value
++    );
++    expect(keys).toContain('xyzzy');
++  });
++});
++
++describe('several skipped spans through conversion', () => {
++  const two = 'A {b, } B {c, } C';
++
++  test('two skipped spans convert without throwing', () => {
++    expect(() => mf1ToMessageData(recovered(two))).not.toThrow();
++  });
++
++  test('the text around both spans survives', () => {
++    const msg = mf1ToMessageData(recovered(two)) as any;
++    expect(msg.pattern.join('')).toBe('A  B  C');
++  });
++
++  test('only the intact arguments become expressions', () => {
++    const msg = mf1ToMessageData(recovered('{a} {b, } {c, } {d}')) as any;
++    const vars = msg.pattern
++      .filter((p: any) => p && p.type === 'expression')
++      .map((p: any) => p.arg.name);
++    expect(vars).toEqual(['a', 'd']);
++  });
++
++  test('adjacent skipped spans leave only the surrounding text', () => {
++    const msg = mf1ToMessageData(recovered('{a, }{b, }x')) as any;
++    expect(msg.pattern.join('')).toBe('x');
++  });
++
++  test('three skipped spans keep the content between them', () => {
++    const msg = mf1ToMessageData(recovered('{a, }x{b, }y{c, }z')) as any;
++    expect(msg.pattern.join('')).toBe('xyz');
++  });
++
++  test('a message of nothing but skipped spans converts to empty text', () => {
++    const msg = mf1ToMessageData(recovered('{a, }{b, }')) as any;
++    expect(msg.pattern.join('')).toBe('');
++  });
++});
++
++describe('semantic recovery through conversion', () => {
++  const reported = (src: string) => {
++    const codes: string[] = [];
++    const tokens = parse(src, {
++      onError: e => codes.push(e.code)
++    }) as Parameters<typeof mf1ToMessageData>[0];
++    return { codes, tokens };
++  };
++
++  const variantKeys = (tokens: Parameters<typeof mf1ToMessageData>[0]) => {
++    const msg = mf1ToMessageData(tokens) as any;
++    return {
++      type: msg.type,
++      keys: (msg.variants ?? []).map((v: any) =>
++        v.keys.map((k: any) => (k.type === '*' ? '*' : k.value)).join(',')
++      )
++    };
++  };
++
++  test('a duplicated case is reported and still converts', () => {
++    const { codes, tokens } = reported('{n, plural, one{a} one{b} other{c}}');
++    expect(codes).toEqual(['duplicate-case']);
++    expect(() => mf1ToMessageData(tokens)).not.toThrow();
++  });
++
++  test('a duplicated key still reaches the converted variants', () => {
++    const { codes, tokens } = reported('{n, plural, one{a} one{b} other{c}}');
++    expect(codes).toEqual(['duplicate-case']);
++    const { type, keys } = variantKeys(tokens);
++    expect(type).toBe('select');
++    expect(keys).toContain('one');
++    expect(keys).toContain('*');
++  });
++
++  test('a select with no other case converts to just its own variants', () => {
++    const { codes, tokens } = reported('{n, plural, one{a}}');
++    expect(codes).toEqual(['missing-other']);
++    const { type, keys } = variantKeys(tokens);
++    expect(type).toBe('select');
++    expect(keys).toEqual(['one']);
++  });
++
++  test('a rejected select offset leaves only the remaining cases', () => {
++    const { codes, tokens } = reported('{n, select, offset:1 other{x}}');
++    expect(codes).toEqual(['unexpected-offset']);
++    const { type, keys } = variantKeys(tokens);
++    expect(type).toBe('select');
++    expect(keys).toEqual(['*']);
++  });
++
++  test('a rejected late offset keeps the surrounding cases', () => {
++    const { codes, tokens } = reported('{n, plural, one{a} offset:1 other{b}}');
++    expect(codes).toEqual(['offset-after-cases']);
++    expect(variantKeys(tokens).keys).toEqual(['one', '*']);
++  });
++
++  test('a retained invalid key converts to its own variant', () => {
++    const { codes, tokens } = reported('{n, plural, xyzzy{a} other{b}}');
++    expect(codes).toEqual(['invalid-plural-key']);
++    expect(variantKeys(tokens).keys).toEqual(['xyzzy', '*']);
++  });
++});
++
++describe('EOF partial nodes through conversion', () => {
++  const withCodes = (src: string) => {
++    const codes: string[] = [];
++    const tokens = parse(src, {
++      onError: e => codes.push(e.code)
++    }) as Parameters<typeof mf1ToMessageData>[0];
++    return { codes, tokens };
++  };
++
++  const expressions = (msg: any) =>
++    msg.pattern
++      .filter((p: any) => p && p.type === 'expression')
++      .map((p: any) => p.arg.name);
++
++  test('a partial argument converts to its expression', () => {
++    const { codes, tokens } = withCodes('Hello {name');
++    expect(codes).toEqual(['missing-end']);
++    const msg = mf1ToMessageData(tokens) as any;
++    expect(msg.pattern.filter((p: any) => typeof p === 'string').join('')).toBe(
++      'Hello '
++    );
++    expect(expressions(msg)).toEqual(['name']);
++  });
++
++  test('a partial formatter keeps its argument', () => {
++    const { codes, tokens } = withCodes('Hello {n, number');
++    expect(codes).toEqual(['missing-end']);
++    expect(expressions(mf1ToMessageData(tokens) as any)).toEqual(['n']);
++  });
++
++  test('a partial select converts to a select message', () => {
++    const { codes, tokens } = withCodes('{n, plural, one{a} other{b}');
++    expect(codes).toEqual(['missing-end']);
++    const msg = mf1ToMessageData(tokens) as any;
++    expect(msg.type).toBe('select');
++    expect(
++      msg.variants.map((v: any) =>
++        v.keys.map((k: any) => (k.type === '*' ? '*' : k.value)).join(',')
++      )
++    ).toEqual(['one', '*']);
++  });
++
++  test('every partial node converts without throwing', () => {
++    for (const src of [
++      'Hello {name',
++      'Hello {n, number',
++      '{n, plural, one{a} other{b}',
++      '{name, '
++    ]) {
++      const { codes, tokens } = withCodes(src);
++      expect(codes).toContain('missing-end');
++      expect(() => mf1ToMessageData(tokens)).not.toThrow();
++    }
++  });
++});
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..16ab5bed
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,72 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="${2:-}"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++cd "$(dirname "$0")"
++
++NEW_PARSER_TEST="mf1/packages/parser/src/recovery.a79142.test.ts"
++NEW_BRIDGE_TEST="mf2/icu-messageformat-1/src/mf1-recovery.a79142.test.ts"
++
++REPORT=()
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  REPORT=(--reporter=junit --outputFile="$OUTPUT_PATH")
++fi
++
++LOG="$(mktemp)"
++
++# Both modes complete in seconds. The bound only exists so that a solution which
++# never terminates is reported as a failure carrying its output, instead of hanging
++# the run until the harness gives up.
++RUN_LIMIT=1200
++
++if [ "$MODE" = "new" ]; then
++  timeout "$RUN_LIMIT" npx vitest run --no-color "${REPORT[@]+"${REPORT[@]}"}" \
++    "$NEW_PARSER_TEST" "$NEW_BRIDGE_TEST" > "$LOG" 2>&1
++  EXIT_CODE=$?
++else
++  WG_EXCLUDE=()
++  if [ ! -d "test/messageformat-wg/test/tests" ]; then
++    WG_EXCLUDE=(--exclude '**/spec.test.ts')
++  fi
++  timeout "$RUN_LIMIT" npx vitest run --no-color \
++    --exclude '**/node_modules/**' \
++    --exclude 'mf1/examples/**' \
++    --exclude '**/recovery.a79142.test.ts' \
++    --exclude '**/mf1-recovery.a79142.test.ts' \
++    "${WG_EXCLUDE[@]+"${WG_EXCLUDE[@]}"}" \
++    "${REPORT[@]+"${REPORT[@]}"}" mf1 mf2 > "$LOG" 2>&1
++  EXIT_CODE=$?
++fi
++
++cat "$LOG"
++
++# Vitest writes no report, or one with no cases, when it fails before collection.
++# Record a failure rather than an empty result, and carry the command output through
++# so the real cause (a transform or resolution error) is visible in the report.
++if [ -n "$OUTPUT_PATH" ] && ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  DETAIL="$(tail -c 4000 "$LOG" | sed -e 's/]]>/]]]]><![CDATA[>/g')"
++  {
++    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
++    printf '<testsuites name="vitest" tests="1" failures="1" errors="0" time="0">\n'
++    printf '<testsuite name="parser-recovery" tests="1" failures="1" errors="0">\n'
++    printf '<testcase name="suite did not produce results" classname="parser-recovery">\n'
++    printf '<failure message="No test results"><![CDATA[%s]]></failure>\n' "$DETAIL"
++    printf '</testcase>\n</testsuite>\n</testsuites>\n'
++  } > "$OUTPUT_PATH"
++  EXIT_CODE=1
++fi
++
++rm -f "$LOG"
++exit $EXIT_CODE

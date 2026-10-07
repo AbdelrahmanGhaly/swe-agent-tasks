@@ -1,0 +1,1395 @@
+diff --git a/sunpy/map/tests/test_carried_quality_c962d5.py b/sunpy/map/tests/test_carried_quality_c962d5.py
+new file mode 100644
+index 0000000..f3882a3
+--- /dev/null
++++ b/sunpy/map/tests/test_carried_quality_c962d5.py
+@@ -0,0 +1,1309 @@
++"""
++Test that a map's mask and uncertainty are carried through the operations that build a
++new map from it.
++"""
++import numpy as np
++import pytest
++
++import astropy.units as u
++import reproject
++from astropy.coordinates import SkyCoord
++from astropy.nddata import InverseVariance, StdDevUncertainty, VarianceUncertainty
++from astropy.wcs import WCS
++
++import sunpy.map
++from sunpy.coordinates import frames
++from sunpy.image.resample import resample as sunpy_image_resample
++
++
++def header_for(data, scale=2):
++    reference = SkyCoord(0 * u.arcsec, 0 * u.arcsec, obstime='2013-10-28',
++                         observer='earth', frame=frames.Helioprojective)
++    return sunpy.map.make_fitswcs_header(
++        data, reference,
++        reference_pixel=[(data.shape[1] - 1) / 2, (data.shape[0] - 1) / 2] * u.pixel,
++        scale=[scale, scale] * u.arcsec / u.pixel)
++
++
++def make_map(size=8, mask_at=((0, 0), (3, 4)), sigma=0.5, unit=None):
++    data = np.arange(size * size, dtype=float).reshape(size, size) + 1.0
++    header = header_for(data)
++    if unit is not None:
++        header['bunit'] = unit
++    mask = None
++    if mask_at is not None:
++        mask = np.zeros((size, size), dtype=bool)
++        for row, column in mask_at:
++            mask[row, column] = True
++    uncertainty = None
++    if sigma is not None:
++        uncertainty = StdDevUncertainty(np.full((size, size), sigma))
++    return sunpy.map.Map(data, header, mask=mask, uncertainty=uncertainty)
++
++
++def target_wcs(size=6, scale=3):
++    return WCS(header_for(np.zeros((size, size)), scale=scale))
++
++
++@pytest.fixture
++def quality_map():
++    return make_map()
++
++
++@pytest.fixture
++def plain_map():
++    return make_map(mask_at=None, sigma=None)
++
++
++def test_submap_carries_both(quality_map):
++    cut = quality_map.submap([1, 1] * u.pixel, top_right=[5, 5] * u.pixel)
++    assert cut.uncertainty.array.shape == cut.data.shape
++    assert np.allclose(cut.uncertainty.array, 0.5)
++    assert cut.mask.shape == cut.data.shape
++    assert bool(cut.mask[2, 3])
++    assert int(cut.mask.sum()) == 1
++
++
++def test_resample_carries_both(quality_map):
++    smaller = quality_map.resample([4, 4] * u.pixel)
++    assert smaller.mask is not None
++    assert smaller.mask.dtype == bool
++    assert smaller.mask.shape == smaller.data.shape
++    assert smaller.uncertainty.array.shape == smaller.data.shape
++
++
++def test_rotate_carries_both(quality_map):
++    turned = quality_map.rotate(90 * u.deg, order=1, missing=0.0)
++    assert turned.mask.dtype == bool
++    assert turned.mask.shape == turned.data.shape
++    assert turned.uncertainty.array.shape == turned.data.shape
++
++
++def test_rotate_keeps_the_masked_pixels(quality_map):
++    turned = quality_map.rotate(90 * u.deg, order=1, missing=0.0)
++    assert int(turned.mask.sum()) == 2
++
++
++def test_rotate_masks_what_comes_in_from_outside(quality_map):
++    turned = quality_map.rotate(30 * u.deg, order=1, missing=0.0)
++    assert int(turned.mask.sum()) > 2
++    assert bool(turned.mask[0, 0])
++
++
++def test_shift_reference_coord_carries_both(quality_map):
++    shifted = quality_map.shift_reference_coord(1 * u.arcsec, 1 * u.arcsec)
++    assert np.array_equal(shifted.mask, quality_map.mask)
++    assert np.allclose(shifted.uncertainty.array, quality_map.uncertainty.array)
++
++
++def test_reproject_carries_both(quality_map):
++    reprojected = quality_map.reproject_to(target_wcs())
++    assert reprojected.mask is not None
++    assert reprojected.mask.shape == reprojected.data.shape
++    assert reprojected.uncertainty.array.shape == reprojected.data.shape
++
++
++def test_reproject_masks_what_no_pixel_reached(quality_map):
++    reprojected = quality_map.reproject_to(target_wcs(size=12, scale=3))
++    assert bool(reprojected.mask[0, 0])
++
++
++def test_masked_pixels_do_not_reach_the_interpolation():
++    data = np.ones((6, 6))
++    data[2, 2] = 1000.0
++    mask = np.zeros((6, 6), dtype=bool)
++    mask[2, 2] = True
++    spoiled = sunpy.map.Map(data, header_for(data), mask=mask)
++    turned = spoiled.rotate(15 * u.deg, order=1, missing=np.nan)
++    around = turned.data[~turned.mask & np.isfinite(turned.data)]
++    assert np.nanmax(around) < 2.0
++
++
++def test_a_pixel_with_no_unmasked_support_is_masked():
++    data = np.ones((6, 6))
++    mask = np.ones((6, 6), dtype=bool)
++    mask[4:, 4:] = False
++    blanked = sunpy.map.Map(data, header_for(data), mask=mask)
++    turned = blanked.rotate(0 * u.deg, order=1, missing=-1.0)
++    assert bool(turned.mask[0, 0])
++    assert turned.data[0, 0] == -1.0
++
++
++def test_uncertainty_is_not_a_number_where_the_result_is_masked(quality_map):
++    turned = quality_map.rotate(30 * u.deg, order=1, missing=0.0)
++    assert np.all(np.isnan(turned.uncertainty.array[turned.mask]))
++
++
++def test_uncertainty_never_goes_below_zero(quality_map):
++    turned = quality_map.rotate(20 * u.deg, order=3, missing=0.0)
++    finite = turned.uncertainty.array[np.isfinite(turned.uncertainty.array)]
++    assert np.all(finite >= 0)
++
++
++def test_superpixel_adds_variances_when_summing(quality_map):
++    blocks = quality_map.superpixel([2, 2] * u.pixel, func=np.sum)
++    assert np.allclose(blocks.uncertainty.array[0, 1], np.sqrt(4 * 0.25))
++
++
++def test_superpixel_counts_only_unmasked_pixels(quality_map):
++    blocks = quality_map.superpixel([2, 2] * u.pixel, func=np.sum)
++    assert np.allclose(blocks.uncertainty.array[0, 0], np.sqrt(3 * 0.25))
++
++
++def test_superpixel_mean_divides_by_the_squared_count(quality_map):
++    blocks = quality_map.superpixel([2, 2] * u.pixel, func=np.mean)
++    assert np.allclose(blocks.uncertainty.array[0, 0], np.sqrt(3 * 0.25) / 3)
++    assert np.allclose(blocks.uncertainty.array[0, 1], np.sqrt(4 * 0.25) / 4)
++
++
++def test_superpixel_leaves_no_uncertainty_for_other_reductions(quality_map):
++    assert quality_map.superpixel([2, 2] * u.pixel, func=np.sum).uncertainty is not None
++    for reduction in (np.min, np.max, np.std):
++        assert quality_map.superpixel([2, 2] * u.pixel, func=reduction).uncertainty is None
++
++
++def test_superpixel_conservative_mask_rule_stands(quality_map):
++    conservative = quality_map.superpixel([2, 2] * u.pixel, func=np.sum,
++                                          conservative_mask=True)
++    assert bool(conservative.mask[0, 0])
++    assert not bool(conservative.mask[0, 1])
++    assert np.isnan(conservative.uncertainty.array[0, 0])
++    assert np.allclose(conservative.uncertainty.array[0, 1], np.sqrt(4 * 0.25))
++
++
++@pytest.mark.parametrize('kind', [StdDevUncertainty, VarianceUncertainty, InverseVariance])
++def test_uncertainty_keeps_its_kind(kind):
++    values = {StdDevUncertainty: 0.5, VarianceUncertainty: 0.25, InverseVariance: 4.0}[kind]
++    data = np.ones((6, 6))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=kind(np.full((6, 6), values)))
++    assert isinstance((quality * 2).uncertainty, kind)
++    assert isinstance(quality.submap([1, 1] * u.pixel,
++                                     top_right=[4, 4] * u.pixel).uncertainty, kind)
++
++
++@pytest.mark.parametrize(('kind', 'before', 'after'), [
++    (StdDevUncertainty, 0.5, 1.0),
++    (VarianceUncertainty, 0.25, 1.0),
++    (InverseVariance, 4.0, 1.0),
++])
++def test_scaling_follows_the_kind(kind, before, after):
++    data = np.ones((6, 6))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=kind(np.full((6, 6), before)))
++    assert np.allclose((quality * 2).uncertainty.array, after)
++
++
++def test_adding_leaves_the_uncertainty(quality_map):
++    assert np.allclose((quality_map + 2).uncertainty.array, 0.5)
++
++
++def test_subtracting_leaves_the_uncertainty(quality_map):
++    assert np.allclose((quality_map - 2).uncertainty.array, 0.5)
++
++
++def test_negating_leaves_the_uncertainty(quality_map):
++    assert np.allclose((-quality_map).uncertainty.array, 0.5)
++
++
++def test_dividing_scales_the_uncertainty(quality_map):
++    assert np.allclose((quality_map / 2).uncertainty.array, 0.25)
++
++
++def test_arithmetic_carries_the_mask(quality_map):
++    assert np.array_equal((quality_map * 3).mask, quality_map.mask)
++
++
++def test_power_leaves_no_uncertainty(quality_map):
++    assert np.allclose((quality_map * 2).uncertainty.array, 1.0)
++    assert (quality_map ** 2).uncertainty is None
++
++
++def test_dividing_into_a_number_leaves_no_uncertainty(quality_map):
++    assert np.allclose((quality_map / 2).uncertainty.array, 0.25)
++    assert (2 / quality_map).uncertainty is None
++
++
++def test_the_unit_follows_the_data():
++    quality = make_map(size=6, mask_at=None, unit='ct')
++    quality = sunpy.map.Map(quality.data, quality.meta,
++                            uncertainty=StdDevUncertainty(np.full((6, 6), 0.5), unit=u.ct))
++    scaled = quality * (2 * u.s)
++    assert scaled.unit == u.ct * u.s
++    assert scaled.uncertainty.unit == u.ct * u.s
++
++
++def test_sequence_reports_a_stacked_uncertainty(quality_map):
++    sequence = sunpy.map.Map([quality_map, quality_map], sequence=True)
++    assert sequence.uncertainty.array.shape == sequence.data.shape
++
++
++def test_sequence_reports_nothing_when_no_map_has_one(plain_map):
++    sequence = sunpy.map.Map([plain_map, plain_map], sequence=True)
++    assert sequence.uncertainty is None
++
++
++def test_nothing_is_invented(plain_map, quality_map):
++    assert plain_map.submap([1, 1] * u.pixel, top_right=[4, 4] * u.pixel).mask is None
++    assert plain_map.resample([4, 4] * u.pixel).uncertainty is None
++    assert plain_map.rotate(30 * u.deg, order=1).mask is None
++    assert plain_map.superpixel([2, 2] * u.pixel).uncertainty is None
++    assert (plain_map * 2).uncertainty is None
++    assert quality_map.resample([4, 4] * u.pixel).uncertainty is not None
++
++
++def test_an_unmasked_map_is_resampled_exactly_as_before(plain_map, quality_map):
++    expected = np.array([[10.0, 12.0, 15.0], [26.0, 28.0, 31.0], [50.0, 52.0, 55.0]])
++    assert np.allclose(plain_map.resample([3, 3] * u.pixel, method='nearest').data,
++                       expected)
++    assert quality_map.resample([3, 3] * u.pixel, method='nearest').mask is not None
++
++
++def test_an_unmasked_map_keeps_its_rotated_data(plain_map, quality_map):
++    turned = plain_map.rotate(90 * u.deg, order=1, missing=0.0)
++    assert np.allclose(np.sort(turned.data.ravel()), np.sort(plain_map.data.ravel()))
++    assert quality_map.rotate(90 * u.deg, order=1, missing=0.0).mask is not None
++
++
++def spoiled_map(size=8, outlier=1000.0):
++    data = np.ones((size, size))
++    sigma = np.full((size, size), 0.5)
++    sigma[3, 3] = outlier
++    mask = np.zeros((size, size), dtype=bool)
++    mask[3, 3] = True
++    return sunpy.map.Map(data, header_for(data), mask=mask,
++                         uncertainty=StdDevUncertainty(sigma))
++
++
++def unmasked_uncertainty(quality):
++    values = quality.uncertainty.array
++    return values[np.isfinite(values) & ~quality.mask]
++
++
++def test_resample_keeps_a_masked_outlier_out_of_the_uncertainty():
++    smaller = spoiled_map().resample([5, 5] * u.pixel)
++    assert unmasked_uncertainty(smaller).max() < 1.0
++
++
++def test_rotate_keeps_a_masked_outlier_out_of_the_uncertainty():
++    turned = spoiled_map().rotate(17 * u.deg, order=1, missing=np.nan)
++    assert unmasked_uncertainty(turned).max() < 1.0
++
++
++def test_reproject_keeps_a_masked_outlier_out_of_the_uncertainty():
++    reprojected = spoiled_map().reproject_to(target_wcs())
++    assert unmasked_uncertainty(reprojected).max() < 1.0
++
++
++def test_resample_keeps_a_masked_outlier_out_of_the_data():
++    data = np.ones((8, 8))
++    data[3, 3] = 1000.0
++    mask = np.zeros((8, 8), dtype=bool)
++    mask[3, 3] = True
++    spoiled = sunpy.map.Map(data, header_for(data), mask=mask)
++    smaller = spoiled.resample([5, 5] * u.pixel)
++    around = smaller.data[~smaller.mask & np.isfinite(smaller.data)]
++    assert np.nanmax(around) < 2.0
++
++
++def test_an_uninterpolated_uncertainty_keeps_its_exact_value():
++    quality = make_map(size=8, mask_at=None)
++    turned = quality.rotate(90 * u.deg, order=1, missing=0.0)
++    assert np.allclose(turned.uncertainty.array, 0.5)
++
++
++def test_a_zero_variance_stays_exactly_zero_through_a_spline():
++    data = np.ones((8, 8))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=VarianceUncertainty(np.zeros((8, 8))))
++    turned = quality.rotate(23 * u.deg, order=3, missing=0.0)
++    carried = turned.uncertainty.array
++    assert np.all(carried[np.isfinite(carried)] == 0.0)
++
++
++@pytest.mark.parametrize('operation', ['resample', 'rotate', 'reproject'])
++def test_uncertainty_is_not_a_number_wherever_the_mask_lands(operation, quality_map):
++    if operation == 'resample':
++        out = quality_map.resample([5, 5] * u.pixel)
++    elif operation == 'rotate':
++        out = quality_map.rotate(30 * u.deg, order=1, missing=0.0)
++    else:
++        out = quality_map.reproject_to(target_wcs(size=12, scale=3))
++    assert np.all(np.isnan(out.uncertainty.array[out.mask]))
++
++
++def test_a_fully_masked_superpixel_has_no_uncertainty_left():
++    data = np.ones((4, 4))
++    mask = np.zeros((4, 4), dtype=bool)
++    mask[0:2, 0:2] = True
++    quality = sunpy.map.Map(data, header_for(data), mask=mask,
++                            uncertainty=StdDevUncertainty(np.full((4, 4), 0.5)))
++    blocks = quality.superpixel([2, 2] * u.pixel, func=np.sum)
++    assert bool(blocks.mask[0, 0])
++    assert np.isnan(blocks.uncertainty.array[0, 0])
++    assert np.allclose(blocks.uncertainty.array[0, 1], np.sqrt(4 * 0.25))
++
++
++@pytest.mark.parametrize('kind', [StdDevUncertainty, VarianceUncertainty, InverseVariance])
++@pytest.mark.parametrize('operation',
++                         ['resample', 'rotate', 'superpixel', 'shift', 'reproject'])
++def test_the_kind_survives_every_operation(kind, operation):
++    values = {StdDevUncertainty: 0.5, VarianceUncertainty: 0.25, InverseVariance: 4.0}[kind]
++    data = np.ones((8, 8))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=kind(np.full((8, 8), values)))
++    outputs = {
++        'resample': lambda: quality.resample([4, 4] * u.pixel),
++        'rotate': lambda: quality.rotate(10 * u.deg, order=1, missing=0.0),
++        'superpixel': lambda: quality.superpixel([2, 2] * u.pixel, func=np.sum),
++        'shift': lambda: quality.shift_reference_coord(1 * u.arcsec, 1 * u.arcsec),
++        'reproject': lambda: quality.reproject_to(target_wcs()),
++    }
++    assert isinstance(outputs[operation]().uncertainty, kind)
++
++
++@pytest.mark.parametrize(('kind', 'before', 'after'), [
++    (StdDevUncertainty, u.ct, u.ct * u.s),
++    (VarianceUncertainty, u.ct ** 2, u.ct ** 2 * u.s ** 2),
++    (InverseVariance, u.ct ** -2, u.ct ** -2 / u.s ** 2),
++])
++def test_the_unit_follows_the_data_for_every_kind(kind, before, after):
++    header = header_for(np.ones((6, 6)))
++    header['bunit'] = 'ct'
++    quality = sunpy.map.Map(np.ones((6, 6)), header,
++                            uncertainty=kind(np.full((6, 6), 1.0), unit=before))
++    scaled = quality * (2 * u.s)
++    assert scaled.unit == u.ct * u.s
++    assert scaled.uncertainty.unit == after
++
++
++def test_a_plain_map_gains_nothing_from_shift_or_reprojection(plain_map, quality_map):
++    shifted = plain_map.shift_reference_coord(1 * u.arcsec, 1 * u.arcsec)
++    assert shifted.mask is None
++    assert shifted.uncertainty is None
++    reprojected = plain_map.reproject_to(target_wcs(size=12, scale=3))
++    assert reprojected.mask is None
++    assert reprojected.uncertainty is None
++    assert quality_map.reproject_to(target_wcs()).uncertainty is not None
++
++
++def test_reprojection_still_reports_coverage_through_the_footprint(plain_map, quality_map):
++    reprojected, footprint = plain_map.reproject_to(target_wcs(size=12, scale=3),
++                                                    return_footprint=True)
++    assert reprojected.mask is None
++    assert (footprint == 0).any()
++    masked = quality_map.reproject_to(target_wcs(size=12, scale=3))
++    assert bool(masked.mask[0, 0])
++
++
++def test_a_sequence_stacks_the_values_it_was_given(quality_map):
++    other = make_map(sigma=0.25)
++    sequence = sunpy.map.Map([quality_map, other], sequence=True)
++    stacked = sequence.uncertainty.array
++    assert stacked.shape == sequence.data.shape
++    assert np.allclose(stacked[..., 0], 0.5)
++    assert np.allclose(stacked[..., 1], 0.25)
++
++
++def test_a_sequence_with_only_one_uncertainty_reports_the_rest_as_not_a_number(quality_map,
++                                                                               plain_map):
++    sequence = sunpy.map.Map([quality_map, plain_map], sequence=True)
++    stacked = sequence.uncertainty.array
++    assert np.allclose(stacked[..., 0], 0.5)
++    assert np.all(np.isnan(stacked[..., 1]))
++
++
++def constant_map(size=8, value=7.0, mask_at=((3, 3),)):
++    data = np.full((size, size), value)
++    mask = np.zeros((size, size), dtype=bool)
++    for row, column in mask_at:
++        mask[row, column] = True
++    return sunpy.map.Map(data, header_for(data), mask=mask,
++                         uncertainty=StdDevUncertainty(np.full((size, size), 0.5)))
++
++
++@pytest.mark.parametrize('operation', ['resample', 'rotate', 'reproject'])
++def test_partial_support_is_renormalised_not_diluted(operation):
++    quality = constant_map()
++    if operation == 'resample':
++        out = quality.resample([5, 5] * u.pixel)
++    elif operation == 'rotate':
++        out = quality.rotate(17 * u.deg, order=1, missing=np.nan)
++    else:
++        out = quality.reproject_to(target_wcs())
++    around = out.data[~out.mask & np.isfinite(out.data)]
++    assert np.allclose(around, 7.0)
++
++
++def test_reprojection_keeps_a_masked_outlier_out_of_the_data():
++    data = np.ones((8, 8))
++    data[3, 3] = 1000.0
++    mask = np.zeros((8, 8), dtype=bool)
++    mask[3, 3] = True
++    spoiled = sunpy.map.Map(data, header_for(data), mask=mask)
++    reprojected = spoiled.reproject_to(target_wcs())
++    around = reprojected.data[~reprojected.mask & np.isfinite(reprojected.data)]
++    assert np.nanmax(around) < 2.0
++
++
++def test_a_varying_variance_is_never_carried_below_zero():
++    data = np.ones((10, 10))
++    variance = np.zeros((10, 10))
++    variance[4:6, 4:6] = 9.0
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=VarianceUncertainty(variance))
++    turned = quality.rotate(23 * u.deg, order=3, missing=0.0)
++    carried = turned.uncertainty.array
++    finite = carried[np.isfinite(carried)]
++    assert np.all(finite >= 0)
++    assert np.any(finite == 0.0)
++
++
++@pytest.mark.parametrize('kind', [VarianceUncertainty, InverseVariance])
++def test_the_kind_survives_arithmetic_that_does_not_scale(kind):
++    values = {VarianceUncertainty: 0.25, InverseVariance: 4.0}[kind]
++    data = np.ones((6, 6))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=kind(np.full((6, 6), values)))
++    for result in (quality + 2, quality - 2, -quality, quality / 2):
++        assert isinstance(result.uncertainty, kind)
++    assert np.allclose((quality + 2).uncertainty.array, values)
++
++
++@pytest.mark.parametrize('operation',
++                         ['submap', 'resample', 'rotate', 'superpixel', 'shift', 'reproject'])
++def test_a_plain_map_gains_neither_attribute(plain_map, quality_map, operation):
++    def run(source):
++        return {
++            'submap': lambda: source.submap([1, 1] * u.pixel, top_right=[4, 4] * u.pixel),
++            'resample': lambda: source.resample([4, 4] * u.pixel),
++            'rotate': lambda: source.rotate(30 * u.deg, order=1, missing=0.0),
++            'superpixel': lambda: source.superpixel([2, 2] * u.pixel, func=np.sum),
++            'shift': lambda: source.shift_reference_coord(1 * u.arcsec, 1 * u.arcsec),
++            'reproject': lambda: source.reproject_to(target_wcs(size=12, scale=3)),
++        }[operation]()
++
++    plain = run(plain_map)
++    assert plain.mask is None
++    assert plain.uncertainty is None
++    carried = run(quality_map)
++    assert carried.mask is not None
++    assert carried.uncertainty is not None
++
++
++@pytest.mark.parametrize('operation',
++                         ['resample', 'rotate', 'superpixel', 'shift', 'reproject'])
++def test_a_quality_map_keeps_the_metadata_a_plain_map_would_get(operation, quality_map,
++                                                                plain_map):
++    def run(source):
++        return {
++            'resample': lambda: source.resample([4, 4] * u.pixel),
++            'rotate': lambda: source.rotate(30 * u.deg, order=1, missing=0.0),
++            'superpixel': lambda: source.superpixel([2, 2] * u.pixel),
++            'shift': lambda: source.shift_reference_coord(1 * u.arcsec, 1 * u.arcsec),
++            'reproject': lambda: source.reproject_to(target_wcs()),
++        }[operation]()
++
++    carried = run(quality_map)
++    plain = run(plain_map)
++    assert carried.data.shape == plain.data.shape
++    assert np.allclose(carried.wcs.wcs.crpix, plain.wcs.wcs.crpix)
++    assert np.allclose(carried.wcs.wcs.cdelt, plain.wcs.wcs.cdelt)
++    assert carried.wcs.wcs.ctype[0] == plain.wcs.wcs.ctype[0]
++    assert carried.mask is not None
++    assert carried.uncertainty is not None
++    assert plain.mask is None
++    assert plain.uncertainty is None
++
++
++@pytest.mark.parametrize('kind', [StdDevUncertainty, VarianceUncertainty, InverseVariance])
++def test_a_reprojected_uncertainty_stops_naming_a_unit_its_map_does_not(kind):
++    header = header_for(np.ones((8, 8)))
++    header['bunit'] = 'ct'
++    quality = sunpy.map.Map(np.ones((8, 8)), header,
++                            uncertainty=kind(np.full((8, 8), 1.0), unit=unit_of_kind(kind)))
++    assert quality.uncertainty.unit == unit_of_kind(kind)
++    reprojected = quality.reproject_to(target_wcs())
++    assert reprojected.unit is None
++    assert reprojected.uncertainty.unit is None
++
++
++def test_reprojection_into_a_caller_buffer_is_not_corrupted():
++    quality = constant_map()
++    buffer = np.zeros((6, 6))
++    reprojected = quality.reproject_to(target_wcs(), output_array=buffer)
++    around = reprojected.data[~reprojected.mask & np.isfinite(reprojected.data)]
++    assert np.allclose(around, 7.0)
++    assert np.allclose(buffer[np.isfinite(buffer) & ~reprojected.mask], 7.0)
++
++
++def stored_variance(kind, variance):
++    if kind is VarianceUncertainty:
++        return variance
++    if kind is InverseVariance:
++        return 1.0 / variance
++    return np.sqrt(variance)
++
++
++def variance_held_by(kind, array):
++    if kind is VarianceUncertainty:
++        return array
++    if kind is InverseVariance:
++        return 1.0 / array
++    return array ** 2
++
++
++def unit_of_kind(kind, unit=u.ct):
++    return {StdDevUncertainty: unit, VarianceUncertainty: unit ** 2,
++            InverseVariance: unit ** -2}[kind]
++
++
++def test_rotating_an_uncertainty_without_a_mask_masks_the_outside():
++    data = np.ones((8, 8))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((8, 8), 0.5)))
++    turned = quality.rotate(30 * u.deg, order=1, missing=0.0)
++    assert turned.mask is not None
++    assert bool(turned.mask[0, 0])
++    assert np.isnan(turned.uncertainty.array[0, 0])
++    assert np.allclose(turned.uncertainty.array[~turned.mask], 0.5)
++
++
++@pytest.mark.parametrize('kind', [StdDevUncertainty, VarianceUncertainty, InverseVariance])
++@pytest.mark.parametrize('operation', ['resample', 'rotate', 'reproject'])
++def test_the_variance_is_what_travels_through_the_interpolation(kind, operation):
++    variance = np.arange(1, 65, dtype=float).reshape(8, 8)
++    quality = sunpy.map.Map(variance.copy(), header_for(variance),
++                            uncertainty=kind(stored_variance(kind, variance)))
++    outputs = {
++        'resample': lambda: quality.resample([5, 5] * u.pixel),
++        'rotate': lambda: quality.rotate(23 * u.deg, order=1, missing=np.nan),
++        'reproject': lambda: quality.reproject_to(target_wcs()),
++    }
++    out = outputs[operation]()
++    carried = variance_held_by(kind, out.uncertainty.array)
++    together = np.isfinite(out.data) & np.isfinite(carried)
++    assert together.sum() > 8
++    assert np.allclose(carried[together], out.data[together])
++
++
++@pytest.mark.parametrize('operation', ['resample', 'rotate', 'reproject'])
++def test_the_uncertainty_beside_a_mask_is_renormalised_not_diluted(operation):
++    quality = constant_map()
++    outputs = {
++        'resample': lambda: quality.resample([5, 5] * u.pixel),
++        'rotate': lambda: quality.rotate(17 * u.deg, order=1, missing=np.nan),
++        'reproject': lambda: quality.reproject_to(target_wcs()),
++    }
++    carried = unmasked_uncertainty(outputs[operation]())
++    assert carried.size > 8
++    assert np.allclose(carried, 0.5)
++
++
++def mostly_masked_map(size=8):
++    data = np.ones((size, size))
++    mask = np.ones((size, size), dtype=bool)
++    mask[size - 2:, size - 2:] = False
++    return sunpy.map.Map(data, header_for(data), mask=mask,
++                         uncertainty=StdDevUncertainty(np.full((size, size), 0.5)))
++
++
++def test_a_resampled_pixel_with_no_unmasked_support_is_masked():
++    smaller = mostly_masked_map().resample([4, 4] * u.pixel)
++    assert bool(smaller.mask[0, 0])
++    assert np.isnan(smaller.data[0, 0])
++    assert np.isnan(smaller.uncertainty.array[0, 0])
++    assert not smaller.mask.all()
++
++
++def test_a_reprojected_pixel_with_no_unmasked_support_is_masked():
++    reprojected = mostly_masked_map().reproject_to(target_wcs())
++    assert bool(reprojected.mask[0, 0])
++    assert np.isnan(reprojected.data[0, 0])
++    assert np.isnan(reprojected.uncertainty.array[0, 0])
++    assert not reprojected.mask.all()
++
++
++@pytest.mark.parametrize('kind', [StdDevUncertainty, VarianceUncertainty, InverseVariance])
++def test_a_superpixel_adds_the_variances_whatever_kind_holds_them(kind):
++    data = np.ones((4, 4))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=kind(stored_variance(kind, np.full((4, 4), 0.25))))
++    summed = quality.superpixel([2, 2] * u.pixel, func=np.sum)
++    averaged = quality.superpixel([2, 2] * u.pixel, func=np.mean)
++    assert np.allclose(variance_held_by(kind, summed.uncertainty.array), 1.0)
++    assert np.allclose(variance_held_by(kind, averaged.uncertainty.array), 0.0625)
++
++
++def test_every_arithmetic_operation_keeps_the_mask():
++    quality = make_map(unit='ct')
++    results = [quality + 2 * u.ct, 2 * u.ct + quality, quality - 2 * u.ct, 2 * u.ct - quality,
++               quality * (2 * u.s), (2 * u.s) * quality, quality / (2 * u.s), -quality,
++               quality ** 2, (2 * u.ct) / quality, quality * 3, 3 * quality, quality / 2]
++    for result in results:
++        assert np.array_equal(result.mask, quality.mask)
++
++
++def test_scaling_by_a_negative_factor_leaves_a_size_behind(quality_map):
++    scaled = quality_map * -2
++    assert np.allclose(scaled.uncertainty.array, 1.0)
++    assert np.allclose((quality_map / -2).uncertainty.array, 0.25)
++
++
++def test_a_sequence_finds_an_uncertainty_that_is_not_in_the_first_map(quality_map, plain_map):
++    sequence = sunpy.map.Map([plain_map, quality_map], sequence=True)
++    stacked = sequence.uncertainty.array
++    assert np.all(np.isnan(stacked[..., 0]))
++    assert np.allclose(stacked[..., 1], 0.5)
++
++
++@pytest.mark.parametrize('kind', [StdDevUncertainty, VarianceUncertainty, InverseVariance])
++@pytest.mark.parametrize('operation',
++                         ['submap', 'resample', 'rotate', 'superpixel', 'shift'])
++def test_the_unit_keeps_the_power_its_kind_implies(kind, operation):
++    data = np.ones((8, 8))
++    header = header_for(data)
++    header['bunit'] = 'ct'
++    quality = sunpy.map.Map(data, header,
++                            uncertainty=kind(np.full((8, 8), 1.0), unit=unit_of_kind(kind)))
++    outputs = {
++        'submap': lambda: quality.submap([1, 1] * u.pixel, top_right=[5, 5] * u.pixel),
++        'resample': lambda: quality.resample([4, 4] * u.pixel),
++        'rotate': lambda: quality.rotate(10 * u.deg, order=1, missing=0.0),
++        'superpixel': lambda: quality.superpixel([2, 2] * u.pixel, func=np.sum),
++        'shift': lambda: quality.shift_reference_coord(1 * u.arcsec, 1 * u.arcsec),
++    }
++    out = outputs[operation]()
++    assert out.unit == u.ct
++    assert out.uncertainty.unit == unit_of_kind(kind)
++
++
++def test_a_plain_map_is_superpixelled_and_shifted_exactly_as_before(plain_map, quality_map):
++    blocks = plain_map.superpixel([2, 2] * u.pixel, func=np.sum)
++    assert np.allclose(blocks.data, plain_map.data.reshape(4, 2, 4, 2).sum(axis=(1, 3)))
++    shifted = plain_map.shift_reference_coord(1 * u.arcsec, 2 * u.arcsec)
++    assert np.array_equal(shifted.data, plain_map.data)
++    assert shifted.meta['crval1'] == plain_map.meta['crval1'] + 1
++    assert shifted.meta['crval2'] == plain_map.meta['crval2'] + 2
++    assert quality_map.superpixel([2, 2] * u.pixel, func=np.sum).uncertainty is not None
++
++
++def test_a_plain_map_reprojected_onto_its_own_wcs_is_unchanged(plain_map, quality_map):
++    its_own = WCS(header_for(plain_map.data))
++    reprojected = plain_map.reproject_to(its_own)
++    assert np.allclose(reprojected.data, plain_map.data)
++    assert reprojected.mask is None
++    assert quality_map.reproject_to(its_own).uncertainty is not None
++
++
++@pytest.mark.parametrize(('func', 'expected'), [
++    (np.ma.sum, 1.0),
++    (np.nansum, 1.0),
++    (np.ma.mean, 0.25),
++    (np.nanmean, 0.25),
++    (np.ptp, None),
++])
++def test_a_superpixel_reads_what_the_reduction_does_not_which_function_it_is(func, expected):
++    data = np.ones((4, 4))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((4, 4), 0.5)))
++    blocks = quality.superpixel([2, 2] * u.pixel, func=func)
++    if expected is None:
++        assert blocks.uncertainty is None
++        assert quality.superpixel([2, 2] * u.pixel, func=np.sum).uncertainty is not None
++    else:
++        assert np.allclose(blocks.uncertainty.array, expected)
++
++
++@pytest.mark.parametrize('method', ['nearest', 'linear', 'spline'])
++def test_every_resample_method_carries_both(method, quality_map):
++    smaller = quality_map.resample([5, 5] * u.pixel, method=method)
++    assert smaller.mask is not None
++    assert smaller.mask.shape == smaller.data.shape
++    carried = unmasked_uncertainty(smaller)
++    assert carried.size > 0
++    assert np.allclose(carried, 0.5)
++
++
++@pytest.mark.parametrize('algorithm', ['interpolation', 'adaptive', 'exact'])
++def test_every_reprojection_algorithm_carries_both(algorithm, quality_map):
++    reprojected = quality_map.reproject_to(target_wcs(), algorithm=algorithm)
++    assert reprojected.mask is not None
++    assert reprojected.mask.shape == reprojected.data.shape
++    carried = unmasked_uncertainty(reprojected)
++    assert carried.size > 0
++    assert np.allclose(carried, 0.5)
++
++
++def test_reflected_arithmetic_on_a_plain_number_keeps_the_mask(quality_map):
++    for result in (2 + quality_map, 2 - quality_map, 2 * quality_map, 2 / quality_map):
++        assert np.array_equal(result.mask, quality_map.mask)
++    assert np.allclose((2 - quality_map).uncertainty.array, 0.5)
++    assert (2 / quality_map).uncertainty is None
++
++
++def test_a_plain_map_is_submapped_and_scaled_exactly_as_before(plain_map, quality_map):
++    cut = plain_map.submap([1, 1] * u.pixel, top_right=[4, 4] * u.pixel)
++    assert np.array_equal(cut.data, plain_map.data[1:5, 1:5])
++    assert cut.meta['crpix1'] == plain_map.meta['crpix1'] - 1
++    assert cut.meta['crpix2'] == plain_map.meta['crpix2'] - 1
++    doubled = plain_map * 2
++    assert np.allclose(doubled.data, plain_map.data * 2)
++    assert doubled.meta['crpix1'] == plain_map.meta['crpix1']
++    assert doubled.meta['crval1'] == plain_map.meta['crval1']
++    assert doubled.mask is None
++    assert doubled.uncertainty is None
++    assert quality_map.submap([1, 1] * u.pixel, top_right=[4, 4] * u.pixel).uncertainty is not None
++
++
++def test_reprojecting_an_uncertainty_without_a_mask_masks_what_no_pixel_reached():
++    data = np.ones((8, 8))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((8, 8), 0.5)))
++    reprojected = quality.reproject_to(target_wcs(size=12, scale=3))
++    assert reprojected.mask is not None
++    assert reprojected.mask.any()
++    assert not reprojected.mask.all()
++    assert bool(reprojected.mask[0, 0])
++    assert np.isnan(reprojected.uncertainty.array[reprojected.mask]).all()
++    assert np.allclose(reprojected.uncertainty.array[~reprojected.mask], 0.5)
++
++
++def test_reprojection_takes_its_output_shape_from_a_caller_buffer():
++    quality = constant_map()
++    wcs_without_a_shape = target_wcs()
++    wcs_without_a_shape.array_shape = None
++    buffer = np.zeros((6, 6))
++    reprojected = quality.reproject_to(wcs_without_a_shape, output_array=buffer)
++    assert reprojected.data.shape == (6, 6)
++    assert reprojected.uncertainty is not None
++    carried = unmasked_uncertainty(reprojected)
++    assert carried.size > 0
++    assert np.allclose(carried, 0.5)
++
++
++def test_reflected_arithmetic_carries_the_value_of_the_uncertainty():
++    quality = make_map(unit='ct')
++    assert np.allclose((2 * u.ct + quality).uncertainty.array, 0.5)
++    assert np.allclose((2 * u.ct - quality).uncertainty.array, 0.5)
++    assert np.allclose(((2 * u.s) * quality).uncertainty.array, 1.0)
++    assert np.allclose((3 * quality).uncertainty.array, 1.5)
++    assert ((2 * u.s) * quality).uncertainty.unit == u.ct * u.s
++
++
++@pytest.mark.parametrize('kind', [StdDevUncertainty, VarianceUncertainty, InverseVariance])
++@pytest.mark.parametrize('factor', [2, -2])
++def test_dividing_scales_every_kind_by_the_size_of_the_factor(kind, factor):
++    data = np.ones((4, 4))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=kind(stored_variance(kind, np.full((4, 4), 0.25))))
++    divided = quality / factor
++    multiplied = quality * factor
++    assert isinstance(divided.uncertainty, kind)
++    assert np.allclose(variance_held_by(kind, divided.uncertainty.array), 0.0625)
++    assert np.allclose(variance_held_by(kind, multiplied.uncertainty.array), 1.0)
++
++
++ROUTES = [('resample', 'nearest'), ('resample', 'linear'), ('resample', 'spline'),
++          ('rotate', 0), ('rotate', 1), ('rotate', 2), ('rotate', 3), ('rotate', 4),
++          ('rotate', 5),
++          ('reproject', 'interpolation'), ('reproject', 'adaptive'), ('reproject', 'exact')]
++
++
++def travelled(quality, operation, setting):
++    if operation == 'resample':
++        return quality.resample([5, 5] * u.pixel, method=setting)
++    if operation == 'rotate':
++        return quality.rotate(23 * u.deg, order=setting, missing=np.nan, clip=False)
++    return quality.reproject_to(target_wcs(), algorithm=setting)
++
++
++def spoiled_in_both(size=8, outlier=1000.0):
++    data = np.ones((size, size))
++    data[3, 3] = outlier
++    sigma = np.full((size, size), 0.5)
++    sigma[3, 3] = outlier
++    mask = np.zeros((size, size), dtype=bool)
++    mask[3, 3] = True
++    return sunpy.map.Map(data, header_for(data), mask=mask,
++                         uncertainty=StdDevUncertainty(sigma))
++
++
++def mask_only_map(size=8):
++    data = np.ones((size, size))
++    mask = np.zeros((size, size), dtype=bool)
++    mask[3, 3] = True
++    return sunpy.map.Map(data, header_for(data), mask=mask)
++
++
++@pytest.mark.parametrize(('operation', 'setting'), ROUTES)
++def test_the_variance_travels_by_the_route_the_data_took(operation, setting):
++    variance = np.arange(1, 65, dtype=float).reshape(8, 8)
++    quality = sunpy.map.Map(variance.copy(), header_for(variance),
++                            uncertainty=VarianceUncertainty(variance.copy()))
++    out = travelled(quality, operation, setting)
++    carried = out.uncertainty.array
++    together = np.isfinite(out.data) & np.isfinite(carried) & (out.data > 0)
++    assert together.sum() >= 4
++    assert np.allclose(carried[together], out.data[together])
++
++
++@pytest.mark.parametrize(('operation', 'setting'), ROUTES)
++def test_every_route_keeps_a_masked_outlier_out_of_both(operation, setting):
++    out = travelled(spoiled_in_both(), operation, setting)
++    live = np.isfinite(out.data) & ~out.mask
++    carried = out.uncertainty.array
++    kept = np.isfinite(carried) & ~out.mask
++    assert live.sum() >= 4
++    assert kept.sum() >= 4
++    assert out.data[live].max() < 2.0
++    assert carried[kept].max() < 1.0
++
++
++def test_a_quality_map_still_reports_its_footprint_and_fills_a_footprint_buffer():
++    quality = constant_map()
++    reprojected, footprint = quality.reproject_to(target_wcs(), return_footprint=True)
++    assert footprint.shape == reprojected.data.shape
++    assert np.allclose(footprint, 1.0)
++    assert reprojected.mask is not None
++    assert reprojected.uncertainty is not None
++    buffer = np.zeros((6, 6))
++    again = quality.reproject_to(target_wcs(), output_array=buffer)
++    assert np.allclose(unmasked_uncertainty(again), 0.5)
++    assert np.allclose(buffer[np.isfinite(buffer) & ~again.mask], 7.0)
++
++
++def test_a_mask_without_an_uncertainty_is_masked_outside_the_frame():
++    turned = mask_only_map().rotate(30 * u.deg, order=1, missing=0.0)
++    assert turned.mask is not None
++    assert bool(turned.mask[0, 0])
++    assert not turned.mask.all()
++    assert turned.uncertainty is None
++    assert np.allclose(turned.data[~turned.mask], 1.0)
++
++
++def test_a_mask_without_an_uncertainty_is_masked_where_no_pixel_reached():
++    reprojected = mask_only_map().reproject_to(target_wcs(size=12, scale=3))
++    assert reprojected.mask is not None
++    assert bool(reprojected.mask[0, 0])
++    assert not reprojected.mask.all()
++    assert reprojected.uncertainty is None
++
++
++def test_a_mask_without_an_uncertainty_survives_arithmetic_and_a_shift():
++    quality = mask_only_map()
++    shifted = quality.shift_reference_coord(1 * u.arcsec, 2 * u.arcsec)
++    assert np.array_equal(shifted.mask, quality.mask)
++    assert shifted.uncertainty is None
++    for result in (quality * 2, 2 * quality, quality + 2, -quality, quality / 2):
++        assert np.array_equal(result.mask, quality.mask)
++        assert result.uncertainty is None
++
++
++def test_submap_lines_the_uncertainty_up_with_the_data():
++    values = np.arange(1, 65, dtype=float).reshape(8, 8)
++    quality = sunpy.map.Map(values.copy(), header_for(values),
++                            uncertainty=VarianceUncertainty(values.copy()))
++    cut = quality.submap([1, 1] * u.pixel, top_right=[5, 5] * u.pixel)
++    assert np.array_equal(cut.uncertainty.array, cut.data)
++    assert cut.uncertainty.array[0, 0] == values[1, 1]
++
++
++def rectangular_quality_map():
++    grid = np.arange(1, 33, dtype=float).reshape(4, 8)
++    return sunpy.map.Map(grid.copy(), header_for(grid),
++                         uncertainty=VarianceUncertainty(grid.copy()))
++
++
++def test_a_rectangular_superpixel_takes_its_first_dimension_along_x():
++    blocks = rectangular_quality_map().superpixel([4, 2] * u.pixel, func=np.sum)
++    assert blocks.data.shape == (2, 2)
++    assert np.allclose(blocks.uncertainty.array, blocks.data)
++    assert np.allclose(blocks.data, [[52.0, 84.0], [180.0, 212.0]])
++
++
++def test_a_superpixel_offset_moves_the_uncertainty_with_the_data():
++    quality = rectangular_quality_map()
++    blocks = quality.superpixel([2, 2] * u.pixel, offset=[1, 1] * u.pixel, func=np.sum)
++    assert blocks.data.shape == (1, 3)
++    assert np.allclose(blocks.uncertainty.array, blocks.data)
++    assert np.allclose(blocks.data, [[58.0, 66.0, 74.0]])
++    assert not np.allclose(quality.superpixel([2, 2] * u.pixel,
++                                              func=np.sum).data[0, :3], [58.0, 66.0, 74.0])
++
++
++def test_an_array_of_factors_scales_the_uncertainty_pixel_by_pixel():
++    factors = np.arange(1, 65, dtype=float).reshape(8, 8)
++    quality = make_map()
++    for result in (quality * factors, factors * quality, quality / factors,
++                   quality + factors, factors + quality, quality - factors):
++        assert np.array_equal(result.mask, quality.mask)
++    assert np.allclose((quality * factors).uncertainty.array, 0.5 * factors)
++    assert np.allclose((factors * quality).uncertainty.array, 0.5 * factors)
++    assert np.allclose((quality * (factors * u.s)).uncertainty.array, 0.5 * factors)
++    assert np.allclose((quality / factors).uncertainty.array, 0.5 / factors)
++    assert np.allclose((quality + factors).uncertainty.array, 0.5)
++    assert np.allclose((factors + quality).uncertainty.array, 0.5)
++    assert np.allclose((quality - factors).uncertainty.array, 0.5)
++
++
++@pytest.mark.parametrize('kind', [StdDevUncertainty, VarianceUncertainty, InverseVariance])
++def test_adding_and_negating_leave_the_stored_uncertainty_untouched(kind):
++    stored = stored_variance(kind, np.full((4, 4), 0.25))
++    data = np.ones((4, 4))
++    quality = sunpy.map.Map(data, header_for(data), uncertainty=kind(stored.copy()))
++    for result in (quality + 2, quality - 2, -quality, 2 - quality):
++        assert isinstance(result.uncertainty, kind)
++        assert np.allclose(result.uncertainty.array, stored)
++
++
++@pytest.mark.parametrize('kind', [StdDevUncertainty, VarianceUncertainty, InverseVariance])
++def test_a_sequence_keeps_the_kind_the_maps_gave_it(kind):
++    stored = stored_variance(kind, np.full((4, 4), 0.25))
++    data = np.ones((4, 4))
++    maps = [sunpy.map.Map(data.copy(), header_for(data), uncertainty=kind(stored.copy()))
++            for _ in range(2)]
++    stacked = sunpy.map.MapSequence(maps).uncertainty
++    assert isinstance(stacked, kind)
++    assert stacked.array.shape == (4, 4, 2)
++    assert np.allclose(stacked.array, stored[..., np.newaxis])
++
++
++def test_an_uncertainty_on_its_own_gains_no_mask_where_nothing_is_unreachable():
++    data = np.arange(1, 65, dtype=float).reshape(8, 8)
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((8, 8), 0.5)))
++    results = [quality.submap([1, 1] * u.pixel, top_right=[5, 5] * u.pixel),
++               quality.resample([4, 4] * u.pixel),
++               quality.superpixel([2, 2] * u.pixel, func=np.sum),
++               quality.shift_reference_coord(1 * u.arcsec, 2 * u.arcsec),
++               quality * 2,
++               2 + quality,
++               -quality]
++    for result in results:
++        assert result.mask is None
++        assert result.uncertainty is not None
++    assert quality.rotate(30 * u.deg, order=1, missing=0.0).mask is not None
++
++
++@pytest.mark.parametrize(('func', 'expected'), [
++    (np.sum, np.sqrt(0.75)),
++    (np.ma.sum, np.sqrt(0.75)),
++    (np.mean, np.sqrt(0.75) / 3),
++    (np.ma.mean, np.sqrt(0.75) / 3),
++])
++def test_a_variant_reduction_counts_only_the_unmasked_constituents(func, expected):
++    data = np.ones((2, 2))
++    mask = np.zeros((2, 2), dtype=bool)
++    mask[0, 1] = True
++    quality = sunpy.map.Map(data, header_for(data), mask=mask,
++                            uncertainty=StdDevUncertainty(np.full((2, 2), 0.5)))
++    blocks = quality.superpixel([2, 2] * u.pixel, func=func)
++    assert blocks.uncertainty.array.shape == blocks.data.shape
++    assert np.allclose(blocks.uncertainty.array, expected)
++
++
++@pytest.mark.parametrize(('func', 'expected'), [
++    (np.nansum, 1.0),
++    (np.nanmean, 0.25),
++])
++def test_a_constituent_that_is_not_a_number_still_counts(func, expected):
++    data = np.ones((2, 2))
++    data[0, 1] = np.nan
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((2, 2), 0.5)))
++    blocks = quality.superpixel([2, 2] * u.pixel, func=func)
++    assert blocks.uncertainty.array.shape == blocks.data.shape
++    assert np.allclose(blocks.uncertainty.array, expected)
++
++def a_sum_the_caller_wrote(array, axis):
++    return np.sum(array, axis=axis)
++
++
++def a_mean_the_caller_wrote(array, axis):
++    return np.mean(array, axis=axis)
++
++
++@pytest.mark.parametrize(('func', 'expected'), [
++    (a_sum_the_caller_wrote, 1.0),
++    (a_mean_the_caller_wrote, 0.25),
++])
++def test_a_reduction_the_caller_wrote_is_read_like_any_other(func, expected):
++    data = np.ones((4, 4))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((4, 4), 0.5)))
++    blocks = quality.superpixel([2, 2] * u.pixel, func=func)
++    assert blocks.uncertainty is not None
++    assert np.allclose(blocks.uncertainty.array, expected)
++
++
++@pytest.mark.filterwarnings('ignore::sunpy.util.exceptions.SunpyUserWarning')
++def test_an_array_that_broadcasts_wider_than_the_map_still_gives_a_map():
++    data = np.ones((8, 8))
++    quality = sunpy.map.Map(data, header_for(data), mask=np.zeros((8, 8), dtype=bool),
++                            uncertainty=StdDevUncertainty(np.full((8, 8), 0.5)))
++    scaled = quality * np.full((1, 8, 8), 3.0)
++    assert scaled.data.shape == (8, 8)
++    assert np.allclose(scaled.data, 3.0)
++    assert scaled.uncertainty.array.shape == (8, 8)
++    assert np.allclose(scaled.uncertainty.array, 1.5)
++    assert scaled.mask.shape == (8, 8)
++
++
++def test_resampling_up_keeps_every_uncertainty_value():
++    values = np.arange(1, 17, dtype=float).reshape(4, 4)
++    quality = sunpy.map.Map(values, header_for(values),
++                            uncertainty=StdDevUncertainty(np.full((4, 4), 0.5)))
++    bigger = quality.resample([8, 8] * u.pixel)
++    assert bigger.data.shape == (8, 8)
++    assert np.isfinite(bigger.uncertainty.array).all()
++    assert np.allclose(bigger.uncertainty.array, 0.5)
++
++
++_aliased_sum = np.sum
++_aliased_nanmean = np.nanmean
++
++
++def a_sum_under_another_name(array, axis):
++    return _aliased_sum(array, axis=axis)
++
++
++def a_nanmean_under_another_name(array, axis):
++    return _aliased_nanmean(array, axis=axis)
++
++
++def a_largest_value_named_sum():
++    def sum(array, axis):
++        return np.max(array, axis=axis)
++    return sum
++
++
++@pytest.mark.parametrize(('func', 'expected'), [
++    (a_sum_under_another_name, 1.0),
++    (a_nanmean_under_another_name, 0.25),
++])
++def test_a_reduction_is_read_by_what_it_returns_not_how_it_is_spelled(func, expected):
++    data = np.ones((4, 4))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((4, 4), 0.5)))
++    blocks = quality.superpixel([2, 2] * u.pixel, func=func)
++    assert blocks.uncertainty is not None
++    assert np.allclose(blocks.uncertainty.array, expected)
++
++
++def test_a_reduction_named_sum_that_returns_the_largest_value_keeps_no_uncertainty():
++    data = np.arange(1, 17, dtype=float).reshape(4, 4)
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((4, 4), 0.5)))
++    assert quality.superpixel([2, 2] * u.pixel, func=np.sum).uncertainty is not None
++    blocks = quality.superpixel([2, 2] * u.pixel, func=a_largest_value_named_sum())
++    assert blocks.uncertainty is None
++
++
++@pytest.mark.parametrize(('func', 'expected'), [
++    (np.nansum, 1.0),
++    (np.nanmean, 0.25),
++])
++def test_a_nan_aware_reduction_still_counts_an_infinite_constituent(func, expected):
++    data = np.array([[1.0, 1.0], [1.0, np.inf]])
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((2, 2), 0.5)))
++    blocks = quality.superpixel([2, 2] * u.pixel, func=func)
++    assert blocks.uncertainty is not None
++    assert np.allclose(blocks.uncertainty.array, expected)
++
++
++@pytest.mark.parametrize('operation', ['submap', 'rotate'])
++def test_an_uncertainty_without_a_unit_stays_without_one(operation):
++    data = np.arange(1, 65, dtype=float).reshape(8, 8)
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((8, 8), 0.5)))
++    assert quality.unit is None
++    outputs = {
++        'submap': lambda: quality.submap([1, 1] * u.pixel, top_right=[5, 5] * u.pixel),
++        'rotate': lambda: quality.rotate(10 * u.deg, order=1),
++    }
++    out = outputs[operation]()
++    assert out.unit is None
++    assert out.uncertainty is not None
++    assert out.uncertainty.unit is None
++
++
++def test_arithmetic_that_cancels_the_unit_leaves_the_uncertainty_in_the_unit_of_the_result():
++    data = np.ones((8, 8))
++    header = header_for(data)
++    header['bunit'] = 'ct'
++    quality = sunpy.map.Map(data, header,
++                            uncertainty=StdDevUncertainty(np.full((8, 8), 0.5), unit=u.ct))
++    ratio = quality / (2 * u.ct)
++    assert ratio.uncertainty.unit == ratio.unit
++    assert np.allclose(ratio.uncertainty.array, 0.25)
++
++
++@pytest.mark.parametrize('method', ['nearest', 'linear', 'spline'])
++def test_a_plain_map_is_resampled_as_before_by_every_method(method, plain_map, quality_map):
++    expected = sunpy_image_resample(plain_map.data.T, [5, 5] * u.pixel, method, center=True).T
++    assert np.allclose(plain_map.resample([5, 5] * u.pixel, method=method).data, expected)
++    assert quality_map.resample([5, 5] * u.pixel, method=method).uncertainty is not None
++
++
++@pytest.mark.parametrize('algorithm', ['interpolation', 'adaptive', 'exact'])
++def test_a_plain_map_is_reprojected_as_before_by_every_algorithm(algorithm, plain_map, quality_map):
++    functions = {'interpolation': reproject.reproject_interp,
++                 'adaptive': reproject.reproject_adaptive,
++                 'exact': reproject.reproject_exact}
++    target = target_wcs()
++    expected = functions[algorithm](plain_map, target, shape_out=target.array_shape,
++                                    return_footprint=False)
++    reprojected = plain_map.reproject_to(target, algorithm=algorithm)
++    assert np.allclose(reprojected.data, expected, equal_nan=True)
++    assert reprojected.mask is None
++    assert quality_map.reproject_to(target, algorithm=algorithm).uncertainty is not None
++
++
++@pytest.mark.parametrize('scale', [
++    lambda quality: (quality * 1j, 0.5),
++    lambda quality: (1j * quality, 0.5),
++    lambda quality: (quality / 1j, 0.5),
++    lambda quality: (quality * np.full((8, 8), 2j), 1.0),
++    lambda quality: (quality * (3 + 4j), 2.5),
++], ids=['map_times_1j', 'reflected_1j', 'map_over_1j', 'map_times_2j_array', 'map_times_3_plus_4j'])
++def test_a_complex_factor_scales_the_uncertainty_by_its_size(scale):
++    data = np.ones((8, 8))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((8, 8), 0.5)))
++    result, expected = scale(quality)
++    assert result.uncertainty is not None
++    assert np.allclose(result.uncertainty.array, expected)
++
++
++def odd_blocked_quality_map():
++    data = np.arange(1, 82, dtype=float).reshape(9, 9) ** 2
++    return sunpy.map.Map(data, header_for(data),
++                         uncertainty=StdDevUncertainty(np.full((9, 9), 0.5)))
++
++
++def test_a_median_over_an_odd_block_keeps_no_uncertainty():
++    quality = odd_blocked_quality_map()
++    assert quality.superpixel([3, 3] * u.pixel, func=np.mean).uncertainty is not None
++    assert quality.superpixel([3, 3] * u.pixel, func=np.median).uncertainty is None
++
++
++def test_a_reduction_that_only_comes_close_to_a_sum_keeps_no_uncertainty():
++    quality = odd_blocked_quality_map()
++
++    def nearly_a_sum(array, axis):
++        return np.sum(array, axis=axis) + 1e-4
++
++    assert quality.superpixel([3, 3] * u.pixel, func=np.sum).uncertainty is not None
++    assert quality.superpixel([3, 3] * u.pixel, func=nearly_a_sum).uncertainty is None
++
++
++def test_rotation_renormalises_a_pixel_the_frame_only_partly_covers():
++    ones = np.ones((8, 8))
++    quality = sunpy.map.Map(ones, header_for(ones),
++                            uncertainty=StdDevUncertainty(np.full((8, 8), 0.5)))
++    turned = quality.rotate(15 * u.deg, order=1, missing=0.0, clip=False)
++    support = sunpy.map.Map(ones.copy(), header_for(ones)).rotate(
++        15 * u.deg, order=1, missing=0.0, clip=False).data
++    partly = (support > 1e-6) & (support < 1 - 1e-6)
++    assert partly.sum() > 8
++    assert not turned.mask[partly].any()
++    assert np.allclose(turned.data[partly], 1.0)
++    assert np.allclose(turned.uncertainty.array[partly], 0.5)
++    assert turned.mask[support < 1e-12].all()
++
++
++@pytest.mark.parametrize(('operation', 'setting'), [
++    ('resample', 'nearest'),
++    ('resample', 'linear'),
++    ('resample', 'spline'),
++    ('reproject_to', 'interpolation'),
++    ('reproject_to', 'exact'),
++])
++def test_a_map_carried_onto_its_own_grid_keeps_exactly_its_masked_pixels(operation, setting,
++                                                                         quality_map):
++    if operation == 'resample':
++        out = quality_map.resample([8, 8] * u.pixel, method=setting)
++    else:
++        out = quality_map.reproject_to(quality_map.wcs, algorithm=setting)
++    kept = ~quality_map.mask
++    assert np.array_equal(out.mask, quality_map.mask)
++    assert np.allclose(out.data[kept], quality_map.data[kept])
++    assert np.allclose(out.uncertainty.array[kept], 0.5)
++    assert np.isnan(out.uncertainty.array[quality_map.mask]).all()
++
++
++def a_sum_on_two_wide_blocks_only(array, axis):
++    if np.shape(array)[axis] == 2:
++        return np.sum(array, axis=axis)
++    return np.max(array, axis=axis)
++
++
++def a_sum_on_three_wide_blocks_only(array, axis):
++    if np.shape(array)[axis] == 3:
++        return np.sum(array, axis=axis)
++    return np.max(array, axis=axis)
++
++
++@pytest.mark.parametrize(('block', 'func'), [
++    (2, a_sum_on_three_wide_blocks_only),
++    (3, a_sum_on_two_wide_blocks_only),
++])
++def test_a_reduction_that_is_no_sum_at_the_block_shape_asked_for_keeps_nothing(block, func):
++    data = np.ones((6, 6))
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((6, 6), 0.5)))
++    assert quality.superpixel([block, block] * u.pixel, func=func).uncertainty is None
++    assert quality.superpixel([block, block] * u.pixel, func=np.sum).uncertainty is not None
++
++
++def a_sum_that_steps_over_a_nan_only_on_three_wide_blocks(array, axis):
++    if np.shape(array)[axis] == 3:
++        return np.nansum(array, axis=axis)
++    return np.sum(array, axis=axis)
++
++
++def test_a_nan_skipped_only_at_the_block_shape_asked_for_is_left_out_of_the_count():
++    data = np.ones((6, 6))
++    data[0, 0] = np.nan
++    quality = sunpy.map.Map(data, header_for(data),
++                            uncertainty=StdDevUncertainty(np.full((6, 6), 0.5)))
++    blocks = quality.superpixel([3, 3] * u.pixel,
++                                func=a_sum_that_steps_over_a_nan_only_on_three_wide_blocks)
++    others = np.ones((2, 2), dtype=bool)
++    others[0, 0] = False
++    assert np.allclose(blocks.data[0, 0], 8.0)
++    assert np.allclose(blocks.uncertainty.array[0, 0], np.sqrt(8 * 0.25))
++    assert np.allclose(blocks.uncertainty.array[others], np.sqrt(9 * 0.25))
++
++
++def test_resampling_to_unequal_dimensions_keeps_both_lined_up_with_the_data():
++    values = np.arange(1, 55, dtype=float).reshape(6, 9)
++    mask = np.zeros((6, 9), dtype=bool)
++    mask[1, 7] = True
++    quality = sunpy.map.Map(values, header_for(values), mask=mask,
++                            uncertainty=VarianceUncertainty(values.copy()))
++    smaller = quality.resample([5, 3] * u.pixel)
++    assert smaller.data.shape == (3, 5)
++    assert smaller.mask.shape == smaller.data.shape
++    assert smaller.uncertainty.array.shape == smaller.data.shape
++    together = np.isfinite(smaller.data) & ~smaller.mask
++    assert together.sum() >= 6
++    assert np.allclose(smaller.uncertainty.array[together], smaller.data[together])
++
++
++@pytest.mark.filterwarnings('ignore::sunpy.util.exceptions.SunpyUserWarning')
++def test_an_operand_widening_a_single_row_map_matches_both_to_the_result():
++    data = np.ones((1, 8))
++    quality = sunpy.map.Map(data, header_for(data), mask=np.zeros((1, 8), dtype=bool),
++                            uncertainty=StdDevUncertainty(np.full((1, 8), 0.5)))
++    widened = quality + np.ones((5, 1))
++    assert widened.data.shape == (5, 8)
++    assert widened.mask.shape == (5, 8)
++    assert widened.uncertainty.array.shape == (5, 8)
++    assert np.allclose(widened.uncertainty.array, 0.5)
++    scaled = quality * np.full((5, 1), 2.0)
++    assert scaled.data.shape == (5, 8)
++    assert scaled.mask.shape == (5, 8)
++    assert np.allclose(scaled.uncertainty.array, 1.0)
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..25cc92d
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,74 @@
++#!/bin/sh
++set -u
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++else
++  OUTPUT_PATH="results.xml"
++fi
++
++NEW_TESTS="sunpy/map/tests/test_carried_quality_c962d5.py"
++LOG="$(mktemp 2>/dev/null || echo /tmp/test-sh-output.log)"
++
++export MPLBACKEND=Agg
++export PYTHONHASHSEED=0
++export SUNPY_DOWNLOADDIR=/tmp/sunpy-downloads
++export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION:-8.1.dev96+gb9fb3034f}"
++
++cd "$(dirname "$0")" || exit 1
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "$NEW_TESTS" -v -p no:cacheprovider --junitxml="$OUTPUT_PATH" > "$LOG" 2>&1
++  EXIT_CODE=$?
++else
++  # test_resample_rotated_map_pc and test_resample_rotated_map_cd are hypothesis
++  # property tests carrying a wall clock deadline of one second, so they report
++  # DeadlineExceeded on a loaded machine no matter what the code under them does.
++  python -m pytest \
++    sunpy/map/tests \
++    sunpy/image/tests \
++    --ignore="$NEW_TESTS" \
++    --deselect sunpy/map/tests/test_mapbase.py::test_resample_rotated_map_pc \
++    --deselect sunpy/map/tests/test_mapbase.py::test_resample_rotated_map_cd \
++    -v -p no:cacheprovider --junitxml="$OUTPUT_PATH" > "$LOG" 2>&1
++  EXIT_CODE=$?
++fi
++
++cat "$LOG"
++
++if [ ! -s "$OUTPUT_PATH" ] || ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  DETAIL=$(tail -c 6000 "$LOG" 2>/dev/null | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
++  if [ -z "$DETAIL" ]; then
++    DETAIL="pytest wrote no output before it stopped."
++  fi
++  cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++<testsuite name="pytest" tests="1" failures="1" errors="0" time="0">
++<testcase name="collection" classname="sunpy.map.tests.test_carried_quality_c962d5">
++<failure message="pytest wrote no test case, so it stopped before or during collection">
++$DETAIL
++</failure>
++</testcase>
++</testsuite>
++</testsuites>
++XMLEOF
++  if [ "$EXIT_CODE" -eq 0 ]; then
++    EXIT_CODE=1
++  fi
++fi
++
++rm -f "$LOG"
++exit $EXIT_CODE

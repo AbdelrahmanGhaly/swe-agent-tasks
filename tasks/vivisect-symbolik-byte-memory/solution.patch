@@ -1,0 +1,769 @@
+diff --git a/vivisect/analysis/generic/symswitchcase.py b/vivisect/analysis/generic/symswitchcase.py
+index ad1cfb61..5a55ed36 100644
+--- a/vivisect/analysis/generic/symswitchcase.py
++++ b/vivisect/analysis/generic/symswitchcase.py
+@@ -89,7 +89,7 @@ class TrackingSymbolikEmulator(vs_anal.SymbolikFunctionEmulator):
+         current symbolik emulator has no knowledge of the state of
+         the given memory symbol, None is returned.
+         '''
+-        addrval = symaddr.update(self).solve(emu=self, vals=vals)
++        addrval = symaddr.solve(emu=self, vals=vals)
+         logger.debug('   TSE.readSymMemory: symaddr:%r  addrval:0x%x symsize:%s',symaddr, addrval, symsize)
+ 
+         # check for a previous write first...
+@@ -99,6 +99,20 @@ class TrackingSymbolikEmulator(vs_anal.SymbolikFunctionEmulator):
+             self.track(self.getMeta('va'), symaddr, symval)
+             return symval
+ 
++        size = self._getSymReadSize(symsize)
++        if size is None:
++            entry = self._sym_membytes.get(addrval)
++            if entry is not None and entry[1] == 0:
++                symval = self._fitSymWidth(entry[0][3], entry[0][1])
++                self.track(self.getMeta('va'), symaddr, symval)
++                return symval
++        else:
++            entries = self._getSymMemEntries(addrval, size)
++            if any(entries):
++                symval = self._buildSymMemRead(symaddr, symsize, addrval, size, entries, self._fillSymMemMapped)
++                self.track(self.getMeta('va'), symaddr, symval)
++                return symval
++
+         # If we have a workspace, check it for meaningful symbols etc...
+         if self._sym_vw is not None:
+             # Make a special check for imports...
+@@ -131,6 +145,29 @@ class TrackingSymbolikEmulator(vs_anal.SymbolikFunctionEmulator):
+ 
+         return vs_com.Mem(symaddr, symsize)
+ 
++    def _fillSymMemMapped(self, symaddr, symsize, addrval, size, offsets):
++        '''
++        Unwritten bytes which are in a memory map come from the workspace.
++        '''
++        value = 0
++        unmapped = []
++        for off in offsets:
++            va = self._getSymMemAddr(addrval, off)
++            if self._sym_vw.isValidPointer(va):
++                value |= self._sym_vw.readMemory(va, 1)[0] << (off * 8)
++            else:
++                unmapped.append(off)
++
++        ret = None
++        if len(unmapped) != len(offsets):
++            ret = vs_com.Const(value, size)
++
++        if unmapped:
++            piece = self._fillSymMemUnknown(symaddr, symsize, addrval, size, unmapped)
++            ret = piece if ret is None else vs_com.o_or(ret, piece, size)
++
++        return ret
++
+ 
+ def contains(symobj, subobj):
+     '''
+@@ -816,7 +853,7 @@ class SwitchCase:
+                     if not self.vw.isValidPointer(solution):
+                         logger.warning(("ARRRG: Non-pointer in ReadMemory???"))
+ 
+-                    target = semu.readSymMemory(eff.symaddr, eff.symsize)
++                    target = semu.readSymMemory(symaddr, eff.symsize)
+                     size = target.getWidth()
+                     derefs.append((eff.va, symaddr, solution, target.solve(), size))
+ 
+diff --git a/vivisect/cli.py b/vivisect/cli.py
+index c160aa38..f6a1f660 100644
+--- a/vivisect/cli.py
++++ b/vivisect/cli.py
+@@ -163,7 +163,7 @@ class VivCli(e_cli.EnviCli, vivisect.VivWorkspace):
+                 if eff.efftype in (EFFTYPE_CONSTRAIN, EFFTYPE_CALLFUNC):
+                     self.vprint(str(eff))
+ 
+-            for addrsym, valsym in emu._sym_mem.values():
++            for addrsym, valsym in emu._getSymMemWrites():
+                 addrsym = addrsym.reduce(emu=emu)
+                 valsym = valsym.reduce(emu=emu)
+                 if emu.isLocalMemory(addrsym):
+diff --git a/vivisect/const.py b/vivisect/const.py
+index 0160ba91..691235a3 100644
+--- a/vivisect/const.py
++++ b/vivisect/const.py
+@@ -204,6 +204,7 @@ EFFTYPE_READMEM      = 2
+ EFFTYPE_WRITEMEM     = 3
+ EFFTYPE_CALLFUNC     = 4
+ EFFTYPE_CONSTRAIN    = 5
++EFFTYPE_REPEAT       = 6
+ 
+ # symboliks object types
+ SYMT_VAR            = 0
+diff --git a/vivisect/symboliks/archs/amd64.py b/vivisect/symboliks/archs/amd64.py
+index 813781b0..8f044eac 100644
+--- a/vivisect/symboliks/archs/amd64.py
++++ b/vivisect/symboliks/archs/amd64.py
+@@ -58,6 +58,7 @@ class Amd64SymbolikTranslator(vsym_i386.IntelSymbolikTranslator):
+     __bp__ = 'rbp'  # we could use regctx.getRegisterName if we want.
+     __srcp__ = 'rsi'
+     __destp__ = 'rdi'
++    __cntr__ = 'rcx'
+ 
+     def setRegObj(self, regidx, obj):
+         ridx = regidx & 0xffff
+@@ -81,10 +82,11 @@ class Amd64SymbolikTranslator(vsym_i386.IntelSymbolikTranslator):
+                 rreg, lshift, mask = self._reg_ctx.getMetaRegInfo(regidx)
+                 # cut hole in mask
+                 finalmask = basemask ^ (mask << lshift)
++                regwidth = rbitwidth >> 3
+                 if lshift != 0:
+-                    obj <<= Const(lshift, rbitwidth >> 3)
++                    obj = o_lshift(obj, Const(lshift, regwidth), regwidth)
+ 
+-                obj = obj | (val & Const(finalmask, rbitwidth >> 3))
++                obj = o_or(obj, val & Const(finalmask, regwidth), regwidth)
+ 
+         self.effSetVariable(rname, obj)
+ 
+@@ -107,6 +109,11 @@ class Amd64SymbolikTranslator(vsym_i386.IntelSymbolikTranslator):
+     def i_pextrd_q(self, op):
+         self.i_pextrb(op, width=op.opers[0].tsize)
+ 
++    def _strWidth(self, op, width):
++        if width != 1 and op.prefixes & e_amd64.PREFIX_REX_W:
++            return 8
++        return vsym_i386.IntelSymbolikTranslator._strWidth(self, op, width)
++
+     def i_movsxd(self, op):
+         dsize = op.opers[0].tsize
+         ssize = op.opers[1].tsize
+@@ -152,8 +159,9 @@ class Amd64SymbolikTranslator(vsym_i386.IntelSymbolikTranslator):
+     def i_pushfd(self, op):
+         sp = self.getRegObj(self._reg_ctx._rctx_spindex)
+         sr = self.getRegObj(self._reg_ctx._rctx_srindex)
+-        self.effSetVariable(self.__sp__, sp - Const(8, self._psize))
+-        self.effWriteMemory(Var(self.__sp__, self._psize), Const(8, self._psize), sr)
++        width = Const(self._stackWidth(op), self._psize)
++        self.effSetVariable(self.__sp__, sp - width)
++        self.effWriteMemory(Var(self.__sp__, self._psize), width, sr)
+ 
+     def i_vmread(self, op):
+         vmcsoff = self.getOperObj(op, 1)
+@@ -204,7 +212,7 @@ class Amd64SymbolikTranslator(vsym_i386.IntelSymbolikTranslator):
+         return self._movs(op, width=8)
+ 
+     def i_stosq(self, op):
+-        return self._stos(op, width=8)
++        return self.i_stosb(op, width=8)
+ 
+     def i_cmpsq(self, op):
+         return self._cmps(op, width=8)
+diff --git a/vivisect/symboliks/archs/i386.py b/vivisect/symboliks/archs/i386.py
+index c0bdf657..c034169d 100644
+--- a/vivisect/symboliks/archs/i386.py
++++ b/vivisect/symboliks/archs/i386.py
+@@ -8,6 +8,7 @@ import envi.archs.i386.opconst as i386_opconst
+ 
+ import vivisect.symboliks.analysis as vsym_analysis
+ import vivisect.symboliks.callconv as vsym_callconv
++import vivisect.symboliks.effects as vsym_effects
+ import vivisect.symboliks.translator as vsym_trans
+ 
+ from vivisect.const import *
+@@ -19,6 +20,15 @@ mulpairs = {
+     8: ('rax', 'rdx')
+ }
+ 
++accumregs = {
++    1: 'al',
++    2: 'ax',
++    4: 'eax',
++    8: 'rax',
++}
++
++repstrops = (i386_opconst.INS_STRMOV, i386_opconst.INS_STRSTOR, i386_opconst.INS_STRLOAD)
++
+ def getSegmentSymbol(op):
+     if op.prefixes & e_i386.PREFIX_CS:
+         return Var('cs', 4)
+@@ -36,7 +46,7 @@ def getSegmentSymbol(op):
+ class IntelSymbolikTranslator(vsym_trans.SymbolikTranslator):
+     '''
+     Common parent for i386 and x64.  Make sure you define:
+-    __arch__, __ip__, __sp__, __srcp__, __destp__
++    __arch__, __ip__, __sp__, __srcp__, __destp__, __cntr__
+ 
+     Symbolik representations that are 'agnostic' to 32 or 64-bit belong here.
+     '''
+@@ -49,6 +59,18 @@ class IntelSymbolikTranslator(vsym_trans.SymbolikTranslator):
+         for i in (0, 1, 2, 4, 8, 16, 32):
+             self._sz_masks[i] = Const((2 ** (i * 8)) - 1, self._psize)
+ 
++    def translateOpcode(self, op):
++        if not op.prefixes & e_i386.PREFIX_REP or op.opcode not in repstrops:
++            return vsym_trans.SymbolikTranslator.translateOpcode(self, op)
++
++        efflog = self._eff_log
++        self._eff_log = []
++        ret = vsym_trans.SymbolikTranslator.translateOpcode(self, op)
++        effects = self._eff_log
++        self._eff_log = efflog
++        self._eff_log.append(vsym_effects.RepeatEffect(op.va, Var(self.__cntr__, self._psize), effects))
++        return ret
++
+     def getRegObj(self, regidx):
+         ridx = regidx & 0xffff
+         rname = self._reg_ctx.getRegisterName(ridx)
+@@ -90,10 +112,11 @@ class IntelSymbolikTranslator(vsym_trans.SymbolikTranslator):
+             rreg, lshift, mask = self._reg_ctx.getMetaRegInfo(regidx)
+             # cut hole in mask
+             finalmask = basemask ^ (mask << lshift)
++            regwidth = rbitwidth >> 3
+             if lshift != 0:
+-                obj <<= Const(lshift, rbitwidth >> 3)
++                obj = o_lshift(obj, Const(lshift, regwidth), regwidth)
+ 
+-            obj = obj | (val & Const(finalmask, rbitwidth >> 3))
++            obj = o_or(obj, val & Const(finalmask, regwidth), regwidth)
+ 
+         self.effSetVariable(rname, obj)
+ 
+@@ -122,7 +145,7 @@ class IntelSymbolikTranslator(vsym_trans.SymbolikTranslator):
+         seg = getSegmentSymbol(op)
+ 
+         if isinstance(oper, e_i386.i386RegMemOper):
+-            reg = Var(self._reg_ctx.getRegisterName(oper.reg), oper.tsize)
++            reg = self.getRegObj(oper.reg)
+             if oper.disp == 0:
+                 base = reg
+             if oper.disp > 0:
+@@ -681,25 +704,33 @@ class IntelSymbolikTranslator(vsym_trans.SymbolikTranslator):
+ 
+     i_jz = i_je
+ 
+-    def i_lea(self, op):
+-        obj = self.getOperAddrObj(op, 1)
++    def _setSizedOperObj(self, op, obj):
++        dsize = op.opers[0].tsize
++        if dsize < obj.getWidth():
++            obj &= self._sz_masks[dsize]
+         self.setOperObj(op, 0, obj)
+ 
++    def i_lea(self, op):
++        self._setSizedOperObj(op, self.getOperAddrObj(op, 1))
++
+     def i_mov(self, op):
+         o = self.getOperObj(op, 1)
+         self.setOperObj(op, 0, o)
+ 
++    def i_movd(self, op):
++        # movd and movq only move the low bytes of a wider register
++        self._setSizedOperObj(op, self.getOperObj(op, 1))
++
+     # All of these mov's are technically different in i386/amd64, but really only differ by widths and sizes, and not by
+     # actual mathematical operation
+     i_movnti = i_mov
+-    i_movq = i_mov
+-    i_movd = i_mov
++    i_movq = i_movd
+     i_movaps = i_mov
+     i_movapd = i_mov
+     i_movups = i_mov
+     i_movdqu = i_mov
+     i_movdqa = i_mov
+-    i_movd_q = i_mov
++    i_movd_q = i_movd
+ 
+     def i_movlps(self, op):
+         valu = self.getOperObj(op, 1) & self._sz_masks[8]
+@@ -730,14 +761,27 @@ class IntelSymbolikTranslator(vsym_trans.SymbolikTranslator):
+             src2 = (self.getOperObj(op, 0, 2) & self._sz_masks[8]) << Const(64, self._psize)
+             self.setOperObj(op, 0, src1 | src2)
+ 
++    def _strWidth(self, op, width):
++        '''
++        The element size of a string instruction, which the decoder always
++        names as the byte or dword form.
++        '''
++        if width != 1 and op.prefixes & e_i386.PREFIX_OP_SIZE:
++            return 2
++        return width
++
++    def _strDelta(self, width):
++        # This is a translation of if df == 0: add, else subtract that
++        # the string instructions are supposed to deal with
++        return Const(width, self._psize) * (Const(1, self._psize) - Const(2, self._psize) * Var('eflags_df', self._psize))
++
+     def _movs(self, op, width=-1):
++        width = self._strWidth(op, width)
+         si = Var(self.__srcp__, self._psize)
+         di = Var(self.__destp__, self._psize)
+         mem = Mem(si, Const(width, self._psize))
+         self.effWriteMemory(di, Const(width, self._psize), mem)
+-        # This is a translation of if df == 0: add, else subtract that
+-        # the movs{b,w,d,q} are supposed to deal with
+-        mod = Const(width, self._psize) * (Const(1, self._psize) - Const(2, self._psize) * Var('eflags_df', self._psize))
++        mod = self._strDelta(width)
+         self.effSetVariable(self.__srcp__, si + mod)
+         self.effSetVariable(self.__destp__, di + mod)
+ 
+@@ -891,17 +935,24 @@ class IntelSymbolikTranslator(vsym_trans.SymbolikTranslator):
+ 
+     i_vpshufhw = i_pshufhw
+ 
++    def _stackWidth(self, op):
++        if op.prefixes & e_i386.PREFIX_OP_SIZE:
++            return 2
++        return self._psize
++
+     def i_push(self, op):
+         v1 = self.getOperObj(op, 0)
++        width = Const(self._stackWidth(op), self._psize)
+         sp = self.getRegObj(self._reg_ctx._rctx_spindex)
+-        self.effSetVariable(self.__sp__, sp - Const(self._psize, self._psize))
++        self.effSetVariable(self.__sp__, sp - width)
+         # NOTE: we do the write after the set, so there is no need
+         # to write to sp - psize...
+-        self.effWriteMemory(Var(self.__sp__, self._psize), Const(self._psize, self._psize), v1)
++        self.effWriteMemory(Var(self.__sp__, self._psize), width, v1)
+ 
+     def i_pop(self, op):
+-        self.setOperObj(op, 0, Mem(Var(self.__sp__, self._psize), Const(self._psize, self._psize)))
+-        self.effSetVariable(self.__sp__, Var(self.__sp__, self._psize) + Const(self._psize, self._psize))
++        width = Const(self._stackWidth(op), self._psize)
++        self.setOperObj(op, 0, Mem(Var(self.__sp__, self._psize), width))
++        self.effSetVariable(self.__sp__, Var(self.__sp__, self._psize) + width)
+ 
+     def _simdshift(self, op, func, width, off=0):
+         res = Const(0, self._psize)
+@@ -1466,15 +1517,25 @@ class IntelSymbolikTranslator(vsym_trans.SymbolikTranslator):
+     def i_stosb(self, op, width=1):
+         # FIXME omg segments in symboliks?
+         # base, size = self.segments[SEG_ES]
++        width = self._strWidth(op, width)
+         di = Var(self.__destp__, self._psize)
+-        mod = Const(width, self._psize) * (Const(1, self._psize) - Const(2, self._psize) * Var('eflags_df', self._psize))
+-        self.effWriteMemory(di, Const(self._psize, self._psize), Var('eax', self._psize))
+-        self.effSetVariable(self.__destp__, di + mod)
++        self.effWriteMemory(di, Const(width, self._psize), self.getRegByName(accumregs[width]))
++        self.effSetVariable(self.__destp__, di + self._strDelta(width))
+ 
+     def i_stosd(self, op):
+         return self.i_stosb(op, width=4)
+ 
++    def i_lodsb(self, op, width=1):
++        width = self._strWidth(op, width)
++        si = Var(self.__srcp__, self._psize)
++        self.setRegByName(accumregs[width], self.effReadMemory(si, Const(width, self._psize)))
++        self.effSetVariable(self.__srcp__, si + self._strDelta(width))
++
++    def i_lodsd(self, op):
++        return self.i_lodsb(op, width=4)
++
+     def _cmps(self, op, width=-1):
++        width = self._strWidth(op, width)
+         si = Var(self.__srcp__, self._psize)
+         di = Var(self.__destp__, self._psize)
+         v1 = Mem(si, Const(width, self._psize))
+@@ -1484,6 +1545,9 @@ class IntelSymbolikTranslator(vsym_trans.SymbolikTranslator):
+         self.effSetVariable('eflags_lt', lt(v1, v2))  # v1 - v2 < 0 :: v1 < v2
+         self.effSetVariable('eflags_sf', lt(v1, v2))  # v1 - v2 < 0 :: v1 < v2
+         self.effSetVariable('eflags_eq', eq(v1, v2))  # v1 - v2 == 0 :: v1 == v2
++        mod = self._strDelta(width)
++        self.effSetVariable(self.__srcp__, si + mod)
++        self.effSetVariable(self.__destp__, di + mod)
+ 
+     def i_cmpsb(self, op):
+         return self._cmps(op, width=1)
+@@ -1498,6 +1562,7 @@ class i386SymbolikTranslator(IntelSymbolikTranslator):
+     __bp__ = 'ebp' # we could use regctx.getRegisterName if we want.
+     __srcp__ = 'esi'
+     __destp__ = 'edi'
++    __cntr__ = 'ecx'
+ 
+     def i_pushad(self, op):
+         esp = self.getRegObj(e_i386.REG_ESP)
+@@ -1515,8 +1580,9 @@ class i386SymbolikTranslator(IntelSymbolikTranslator):
+     def i_pushfd(self, op):
+         esp = self.getRegObj(e_i386.REG_ESP)
+         eflags = self.getRegObj(e_i386.REG_EFLAGS)
+-        self.effSetVariable('esp', esp - Const(4, self._psize))
+-        self.effWriteMemory(Var('esp', self._psize), Const(4, self._psize), eflags)
++        width = Const(self._stackWidth(op), self._psize)
++        self.effSetVariable('esp', esp - width)
++        self.effWriteMemory(Var('esp', self._psize), width, eflags)
+ 
+     def i_popad(self, op):
+         esp = self.getRegObj(e_i386.REG_ESP)
+diff --git a/vivisect/symboliks/common.py b/vivisect/symboliks/common.py
+index d6dd7c30..96393ab9 100644
+--- a/vivisect/symboliks/common.py
++++ b/vivisect/symboliks/common.py
+@@ -569,16 +569,35 @@ class Mem(SymbolikBase):
+         # non-updated memory locations are *never* discrete
+         return False
+ 
+-    def _solve(self, emu=None, vals=None):
++    def solve(self, emu=None, vals=None):
++        # what memory holds depends on the emulator, so only plain solves are cached
+         if emu is not None:
+-            val = emu.readSymMemory(self.kids[0], self.kids[1], vals=vals)
+-            if val and val.isDiscrete():
+-                return val.solve()
++            return self._solve(emu=emu, vals=vals)
++        return SymbolikBase.solve(self, vals=vals)
+ 
++    def _solve(self, emu=None, vals=None):
+         addrval = self.kids[0].solve(emu=emu, vals=vals)
++        if emu is not None:
++            # read through the solved address, so a pointer in the emulator's memory is followed for
++            # unwritten bytes too, and solve the value read without the emulator since it already reflects memory
++            symaddr = Const(addrval, emu.__width__ or self.kids[0].getWidth())
++            val = emu.readSymMemory(symaddr, self.kids[1], vals=vals)
++            if isinstance(val, SymbolikBase):
++                return val.solve(vals=vals)
++
++            # raw ints are their own value and raw bytes are memory, least significant byte first;
++            # any other raw value (a string, say) has no number and solves like unwritten memory
++            if isinstance(val, int):
++                return val
++            if isinstance(val, (bytes, bytearray)):
++                return int.from_bytes(val, 'little')
++
+         sizeval = self.kids[1].solve(emu=emu, vals=vals)
+ 
+-        return varsolve(f'[{addrval}:{sizeval}]', 32)
++        ret = varsolve(f'[{addrval}:{sizeval}]', 32)
++        if self.kids[1].isDiscrete():
++            ret &= (1 << (sizeval * 8)) - 1
++        return ret
+ 
+     def getWidth(self):
+         # FIXME should we do something about that?
+diff --git a/vivisect/symboliks/effects.py b/vivisect/symboliks/effects.py
+index 236fa31f..e8c41b44 100644
+--- a/vivisect/symboliks/effects.py
++++ b/vivisect/symboliks/effects.py
+@@ -206,7 +206,7 @@ class WriteMemory(SymbolikEffect):
+         symaddr = self.symaddr.update(emu)
+         symsize = self.symsize.update(emu)
+         symval = self.symval.update(emu)
+-        emu.writeSymMemory(symaddr, symval)
++        emu.writeSymMemory(symaddr, symval, symsize=symsize)
+         return WriteMemory(self.va, symaddr, symsize, symval)
+ 
+ class CallFunction(SymbolikEffect):
+@@ -290,6 +290,63 @@ class CallFunction(SymbolikEffect):
+ 
+         canvas.addText(')')
+ 
++class RepeatEffect(SymbolikEffect):
++    '''
++    RepeatEffect represents effects which run as many times as the count
++    variable holds when they are applied (such as a rep prefixed string
++    instruction), after which the count variable is zero.  A count which is
++    not discrete runs the effects once.
++
++    Applying a RepeatEffect returns the list of every applied effect.
++    '''
++    efftype = EFFTYPE_REPEAT
++
++    def __init__(self, va, countsym, effects):
++        SymbolikEffect.__init__(self, va)
++        self.countsym = countsym
++        self.effects = effects
++
++    def __repr__(self):
++        return 'RepeatEffect( 0x%.8x, %s, %s )' % (self.va, repr(self.countsym), repr(self.effects))
++
++    def __str__(self):
++        return 'repeat %s { %s }' % (str(self.countsym), '; '.join(str(eff) for eff in self.effects))
++
++    def __eq__(self, other):
++        if other is None:
++            return False
++        if self.__class__ != other.__class__:
++            return False
++        if not self.countsym == other.countsym:
++            return False
++        if not self.effects == other.effects:
++            return False
++
++        return True
++
++    def walkTree(self, cb, ctx=None, once=True):
++        self.countsym = self.countsym.walkTree(cb, ctx=ctx, once=once)
++        for eff in self.effects:
++            eff.walkTree(cb, ctx=ctx, once=once)
++
++    def reduce(self, emu=None):
++        self.countsym = self.countsym.reduce(emu=emu)
++        for eff in self.effects:
++            eff.reduce(emu=emu)
++
++    def applyEffect(self, emu):
++        count = self.countsym.update(emu)
++        if not count.isDiscrete():
++            return emu.applyEffects(self.effects)
++
++        applied = []
++        for i in range(count.solve()):
++            applied.extend(emu.applyEffects(self.effects))
++
++        zero = SetVariable(self.va, self.countsym.name, Const(0, self.countsym.getWidth()))
++        applied.append(zero.applyEffect(emu))
++        return applied
++
+ class ConstrainPath(SymbolikEffect):
+ 
+     efftype = EFFTYPE_CONSTRAIN
+diff --git a/vivisect/symboliks/emulator.py b/vivisect/symboliks/emulator.py
+index c2e6d3c9..e2756043 100644
+--- a/vivisect/symboliks/emulator.py
++++ b/vivisect/symboliks/emulator.py
+@@ -1,5 +1,6 @@
+ import os
+ 
++import envi.bits as e_bits
+ import envi.common as e_common
+ import vivisect.symboliks.expression as v_s_expr
+ 
+@@ -21,6 +22,7 @@ class SymbolikEmulator:
+         self._sym_meta = {}
+         self._sym_vars = {}
+         self._sym_mem = {}
++        self._sym_membytes = {}
+         self._sym_rseed = ''
+         self._sym_vw = vw
+         self._sym_cconvs = {}    # function emulation can be calling convention aware
+@@ -31,13 +33,16 @@ class SymbolikEmulator:
+         return (dict(self._sym_meta),
+                 dict(self._sym_vars),
+                 dict(self._sym_mem),
+-                self._sym_rseed)
++                self._sym_rseed,
++                dict(self._sym_membytes))
+ 
+     def setSymSnapshot(self, snap):
+-        (self._sym_meta,
+-         self._sym_vars,
+-         self._sym_mem,
+-         self._sym_rseed) = snap
++        meta, symvars, symmem, rseed, membytes = snap
++        self._sym_meta = dict(meta)
++        self._sym_vars = dict(symvars)
++        self._sym_mem = dict(symmem)
++        self._sym_rseed = rseed
++        self._sym_membytes = dict(membytes)
+ 
+     def setMeta(self, name, val):
+         '''
+@@ -66,9 +71,17 @@ class SymbolikEmulator:
+     def applyEffects(self, effects):
+         '''
+         Apply the given effects to the emulator.  Return a list of updated
+-        effects which reflect the state during emulation.
++        effects which reflect the state during emulation (a repeated effect
++        contributes the updated effects of every repetition).
+         '''
+-        return [e.applyEffect(self) for e in effects]
++        ret = []
++        for eff in effects:
++            applied = eff.applyEffect(self)
++            if isinstance(applied, list):
++                ret.extend(applied)
++            else:
++                ret.append(applied)
++        return ret
+ 
+     def applyFunctionCall(self, funcsym):
+         '''
+@@ -96,18 +109,102 @@ class SymbolikEmulator:
+     def readSymMemory(self, symaddr, symsize, vals=None):
+         '''
+         The readSymMemory API is designed to read from the given
+-        symbolik address for the specified symbolik length.  If the
+-        current symbolik emulator has no knowledge of the state of
+-        the given memory symbol, None is returned.
++        symbolik address for the specified symbolik length.  Each byte
++        comes from the most recent write which covered it, and bytes
++        no write covered keep the value of the plain memory reference.
++        If the current symbolik emulator has no knowledge of any byte
++        of the given memory symbol, None is returned.
+         '''
+         addrval = symaddr.solve(emu=self, vals=vals)
+ 
+-        # check for a previous write first...
++        # values of unknown size are only visible at their own address
+         symmem = self._sym_mem.get(addrval)
+         if symmem is not None:
+-            symaddr, symval = symmem
+-            return symval
++            return symmem[1]
++
++        size = self._getSymReadSize(symsize)
++        if size is None:
++            entry = self._sym_membytes.get(addrval)
++            if entry is not None and entry[1] == 0:
++                return self._fitSymWidth(entry[0][3], entry[0][1])
++            return self._getSymImport(addrval)
++
++        entries = self._getSymMemEntries(addrval, size)
++        if not any(entries):
++            return self._getSymImport(addrval)
++
++        return self._buildSymMemRead(symaddr, symsize, addrval, size, entries, self._fillSymMemUnknown)
++
++    def writeSymMemory(self, symaddr, symval, vals=None, symsize=None):
++        '''
++        Write symval to the memory at symaddr.  The write covers symsize
++        bytes (the width of symval when symsize is not specified) and
++        replaces only those bytes.  Values which are not symbolik objects
++        have no known size and may only be read back from symaddr.
++        '''
++        addrval = symaddr.solve(emu=self, vals=vals)
++
++        size = None
++        if isinstance(symval, SymbolikBase):
++            if symsize is not None:
++                size = self._getSymMemSize(symsize)
++            else:
++                size = self._getSymValWidth(symval)
++
++        if size is None:
++            self._sym_mem[addrval] = (symaddr, symval)
++            return
++
++        wrec = (addrval, size, symaddr, symval)
++        for off in range(size):
++            byteaddr = self._getSymMemAddr(addrval, off)
++            self._sym_membytes[byteaddr] = (wrec, off)
++            self._sym_mem.pop(byteaddr, None)
++
++    def _getSymMemWrites(self):
++        '''
++        Return (symaddr, symval) tuples for the writes of unknown size and
++        for the writes which still own at least one byte of memory.
++        '''
++        writes = {}
++        for wrec, off in self._sym_membytes.values():
++            writes[id(wrec)] = (wrec[2], wrec[3])
++        return list(self._sym_mem.values()) + list(writes.values())
++
++    def _getSymMemSize(self, symsize):
++        if isinstance(symsize, int):
++            size = symsize
++        elif isinstance(symsize, SymbolikBase) and symsize.isDiscrete():
++            size = symsize.solve()
++        else:
++            return None
++        return size
++
++    def _getSymReadSize(self, symsize):
++        size = self._getSymMemSize(symsize)
++        # no symbolik value is wider than MAX_WORD, so wider reads keep the exact address behavior
++        if size is not None and size > e_bits.MAX_WORD:
++            return None
++        return size
++
++    def _getSymValWidth(self, symval):
++        '''
++        Return the width of a symbolik value, or None when it has no known
++        width (a Mem whose own size is not discrete).
++        '''
++        if symval.symtype == SYMT_MEM and not symval.kids[1].isDiscrete():
++            return None
++        return symval.getWidth()
++
++    def _getSymMemAddr(self, addrval, off):
++        if not self.__width__:
++            return addrval + off
++        return (addrval + off) & ((1 << (self.__width__ * 8)) - 1)
++
++    def _getSymMemEntries(self, addrval, size):
++        return [self._sym_membytes.get(self._getSymMemAddr(addrval, off)) for off in range(size)]
+ 
++    def _getSymImport(self, addrval):
+         # If we have a workspace, check it for meaningful
+         # symbols etc...
+         if self._sym_vw is not None:
+@@ -120,12 +217,76 @@ class SymbolikEmulator:
+ 
+         return None
+ 
+-    def writeSymMemory(self, symaddr, symval, vals=None):
+-        # FIXME handle memory offsets etc...
+-        # FIXME handle write size.. (using isDiscrete?)
+-        addrval = symaddr.solve(emu=self, vals=vals)
+-        # sizeval = symsize.solve(slvctx=self)
+-        self._sym_mem[addrval] = (symaddr, symval)
++    def _getSymMemSlice(self, symval, off, length, width):
++        mask = (1 << (length * 8)) - 1
++        if symval.symtype == SYMT_CONST:
++            return Const((symval.value >> (off * 8)) & mask, width)
++
++        valwidth = self._getSymValWidth(symval)
++        if valwidth is not None:
++            if off >= valwidth:
++                # bytes past the end of the value are its zero extension
++                return Const(0, width)
++            if off == 0 and length >= valwidth and width == valwidth:
++                return symval
++
++        # shift at the value's own width, which no symbolik operator may exceed
++        shiftwidth = min(valwidth or e_bits.MAX_WORD, e_bits.MAX_WORD)
++        if off:
++            symval = o_rshift(symval, Const(off * 8, shiftwidth), shiftwidth)
++        return o_and(symval, Const(mask, width), width)
++
++    def _fitSymWidth(self, symval, size):
++        # nothing wider than MAX_WORD can be built, and zero extending a value does not change it
++        if size > e_bits.MAX_WORD or self._getSymValWidth(symval) == size:
++            return symval
++        return self._getSymMemSlice(symval, 0, size, size)
++
++    def _fillSymMemUnknown(self, symaddr, symsize, addrval, size, offsets):
++        if not isinstance(symsize, SymbolikBase):
++            symsize = Const(size, symaddr.getWidth())
++
++        mask = 0
++        for off in offsets:
++            mask |= 0xff << (off * 8)
++        return o_and(Mem(symaddr, symsize), Const(mask, size), size)
++
++    def _buildSymMemRead(self, symaddr, symsize, addrval, size, entries, fill):
++        '''
++        Build the value of a size byte read from the (write, offset)
++        entries of each byte, using fill() for the bytes nothing wrote.
++        '''
++        first = entries[0]
++        if first is not None and first[1] == 0 and first[0][1] == size:
++            if all(entry is not None and entry[0] is first[0] for entry in entries):
++                return self._fitSymWidth(first[0][3], size)
++
++        ret = None
++        unknown = []
++        idx = 0
++        while idx < size:
++            entry = entries[idx]
++            if entry is None:
++                unknown.append(idx)
++                idx += 1
++                continue
++
++            wrec, off = entry
++            end = idx + 1
++            while end < size and entries[end] is not None and entries[end][0] is wrec:
++                end += 1
++
++            piece = self._getSymMemSlice(wrec[3], off, end - idx, size)
++            if idx:
++                piece = o_lshift(piece, Const(idx * 8, size), size)
++            ret = piece if ret is None else o_or(ret, piece, size)
++            idx = end
++
++        if unknown:
++            piece = fill(symaddr, symsize, addrval, size, unknown)
++            ret = piece if ret is None else o_or(ret, piece, size)
++
++        return ret
+ 
+     def setSymVariable(self, name, symval, width=None):
+         if width is None:

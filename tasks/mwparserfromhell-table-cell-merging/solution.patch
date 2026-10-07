@@ -1,0 +1,497 @@
+diff --git a/CHANGELOG b/CHANGELOG
+index 6fd55fc..37551c4 100644
+--- a/CHANGELOG
++++ b/CHANGELOG
+@@ -1,6 +1,8 @@
+ v0.7.3 (unreleased):
+ 
+ - Add support for Python 3.14 and drop end-of-life 3.9.
++- Add Wikicode.get_tables() and the Table class, which lays out table cells
++  on a grid and can merge and split them.
+ 
+ v0.7.2 (released July 1, 2025):
+ 
+diff --git a/docs/api/mwparserfromhell.rst b/docs/api/mwparserfromhell.rst
+index ad0ecbe..2515db5 100644
+--- a/docs/api/mwparserfromhell.rst
++++ b/docs/api/mwparserfromhell.rst
+@@ -23,6 +23,13 @@ mwparserfromhell Package
+     :undoc-members:
+     :no-index:
+ 
++:mod:`table` Module
++-------------------
++
++.. automodule:: mwparserfromhell.table
++    :members:
++    :undoc-members:
++
+ :mod:`wikicode` Module
+ ----------------------
+ 
+diff --git a/src/mwparserfromhell/__init__.py b/src/mwparserfromhell/__init__.py
+index aab44eb..79ee08d 100644
+--- a/src/mwparserfromhell/__init__.py
++++ b/src/mwparserfromhell/__init__.py
+@@ -43,12 +43,22 @@ __all__ = [
+     "parser",
+     "smart_list",
+     "string_mixin",
++    "table",
+     "utils",
+     "wikicode",
+     "parse",
+ ]
+ 
+-from . import definitions, nodes, parser, smart_list, string_mixin, utils, wikicode
++from . import (
++    definitions,
++    nodes,
++    parser,
++    smart_list,
++    string_mixin,
++    table,
++    utils,
++    wikicode,
++)
+ 
+ parse = utils.parse_anything
+ 
+diff --git a/src/mwparserfromhell/table.py b/src/mwparserfromhell/table.py
+new file mode 100644
+index 0000000..65b8301
+--- /dev/null
++++ b/src/mwparserfromhell/table.py
+@@ -0,0 +1,401 @@
++# Copyright (C) 2012-2025 Ben Kurtovic <ben.kurtovic@gmail.com>
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in
++# all copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++"""
++This module contains the :class:`.Table` class, which lays out the cells of a
++table tag on a grid and lets them be merged and split.
++"""
++
++from __future__ import annotations
++
++import re
++from typing import TYPE_CHECKING, Any, TypeGuard, cast
++
++from .nodes import Node, Tag, Text
++
++if TYPE_CHECKING:
++    from .wikicode import Wikicode
++
++__all__ = ["Table"]
++
++_SPAN_VALUE = re.compile(r"\s*(\d+)")
++_INLINE_MARKUP = ("||", "!!")
++
++
++def _is_tag(node: Node, *names: str) -> TypeGuard[Tag]:
++    """Return whether *node* is a tag whose lowercase name is in *names*."""
++    return isinstance(node, Tag) and str(node.tag).strip().lower() in names
++
++
++def _is_cell(node: Node) -> TypeGuard[Tag]:
++    """Return whether *node* is a table cell, which excludes ``|+`` captions."""
++    if not _is_tag(node, "td", "th"):
++        return False
++    return not (node.wiki_markup == "|" and str(node).startswith("|+"))
++
++
++def _read_span(cell: Tag, name: str) -> int:
++    """Return the value of the span attribute *name* of *cell*.
++
++    The last attribute with that name counts. A missing or unreadable value
++    counts as one.
++    """
++    value: Any = None
++    for attr in cell.attributes:
++        if attr.name.strip().lower() == name:
++            value = attr.value
++    match = _SPAN_VALUE.match(str(value)) if value is not None else None
++    return int(match.group(1)) if match else 1
++
++
++def _line_marker(cell: Tag) -> str:
++    """Return the wiki markup that starts a line with *cell*."""
++    return "!" if _is_tag(cell, "th") else "|"
++
++
++def _set_wiki_markup(cell: Tag, markup: str) -> None:
++    """Change the wiki markup of *cell* without giving it closing markup."""
++    cell.wiki_markup = markup
++    cell.closing_wiki_markup = None
++
++
++class _Row:
++    """A row of a table: the cells in it and the code holding them."""
++
++    def __init__(self, container: Wikicode, group: int):
++        self.container = container
++        self.group = group
++        self.cells: list[Tag] = []
++
++
++class _Placement:
++    """Where a cell sits on the grid of a table."""
++
++    def __init__(self, cell: Tag, row: int, column: int, rowspan: int, colspan: int):
++        self.cell = cell
++        self.row = row
++        self.column = column
++        self.rowspan = rowspan
++        self.colspan = colspan
++
++    def meets(self, top: int, left: int, bottom: int, right: int) -> bool:
++        return (
++            self.row <= bottom
++            and self.column <= right
++            and top <= self.row + self.rowspan - 1
++            and left <= self.column + self.colspan - 1
++        )
++
++    def inside(self, top: int, left: int, bottom: int, right: int) -> bool:
++        return (
++            top <= self.row
++            and left <= self.column
++            and self.row + self.rowspan - 1 <= bottom
++            and self.column + self.colspan - 1 <= right
++        )
++
++
++class _Layout:
++    """The grid of a table as it stands when the layout is computed."""
++
++    def __init__(self, rows: list[_Row]):
++        self.rows = rows
++        self.placements: list[_Placement] = []
++        self.owners: dict[tuple[int, int], Tag] = {}
++        self.width = 0
++        last_of_group = {row.group: index for index, row in enumerate(rows)}
++        for index, row in enumerate(rows):
++            column = 0
++            for cell in row.cells:
++                while (index, column) in self.owners:
++                    column += 1
++                available = last_of_group[row.group] - index + 1
++                rowspan = _read_span(cell, "rowspan")
++                rowspan = available if rowspan == 0 else min(rowspan, available)
++                colspan = _read_span(cell, "colspan") or 1
++                for i in range(index, index + rowspan):
++                    for j in range(column, column + colspan):
++                        self.owners.setdefault((i, j), cell)
++                self.placements.append(
++                    _Placement(cell, index, column, rowspan, colspan)
++                )
++                column += colspan
++                self.width = max(self.width, column)
++
++    @property
++    def height(self) -> int:
++        return len(self.rows)
++
++    def find(self, cell: Any) -> _Placement:
++        for placement in self.placements:
++            if placement.cell is cell:
++                return placement
++        raise ValueError(cell)
++
++    def check(self, row: int, column: int) -> None:
++        if not (0 <= row < self.height and 0 <= column < self.width):
++            raise IndexError((row, column))
++
++    def following(self, row: int, column: int) -> Tag | None:
++        """Return the first cell of *row* that starts right of *column*."""
++        for placement in self.placements:
++            if placement.row == row and placement.column > column:
++                return placement.cell
++        return None
++
++
++class Table:
++    """Represents the grid of cells of a ``table`` tag.
++
++    Rows are ``tr`` tags directly inside the table, or inside a ``thead``,
++    ``tbody`` or ``tfoot`` tag directly inside it; each run of cells found
++    directly in those places, broken only by whitespace, forms a row of its
++    own. Cells are placed on
++    the grid the way HTML places them, honoring ``rowspan`` and ``colspan``.
++    The grid is worked out again from the tag every time it is used, so it
++    always reflects the current state of the wikicode.
++    """
++
++    def __init__(self, node: Tag):
++        if not _is_tag(node, "table"):
++            raise ValueError(node)
++        self._node = node
++
++    def __repr__(self) -> str:
++        return f"Table({self._node!r})"
++
++    def _collect_rows(self) -> list[_Row]:
++        """Return the rows of the table, in order."""
++        rows: list[_Row] = []
++        groups = 0
++
++        def scan(container: Wikicode, nodes: list[Node]) -> None:
++            nonlocal groups
++            groups += 1
++            loose: _Row | None = None
++            for node in nodes:
++                if _is_cell(node):
++                    if loose is None:
++                        loose = _Row(container, groups)
++                        rows.append(loose)
++                    loose.cells.append(node)
++                    continue
++                if not (isinstance(node, Text) and not node.value.strip()):
++                    loose = None
++                if _is_tag(node, "tr"):
++                    row = _Row(node.contents, groups)
++                    row.cells = [
++                        child for child in node.contents.nodes if _is_cell(child)
++                    ]
++                    rows.append(row)
++
++        contents = self._node.contents
++        run: list[Node] = []
++        for node in contents.nodes:
++            if _is_tag(node, "thead", "tbody", "tfoot"):
++                if run:
++                    scan(contents, run)
++                    run = []
++                scan(node.contents, node.contents.nodes)
++            else:
++                run.append(node)
++        if run:
++            scan(contents, run)
++        return rows
++
++    def _layout(self) -> _Layout:
++        return _Layout(self._collect_rows())
++
++    @property
++    def node(self) -> Tag:
++        """The :class:`.Tag` of the table."""
++        return self._node
++
++    @property
++    def cells(self) -> list[Tag]:
++        """The cells of the table, row by row, in the order they appear."""
++        return [placement.cell for placement in self._layout().placements]
++
++    @property
++    def grid(self) -> list[list[Tag | None]]:
++        """The grid of the table as a list of rows.
++
++        Every row has one entry per column: the cell covering that slot, or
++        ``None`` where no cell does.
++        """
++        layout = self._layout()
++        return [
++            [layout.owners.get((row, column)) for column in range(layout.width)]
++            for row in range(layout.height)
++        ]
++
++    def position(self, cell: Tag) -> tuple[int, int]:
++        """Return the ``(row, column)`` of the top-left slot of *cell*.
++
++        Raises :exc:`ValueError` if *cell* is not a cell of this table.
++        """
++        placement = self._layout().find(cell)
++        return (placement.row, placement.column)
++
++    def span(self, cell: Tag) -> tuple[int, int]:
++        """Return the number of rows and columns *cell* covers on the grid.
++
++        Raises :exc:`ValueError` if *cell* is not a cell of this table.
++        """
++        placement = self._layout().find(cell)
++        return (placement.rowspan, placement.colspan)
++
++    def _new_cell(self, name: str) -> Tag:
++        if self._node.wiki_markup:
++            cell = Tag(name, "\n")
++            _set_wiki_markup(cell, "!" if name == "th" else "|")
++            return cell
++        return Tag(name)
++
++    def _insert(self, row: _Row, before: Tag | None, cell: Tag) -> None:
++        """Insert the new *cell* into *row*, ahead of *before* if given."""
++        container = row.container
++        if before is not None:
++            index = container.index(before)
++            if cell.wiki_markup and before.wiki_markup in _INLINE_MARKUP:
++                cast(Tag, container.get(index - 1)).contents.append("\n")
++                _set_wiki_markup(before, _line_marker(before))
++            container.insert(index, cell)
++            return
++        index = (
++            container.index(row.cells[-1]) + 1 if row.cells else len(container.nodes)
++        )
++        if cell.wiki_markup and index:
++            previous = container.get(index - 1)
++            if not str(previous).endswith("\n"):
++                if isinstance(previous, Tag) and previous.wiki_markup:
++                    previous.contents.append("\n")
++                else:
++                    container.insert(index, "\n")
++                    index += 1
++        container.insert(index, cell)
++
++    def _remove(self, row: _Row, cell: Tag) -> None:
++        """Remove *cell* from *row*, keeping the lines around it intact."""
++        container = row.container
++        index = container.index(cell)
++        if cell.wiki_markup:
++            ends_line = str(cell.contents).endswith("\n")
++            if cell.wiki_markup in _INLINE_MARKUP:
++                if ends_line:
++                    cast(Tag, container.get(index - 1)).contents.append("\n")
++            elif not ends_line and index + 1 < len(container.nodes):
++                following = container.get(index + 1)
++                if (
++                    isinstance(following, Tag)
++                    and following.wiki_markup in _INLINE_MARKUP
++                ):
++                    _set_wiki_markup(following, _line_marker(following))
++        container.nodes.pop(index)
++
++    def _set_span(self, cell: Tag, name: str, value: int) -> None:
++        attrs = [attr for attr in cell.attributes if attr.name.strip().lower() == name]
++        if value == 1:
++            cell.attributes[:] = [
++                attr for attr in cell.attributes if not any(attr is a for a in attrs)
++            ]
++            if cell.wiki_markup and not cell.attributes:
++                cell.padding = ""
++                cell.wiki_style_separator = None
++        elif attrs:
++            attrs[-1].value = str(value)
++        else:
++            cell.add(name, str(value))
++            if cell.wiki_markup and not cell.wiki_style_separator:
++                cell.padding = " "
++                cell.wiki_style_separator = "|"
++
++    def merge(self, top: int, left: int, bottom: int, right: int) -> Tag:
++        """Merge the slots from ``(top, left)`` to ``(bottom, right)``.
++
++        The cell at the top-left slot grows to cover the whole region and every
++        other cell inside it is removed. Returns the merged cell.
++
++        Raises :exc:`IndexError` if a corner of the region is not on the grid,
++        and :exc:`ValueError` without changing anything if the corners are out
++        of order, no cell covers the top-left slot, a cell covers slots both
++        inside and outside the region, a removed cell is not blank, or the
++        region crosses a row group.
++        """
++        layout = self._layout()
++        layout.check(top, left)
++        layout.check(bottom, right)
++        if top > bottom or left > right:
++            raise ValueError((top, left, bottom, right))
++        anchor = layout.owners.get((top, left))
++        if anchor is None:
++            raise ValueError((top, left))
++        if layout.rows[top].group != layout.rows[bottom].group:
++            raise ValueError("region crosses a row group")
++        involved = [
++            placement
++            for placement in layout.placements
++            if placement.meets(top, left, bottom, right)
++        ]
++        for placement in involved:
++            if not placement.inside(top, left, bottom, right):
++                raise ValueError(placement.cell)
++            if placement.cell is not anchor and str(placement.cell.contents).strip():
++                raise ValueError(placement.cell)
++        for placement in involved:
++            if placement.cell is not anchor:
++                self._remove(layout.rows[placement.row], placement.cell)
++        self._set_span(anchor, "rowspan", bottom - top + 1)
++        self._set_span(anchor, "colspan", right - left + 1)
++        return anchor
++
++    def split(self, row: int, column: int) -> list[Tag]:
++        """Split the cell covering the slot at ``(row, column)``.
++
++        The cell shrinks to its top-left slot and each other slot it covered
++        gets a new, empty cell of the same kind. Returns the new cells, row by
++        row and left to right.
++
++        Raises :exc:`IndexError` if the slot is not on the grid and
++        :exc:`ValueError` if no cell covers it.
++        """
++        layout = self._layout()
++        layout.check(row, column)
++        cell = layout.owners.get((row, column))
++        if cell is None:
++            raise ValueError((row, column))
++        placement = layout.find(cell)
++        name = "th" if _is_tag(cell, "th") else "td"
++        self._set_span(cell, "rowspan", 1)
++        self._set_span(cell, "colspan", 1)
++        created = []
++        for i in range(placement.row, placement.row + placement.rowspan):
++            for j in range(placement.column, placement.column + placement.colspan):
++                if (i, j) == (placement.row, placement.column):
++                    continue
++                if layout.owners.get((i, j)) is not cell:
++                    continue
++                new = self._new_cell(name)
++                before = layout.following(i, j)
++                self._insert(layout.rows[i], before, new)
++                if before is None:
++                    layout.rows[i].cells.append(new)
++                created.append(new)
++        return created
+diff --git a/src/mwparserfromhell/wikicode.py b/src/mwparserfromhell/wikicode.py
+index 482d937..4accec4 100644
+--- a/src/mwparserfromhell/wikicode.py
++++ b/src/mwparserfromhell/wikicode.py
+@@ -40,6 +40,7 @@ from .nodes import (
+ )
+ from .smart_list.list_proxy import ListProxy
+ from .string_mixin import StringMixIn
++from .table import Table
+ from .utils import parse_anything
+ 
+ __all__ = ["Wikicode"]
+@@ -1015,6 +1016,18 @@ class Wikicode(StringMixIn):
+         # Ensure that earlier sections are earlier in the returned list:
+         return [section for i, section in sorted(sections)]
+ 
++    def get_tables(self) -> list[Table]:
++        """Return a :class:`.Table` for each table in the wikicode.
++
++        Tables nested inside other nodes, including other tables, are
++        included. They are listed in the order they start in the text.
++        """
++        return [
++            Table(node)
++            for node in self.ifilter_tags(recursive=True)
++            if node.tag.strip().lower() == "table"
++        ]
++
+     def strip_code(
+         self,
+         normalize: bool = True,

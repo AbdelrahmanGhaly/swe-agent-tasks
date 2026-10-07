@@ -1,0 +1,1399 @@
+diff --git a/crates/syncpack-specifier/src/git.rs b/crates/syncpack-specifier/src/git.rs
+index 21e9795a..aaebfb8d 100644
+--- a/crates/syncpack-specifier/src/git.rs
++++ b/crates/syncpack-specifier/src/git.rs
+@@ -1,5 +1,5 @@
+ use {
+-  crate::{Specifier, semver_range::SemverRange},
++  crate::{HUGE, Specifier, semver_range::SemverRange},
+   std::rc::Rc,
+ };
+ 
+@@ -69,6 +69,18 @@ pub struct Git {
+   pub semver_range: Option<SemverRange>,
+ }
+ 
++/// The version a `#semver:` selector carries, so that a shorthand such as "1.2"
++/// can be compared and elected like any other version. It is padded the way the
++/// minor and major specifiers pad theirs.
++fn selector_version(bare_version: &str) -> Option<Rc<node_semver::Version>> {
++  let padded = match bare_version.split('.').count() {
++    1 => format!("{bare_version}.{HUGE}.{HUGE}"),
++    2 => format!("{bare_version}.{HUGE}"),
++    _ => bare_version.to_string(),
++  };
++  Specifier::new_node_version(&padded)
++}
++
+ impl Git {
+   pub fn create(raw: &str) -> Specifier {
+     raw
+@@ -120,13 +132,18 @@ impl Git {
+           let semver_range = SemverRange::parse(tag);
+           let range_str = semver_range.unwrap();
+           let bare_version = tag.strip_prefix(&range_str).unwrap_or(tag);
++          // npm allows "=1.2.3" as an exact version, so it is stripped here the way
++          // an exact specifier strips it and every later rewrite sees the same
++          // version this parsed
++          let bare_version = bare_version.strip_prefix('=').unwrap_or(bare_version);
+ 
+           // Parse the bare version - note that node_range can parse shorthand like "^1"
+-          // but node_version requires complete versions like "1.0.0"
+-          let node_version = Specifier::new_node_version(bare_version);
++          // and equality forms like "=1.2.3" which node_version cannot, so the version
++          // a selector carries is read here rather than from node_version alone
++          let node_version = selector_version(bare_version);
+ 
+-          // Valid semver tag - store semver_number and semver_range even for shorthand
+-          // versions where node_version parsing fails
++          // Valid semver tag - store semver_number and semver_range alongside the
++          // completed version, so the selector can still be read back as written
+           Specifier::Git(Self {
+             raw: raw.to_string(),
+             node_range: Some(node_range.unwrap()),
+diff --git a/crates/syncpack-specifier/src/lib.rs b/crates/syncpack-specifier/src/lib.rs
+index a8cbc4f4..30b1d490 100644
+--- a/crates/syncpack-specifier/src/lib.rs
++++ b/crates/syncpack-specifier/src/lib.rs
+@@ -608,8 +608,9 @@ impl Specifier {
+       }
+       Self::Git(s) => s.semver_number.as_ref().map(|semver_number| {
+         if range_str.is_empty() {
+-          // Exact version: use #version
+-          Self::new(&format!("{}#{}", s.origin, semver_number))
++          // Exact version: use #version, keeping a semver: marker the source had
++          let selector = if s.raw.contains("#semver:") { "semver:" } else { "" };
++          Self::new(&format!("{}#{}{}", s.origin, selector, semver_number))
+         } else {
+           // Range: use #semver:range+version
+           Self::new(&format!("{}#semver:{}{}", s.origin, range_str, semver_number))
+@@ -716,10 +717,11 @@ impl Specifier {
+             _ => version_str.clone(),
+           };
+ 
+-          // Rebuild git URL with new version
+-          // Note: Output format is always origin#range+version, not
+-          // origin#semver:range+version
+-          Self::new(&format!("{}#{}{}", g.origin, range_str, formatted_version))
++          // Rebuild git URL with new version, keeping a `semver:` selector when
++          // the original had one so the result stays a semver range rather than
++          // becoming a committish
++          let selector = if g.raw.contains("#semver:") { "semver:" } else { "" };
++          Self::new(&format!("{}#{}{}{}", g.origin, selector, range_str, formatted_version))
+         })
+       }
+ 
+@@ -741,7 +743,7 @@ impl Specifier {
+ impl Specifier {
+   /// Check if this specifier has a version that should be used for comparison.
+   /// Returns false for Latest (which has HUGE version only for sorting purposes).
+-  fn has_comparable_version(&self) -> bool {
++  pub fn has_comparable_version(&self) -> bool {
+     match self {
+       Self::Latest(_) => false,
+       Self::Alias(a) => !matches!(&*a.inner_specifier, Self::Latest(_)) && a.inner_specifier.get_node_version().is_some(),
+diff --git a/npm/syncpack.ts b/npm/syncpack.ts
+index 501fd42a..247aacb7 100644
+--- a/npm/syncpack.ts
++++ b/npm/syncpack.ts
+@@ -155,9 +155,23 @@ namespace VersionGroup {
+     /** @see https://syncpack.dev/version-groups/range-only/#severity */
+     severity?: { SemverRangeMismatch?: Severity };
+   }
++  /**
++   * How a version group divides a dependency's instances before it elects a
++   * preferred version. Either a named dimension or the semver ranges to sort
++   * each instance into, tried in the order they are written.
++   *
++   * @see https://syncpack.dev/version-groups/highest-semver/#partitionby
++   */
++  export type PartitionBy = 'major' | 'minor' | 'releaseChannel' | string[];
+   export interface SameMinor extends GroupSelector {
+     /** @see https://syncpack.dev/version-groups/same-minor/#policy */
+     policy: 'sameMinor';
++    /** @see https://syncpack.dev/version-groups/same-minor/#preferversion */
++    preferVersion?: 'highestSemver' | 'lowestSemver';
++    /** @see https://syncpack.dev/version-groups/same-minor/#partitionby */
++    partitionBy?: PartitionBy;
++    /** @see https://syncpack.dev/version-groups/same-minor/#maxpartitions */
++    maxPartitions?: number;
+     /** @see https://syncpack.dev/version-groups/same-minor/#severity */
+     severity?: {
+       DiffersToHighestOrLowestSemverMinor?: Severity;
+@@ -169,6 +183,10 @@ namespace VersionGroup {
+   export interface Standard extends GroupSelector {
+     /** @see https://syncpack.dev/version-groups/lowest-semver/#preferversion */
+     preferVersion?: 'highestSemver' | 'lowestSemver';
++    /** @see https://syncpack.dev/version-groups/highest-semver/#partitionby */
++    partitionBy?: PartitionBy;
++    /** @see https://syncpack.dev/version-groups/highest-semver/#maxpartitions */
++    maxPartitions?: number;
+     /** @see https://syncpack.dev/version-groups/highest-semver/#severity */
+     severity?: {
+       SemverRangeMismatch?: Severity;
+@@ -266,6 +284,8 @@ export type JsonOutput = {
+   dependencyGroup: string;
+   dependencyType: DependencyType;
+   package: string;
++  /** The partition this instance was placed in, or null when it was not partitioned */
++  partition: string | null;
+   property: string[];
+   strategy: CustomType.Any['strategy'];
+   versionGroup: VersionGroupVariant;
+@@ -344,6 +364,7 @@ export type StatusCode =
+   | 'SemverRangeMismatch'
+   | 'DependsOnInvalidLocalPackage'
+   | 'NonSemverMismatch'
++  | 'PartitionLimitExceeded'
+   | 'SameRangeMismatch'
+   | 'SameMinorMismatch'
+   | 'DependsOnMissingSnapTarget'
+diff --git a/site/remark-plugins/link-aliases.mjs b/site/remark-plugins/link-aliases.mjs
+index 53479f21..6172d11f 100644
+--- a/site/remark-plugins/link-aliases.mjs
++++ b/site/remark-plugins/link-aliases.mjs
+@@ -129,6 +129,7 @@ export function linkAliases() {
+     STATUS_NON_SEMVER_MISMATCH: '/status/non-semver-mismatch/',
+     STATUS_NOT_USING_CATALOG: '/status/not-using-catalog/',
+     STATUS_NOT_USING_CATALOG_AND_CATALOG_UNKNOWN: '/status/not-using-catalog-and-catalog-unknown/',
++    STATUS_PARTITION_LIMIT_EXCEEDED: '/status/partition-limit-exceeded/',
+     STATUS_PIN_OVERRIDES_SEMVER_RANGE: '/status/pin-overrides-semver-range/',
+     STATUS_PIN_OVERRIDES_SEMVER_RANGE_MISMATCH: '/status/pin-overrides-semver-range-mismatch/',
+     STATUS_REFUSE_TO_BAN_LOCAL: '/status/refuse-to-ban-local/',
+diff --git a/site/src/content/docs/status/partition-limit-exceeded.mdx b/site/src/content/docs/status/partition-limit-exceeded.mdx
+new file mode 100644
+index 00000000..4fcde258
+--- /dev/null
++++ b/site/src/content/docs/status/partition-limit-exceeded.mdx
+@@ -0,0 +1,20 @@
++---
++title: PartitionLimitExceeded
++status: unfixable
++description: Dependency is split into more partitions than its version group allows
++---
++
++import SeverityUnfixable from "@partials/severity/unfixable.mdx";
++
++## When this happens
++
++- ✓ Instance is in a version group with a `partitionBy` and a `maxPartitions`
++- ✘ Its dependency is divided into more partitions than `maxPartitions` allows
++- ? We cannot know which of those partitions you meant to keep
++
++Every instance of the dependency is reported, including any which could not be
++partitioned, and each keeps its own specifier.
++
++## Severity
++
++<SeverityUnfixable />
+diff --git a/site/src/content/docs/version-groups/highest-semver.mdx b/site/src/content/docs/version-groups/highest-semver.mdx
+index 5f35dda6..8a0b886a 100644
+--- a/site/src/content/docs/version-groups/highest-semver.mdx
++++ b/site/src/content/docs/version-groups/highest-semver.mdx
+@@ -35,6 +35,52 @@ Require all dependencies in this group to use the highest semver version found o
+ 
+ <Packages />
+ 
++### partitionBy <Badge text="Optional" variant="note" />
++
++Divide this group's instances before a preferred version is elected, so that each partition elects
++its own. Instances in different partitions are never compared, which lets a monorepo hold more than
++one major of a dependency on purpose.
++
++Set it to `major`, `minor`, `releaseChannel`, or a list of semver ranges which each instance is
++sorted into by the first range it satisfies.
++
++```json title=".syncpackrc.json"
++{
++  "versionGroups": [
++    {
++      "dependencies": ["zod"],
++      "partitionBy": "major"
++    }
++  ]
++}
++```
++
++An instance whose specifier has no version to compare, such as `workspace:*` or a tag, is not
++partitioned. Those instances stay grouped under the dependency's own name and are reported after all
++of its partitions. The same applies under `minor` to a specifier which pins only a major, such as
++`^1`, because it names no single minor.
++
++`syncpack json` reports each instance's partition under `partition`, and `syncpack list` gives each
++partition its own row headed by the dependency name and the partition key, such as `zod 3`.
++
++### maxPartitions <Badge text="Optional" variant="note" />
++
++The most partitions any one dependency in this group may be divided into. A dependency over that
++limit is reported as [PartitionLimitExceeded](STATUS_PARTITION_LIMIT_EXCEEDED) and is not resolved
++automatically. Instances which could not be partitioned do not count towards the limit.
++
++```json title=".syncpackrc.json"
++{
++  "versionGroups": [
++    {
++      "dependencies": ["zod"],
++      "partitionBy": "major",
++      "maxPartitions": 2
++    }
++  ]
++}
++```
++
+ ### severity <Badge text="Optional" variant="note" />
+ 
+ <SeverityGroupSection group="highestSemver">
+@@ -73,3 +119,7 @@ These are all the issues that a {frontmatter.title} Version Group can find:
+ 
+ - [MatchConflictsWithHighestOrLowestSemver](STATUS_MATCH_CONFLICTS_WITH_HIGHEST_OR_LOWEST_SEMVER)
+ - [MismatchConflictsWithHighestOrLowestSemver](STATUS_MISMATCH_CONFLICTS_WITH_HIGHEST_OR_LOWEST_SEMVER)
++
++### Unfixable
++
++- [PartitionLimitExceeded](STATUS_PARTITION_LIMIT_EXCEEDED)
+diff --git a/site/src/content/docs/version-groups/lowest-semver.mdx b/site/src/content/docs/version-groups/lowest-semver.mdx
+index 9bc7f1fe..401f9bed 100644
+--- a/site/src/content/docs/version-groups/lowest-semver.mdx
++++ b/site/src/content/docs/version-groups/lowest-semver.mdx
+@@ -52,6 +52,54 @@ Must be set to `lowestSemver`.
+ 
+ <Packages />
+ 
++### partitionBy <Badge text="Optional" variant="note" />
++
++Divide this group's instances before a preferred version is elected, so that each partition elects
++its own. Instances in different partitions are never compared, which lets a monorepo hold more than
++one major of a dependency on purpose.
++
++Set it to `major`, `minor`, `releaseChannel`, or a list of semver ranges which each instance is
++sorted into by the first range it satisfies.
++
++```json title=".syncpackrc.json"
++{
++  "versionGroups": [
++    {
++      "dependencies": ["zod"],
++      "preferVersion": "lowestSemver",
++      "partitionBy": "major"
++    }
++  ]
++}
++```
++
++An instance whose specifier has no version to compare, such as `workspace:*` or a tag, is not
++partitioned. Those instances stay grouped under the dependency's own name and are reported after all
++of its partitions. The same applies under `minor` to a specifier which pins only a major, such as
++`^1`, because it names no single minor.
++
++`syncpack json` reports each instance's partition under `partition`, and `syncpack list` gives each
++partition its own row headed by the dependency name and the partition key, such as `zod 3`.
++
++### maxPartitions <Badge text="Optional" variant="note" />
++
++The most partitions any one dependency in this group may be divided into. A dependency over that
++limit is reported as [PartitionLimitExceeded](STATUS_PARTITION_LIMIT_EXCEEDED) and is not resolved
++automatically. Instances which could not be partitioned do not count towards the limit.
++
++```json title=".syncpackrc.json"
++{
++  "versionGroups": [
++    {
++      "dependencies": ["zod"],
++      "preferVersion": "lowestSemver",
++      "partitionBy": "major",
++      "maxPartitions": 2
++    }
++  ]
++}
++```
++
+ ### severity <Badge text="Optional" variant="note" />
+ 
+ <SeverityGroupSection group="lowestSemver">
+@@ -91,3 +139,7 @@ These are all the issues that a {frontmatter.title} Version Group can find:
+ 
+ - [MatchConflictsWithHighestOrLowestSemver](STATUS_MATCH_CONFLICTS_WITH_HIGHEST_OR_LOWEST_SEMVER)
+ - [MismatchConflictsWithHighestOrLowestSemver](STATUS_MISMATCH_CONFLICTS_WITH_HIGHEST_OR_LOWEST_SEMVER)
++
++### Unfixable
++
++- [PartitionLimitExceeded](STATUS_PARTITION_LIMIT_EXCEEDED)
+diff --git a/site/src/content/docs/version-groups/same-minor.mdx b/site/src/content/docs/version-groups/same-minor.mdx
+index d43dcb96..dae812f9 100644
+--- a/site/src/content/docs/version-groups/same-minor.mdx
++++ b/site/src/content/docs/version-groups/same-minor.mdx
+@@ -84,6 +84,56 @@ Setting a `preferVersion` loosens this requirement, but beware of dependencies w
+ 
+ <Packages />
+ 
++### partitionBy <Badge text="Optional" variant="note" />
++
++Divide this group's instances before a preferred version is elected, so that each partition elects
++its own. Instances in different partitions are never compared, which lets a monorepo hold more than
++one major of a dependency on purpose.
++
++Set it to `major`, `minor`, `releaseChannel`, or a list of semver ranges which each instance is
++sorted into by the first range it satisfies.
++
++```json title=".syncpackrc.json"
++{
++  "versionGroups": [
++    {
++      "dependencies": ["zod"],
++      "policy": "sameMinor",
++      "preferVersion": "highestSemver",
++      "partitionBy": "major"
++    }
++  ]
++}
++```
++
++An instance whose specifier has no version to compare, such as `workspace:*` or a tag, is not
++partitioned. Those instances stay grouped under the dependency's own name and are reported after all
++of its partitions. The same applies under `minor` to a specifier which pins only a major, such as
++`^1`, because it names no single minor.
++
++`syncpack json` reports each instance's partition under `partition`, and `syncpack list` gives each
++partition its own row headed by the dependency name and the partition key, such as `zod 3`.
++
++### maxPartitions <Badge text="Optional" variant="note" />
++
++The most partitions any one dependency in this group may be divided into. A dependency over that
++limit is reported as [PartitionLimitExceeded](STATUS_PARTITION_LIMIT_EXCEEDED) and is not resolved
++automatically. Instances which could not be partitioned do not count towards the limit.
++
++```json title=".syncpackrc.json"
++{
++  "versionGroups": [
++    {
++      "dependencies": ["zod"],
++      "policy": "sameMinor",
++      "preferVersion": "highestSemver",
++      "partitionBy": "major",
++      "maxPartitions": 2
++    }
++  ]
++}
++```
++
+ ### severity <Badge text="Optional" variant="note" />
+ 
+ <SeverityGroupSection group="sameMinor">
+@@ -125,6 +175,8 @@ These are all the issues that a {frontmatter.title} Version Group can find:
+ 
+ ### Unfixable
+ 
++- [PartitionLimitExceeded](STATUS_PARTITION_LIMIT_EXCEEDED)
++
+ - [SameMinorHasMajorMismatch](STATUS_SAME_MINOR_HAS_MAJOR_MISMATCH)
+ - [SameMinorMismatch](STATUS_SAME_MINOR_MISMATCH)
+ - [NonSemverMismatch](STATUS_NON_SEMVER_MISMATCH)
+diff --git a/src/commands/json.rs b/src/commands/json.rs
+index 22227768..ee34eb92 100644
+--- a/src/commands/json.rs
++++ b/src/commands/json.rs
+@@ -20,6 +20,7 @@ pub fn instance_to_json(ctx: &Context, instance: &Instance, variant_label: &str)
+     "dependencyGroup": instance.descriptor.internal_name,
+     "dependencyType": instance.descriptor.dependency_type.name,
+     "package": package_path,
++    "partition": instance.partition.borrow().clone(),
+     "property": instance.descriptor.dependency_type.path.split('/').filter(|part| !part.is_empty()).collect::<Vec<&str>>(),
+     "strategy": instance.descriptor.dependency_type.strategy,
+     "versionGroup": variant_label,
+diff --git a/src/commands/ui/dependency.rs b/src/commands/ui/dependency.rs
+index 7097fda5..cc86d8d9 100644
+--- a/src/commands/ui/dependency.rs
++++ b/src/commands/ui/dependency.rs
+@@ -160,7 +160,7 @@ fn get_invalid_status_codes_in_brackets(ctx: &Context, dependency: &DependencyCo
+ fn get_common_parts(ctx: &Context, dependency: &DependencyCore, _group_variant: &str) -> (String, String, String, String, String, String) {
+   let instances_len = dependency.instances.len();
+   let count_column = ui::util::count_column(instances_len);
+-  let name = dependency.internal_name.to_string();
++  let name = dependency.display_name();
+   let local_hint = get_local_hint(ctx, dependency);
+   let alias_hint = get_alias_hint(dependency);
+   let expected_specifier = if ctx.config.cli.show_instances {
+diff --git a/src/errors.rs b/src/errors.rs
+index 1f1eb349..f3591b41 100644
+--- a/src/errors.rs
++++ b/src/errors.rs
+@@ -29,6 +29,12 @@ pub enum UnsupportedConfigError {
+   InvalidSemverGroup,
+   #[error("Invalid update group: must have isIgnored or target")]
+   InvalidUpdateGroup,
++  #[error("Unrecognised version group partitionBy: '{0}'")]
++  InvalidVersionGroupPartition(String),
++  #[error("Invalid version group maxPartitions: {0}")]
++  InvalidVersionGroupPartitionLimit(String),
++  #[error("partitionBy is not supported on {group_type} version groups, only groups which elect a preferred version can be partitioned")]
++  PartitioningNotSupported { group_type: String },
+   #[error("Unrecognised version group policy: '{0}'")]
+   InvalidVersionGroupPolicy(String),
+   #[error("severity key '{key}' is not valid on a {group_type} group at {path}. Permitted: {}.", permitted.join(", "))]
+diff --git a/src/instance.rs b/src/instance.rs
+index d9941c34..ed6fa7a8 100644
+--- a/src/instance.rs
++++ b/src/instance.rs
+@@ -81,6 +81,11 @@ pub struct Instance {
+   /// by Version Groups when determining the preferred version, so it tries
+   /// to also satisfy any applicable semver group ranges.
+   pub preferred_semver_range: Option<SemverRange>,
++  /// The partition this instance was placed in by its version group's
++  /// `partitionBy`, assigned while the group collects its instances.
++  /// `None` when the group does not partition, or when the specifier has no
++  /// comparable version to divide on.
++  pub partition: RefCell<Option<String>>,
+   /// If this instance matched an `updateGroups` entry, the policy applied
+   /// when picking eligible registry updates (skip entirely or clamp the
+   /// effective `UpdateTarget`). `None` when no group matched.
+@@ -110,6 +115,7 @@ impl Instance {
+       expected_specifier: RefCell::new(None),
+       id,
+       is_local_instance,
++      partition: RefCell::new(None),
+       preferred_semver_range,
+       preferred_update_policy,
+       severity: RefCell::new(None),
+diff --git a/src/instance/instance_state.rs b/src/instance/instance_state.rs
+index 08d92e2a..fd9bb063 100644
+--- a/src/instance/instance_state.rs
++++ b/src/instance/instance_state.rs
+@@ -311,6 +311,10 @@ pub enum UnfixableInstance {
+   /// - ✘ Instance does not use the catalog: protocol
+   /// - ? Syncpack cannot determine which catalog the dependency belongs to
+   NotUsingCatalogAndCatalogUnknown,
++  /// - ✘ Instance's dependency is split into more partitions than its version
++  ///   group's maxPartitions allows
++  /// - ? We cannot know which partitions the user meant to keep
++  PartitionLimitExceeded,
+   /// - ✓ Instance is in a catalog version group
+   /// - ✓ Project has 0 catalogs
+   /// - ✘ `Disk.package_manager` is npm/yarn/Unknown — no recognized lock file
+diff --git a/src/version_group.rs b/src/version_group.rs
+index 5ef30b77..07a537b1 100644
+--- a/src/version_group.rs
++++ b/src/version_group.rs
+@@ -18,7 +18,7 @@ use {
+   std::{
+     cell::RefCell,
+     cmp::Ordering,
+-    collections::{BTreeMap, HashMap},
++    collections::{BTreeMap, HashMap, HashSet},
+     rc::Rc,
+   },
+   syncpack_specifier::update_target::UpdateTarget,
+@@ -37,6 +37,7 @@ mod catalog_defs_test;
+ #[path = "version_group/catalog_test.rs"]
+ mod catalog_test;
+ mod ignored;
++mod partition;
+ mod pinned;
+ mod preferred_semver;
+ mod same_minor;
+@@ -72,6 +73,8 @@ pub struct AnyVersionGroup {
+   pub policy: Option<String>,
+   pub snap_to: Option<Vec<String>>,
+   pub prefer_version: Option<String>,
++  pub partition_by: Option<RawPartitionBy>,
++  pub max_partitions: Option<usize>,
+   #[serde(default)]
+   pub severity: SeverityMap,
+   #[serde(flatten)]
+@@ -79,8 +82,16 @@ pub struct AnyVersionGroup {
+ }
+ 
+ pub use {
+-  banned::BannedGroup, catalog::CatalogGroup, catalog_defs::CatalogDefsGroup, ignored::IgnoredGroup, pinned::PinnedGroup,
+-  preferred_semver::PreferredSemverGroup, same_minor::SameMinorGroup, same_range::SameRangeGroup, semver_range_only::SemverRangeOnlyGroup,
++  banned::BannedGroup,
++  catalog::CatalogGroup,
++  catalog_defs::CatalogDefsGroup,
++  ignored::IgnoredGroup,
++  partition::{PartitionBy, PartitionOrder, RawPartitionBy, partition_name},
++  pinned::PinnedGroup,
++  preferred_semver::PreferredSemverGroup,
++  same_minor::SameMinorGroup,
++  same_range::SameRangeGroup,
++  semver_range_only::SemverRangeOnlyGroup,
+   snapped_to::SnappedToGroup,
+ };
+ 
+@@ -95,6 +106,15 @@ pub(crate) const L8: &str = "                ";
+ pub(crate) const L9: &str = "                  ";
+ pub(crate) const L10: &str = "                    ";
+ 
++/// How a dependency's instances are grouped inside a version group: its
++/// internal name, plus the partition it was divided into when its group
++/// partitions. Keeping the two apart means a dependency group whose alias
++/// happens to read like a partitioned name can never collide with one.
++pub type DependencyKey = (String, Option<String>);
++
++/// The dependencies a version group has collected, keyed by [`DependencyKey`].
++pub type Dependencies = BTreeMap<DependencyKey, DependencyCore>;
++
+ #[derive(Debug)]
+ pub struct DependencyCore {
+   pub expected: RefCell<Option<Rc<Specifier>>>,
+@@ -102,19 +122,42 @@ pub struct DependencyCore {
+   pub instances: Vec<InstanceIdx>,
+   pub local_instance: RefCell<Option<InstanceIdx>>,
+   pub internal_name: String,
++  /// The partition its instances share, when its version group partitions
++  /// them. `None` when the group does not partition, or when none of its
++  /// instances had a comparable version to divide on.
++  pub partition: Option<String>,
++  /// Where its partition sits in the order the user configured, when its
++  /// version group orders partitions itself rather than by version.
++  pub partition_rank: Option<usize>,
+ }
+ 
+ impl DependencyCore {
+   fn new(internal_name: String) -> Self {
++    Self::with_partition(internal_name, None, None)
++  }
++
++  fn with_partition(internal_name: String, partition: Option<String>, partition_rank: Option<usize>) -> Self {
+     Self {
+       expected: RefCell::new(None),
+       has_alias: false,
+       instances: vec![],
+       local_instance: RefCell::new(None),
+       internal_name,
++      partition,
++      partition_rank,
+     }
+   }
+ 
++  /// The name to show a user, which names the partition when there is one so
++  /// that the several partitions of one dependency can be told apart.
++  pub fn display_name(&self) -> String {
++    partition_name(&self.internal_name, self.partition.as_deref())
++  }
++
++  pub fn partition_order(&self) -> PartitionOrder {
++    PartitionOrder::new(self.partition.as_deref(), self.partition_rank)
++  }
++
+   pub fn get_update_url(&self, arena: &[Instance]) -> Option<UpdateUrl> {
+     if self.internal_name_is_supported() {
+       self.instances.iter().find_map(|idx| arena[idx.0].get_update_url())
+@@ -217,10 +260,87 @@ impl DependencyCore {
+   }
+ }
+ 
+-pub(crate) fn add_instance_to_dependencies(dependencies: &mut BTreeMap<String, DependencyCore>, idx: InstanceIdx, instance: &Instance) {
++pub(crate) fn add_instance_to_dependencies(dependencies: &mut Dependencies, idx: InstanceIdx, instance: &Instance) {
+   let dep = dependencies
+-    .entry(instance.descriptor.internal_name.clone())
++    .entry((instance.descriptor.internal_name.clone(), None))
+     .or_insert_with(|| DependencyCore::new(instance.descriptor.internal_name.clone()));
++  push_instance(dep, idx, instance);
++}
++
++/// The dependencies in a group which it has divided into more partitions than
++/// its `maxPartitions` allows. Instances with no comparable version are gathered
++/// under the dependency's own name rather than a partition, so they never push a
++/// dependency over its limit.
++pub(crate) fn dependencies_over_partition_limit(dependencies: &Dependencies, max_partitions: Option<usize>) -> HashSet<&str> {
++  let Some(max_partitions) = max_partitions else {
++    return HashSet::new();
++  };
++  let mut counts: HashMap<&str, usize> = HashMap::new();
++  for dep in dependencies.values() {
++    if dep.partition.is_some() {
++      *counts.entry(dep.internal_name.as_str()).or_default() += 1;
++    }
++  }
++  counts
++    .into_iter()
++    .filter(|(_, count)| *count > max_partitions)
++    .map(|(internal_name, _)| internal_name)
++    .collect()
++}
++
++/// A cap on how many partitions a dependency may be split into is only
++/// meaningful when the group partitions, and a cap of zero would reject every
++/// partitioned dependency, so both are reported as config mistakes.
++fn validate_max_partitions(max_partitions: Option<usize>, is_partitioned: bool) -> Result<Option<usize>, UnsupportedConfigError> {
++  match max_partitions {
++    None => Ok(None),
++    Some(0) => Err(UnsupportedConfigError::InvalidVersionGroupPartitionLimit(
++      "a group cannot allow zero partitions".to_string(),
++    )),
++    Some(_) if !is_partitioned => Err(UnsupportedConfigError::InvalidVersionGroupPartitionLimit(
++      "maxPartitions needs partitionBy".to_string(),
++    )),
++    Some(limit) => Ok(Some(limit)),
++  }
++}
++
++/// Only groups which elect a preferred version divide their instances, so
++/// asking any other kind of group to partition is reported instead of being
++/// quietly dropped.
++fn reject_partitioning_of_other_group_types(
++  is_banned: &Option<bool>,
++  is_ignored: &Option<bool>,
++  pin_version: &Option<String>,
++  policy: &Option<String>,
++  prefer_version: &Option<String>,
++  snap_to: &Option<Vec<String>>,
++) -> Result<(), UnsupportedConfigError> {
++  // A sameMinor group elects a preferred MAJOR.MINOR when it is given a
++  // preferVersion, so it partitions like any other electing group. Without one
++  // it elects nothing and there is no per-partition winner to pick.
++  let elects_within_a_policy = matches!(policy.as_deref(), Some("sameMinor")) && prefer_version.is_some();
++  let conflict = if matches!(is_banned, Some(true)) {
++    Some("isBanned")
++  } else if matches!(is_ignored, Some(true)) {
++    Some("isIgnored")
++  } else if pin_version.is_some() {
++    Some("pinVersion")
++  } else if snap_to.is_some() {
++    Some("snapTo")
++  } else if elects_within_a_policy {
++    None
++  } else {
++    policy.as_deref()
++  };
++  match conflict {
++    Some(group_type) => Err(UnsupportedConfigError::PartitioningNotSupported {
++      group_type: group_type.to_string(),
++    }),
++    None => Ok(()),
++  }
++}
++
++fn push_instance(dep: &mut DependencyCore, idx: InstanceIdx, instance: &Instance) {
+   dep.instances.push(idx);
+   if instance.is_local_instance {
+     *dep.local_instance.borrow_mut() = Some(idx);
+@@ -230,6 +350,23 @@ pub(crate) fn add_instance_to_dependencies(dependencies: &mut BTreeMap<String, D
+   }
+ }
+ 
++/// Group an instance under an explicit key. The key may divide one dependency
++/// into several partitions, so the stored `internal_name` remains the
++/// dependency's real name and only the grouping changes.
++pub(crate) fn add_instance_to_partition(
++  dependencies: &mut Dependencies,
++  partition: Option<String>,
++  partition_rank: Option<usize>,
++  idx: InstanceIdx,
++  instance: &Instance,
++) {
++  *instance.partition.borrow_mut() = partition.clone();
++  let dep = dependencies
++    .entry((instance.descriptor.internal_name.clone(), partition.clone()))
++    .or_insert_with(|| DependencyCore::with_partition(instance.descriptor.internal_name.clone(), partition, partition_rank));
++  push_instance(dep, idx, instance);
++}
++
+ /// Sort registry updates DESC by node version. Pre-computed once per
+ /// dependency so per-instance lookups can early-exit on first match.
+ pub(super) fn sort_updates_desc(updates: &[Rc<Specifier>]) -> Vec<Rc<Specifier>> {
+@@ -287,7 +424,7 @@ mod dependency_core_test {
+ 
+ pub trait VersionGroupBehavior {
+   fn selector(&self) -> &GroupSelector;
+-  fn dependencies(&self) -> &BTreeMap<String, DependencyCore>;
++  fn dependencies(&self) -> &Dependencies;
+   fn add_instance(&mut self, idx: InstanceIdx, instance: &Instance);
+   fn visit(&self, ctx: &Context, registry_updates: &Option<RegistryUpdates>);
+ }
+@@ -327,7 +464,7 @@ impl VersionGroupBehavior for VersionGroup {
+     }
+   }
+ 
+-  fn dependencies(&self) -> &BTreeMap<String, DependencyCore> {
++  fn dependencies(&self) -> &Dependencies {
+     match self {
+       Self::Banned(g) => &g.dependencies,
+       Self::Catalog(g) => &g.dependencies,
+@@ -400,9 +537,21 @@ impl VersionGroup {
+   }
+ 
+   pub fn get_sorted_dependencies(&self, sort: &SortBy) -> impl Iterator<Item = &DependencyCore> {
+-    self.dependencies().values().sorted_by(|a, b| match sort {
+-      SortBy::Count => b.instances.len().cmp(&a.instances.len()),
+-      SortBy::Name => Ordering::Equal,
++    let mut totals: HashMap<&str, usize> = HashMap::new();
++    for dep in self.dependencies().values() {
++      *totals.entry(dep.internal_name.as_str()).or_default() += dep.instances.len();
++    }
++    self.dependencies().values().sorted_by(move |a, b| {
++      // Sorting applies to whole dependencies. A dependency's partitions are an
++      // ordered sequence within it, so they are never interleaved with another
++      // dependency's, whichever order the dependencies themselves are in.
++      let by_dependency = match sort {
++        SortBy::Count => totals[b.internal_name.as_str()].cmp(&totals[a.internal_name.as_str()]),
++        SortBy::Name => Ordering::Equal,
++      };
++      by_dependency
++        .then_with(|| a.internal_name.cmp(&b.internal_name))
++        .then_with(|| a.partition_order().cmp(&b.partition_order()))
+     })
+   }
+ 
+@@ -420,6 +569,8 @@ impl VersionGroup {
+       selector: GroupSelector::new(vec![], vec![], "Default Version Group".into(), vec![], vec![]),
+       dependencies: BTreeMap::new(),
+       prefer_highest: true,
++      partition_by: None,
++      max_partitions: None,
+       severity: SeverityMap::new(),
+     })
+   }
+@@ -433,6 +584,19 @@ impl VersionGroup {
+       group.specifier_types,
+     );
+ 
++    let partition_by = group.partition_by.as_ref().map(PartitionBy::from_config).transpose()?;
++    let max_partitions = validate_max_partitions(group.max_partitions, partition_by.is_some())?;
++    if partition_by.is_some() || max_partitions.is_some() {
++      reject_partitioning_of_other_group_types(
++        &group.is_banned,
++        &group.is_ignored,
++        &group.pin_version,
++        &group.policy,
++        &group.prefer_version,
++        &group.snap_to,
++      )?;
++    }
++
+     if let Some(true) = group.is_banned {
+       let severity = validate_severity(group.severity, "Banned", index, BANNED_KEYS)?;
+       return Ok(Self::Banned(BannedGroup {
+@@ -479,6 +643,8 @@ impl VersionGroup {
+           selector,
+           dependencies: BTreeMap::new(),
+           prefer_version,
++          partition_by,
++          max_partitions,
+           severity,
+         }));
+       } else if policy == "catalog" {
+@@ -524,6 +690,8 @@ impl VersionGroup {
+         selector,
+         dependencies: BTreeMap::new(),
+         prefer_highest,
++        partition_by,
++        max_partitions,
+         severity,
+       }));
+     }
+@@ -532,6 +700,8 @@ impl VersionGroup {
+       selector,
+       dependencies: BTreeMap::new(),
+       prefer_highest: true,
++      partition_by,
++      max_partitions,
+       severity,
+     }))
+   }
+diff --git a/src/version_group/banned.rs b/src/version_group/banned.rs
+index 6b7789b5..2894c331 100644
+--- a/src/version_group/banned.rs
++++ b/src/version_group/banned.rs
+@@ -1,5 +1,5 @@
+ use {
+-  super::{DependencyCore, L1, L2, L3, L4, L5, add_instance_to_dependencies},
++  super::{Dependencies, L1, L2, L3, L4, L5, add_instance_to_dependencies},
+   crate::{
+     context::Context,
+     group_selector::GroupSelector,
+@@ -8,7 +8,6 @@ use {
+     specifier::Specifier,
+   },
+   log::debug,
+-  std::collections::BTreeMap,
+ };
+ 
+ #[cfg(test)]
+@@ -18,7 +17,7 @@ mod banned_test;
+ #[derive(Debug)]
+ pub struct BannedGroup {
+   pub selector: GroupSelector,
+-  pub dependencies: BTreeMap<String, DependencyCore>,
++  pub dependencies: Dependencies,
+   pub severity: SeverityMap,
+ }
+ 
+diff --git a/src/version_group/catalog.rs b/src/version_group/catalog.rs
+index f35828ef..89529fe3 100644
+--- a/src/version_group/catalog.rs
++++ b/src/version_group/catalog.rs
+@@ -1,5 +1,5 @@
+ use {
+-  super::{DependencyCore, L1, L2, L3, L4, L5, add_instance_to_dependencies},
++  super::{Dependencies, DependencyCore, L1, L2, L3, L4, L5, add_instance_to_dependencies},
+   crate::{
+     context::Context,
+     disk::PackageManager,
+@@ -9,13 +9,13 @@ use {
+     specifier::Specifier,
+   },
+   log::debug,
+-  std::{collections::BTreeMap, rc::Rc},
++  std::rc::Rc,
+ };
+ 
+ #[derive(Debug)]
+ pub struct CatalogGroup {
+   pub selector: GroupSelector,
+-  pub dependencies: BTreeMap<String, DependencyCore>,
++  pub dependencies: Dependencies,
+   pub severity: SeverityMap,
+ }
+ 
+diff --git a/src/version_group/catalog_defs.rs b/src/version_group/catalog_defs.rs
+index c66ab25f..e1148e0a 100644
+--- a/src/version_group/catalog_defs.rs
++++ b/src/version_group/catalog_defs.rs
+@@ -1,5 +1,5 @@
+ use {
+-  super::{DependencyCore, L1, L2, L3, L4, L5, add_instance_to_dependencies, highest_eligible_for, sort_updates_desc},
++  super::{Dependencies, L1, L2, L3, L4, L5, add_instance_to_dependencies, highest_eligible_for, sort_updates_desc},
+   crate::{
+     context::Context,
+     group_selector::GroupSelector,
+@@ -9,13 +9,13 @@ use {
+     semver_range::SemverRange,
+   },
+   log::debug,
+-  std::{collections::BTreeMap, rc::Rc},
++  std::rc::Rc,
+ };
+ 
+ #[derive(Debug)]
+ pub struct CatalogDefsGroup {
+   pub selector: GroupSelector,
+-  pub dependencies: BTreeMap<String, DependencyCore>,
++  pub dependencies: Dependencies,
+   pub severity: SeverityMap,
+ }
+ 
+diff --git a/src/version_group/ignored.rs b/src/version_group/ignored.rs
+index bd83bc0f..c3e1d3b4 100644
+--- a/src/version_group/ignored.rs
++++ b/src/version_group/ignored.rs
+@@ -1,5 +1,5 @@
+ use {
+-  super::{DependencyCore, L1, L2, add_instance_to_dependencies},
++  super::{Dependencies, L1, L2, add_instance_to_dependencies},
+   crate::{
+     context::Context,
+     group_selector::GroupSelector,
+@@ -7,7 +7,6 @@ use {
+     registry::updates::RegistryUpdates,
+   },
+   log::debug,
+-  std::collections::BTreeMap,
+ };
+ 
+ #[cfg(test)]
+@@ -17,7 +16,7 @@ mod ignored_test;
+ #[derive(Debug)]
+ pub struct IgnoredGroup {
+   pub selector: GroupSelector,
+-  pub dependencies: BTreeMap<String, DependencyCore>,
++  pub dependencies: Dependencies,
+   pub severity: SeverityMap,
+ }
+ 
+diff --git a/src/version_group/partition.rs b/src/version_group/partition.rs
+new file mode 100644
+index 00000000..dc697213
+--- /dev/null
++++ b/src/version_group/partition.rs
+@@ -0,0 +1,225 @@
++use {
++  crate::{errors::UnsupportedConfigError, specifier::Specifier},
++  serde::Deserialize,
++  std::{cmp::Ordering, rc::Rc},
++  syncpack_specifier::workspace_specifier::WorkspaceSpecifier,
++};
++
++/// The raw `partitionBy` value as written in the rcfile: either the name of a
++/// built-in dimension or a list of semver ranges.
++#[derive(Clone, Debug, Deserialize)]
++#[serde(untagged)]
++pub enum RawPartitionBy {
++  Named(String),
++  Ranges(Vec<String>),
++}
++
++/// One range a version group divides its instances by, kept alongside the text
++/// the user wrote so it can be reported back to them.
++#[derive(Clone, Debug)]
++pub struct PartitionRange {
++  pub raw: String,
++  pub range: Rc<node_semver::Range>,
++}
++
++/// The dimension a version group divides its instances into before a preferred
++/// version is elected. Each partition elects its own version, so instances in
++/// different partitions are never compared to one another.
++#[derive(Clone, Debug)]
++pub enum PartitionBy {
++  Major,
++  Minor,
++  ReleaseChannel,
++  Ranges(Vec<PartitionRange>),
++}
++
++impl PartitionBy {
++  /// Reject anything which is not a supported dimension or a list of parseable
++  /// ranges, so a typo is reported instead of silently disabling partitioning.
++  pub fn from_config(raw: &RawPartitionBy) -> Result<Self, UnsupportedConfigError> {
++    match raw {
++      RawPartitionBy::Named(name) => match name.as_str() {
++        "major" => Ok(Self::Major),
++        "minor" => Ok(Self::Minor),
++        "releaseChannel" => Ok(Self::ReleaseChannel),
++        other => Err(UnsupportedConfigError::InvalidVersionGroupPartition(other.to_string())),
++      },
++      RawPartitionBy::Ranges(raws) => {
++        if raws.is_empty() {
++          return Err(UnsupportedConfigError::InvalidVersionGroupPartition("[]".to_string()));
++        }
++        raws
++          .iter()
++          .map(|raw| match Specifier::new_node_range(raw) {
++            Some(range) => Ok(PartitionRange { raw: raw.clone(), range }),
++            None => Err(UnsupportedConfigError::InvalidVersionGroupPartition(raw.clone())),
++          })
++          .collect::<Result<Vec<PartitionRange>, UnsupportedConfigError>>()
++          .map(Self::Ranges)
++      }
++    }
++  }
++
++  /// The partition a specifier belongs to, or `None` when it has no comparable
++  /// version to divide on. A dependency which is itself a package in this
++  /// monorepo is never divided, so its instances keep the local package as the
++  /// single version they are all measured against. `latest`, `*`, `workspace:*`, catalogs, tags, files,
++  /// links and urls all fall into that case, as do git urls without a semver
++  /// fragment and aliases wrapping any of them.
++  pub fn key_for(&self, specifier: &Specifier) -> Option<String> {
++    let version = comparable_version(specifier)?;
++    match self {
++      Self::Major => Some(version.major.to_string()),
++      Self::Minor => {
++        if is_major_only(specifier) {
++          None
++        } else {
++          Some(format!("{}.{}", version.major, version.minor))
++        }
++      }
++      Self::ReleaseChannel => Some(release_channel_of(&version)),
++      Self::Ranges(ranges) => ranges
++        .iter()
++        .find(|partition| version.satisfies(&partition.range))
++        .map(|partition| partition.raw.clone()),
++    }
++  }
++
++  /// Where a partition sits in the order the user configured. Ranges are tried
++  /// in the order they are written, so they are reported in that same order
++  /// rather than by how their text happens to sort. Every other dimension
++  /// derives its key from the version itself and has no configured order.
++  pub fn rank_of(&self, partition: &str) -> Option<usize> {
++    match self {
++      Self::Ranges(ranges) => ranges.iter().position(|candidate| candidate.raw == partition),
++      _ => None,
++    }
++  }
++}
++
++/// The version a specifier carries for the purpose of partitioning.
++fn comparable_version(specifier: &Specifier) -> Option<Rc<node_semver::Version>> {
++  if resolves_to_latest(specifier) || !specifier.has_comparable_version() {
++    return None;
++  }
++  specifier.get_node_version()
++}
++
++/// Whether a specifier resolves to a `latest` value at any depth. `latest` and
++/// `x` carry a huge synthetic version so that they sort above everything, which
++/// is a sorting device rather than a version anyone pinned, so they name no
++/// partition however they are wrapped.
++fn resolves_to_latest(specifier: &Specifier) -> bool {
++  match specifier {
++    Specifier::Latest(_) => true,
++    Specifier::Alias(alias) => resolves_to_latest(&alias.inner_specifier),
++    Specifier::WorkspaceProtocol(workspace) => match &workspace.inner_specifier {
++      WorkspaceSpecifier::Resolved(inner) => resolves_to_latest(inner),
++      WorkspaceSpecifier::RangeOnly(_) => false,
++    },
++    _ => false,
++  }
++}
++
++/// Whether a specifier names a major version and nothing more, such as "1" or
++/// "^1". Such a specifier belongs to no single minor partition. This asks the
++/// specifier what form it takes rather than looking at the completed version,
++/// because the padding used to complete a shorthand is a value an exact
++/// specifier is also allowed to pin.
++fn is_major_only(specifier: &Specifier) -> bool {
++  match specifier {
++    Specifier::Major(_) | Specifier::RangeMajor(_) => true,
++    Specifier::Alias(alias) => is_major_only(&alias.inner_specifier),
++    Specifier::WorkspaceProtocol(workspace) => match &workspace.inner_specifier {
++      WorkspaceSpecifier::Resolved(inner) => is_major_only(inner),
++      WorkspaceSpecifier::RangeOnly(_) => false,
++    },
++    Specifier::Git(git) => git.semver_number.as_ref().is_some_and(|number| !number.contains('.')),
++    _ => false,
++  }
++}
++
++/// The release channel of a version: `stable` when it has no prerelease, and
++/// otherwise the first prerelease identifier, so `1.2.3-alpha.1` and
++/// `2.0.0-alpha.4` share the `alpha` channel.
++fn release_channel_of(version: &node_semver::Version) -> String {
++  match version.pre_release.first() {
++    Some(identifier) => identifier.to_string(),
++    None => "stable".to_string(),
++  }
++}
++
++/// The key an instance is grouped under. Instances which cannot be partitioned
++/// stay together under the dependency's own name, so they keep being compared
++/// to each other exactly as they are when no partitioning is configured.
++pub fn partition_name(internal_name: &str, partition: Option<&str>) -> String {
++  match partition {
++    Some(key) => format!("{internal_name} {key}"),
++    None => internal_name.to_string(),
++  }
++}
++
++/// One run of a partition key: digits are compared as numbers so that `9`
++/// comes before `10`, everything else is compared as text.
++#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
++enum Segment {
++  Number(u64),
++  Text(String),
++}
++
++/// A partition key in the order a person reads it. A configured rank wins when
++/// there is one, so range partitions keep the order they were written in.
++/// Otherwise keys are split into runs of digits and runs of everything else, so
++/// `5.9` precedes `5.10` where sorting the raw strings would not. Instances
++/// which could not be partitioned sort after every partition of the dependency.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct PartitionOrder {
++  is_unpartitioned: bool,
++  rank: Option<usize>,
++  segments: Vec<Segment>,
++}
++
++impl PartitionOrder {
++  pub fn new(partition: Option<&str>, rank: Option<usize>) -> Self {
++    let Some(key) = partition else {
++      return Self {
++        is_unpartitioned: true,
++        rank: None,
++        segments: vec![],
++      };
++    };
++    let mut segments = vec![];
++    let mut rest = key;
++    while !rest.is_empty() {
++      let is_digit = rest.starts_with(|c: char| c.is_ascii_digit());
++      let end = rest.find(|c: char| c.is_ascii_digit() != is_digit).unwrap_or(rest.len());
++      let (run, remainder) = rest.split_at(end);
++      segments.push(match run.parse::<u64>() {
++        Ok(number) if is_digit => Segment::Number(number),
++        _ => Segment::Text(run.to_string()),
++      });
++      rest = remainder;
++    }
++    Self {
++      is_unpartitioned: false,
++      rank,
++      segments,
++    }
++  }
++}
++
++impl Ord for PartitionOrder {
++  fn cmp(&self, other: &Self) -> Ordering {
++    self
++      .is_unpartitioned
++      .cmp(&other.is_unpartitioned)
++      .then_with(|| self.rank.cmp(&other.rank))
++      .then_with(|| self.segments.cmp(&other.segments))
++  }
++}
++
++impl PartialOrd for PartitionOrder {
++  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
++    Some(self.cmp(other))
++  }
++}
+diff --git a/src/version_group/pinned.rs b/src/version_group/pinned.rs
+index c1c6c2f4..27680677 100644
+--- a/src/version_group/pinned.rs
++++ b/src/version_group/pinned.rs
+@@ -1,5 +1,5 @@
+ use {
+-  super::{DependencyCore, L1, L2, L3, L4, L5, L6, L7, L8, add_instance_to_dependencies},
++  super::{Dependencies, L1, L2, L3, L4, L5, L6, L7, L8, add_instance_to_dependencies},
+   crate::{
+     context::Context,
+     group_selector::GroupSelector,
+@@ -8,7 +8,7 @@ use {
+     specifier::Specifier,
+   },
+   log::debug,
+-  std::{collections::BTreeMap, rc::Rc},
++  std::rc::Rc,
+ };
+ 
+ #[cfg(test)]
+@@ -18,7 +18,7 @@ mod pinned_test;
+ #[derive(Debug)]
+ pub struct PinnedGroup {
+   pub selector: GroupSelector,
+-  pub dependencies: BTreeMap<String, DependencyCore>,
++  pub dependencies: Dependencies,
+   pub pin_version: Rc<Specifier>,
+   pub severity: SeverityMap,
+ }
+diff --git a/src/version_group/preferred_semver.rs b/src/version_group/preferred_semver.rs
+index ac816b52..315281ce 100644
+--- a/src/version_group/preferred_semver.rs
++++ b/src/version_group/preferred_semver.rs
+@@ -1,5 +1,8 @@
+ use {
+-  super::{DependencyCore, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, add_instance_to_dependencies, highest_eligible_for, sort_updates_desc},
++  super::{
++    Dependencies, DependencyCore, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, PartitionBy, add_instance_to_partition,
++    dependencies_over_partition_limit, highest_eligible_for, sort_updates_desc,
++  },
+   crate::{
+     context::Context,
+     group_selector::GroupSelector,
+@@ -13,7 +16,7 @@ use {
+     specifier::Specifier,
+   },
+   log::debug,
+-  std::{collections::BTreeMap, rc::Rc},
++  std::rc::Rc,
+ };
+ 
+ #[cfg(test)]
+@@ -23,14 +26,29 @@ mod preferred_semver_test;
+ #[derive(Debug)]
+ pub struct PreferredSemverGroup {
+   pub selector: GroupSelector,
+-  pub dependencies: BTreeMap<String, DependencyCore>,
++  pub dependencies: Dependencies,
+   pub prefer_highest: bool,
++  /// When set, instances are divided by this dimension and each partition
++  /// elects its own preferred version.
++  pub partition_by: Option<PartitionBy>,
++  /// The most partitions any one dependency in this group may be split into.
++  pub max_partitions: Option<usize>,
+   pub severity: SeverityMap,
+ }
+ 
+ impl PreferredSemverGroup {
+   pub fn add_instance(&mut self, idx: InstanceIdx, instance: &Instance) {
+-    add_instance_to_dependencies(&mut self.dependencies, idx, instance);
++    let partition = self
++      .partition_by
++      .as_ref()
++      .filter(|_| !instance.descriptor.is_local_dependency)
++      .and_then(|partition_by| partition_by.key_for(&instance.descriptor.specifier));
++    let partition_rank = self
++      .partition_by
++      .as_ref()
++      .zip(partition.as_deref())
++      .and_then(|(partition_by, key)| partition_by.rank_of(key));
++    add_instance_to_partition(&mut self.dependencies, partition, partition_rank, idx, instance);
+   }
+ 
+   pub fn get_highest_or_lowest_specifier(&self, dep: &DependencyCore, arena: &[Instance]) -> Option<Rc<Specifier>> {
+@@ -49,9 +67,19 @@ impl PreferredSemverGroup {
+ 
+   pub fn visit(&self, ctx: &Context, registry_updates: &Option<RegistryUpdates>) {
+     let arena = &ctx.instances;
++    let over_partition_limit = dependencies_over_partition_limit(&self.dependencies, self.max_partitions);
+     for dep in self.dependencies.values() {
+       debug!("visit standard version group");
+       debug!("{L1}visit dependency '{}'", dep.internal_name);
++      if over_partition_limit.contains(dep.internal_name.as_str()) {
++        debug!("{L2}it is split into more partitions than this group allows");
++        for &idx in &dep.instances {
++          debug!("{L3}visit instance '{}'", arena[idx.0].id);
++          debug!("{L4}mark as error");
++          arena[idx.0].mark_unfixable(UnfixableInstance::PartitionLimitExceeded);
++        }
++        continue;
++      }
+       if dep.has_local_instance_with_invalid_specifier(arena) {
+         debug!("{L2}it has an invalid local instance");
+         for &idx in &dep.instances {
+diff --git a/src/version_group/same_minor.rs b/src/version_group/same_minor.rs
+index 7b2aa9f1..a6cc5813 100644
+--- a/src/version_group/same_minor.rs
++++ b/src/version_group/same_minor.rs
+@@ -1,5 +1,8 @@
+ use {
+-  super::{DependencyCore, L1, L2, L3, L4, L5, L6, L7, L8, L9, PreferVersion, add_instance_to_dependencies},
++  super::{
++    Dependencies, DependencyCore, L1, L2, L3, L4, L5, L6, L7, L8, L9, PartitionBy, PreferVersion, add_instance_to_partition,
++    dependencies_over_partition_limit,
++  },
+   crate::{
+     context::Context,
+     group_selector::GroupSelector,
+@@ -9,7 +12,7 @@ use {
+     specifier::Specifier,
+   },
+   log::debug,
+-  std::{collections::BTreeMap, rc::Rc},
++  std::rc::Rc,
+ };
+ 
+ #[cfg(test)]
+@@ -19,8 +22,13 @@ mod same_minor_test;
+ #[derive(Debug)]
+ pub struct SameMinorGroup {
+   pub selector: GroupSelector,
+-  pub dependencies: BTreeMap<String, DependencyCore>,
++  pub dependencies: Dependencies,
+   pub prefer_version: Option<PreferVersion>,
++  /// When set, instances are divided by this dimension and each partition
++  /// elects its own preferred minor.
++  pub partition_by: Option<PartitionBy>,
++  /// The most partitions any one dependency in this group may be split into.
++  pub max_partitions: Option<usize>,
+   pub severity: SeverityMap,
+ }
+ 
+@@ -30,7 +38,17 @@ fn is_safe_range(range: &SemverRange) -> bool {
+ 
+ impl SameMinorGroup {
+   pub fn add_instance(&mut self, idx: InstanceIdx, instance: &Instance) {
+-    add_instance_to_dependencies(&mut self.dependencies, idx, instance);
++    let partition = self
++      .partition_by
++      .as_ref()
++      .filter(|_| !instance.descriptor.is_local_dependency)
++      .and_then(|partition_by| partition_by.key_for(&instance.descriptor.specifier));
++    let partition_rank = self
++      .partition_by
++      .as_ref()
++      .zip(partition.as_deref())
++      .and_then(|(partition_by, key)| partition_by.rank_of(key));
++    add_instance_to_partition(&mut self.dependencies, partition, partition_rank, idx, instance);
+   }
+ 
+   pub fn get_highest_or_lowest_minor_specifier(&self, dep: &DependencyCore, arena: &[Instance]) -> Option<Rc<Specifier>> {
+@@ -61,9 +79,19 @@ impl SameMinorGroup {
+ 
+   pub fn visit(&self, ctx: &Context, _registry_updates: &Option<RegistryUpdates>) {
+     let arena = &ctx.instances;
++    let over_partition_limit = dependencies_over_partition_limit(&self.dependencies, self.max_partitions);
+     for dep in self.dependencies.values() {
+       debug!("visit same minor version group");
+       debug!("{L1}visit dependency '{}'", dep.internal_name);
++      if over_partition_limit.contains(dep.internal_name.as_str()) {
++        debug!("{L2}it is split into more partitions than this group allows");
++        for &idx in &dep.instances {
++          debug!("{L3}visit instance '{}'", arena[idx.0].id);
++          debug!("{L4}mark as error");
++          arena[idx.0].mark_unfixable(UnfixableInstance::PartitionLimitExceeded);
++        }
++        continue;
++      }
+ 
+       let any_has_semver = dep
+         .instances
+diff --git a/src/version_group/same_range.rs b/src/version_group/same_range.rs
+index bf2cb0d6..f2b3cf8d 100644
+--- a/src/version_group/same_range.rs
++++ b/src/version_group/same_range.rs
+@@ -1,5 +1,5 @@
+ use {
+-  super::{DependencyCore, L1, L2, L3, L4, L5, add_instance_to_dependencies},
++  super::{Dependencies, L1, L2, L3, L4, L5, add_instance_to_dependencies},
+   crate::{
+     context::Context,
+     group_selector::GroupSelector,
+@@ -7,7 +7,6 @@ use {
+     registry::updates::RegistryUpdates,
+   },
+   log::debug,
+-  std::collections::BTreeMap,
+ };
+ 
+ #[cfg(test)]
+@@ -17,7 +16,7 @@ mod same_range_test;
+ #[derive(Debug)]
+ pub struct SameRangeGroup {
+   pub selector: GroupSelector,
+-  pub dependencies: BTreeMap<String, DependencyCore>,
++  pub dependencies: Dependencies,
+   pub severity: SeverityMap,
+ }
+ 
+diff --git a/src/version_group/semver_range_only.rs b/src/version_group/semver_range_only.rs
+index 5ed2b371..5546f91a 100644
+--- a/src/version_group/semver_range_only.rs
++++ b/src/version_group/semver_range_only.rs
+@@ -1,5 +1,5 @@
+ use {
+-  super::{DependencyCore, L1, L2, L3, L4, add_instance_to_dependencies, highest_eligible_for, sort_updates_desc},
++  super::{Dependencies, L1, L2, L3, L4, add_instance_to_dependencies, highest_eligible_for, sort_updates_desc},
+   crate::{
+     context::Context,
+     group_selector::GroupSelector,
+@@ -9,7 +9,6 @@ use {
+     semver_range::SemverRange,
+   },
+   log::debug,
+-  std::collections::BTreeMap,
+ };
+ 
+ #[cfg(test)]
+@@ -19,7 +18,7 @@ mod semver_range_only_test;
+ #[derive(Debug)]
+ pub struct SemverRangeOnlyGroup {
+   pub selector: GroupSelector,
+-  pub dependencies: BTreeMap<String, DependencyCore>,
++  pub dependencies: Dependencies,
+   pub severity: SeverityMap,
+ }
+ 
+diff --git a/src/version_group/snapped_to.rs b/src/version_group/snapped_to.rs
+index 2567c02f..5acaaed1 100644
+--- a/src/version_group/snapped_to.rs
++++ b/src/version_group/snapped_to.rs
+@@ -1,5 +1,5 @@
+ use {
+-  super::{DependencyCore, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, add_instance_to_dependencies},
++  super::{Dependencies, DependencyCore, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, add_instance_to_dependencies},
+   crate::{
+     context::Context,
+     group_selector::GroupSelector,
+@@ -11,7 +11,7 @@ use {
+     specifier::Specifier,
+   },
+   log::debug,
+-  std::{collections::BTreeMap, rc::Rc},
++  std::rc::Rc,
+ };
+ 
+ #[cfg(test)]
+@@ -21,7 +21,7 @@ mod snapped_to_test;
+ #[derive(Debug)]
+ pub struct SnappedToGroup {
+   pub selector: GroupSelector,
+-  pub dependencies: BTreeMap<String, DependencyCore>,
++  pub dependencies: Dependencies,
+   pub snap_to: Vec<SourceIdx>,
+   pub severity: SeverityMap,
+ }

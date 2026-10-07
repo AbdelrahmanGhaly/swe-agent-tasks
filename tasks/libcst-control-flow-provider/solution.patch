@@ -1,0 +1,459 @@
+diff --git a/libcst/codemod/commands/remove_unreachable_code.py b/libcst/codemod/commands/remove_unreachable_code.py
+new file mode 100644
+index 0000000..694dc70
+--- /dev/null
++++ b/libcst/codemod/commands/remove_unreachable_code.py
+@@ -0,0 +1,18 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++# This source code is licensed under the MIT license found in the
++# LICENSE file in the root directory of this source tree.
++#
++from libcst.codemod import VisitorBasedCodemodCommand
++from libcst.codemod.visitors import RemoveUnreachableCodeVisitor
++
++
++class RemoveUnreachableCodeCommand(
++    RemoveUnreachableCodeVisitor, VisitorBasedCodemodCommand
++):
++    """
++    Removes every statement that can never be reached, leaving each block
++    syntactically valid.
++    """
++
++    DESCRIPTION: str = "Removes statements that can never be reached."
+diff --git a/libcst/codemod/visitors/__init__.py b/libcst/codemod/visitors/__init__.py
+index 632d6fa..ceaa32e 100644
+--- a/libcst/codemod/visitors/__init__.py
++++ b/libcst/codemod/visitors/__init__.py
+@@ -15,6 +15,9 @@ from libcst.codemod.visitors._gather_string_annotation_names import (
+ from libcst.codemod.visitors._gather_unused_imports import GatherUnusedImportsVisitor
+ from libcst.codemod.visitors._imports import ImportItem
+ from libcst.codemod.visitors._remove_imports import RemoveImportsVisitor
++from libcst.codemod.visitors._remove_unreachable_code import (
++    RemoveUnreachableCodeVisitor,
++)
+ 
+ __all__ = [
+     "AddImportsVisitor",
+@@ -27,4 +30,5 @@ __all__ = [
+     "GatherUnusedImportsVisitor",
+     "ImportItem",
+     "RemoveImportsVisitor",
++    "RemoveUnreachableCodeVisitor",
+ ]
+diff --git a/libcst/codemod/visitors/_remove_unreachable_code.py b/libcst/codemod/visitors/_remove_unreachable_code.py
+new file mode 100644
+index 0000000..169efd2
+--- /dev/null
++++ b/libcst/codemod/visitors/_remove_unreachable_code.py
+@@ -0,0 +1,80 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++# This source code is licensed under the MIT license found in the
++# LICENSE file in the root directory of this source tree.
++#
++from typing import List, Sequence, Union
++
++import libcst as cst
++from libcst.codemod._visitor import ContextAwareTransformer
++from libcst.metadata import ControlFlowProvider
++
++
++def _pass_line() -> cst.SimpleStatementLine:
++    return cst.SimpleStatementLine(body=[cst.Pass()])
++
++
++def _without_trailing_semicolon(
++    body: Sequence[cst.BaseSmallStatement],
++) -> List[cst.BaseSmallStatement]:
++    kept = list(body)
++    kept[-1] = kept[-1].with_changes(semicolon=cst.MaybeSentinel.DEFAULT)
++    return kept
++
++
++class RemoveUnreachableCodeVisitor(ContextAwareTransformer):
++    """
++    Removes statements that :class:`~libcst.metadata.ControlFlowProvider` reports as
++    unreachable, keeping every block syntactically valid.
++    """
++
++    METADATA_DEPENDENCIES = (ControlFlowProvider,)
++
++    def _is_unreachable(self, node: cst.CSTNode) -> bool:
++        info = self.get_metadata(ControlFlowProvider, node, None)
++        return info is not None and not info.reachable
++
++    def on_leave(
++        self, original_node: cst.CSTNodeT, updated_node: cst.CSTNodeT
++    ) -> Union[cst.CSTNodeT, cst.RemovalSentinel]:
++        result = super().on_leave(original_node, updated_node)
++        if isinstance(result, cst.RemovalSentinel):
++            return result
++        if not isinstance(original_node, (cst.BaseStatement, cst.BaseSmallStatement)):
++            return result
++        if self._is_unreachable(original_node):
++            return cst.RemoveFromParent()
++        return result
++
++    def leave_SimpleStatementLine(
++        self,
++        original_node: cst.SimpleStatementLine,
++        updated_node: cst.SimpleStatementLine,
++    ) -> Union[cst.SimpleStatementLine, cst.RemovalSentinel]:
++        if not updated_node.body:
++            return cst.RemoveFromParent()
++        if len(updated_node.body) == len(original_node.body):
++            return updated_node
++        return updated_node.with_changes(
++            body=_without_trailing_semicolon(updated_node.body)
++        )
++
++    def leave_SimpleStatementSuite(
++        self,
++        original_node: cst.SimpleStatementSuite,
++        updated_node: cst.SimpleStatementSuite,
++    ) -> cst.SimpleStatementSuite:
++        if not updated_node.body:
++            return updated_node.with_changes(body=[cst.Pass()])
++        if len(updated_node.body) == len(original_node.body):
++            return updated_node
++        return updated_node.with_changes(
++            body=_without_trailing_semicolon(updated_node.body)
++        )
++
++    def leave_IndentedBlock(
++        self, original_node: cst.IndentedBlock, updated_node: cst.IndentedBlock
++    ) -> cst.IndentedBlock:
++        if updated_node.body:
++            return updated_node
++        return updated_node.with_changes(body=[_pass_line()])
+diff --git a/libcst/metadata/__init__.py b/libcst/metadata/__init__.py
+index ecc4274..878c17c 100644
+--- a/libcst/metadata/__init__.py
++++ b/libcst/metadata/__init__.py
+@@ -12,6 +12,11 @@ from libcst.metadata.base_provider import (
+     ProviderT,
+     VisitorMetadataProvider,
+ )
++from libcst.metadata.control_flow_provider import (
++    ControlFlowInfo,
++    ControlFlowProvider,
++    ExitKind,
++)
+ from libcst.metadata.expression_context_provider import (
+     ExpressionContext,
+     ExpressionContextProvider,
+@@ -89,6 +94,9 @@ __all__ = [
+     "TypeInferenceProvider",
+     "FullRepoManager",
+     "AccessorProvider",
++    "ControlFlowInfo",
++    "ControlFlowProvider",
++    "ExitKind",
+     "FilePathProvider",
+     # Experimental APIs:
+     "ExperimentalReentrantCodegenProvider",
+diff --git a/libcst/metadata/control_flow_provider.py b/libcst/metadata/control_flow_provider.py
+new file mode 100644
+index 0000000..e9fd672
+--- /dev/null
++++ b/libcst/metadata/control_flow_provider.py
+@@ -0,0 +1,297 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++# This source code is licensed under the MIT license found in the
++# LICENSE file in the root directory of this source tree.
++
++
++from ast import literal_eval
++from dataclasses import dataclass
++from enum import auto, Enum
++from typing import FrozenSet, List, Optional, Sequence, Union
++
++import libcst as cst
++from libcst.metadata.base_provider import VisitorMetadataProvider
++
++
++class ExitKind(Enum):
++    """
++    A way in which control can leave a statement.
++    """
++
++    #: Control reaches the end of the statement and continues with the next one.
++    FALL_THROUGH = auto()
++
++    #: Control leaves the enclosing function through a ``return``.
++    RETURN = auto()
++
++    #: Control leaves through a raised exception.
++    RAISE = auto()
++
++    #: Control leaves the enclosing loop through a ``break``.
++    BREAK = auto()
++
++    #: Control returns to the top of the enclosing loop through a ``continue``.
++    CONTINUE = auto()
++
++
++@dataclass(frozen=True)
++class ControlFlowInfo:
++    """
++    Control flow facts about a single statement.
++    """
++
++    #: Whether control can reach this statement from the start of its block.
++    reachable: bool
++
++    #: Every way in which control can leave this statement, whether or not the
++    #: statement itself is reachable.
++    exits: FrozenSet[ExitKind]
++
++
++AnyStatement = Union[cst.BaseStatement, cst.BaseSmallStatement]
++
++_FALL_THROUGH: FrozenSet[ExitKind] = frozenset({ExitKind.FALL_THROUGH})
++_LOOP_ABSORBED: FrozenSet[ExitKind] = frozenset(
++    {ExitKind.BREAK, ExitKind.CONTINUE, ExitKind.FALL_THROUGH}
++)
++_NUMBERS = (cst.Integer, cst.Float, cst.Imaginary)
++_UNPACKED = (cst.StarredElement, cst.StarredDictElement)
++
++
++def _display_truth(
++    elements: Sequence[Union[cst.BaseElement, cst.BaseDictElement]],
++) -> Optional[bool]:
++    if not elements:
++        return False
++    if any(not isinstance(element, _UNPACKED) for element in elements):
++        return True
++    return None
++
++
++def _formatted_string_truth(test: cst.FormattedString) -> Optional[bool]:
++    texts: List[str] = []
++    for part in test.parts:
++        if not isinstance(part, cst.FormattedStringText):
++            return None
++        texts.append(part.value)
++    quote = test.start.lstrip("bBfFrRuU")
++    prefix = test.start[: len(test.start) - len(quote)]
++    plain = prefix.replace("f", "").replace("F", "") + quote
++    literal = plain + "".join(texts) + test.end
++    try:
++        return bool(literal_eval(literal))
++    except (SyntaxError, ValueError):
++        return None
++
++
++def _concatenated_string_truth(test: cst.ConcatenatedString) -> Optional[bool]:
++    left = _constant_truth(test.left)
++    right = _constant_truth(test.right)
++    if left is None or right is None:
++        return None
++    return left or right
++
++
++def _unary_truth(test: cst.UnaryOperation) -> Optional[bool]:
++    inner = _constant_truth(test.expression)
++    if isinstance(test.operator, cst.Not):
++        return None if inner is None else not inner
++    if isinstance(test.operator, (cst.Minus, cst.Plus)) and isinstance(
++        test.expression, _NUMBERS
++    ):
++        return inner
++    return None
++
++
++def _constant_truth(test: cst.BaseExpression) -> Optional[bool]:
++    """
++    The truth value of a test that syntax alone decides, or ``None`` when it
++    depends on something only known at runtime.
++    """
++    if isinstance(test, cst.Name):
++        if test.value == "True":
++            return True
++        if test.value in ("False", "None"):
++            return False
++        return None
++    if isinstance(test, _NUMBERS):
++        return bool(test.evaluated_value)
++    if isinstance(test, cst.SimpleString):
++        value = test.evaluated_value
++        return None if value is None else bool(value)
++    if isinstance(test, cst.ConcatenatedString):
++        return _concatenated_string_truth(test)
++    if isinstance(test, cst.FormattedString):
++        return _formatted_string_truth(test)
++    if isinstance(test, (cst.List, cst.Set, cst.Tuple)):
++        return _display_truth(test.elements)
++    if isinstance(test, cst.Dict):
++        return _display_truth(test.elements)
++    if isinstance(test, cst.UnaryOperation):
++        return _unary_truth(test)
++    return None
++
++
++def _is_irrefutable_pattern(pattern: cst.MatchPattern) -> bool:
++    if isinstance(pattern, cst.MatchAs):
++        inner = pattern.pattern
++        return inner is None or _is_irrefutable_pattern(inner)
++    if isinstance(pattern, cst.MatchOr):
++        return any(_is_irrefutable_pattern(item.pattern) for item in pattern.patterns)
++    return False
++
++
++def _is_irrefutable_case(case: cst.MatchCase) -> bool:
++    return case.guard is None and _is_irrefutable_pattern(case.pattern)
++
++
++def _loop_enters_body(node: Union[cst.While, cst.For]) -> bool:
++    return not isinstance(node, cst.While) or _constant_truth(node.test) is not False
++
++
++def _loop_repeats_forever(node: Union[cst.While, cst.For]) -> bool:
++    return isinstance(node, cst.While) and _constant_truth(node.test) is True
++
++
++def _exits_of_small_statement(node: cst.BaseSmallStatement) -> FrozenSet[ExitKind]:
++    if isinstance(node, cst.Return):
++        return frozenset({ExitKind.RETURN})
++    if isinstance(node, cst.Raise):
++        return frozenset({ExitKind.RAISE})
++    if isinstance(node, cst.Break):
++        return frozenset({ExitKind.BREAK})
++    if isinstance(node, cst.Continue):
++        return frozenset({ExitKind.CONTINUE})
++    return _FALL_THROUGH
++
++
++def _sequence_exits(
++    exits_per_item: Sequence[FrozenSet[ExitKind]],
++) -> FrozenSet[ExitKind]:
++    reached: FrozenSet[ExitKind] = _FALL_THROUGH
++    for item in exits_per_item:
++        if ExitKind.FALL_THROUGH not in reached:
++            break
++        reached = (reached - _FALL_THROUGH) | item
++    return reached
++
++
++class ControlFlowProvider(VisitorMetadataProvider[ControlFlowInfo]):
++    """
++    Provides :class:`ControlFlowInfo` for every statement and small statement,
++    describing whether the statement is reachable and how control can leave it.
++    """
++
++    def _gen_impl(self, module: cst.Module) -> None:
++        self._visit_block(module.body, True)
++
++    def _record(
++        self, node: AnyStatement, reachable: bool, exits: FrozenSet[ExitKind]
++    ) -> FrozenSet[ExitKind]:
++        self.set_metadata(node, ControlFlowInfo(reachable, exits))
++        return exits
++
++    def _visit_block(
++        self, statements: Sequence[AnyStatement], reachable: bool
++    ) -> FrozenSet[ExitKind]:
++        collected: List[FrozenSet[ExitKind]] = []
++        running = reachable
++        for statement in statements:
++            exits = self._visit(statement, running)
++            collected.append(exits)
++            running = running and ExitKind.FALL_THROUGH in exits
++        return _sequence_exits(collected)
++
++    def _visit_suite(
++        self, suite: cst.BaseSuite, reachable: bool
++    ) -> FrozenSet[ExitKind]:
++        return self._visit_block(suite.body, reachable)
++
++    def _visit(self, node: AnyStatement, reachable: bool) -> FrozenSet[ExitKind]:
++        return self._record(node, reachable, self._exits_of(node, reachable))
++
++    def _exits_of(self, node: AnyStatement, reachable: bool) -> FrozenSet[ExitKind]:
++        if isinstance(node, cst.BaseSmallStatement):
++            return _exits_of_small_statement(node)
++        if isinstance(node, cst.SimpleStatementLine):
++            return self._visit_block(node.body, reachable)
++        if isinstance(node, cst.If):
++            return self._exits_of_if(node, reachable)
++        if isinstance(node, (cst.While, cst.For)):
++            return self._exits_of_loop(node, reachable)
++        if isinstance(node, (cst.Try, cst.TryStar)):
++            return self._exits_of_try(node, reachable)
++        if isinstance(node, cst.With):
++            return self._visit_suite(node.body, reachable)
++        if isinstance(node, cst.Match):
++            return self._exits_of_match(node, reachable)
++        if isinstance(node, (cst.FunctionDef, cst.ClassDef)):
++            self._visit_suite(node.body, True)
++        return _FALL_THROUGH
++
++    def _exits_of_if(self, node: cst.If, reachable: bool) -> FrozenSet[ExitKind]:
++        taken = _constant_truth(node.test)
++        body_exits = self._visit_suite(node.body, reachable and taken is not False)
++        orelse = node.orelse
++        tail_reachable = reachable and taken is not True
++        if orelse is None:
++            tail_exits = _FALL_THROUGH
++        elif isinstance(orelse, cst.If):
++            tail_exits = self._visit(orelse, tail_reachable)
++        else:
++            tail_exits = self._visit_suite(orelse.body, tail_reachable)
++        if taken is True:
++            return body_exits
++        if taken is False:
++            return tail_exits
++        return body_exits | tail_exits
++
++    def _exits_of_loop(
++        self, node: Union[cst.While, cst.For], reachable: bool
++    ) -> FrozenSet[ExitKind]:
++        enters = _loop_enters_body(node)
++        completes = not _loop_repeats_forever(node)
++        body_exits = self._visit_suite(node.body, reachable and enters)
++        orelse = node.orelse
++        after = (
++            _FALL_THROUGH
++            if orelse is None
++            else self._visit_suite(orelse.body, reachable and completes)
++        )
++        if not enters:
++            return after
++        exits = body_exits - _LOOP_ABSORBED
++        if ExitKind.BREAK in body_exits:
++            exits = exits | _FALL_THROUGH
++        if completes:
++            exits = exits | after
++        return exits
++
++    def _exits_of_try(
++        self, node: Union[cst.Try, cst.TryStar], reachable: bool
++    ) -> FrozenSet[ExitKind]:
++        protected = self._visit_suite(node.body, reachable)
++        orelse = node.orelse
++        if orelse is not None:
++            body_falls = ExitKind.FALL_THROUGH in protected
++            protected = _sequence_exits(
++                [protected, self._visit_suite(orelse.body, reachable and body_falls)]
++            )
++        guarded = protected
++        for handler in node.handlers:
++            guarded = guarded | self._visit_suite(handler.body, reachable)
++        finalbody = node.finalbody
++        if finalbody is None:
++            return guarded
++        final_exits = self._visit_suite(finalbody.body, reachable)
++        if ExitKind.FALL_THROUGH not in final_exits:
++            return final_exits
++        return guarded | (final_exits - _FALL_THROUGH)
++
++    def _exits_of_match(self, node: cst.Match, reachable: bool) -> FrozenSet[ExitKind]:
++        exits: FrozenSet[ExitKind] = frozenset()
++        for case in node.cases:
++            exits = exits | self._visit_suite(case.body, reachable)
++        if not any(_is_irrefutable_case(case) for case in node.cases):
++            exits = exits | _FALL_THROUGH
++        return exits

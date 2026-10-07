@@ -1,0 +1,1850 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..c8c0f96
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,117 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || { echo "missing value for --output_path" >&2; usage; }
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 2
++
++export CARGO_HOME="${CARGO_HOME:-/opt/cargo}"
++export PATH="$CARGO_HOME/bin:$PATH"
++export CARGO_NET_OFFLINE=true
++export CARGO_TERM_COLOR=never
++export RUSTC_BOOTSTRAP=1
++
++NEW_TARGET="sequencer_settings_127feb"
++TEST_JSON="$(mktemp)"
++TEST_ERR="$(mktemp)"
++trap 'rm -f "$TEST_JSON" "$TEST_ERR"' EXIT
++
++LIMIT=""
++if command -v timeout >/dev/null 2>&1; then
++  LIMIT="timeout 1800"
++fi
++
++if [ "$MODE" = "base" ]; then
++  $LIMIT cargo test --offline --lib \
++    --test test_basic --test test_dynamics --test test_flow --test test_follow \
++    -- -Z unstable-options --format json --report-time >"$TEST_JSON" 2>"$TEST_ERR"
++  STATUS=$?
++else
++  $LIMIT cargo test --offline --test "$NEW_TARGET" \
++    -- -Z unstable-options --format json --report-time >"$TEST_JSON" 2>"$TEST_ERR"
++  STATUS=$?
++fi
++tail -n 200 "$TEST_ERR" >&2
++
++xml_escape() {
++  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
++}
++
++expected_tests() {
++  awk '/#\[test\]/ { want = 1; next }
++       want && /fn [A-Za-z0-9_]+/ { sub(/.*fn /, ""); sub(/\(.*/, ""); print; want = 0 }' \
++    "tests/$NEW_TARGET.rs"
++}
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  cargo2junit <"$TEST_JSON" >"$OUTPUT_PATH" 2>/dev/null || true
++  DETAIL="$({ tail -c 3000 "$TEST_ERR"; tail -c 1000 "$TEST_JSON"; } | xml_escape)"
++  if [ "$MODE" = "new" ]; then
++    MISSING=0
++    for name in $(expected_tests); do
++      grep -q "name=\"$name\"" "$OUTPUT_PATH" 2>/dev/null || MISSING=1
++    done
++    if [ "$MISSING" -eq 1 ]; then
++      [ "$STATUS" -eq 0 ] && STATUS=1
++      {
++        echo '<?xml version="1.0" encoding="UTF-8"?>'
++        echo '<testsuites>'
++        echo '  <testsuite name="cargo test #0" errors="0">'
++        for name in $(expected_tests); do
++          if grep -q "\"name\": \"$name\", \"event\": \"ok\"" "$TEST_JSON"; then
++            echo "    <testcase name=\"$name\" classname=\"\" />"
++          else
++            echo "    <testcase name=\"$name\" classname=\"\"><failure message=\"test did not run to completion\">$DETAIL</failure></testcase>"
++          fi
++        done
++        echo '  </testsuite>'
++        echo '</testsuites>'
++      } >"$OUTPUT_PATH"
++    fi
++  elif ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    {
++      echo '<?xml version="1.0" encoding="UTF-8"?>'
++      echo '<testsuites>'
++      echo '  <testsuite name="cargo test #0" errors="0">'
++      echo "    <testcase name=\"compilation\" classname=\"\"><failure message=\"build failed\">$DETAIL</failure></testcase>"
++      echo '  </testsuite>'
++      echo '</testsuites>'
++    } >"$OUTPUT_PATH"
++  fi
++fi
++
++exit "$STATUS"
+diff --git a/tests/sequencer_settings_127feb.rs b/tests/sequencer_settings_127feb.rs
+new file mode 100644
+index 0000000..426aa0c
+--- /dev/null
++++ b/tests/sequencer_settings_127feb.rs
+@@ -0,0 +1,1721 @@
++#![allow(
++    clippy::float_cmp,
++    clippy::manual_range_contains,
++    clippy::needless_range_loop
++)]
++
++use fundsp::prelude64::*;
++use std::sync::{Arc, Mutex};
++
++const SR: f64 = 44100.0;
++
++const BLOCKS: [&[usize]; 6] = [&[64], &[1], &[7], &[13, 51], &[32, 3, 64, 29], &[60, 4]];
++
++type Log = Arc<Mutex<Vec<(usize, f32)>>>;
++
++#[derive(Clone)]
++struct Probe {
++    value: f32,
++    rendered: usize,
++    log: Log,
++}
++
++fn probe(value: f32) -> (Box<dyn AudioUnit>, Log) {
++    let log: Log = Arc::new(Mutex::new(Vec::new()));
++    let unit = Probe {
++        value,
++        rendered: 0,
++        log: log.clone(),
++    };
++    (Box::new(unit), log)
++}
++
++impl AudioUnit for Probe {
++    fn reset(&mut self) {
++        self.rendered = 0;
++    }
++
++    fn tick(&mut self, _input: &[f32], output: &mut [f32]) {
++        output[0] = self.value;
++        self.rendered += 1;
++    }
++
++    fn process(&mut self, size: usize, _input: &BufferRef, output: &mut BufferMut) {
++        for i in 0..size {
++            output.set_f32(0, i, self.value);
++        }
++        self.rendered += size;
++    }
++
++    fn set(&mut self, setting: Setting) {
++        if let Parameter::Value(value) = setting.parameter() {
++            self.value = *value;
++            self.log.lock().unwrap().push((self.rendered, *value));
++        }
++    }
++
++    fn inputs(&self) -> usize {
++        0
++    }
++
++    fn outputs(&self) -> usize {
++        1
++    }
++
++    fn route(&mut self, input: &SignalFrame, _frequency: f64) -> SignalFrame {
++        Routing::Generator(0.0).route(input, 1)
++    }
++
++    fn get_id(&self) -> u64 {
++        0x127feb
++    }
++
++    fn footprint(&self) -> usize {
++        core::mem::size_of::<Self>()
++    }
++}
++
++fn at(sample: usize) -> f64 {
++    sample as f64 / SR
++}
++
++fn entries(log: &Log) -> Vec<(usize, f32)> {
++    log.lock().unwrap().clone()
++}
++
++fn ticks(unit: &mut dyn AudioUnit, length: usize) -> Vec<f32> {
++    let input = vec![0.0; unit.inputs()];
++    let mut output = vec![0.0; unit.outputs()];
++    let mut result = Vec::with_capacity(length);
++    for _ in 0..length {
++        unit.tick(&input, &mut output);
++        result.push(output[0]);
++    }
++    result
++}
++
++fn blocks(unit: &mut dyn AudioUnit, length: usize, sizes: &[usize]) -> Vec<f32> {
++    let input = BufferVec::new(unit.inputs());
++    let mut output = BufferVec::new(unit.outputs());
++    let mut result = Vec::with_capacity(length);
++    let mut k = 0;
++    while result.len() < length {
++        let size = core::cmp::min(sizes[k % sizes.len()], length - result.len());
++        k += 1;
++        unit.process(size, &input.buffer_ref(), &mut output.buffer_mut());
++        for i in 0..size {
++            result.push(output.at_f32(0, i));
++        }
++    }
++    result
++}
++
++fn ticks_with_input(unit: &mut dyn AudioUnit, input: &[f32]) -> Vec<f32> {
++    let mut output = vec![0.0; unit.outputs()];
++    let mut result = Vec::with_capacity(input.len());
++    for x in input {
++        unit.tick(&[*x], &mut output);
++        result.push(output[0]);
++    }
++    result
++}
++
++fn blocks_with_input(unit: &mut dyn AudioUnit, input: &[f32], sizes: &[usize]) -> Vec<f32> {
++    let mut input_buffer = BufferVec::new(1);
++    let mut output = BufferVec::new(unit.outputs());
++    let mut result = Vec::with_capacity(input.len());
++    let mut k = 0;
++    while result.len() < input.len() {
++        let offset = result.len();
++        let size = core::cmp::min(sizes[k % sizes.len()], input.len() - offset);
++        k += 1;
++        for i in 0..size {
++            input_buffer.set_f32(0, i, input[offset + i]);
++        }
++        unit.process(size, &input_buffer.buffer_ref(), &mut output.buffer_mut());
++        for i in 0..size {
++            result.push(output.at_f32(0, i));
++        }
++    }
++    result
++}
++
++fn assert_same(context: &str, expected: &[f32], actual: &[f32]) {
++    assert_eq!(expected.len(), actual.len(), "{context}: length");
++    for i in 0..expected.len() {
++        assert!(
++            (expected[i] - actual[i]).abs() <= 1.0e-4,
++            "{context}: sample {i}: expected {} got {}",
++            expected[i],
++            actual[i]
++        );
++    }
++}
++
++fn segments(parts: &[(f32, usize)]) -> Vec<f32> {
++    let mut result = Vec::new();
++    for (value, length) in parts {
++        result.extend(core::iter::repeat_n(*value, *length));
++    }
++    result
++}
++
++fn check_blocks(build: impl Fn() -> Sequencer, length: usize) -> Vec<f32> {
++    let expected = ticks(&mut build(), length);
++    for sizes in BLOCKS {
++        let actual = blocks(&mut build(), length, sizes);
++        assert_same(&format!("block sizes {sizes:?}"), &expected, &actual);
++    }
++    expected
++}
++
++fn check_blocks_with_input(build: impl Fn() -> Sequencer, input: &[f32]) -> Vec<f32> {
++    let expected = ticks_with_input(&mut build(), input);
++    for sizes in BLOCKS {
++        let actual = blocks_with_input(&mut build(), input, sizes);
++        assert_same(&format!("block sizes {sizes:?}"), &expected, &actual);
++    }
++    expected
++}
++
++fn dc_event(seq: &mut Sequencer, start: usize, end: usize, value: f32) -> EventId {
++    seq.push(
++        at(start),
++        at(end),
++        Fade::Smooth,
++        0.0,
++        0.0,
++        Box::new(dc(value)),
++    )
++}
++
++#[test]
++fn setting_arrives_on_its_sample() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = dc_event(&mut seq, 0, 44100, 1.0);
++        seq.set_at(at(10), Setting::value(5.0).event(id));
++        seq
++    };
++    let output = check_blocks(build, 40);
++    assert_same("output", &segments(&[(1.0, 10), (5.0, 30)]), &output);
++}
++
++#[test]
++fn fractional_times_round_to_the_nearest_sample() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = seq.push(0.0, 1.0, Fade::Smooth, 0.0, 0.0, Box::new(dc(1.0)));
++        seq.set_at(10.3 / SR, Setting::value(2.0).event(id));
++        seq.set_at(20.7 / SR, Setting::value(3.0).event(id));
++        seq.set_at(63.6 / SR, Setting::value(4.0).event(id));
++        seq.set_at(70.2 / SR, Setting::value(5.0).event(id));
++        let late = seq.push(30.8 / SR, 1.0, Fade::Smooth, 0.0, 0.0, Box::new(dc(10.0)));
++        seq.set_at(29.9 / SR, Setting::value(20.0).event(late));
++        seq.set_at(45.4 / SR, Setting::value(30.0).event(late));
++        seq
++    };
++    let output = check_blocks(build, 100);
++    let expected = segments(&[
++        (1.0, 10),
++        (2.0, 11),
++        (3.0, 10),
++        (23.0, 14),
++        (33.0, 19),
++        (34.0, 6),
++        (35.0, 30),
++    ]);
++    assert_same("output", &expected, &output);
++}
++
++#[test]
++fn event_address_is_peeled_in_order() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++    let id = dc_event(&mut seq, 0, 100, 1.0);
++    let node = NodeId::new();
++    let setting = Setting::value(1.0).event(id).node(node);
++    match setting.direction() {
++        Address::Event(event) => assert!(event == id),
++        _ => panic!("expected an event address"),
++    }
++    match setting.peel().direction() {
++        Address::Node(inner) => assert!(inner == node),
++        _ => panic!("expected a node address"),
++    }
++    let outer = Setting::value(1.0).node(node).event(id);
++    match outer.peel().direction() {
++        Address::Event(event) => assert!(event == id),
++        _ => panic!("expected an event address"),
++    }
++}
++
++#[test]
++fn settings_on_block_edges_arrive_on_their_samples() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = dc_event(&mut seq, 0, 44100, 1.0);
++        seq.set_at(at(63), Setting::value(2.0).event(id));
++        seq.set_at(at(64), Setting::value(3.0).event(id));
++        seq.set_at(at(65), Setting::value(4.0).event(id));
++        seq.set_at(at(127), Setting::value(5.0).event(id));
++        seq.set_at(at(128), Setting::value(6.0).event(id));
++        seq
++    };
++    let output = check_blocks(build, 200);
++    let expected = segments(&[
++        (1.0, 63),
++        (2.0, 1),
++        (3.0, 1),
++        (4.0, 62),
++        (5.0, 1),
++        (6.0, 72),
++    ]);
++    assert_same("output", &expected, &output);
++}
++
++#[test]
++fn many_settings_inside_one_block() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = dc_event(&mut seq, 0, 44100, 0.0);
++        for i in 1..40 {
++            seq.set_at(at(i * 3), Setting::value(i as f32).event(id));
++        }
++        seq
++    };
++    let output = check_blocks(build, 150);
++    for i in 0..150 {
++        let expected = core::cmp::min(i / 3, 39) as f32;
++        assert_eq!(output[i], expected, "sample {i}");
++    }
++}
++
++#[test]
++fn setting_before_start_arrives_before_first_sample() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = dc_event(&mut seq, 5, 40, 1.0);
++        seq.set_at(at(2), Setting::value(3.0).event(id));
++        seq
++    };
++    let output = check_blocks(build, 50);
++    assert_same(
++        "output",
++        &segments(&[(0.0, 5), (3.0, 35), (0.0, 10)]),
++        &output,
++    );
++}
++
++#[test]
++fn setting_at_start_arrives_before_first_sample() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let a = dc_event(&mut seq, 20, 90, 1.0);
++        let b = dc_event(&mut seq, 70, 100, 10.0);
++        seq.set_at(at(20), Setting::value(2.0).event(a));
++        seq.set_at(at(70), Setting::value(30.0).event(b));
++        seq
++    };
++    let output = check_blocks(build, 110);
++    let expected = segments(&[(0.0, 20), (2.0, 50), (32.0, 20), (30.0, 10), (0.0, 10)]);
++    assert_same("output", &expected, &output);
++}
++
++#[test]
++fn settings_at_or_after_end_never_arrive() {
++    for sizes in [None, Some(&[64usize][..]), Some(&[3usize][..])] {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let (unit, log) = probe(1.0);
++        let id = seq.push(0.0, at(10), Fade::Smooth, 0.0, 0.0, unit);
++        seq.set_at(at(9), Setting::value(6.0).event(id));
++        seq.set_at(at(10), Setting::value(7.0).event(id));
++        seq.set_at(at(30), Setting::value(8.0).event(id));
++        let output = match sizes {
++            None => ticks(&mut seq, 40),
++            Some(sizes) => blocks(&mut seq, 40, sizes),
++        };
++        assert_same(
++            "output",
++            &segments(&[(1.0, 9), (6.0, 1), (0.0, 30)]),
++            &output,
++        );
++        assert_eq!(entries(&log), vec![(9, 6.0)], "{sizes:?}");
++    }
++}
++
++#[test]
++fn setting_after_edited_end_never_arrives() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++    let (unit, log) = probe(1.0);
++    let id = seq.push(0.0, 1.0, Fade::Smooth, 0.0, 0.0, unit);
++    seq.set_at(at(15), Setting::value(2.0).event(id));
++    seq.set_at(at(25), Setting::value(3.0).event(id));
++    let first = ticks(&mut seq, 10);
++    seq.edit(id, at(20), 0.0);
++    let second = ticks(&mut seq, 30);
++    assert_same("first", &segments(&[(1.0, 10)]), &first);
++    assert_same(
++        "second",
++        &segments(&[(1.0, 5), (2.0, 5), (0.0, 20)]),
++        &second,
++    );
++    assert_eq!(entries(&log), vec![(15, 2.0)]);
++}
++
++#[test]
++fn same_sample_settings_arrive_in_scheduling_order() {
++    for sizes in [None, Some(&[64usize][..]), Some(&[5usize][..])] {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let (unit, log) = probe(1.0);
++        let id = seq.push(0.0, 1.0, Fade::Smooth, 0.0, 0.0, unit);
++        seq.set_at(at(8), Setting::value(5.0).event(id));
++        seq.set_at(at(4), Setting::value(2.0).event(id));
++        seq.set_at(at(4), Setting::value(3.0).event(id));
++        seq.set_at(at(6), Setting::value(7.0).event(id));
++        seq.set_at(at(4), Setting::value(9.0).event(id));
++        seq.set_at(at(8), Setting::value(4.0).event(id));
++        let output = match sizes {
++            None => ticks(&mut seq, 12),
++            Some(sizes) => blocks(&mut seq, 12, sizes),
++        };
++        assert_same(
++            "output",
++            &segments(&[(1.0, 4), (9.0, 2), (7.0, 2), (4.0, 4)]),
++            &output,
++        );
++        assert_eq!(
++            entries(&log),
++            vec![(4, 2.0), (4, 3.0), (4, 9.0), (6, 7.0), (8, 5.0), (8, 4.0)],
++            "{sizes:?}"
++        );
++    }
++}
++
++#[test]
++fn same_sample_settings_keep_scheduling_order_across_fractions() {
++    for sizes in [None, Some(&[64usize][..]), Some(&[3usize][..])] {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++        let (unit, log) = probe(1.0);
++        let id = seq.push(0.0, at(40), Fade::Smooth, 0.0, 0.0, unit);
++        seq.set_at(10.4 / SR, Setting::value(2.0).event(id));
++        seq.set_at(10.3 / SR, Setting::value(3.0).event(id));
++        seq.set_at(20.2 / SR, Setting::value(5.0).event(id));
++        seq.set_at(19.6 / SR, Setting::value(6.0).event(id));
++        seq.set_at(30.6 / SR, Setting::value(7.0).event(id));
++        seq.set_at(30.2 / SR, Setting::value(8.0).event(id));
++        let render = |seq: &mut Sequencer| match sizes {
++            None => ticks(seq, 50),
++            Some(sizes) => blocks(seq, 50, sizes),
++        };
++        let expected = segments(&[
++            (1.0, 10),
++            (3.0, 10),
++            (6.0, 10),
++            (8.0, 1),
++            (7.0, 9),
++            (0.0, 10),
++        ]);
++        let pass = [
++            (10, 2.0),
++            (10, 3.0),
++            (20, 5.0),
++            (20, 6.0),
++            (30, 8.0),
++            (31, 7.0),
++        ];
++        assert_same("first pass", &expected, &render(&mut seq));
++        assert_eq!(entries(&log), pass.to_vec(), "{sizes:?}");
++        seq.reset();
++        assert_same("replay", &expected, &render(&mut seq));
++        assert_eq!(entries(&log), [pass, pass].concat(), "{sizes:?}");
++    }
++}
++
++#[test]
++fn late_setting_arrives_before_next_sample() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++    let (unit, log) = probe(1.0);
++    let id = seq.push(0.0, 1.0, Fade::Smooth, 0.0, 0.0, unit);
++    let first = ticks(&mut seq, 20);
++    seq.set_at(at(3), Setting::value(4.0).event(id));
++    let second = ticks(&mut seq, 5);
++    assert_same("first", &segments(&[(1.0, 20)]), &first);
++    assert_same("second", &segments(&[(4.0, 5)]), &second);
++    assert_eq!(entries(&log), vec![(20, 4.0)]);
++}
++
++#[test]
++fn late_setting_before_a_delivered_one_arrives_next() {
++    for sizes in [None, Some(&[64usize][..]), Some(&[9usize][..])] {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++        let (unit, log) = probe(1.0);
++        let id = seq.push(0.0, at(40), Fade::Smooth, 0.0, 0.0, unit);
++        seq.set_at(at(10), Setting::value(2.0).event(id));
++        let render = |seq: &mut Sequencer, length: usize| match sizes {
++            None => ticks(seq, length),
++            Some(sizes) => blocks(seq, length, sizes),
++        };
++        let first = render(&mut seq, 20);
++        seq.set_at(at(5), Setting::value(3.0).event(id));
++        let second = render(&mut seq, 30);
++        seq.reset();
++        let third = render(&mut seq, 50);
++        assert_same(
++            "first pass",
++            &segments(&[(1.0, 10), (2.0, 10), (3.0, 20), (0.0, 10)]),
++            &[first, second].concat(),
++        );
++        assert_same(
++            "replay",
++            &segments(&[(1.0, 5), (3.0, 5), (2.0, 30), (0.0, 10)]),
++            &third,
++        );
++        assert_eq!(
++            entries(&log),
++            vec![(10, 2.0), (20, 3.0), (5, 3.0), (10, 2.0)],
++            "{sizes:?}"
++        );
++    }
++}
++
++#[test]
++fn late_setting_arrives_before_next_block() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++    let (unit, log) = probe(1.0);
++    let id = seq.push(0.0, 1.0, Fade::Smooth, 0.0, 0.0, unit);
++    let first = blocks(&mut seq, 37, &[37]);
++    seq.set_at(at(5), Setting::value(4.0).event(id));
++    seq.set_at(at(36), Setting::value(6.0).event(id));
++    let second = blocks(&mut seq, 20, &[20]);
++    assert_same("first", &segments(&[(1.0, 37)]), &first);
++    assert_same("second", &segments(&[(6.0, 20)]), &second);
++    assert_eq!(entries(&log), vec![(37, 4.0), (37, 6.0)]);
++}
++
++#[test]
++fn relative_setting_counts_from_current_time() {
++    let mut a = Sequencer::new(0, 1, ReplayMode::None);
++    let id_a = dc_event(&mut a, 0, 44100, 1.0);
++    let mut b = Sequencer::new(0, 1, ReplayMode::None);
++    let id_b = dc_event(&mut b, 0, 44100, 1.0);
++    let first_a = ticks(&mut a, 10);
++    let first_b = blocks(&mut b, 10, &[10]);
++    a.set_at_relative(at(5), Setting::value(6.0).event(id_a));
++    b.set_at_relative(at(5), Setting::value(6.0).event(id_b));
++    let second_a = ticks(&mut a, 20);
++    let second_b = blocks(&mut b, 20, &[64]);
++    let expected = segments(&[(1.0, 5), (6.0, 15)]);
++    assert_same("first", &first_a, &first_b);
++    assert_same("ticks", &expected, &second_a);
++    assert_same("blocks", &expected, &second_b);
++}
++
++#[test]
++fn set_on_sequencer_applies_at_current_time() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++    let (unit, log) = probe(1.0);
++    let id = seq.push(0.0, 1.0, Fade::Smooth, 0.0, 0.0, unit);
++    let first = ticks(&mut seq, 10);
++    seq.set(Setting::value(2.0).event(id));
++    let second = blocks(&mut seq, 10, &[64]);
++    seq.set(Setting::value(3.0).event(id));
++    let third = ticks(&mut seq, 3);
++    assert_same(
++        "output",
++        &segments(&[(1.0, 10), (2.0, 10), (3.0, 3)]),
++        &[first, second, third].concat(),
++    );
++    assert_eq!(entries(&log), vec![(10, 2.0), (20, 3.0)]);
++}
++
++#[test]
++fn set_on_sequencer_before_event_starts() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++    let id = dc_event(&mut seq, 30, 60, 1.0);
++    let first = ticks(&mut seq, 10);
++    seq.set(Setting::value(8.0).event(id));
++    let second = blocks(&mut seq, 60, &[64]);
++    assert_same("first", &segments(&[(0.0, 10)]), &first);
++    assert_same(
++        "second",
++        &segments(&[(0.0, 20), (8.0, 30), (0.0, 10)]),
++        &second,
++    );
++}
++
++#[test]
++fn settings_without_existing_event_are_ignored() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++        let id = dc_event(&mut seq, 0, 100, 1.0);
++        seq.set_at(at(2), Setting::value(5.0));
++        seq.set_at(at(3), Setting::value(5.0).left());
++        seq.set_at(at(4), Setting::value(5.0).node(NodeId::new()));
++        seq.set_at(at(5), Setting::value(5.0).event(EventId::new()));
++        seq.set(Setting::value(5.0));
++        seq.set(Setting::value(5.0).event(EventId::new()));
++        seq.set_at(at(50), Setting::value(2.0).event(id));
++        seq
++    };
++    let output = check_blocks(build, 120);
++    assert_same(
++        "output",
++        &segments(&[(1.0, 50), (2.0, 50), (0.0, 20)]),
++        &output,
++    );
++}
++
++#[test]
++fn address_continues_into_net_unit() {
++    let build = || {
++        let mut net = Net::new(0, 1);
++        let a = net.push(Box::new(dc(1.0)));
++        let b = net.push(Box::new(dc(2.0)));
++        let sum = net.push(Box::new(pass() + pass()));
++        net.connect(a, 0, sum, 0);
++        net.connect(b, 0, sum, 1);
++        net.pipe_output(sum);
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = seq.push(0.0, 1.0, Fade::Smooth, 0.0, 0.0, Box::new(net));
++        seq.set_at(at(12), Setting::value(4.0).event(id).node(b));
++        seq.set_at(at(40), Setting::value(10.0).event(id).node(a));
++        seq
++    };
++    let output = check_blocks(build, 80);
++    assert_same(
++        "output",
++        &segments(&[(3.0, 12), (5.0, 28), (14.0, 40)]),
++        &output,
++    );
++}
++
++#[test]
++fn address_continues_into_graph_unit() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = seq.push(
++            0.0,
++            1.0,
++            Fade::Smooth,
++            0.0,
++            0.0,
++            Box::new(dc(1.0) + dc(2.0)),
++        );
++        seq.set_at(at(7), Setting::value(5.0).event(id).right());
++        seq.set_at(at(70), Setting::value(-1.0).event(id).left());
++        seq
++    };
++    let output = check_blocks(build, 100);
++    assert_same(
++        "output",
++        &segments(&[(3.0, 7), (6.0, 63), (4.0, 30)]),
++        &output,
++    );
++}
++
++#[test]
++fn sequencer_inside_net_receives_addressed_settings() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++    let id = dc_event(&mut seq, 0, 44100, 1.0);
++    let (mut net, node) = Net::wrap_id(Box::new(seq));
++    let first = ticks(&mut net, 10);
++    net.set(Setting::value(3.0).node(node).event(id));
++    let second = blocks(&mut net, 70, &[64]);
++    net.set(Setting::value(7.0).node(node).event(id));
++    let third = ticks(&mut net, 2);
++    assert_same(
++        "output",
++        &segments(&[(1.0, 10), (3.0, 70), (7.0, 2)]),
++        &[first, second, third].concat(),
++    );
++}
++
++#[test]
++fn nested_sequencer_receives_settings_on_time() {
++    let build = || {
++        let mut inner = Sequencer::new(0, 1, ReplayMode::None);
++        let inner_id = dc_event(&mut inner, 0, 44100, 1.0);
++        let mut outer = Sequencer::new(0, 1, ReplayMode::None);
++        let outer_id = outer.push(at(10), 1.0, Fade::Smooth, 0.0, 0.0, Box::new(inner));
++        outer.set_at(at(30), Setting::value(6.0).event(outer_id).event(inner_id));
++        outer.set_at(at(100), Setting::value(2.0).event(outer_id).event(inner_id));
++        outer
++    };
++    let output = check_blocks(build, 140);
++    assert_same(
++        "output",
++        &segments(&[(0.0, 10), (1.0, 20), (6.0, 70), (2.0, 40)]),
++        &output,
++    );
++}
++
++#[test]
++fn stereo_events_receive_settings_on_both_channels() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 2, ReplayMode::All);
++        let id = seq.push(
++            at(9),
++            at(120),
++            Fade::Smooth,
++            at(6),
++            at(17),
++            Box::new(dc((1.0, 2.0))),
++        );
++        seq.set_at(at(40), Setting::value(5.0).event(id));
++        let other = seq.push(
++            at(30),
++            at(90),
++            Fade::Power,
++            0.0,
++            0.0,
++            Box::new(dc((0.5, -0.5))),
++        );
++        seq.set_at(at(70), Setting::value(-3.0).event(other));
++        seq
++    };
++    let mut seq = build();
++    let mut expected = Vec::new();
++    let mut frame = [0.0f32; 2];
++    for _ in 0..140 {
++        seq.tick(&[], &mut frame);
++        expected.push(frame);
++    }
++    for sizes in BLOCKS {
++        let mut seq = build();
++        let input = BufferVec::new(0);
++        let mut output = BufferVec::new(2);
++        let mut actual = Vec::new();
++        let mut k = 0;
++        while actual.len() < 140 {
++            let size = core::cmp::min(sizes[k % sizes.len()], 140 - actual.len());
++            k += 1;
++            seq.process(size, &input.buffer_ref(), &mut output.buffer_mut());
++            for i in 0..size {
++                actual.push([output.at_f32(0, i), output.at_f32(1, i)]);
++            }
++        }
++        for channel in 0..2 {
++            let a: Vec<f32> = expected.iter().map(|x| x[channel]).collect();
++            let b: Vec<f32> = actual.iter().map(|x| x[channel]).collect();
++            assert_same(&format!("channel {channel} block sizes {sizes:?}"), &a, &b);
++        }
++    }
++    assert_eq!(expected[20], [1.0, 2.0]);
++    assert_eq!(expected[50], [5.5, 4.5]);
++    assert_eq!(expected[80], [2.0, 2.0]);
++    assert_eq!(expected[130], [0.0, 0.0]);
++}
++
++#[test]
++fn stateful_unit_settings_match_ticks_in_any_block_size() {
++    let unit = || Box::new(dc(1.0) >> lowpole_hz(400.0));
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = seq.push(at(3), 1.0, Fade::Smooth, 0.0, 0.0, unit());
++        seq.set_at(at(17), Setting::center(3000.0).event(id).right());
++        seq.set_at(at(64), Setting::value(-1.0).event(id).left());
++        seq.set_at(at(100), Setting::center(800.0).event(id).right());
++        seq.set_at(at(101), Setting::value(0.5).event(id).left());
++        seq.set_at(at(250), Setting::center(10000.0).event(id).right());
++        seq
++    };
++    let output = check_blocks(build, 400);
++    let mut plain = Sequencer::new(0, 1, ReplayMode::None);
++    plain.push(at(3), 1.0, Fade::Smooth, 0.0, 0.0, unit());
++    let reference = ticks(&mut plain, 400);
++    assert_same("before first setting", &reference[..17], &output[..17]);
++    assert!((output[17] - reference[17]).abs() > 1.0e-3);
++    assert!(output[63] > 0.999);
++    assert!(output[64] < 0.5);
++    assert!(output[99] < -0.999);
++    assert!(output[100] < -0.999 && output[101] > -0.9);
++    assert!((output[240] - 0.5).abs() < 1.0e-3);
++}
++
++#[test]
++fn event_starting_mid_block_with_short_fade_in() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = seq.push(
++            at(10),
++            at(300),
++            Fade::Smooth,
++            at(20),
++            0.0,
++            Box::new(dc(1.0)),
++        );
++        seq.set_at(at(15), Setting::value(2.0).event(id));
++        seq.set_at(at(70), Setting::value(3.0).event(id));
++        seq
++    };
++    let output = check_blocks(build, 320);
++    assert_eq!(output[9], 0.0);
++    assert!(output[12] > 0.0 && output[12] < 1.0);
++    assert!(output[25] > 1.0 && output[25] < 2.0);
++    for i in 30..70 {
++        assert_eq!(output[i], 2.0, "sample {i}");
++    }
++    for i in 70..300 {
++        assert_eq!(output[i], 3.0, "sample {i}");
++    }
++    assert_eq!(output[300], 0.0);
++}
++
++#[test]
++fn event_fading_out_inside_block() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = seq.push(at(10), at(50), Fade::Smooth, 0.0, at(20), Box::new(dc(1.0)));
++        seq.set_at(at(35), Setting::value(2.0).event(id));
++        seq
++    };
++    let output = check_blocks(build, 70);
++    for i in 10..30 {
++        assert_eq!(output[i], 1.0, "sample {i}");
++    }
++    assert!(output[33] < 1.0 && output[33] > 0.5);
++    assert!(output[36] > output[34]);
++    assert!(output[48] < 0.1);
++    for i in 50..70 {
++        assert_eq!(output[i], 0.0, "sample {i}");
++    }
++}
++
++#[test]
++fn power_fades_around_settings() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = seq.push(
++            at(5),
++            at(100),
++            Fade::Power,
++            at(30),
++            at(30),
++            Box::new(dc(1.0)),
++        );
++        seq.set_at(at(20), Setting::value(4.0).event(id));
++        seq.set_at(at(80), Setting::value(0.5).event(id));
++        let other = seq.push(
++            at(41),
++            at(77),
++            Fade::Smooth,
++            at(9),
++            at(11),
++            Box::new(dc(2.0)),
++        );
++        seq.set_at(at(60), Setting::value(-2.0).event(other));
++        seq
++    };
++    let output = check_blocks(build, 130);
++    assert_eq!(output[4], 0.0);
++    assert_eq!(output[50], 6.0);
++    assert_eq!(output[62], 2.0);
++    assert_eq!(output[110], 0.0);
++}
++
++#[test]
++fn events_reading_inputs_mid_block() {
++    let input: Vec<f32> = (0..300).map(|i| i as f32).collect();
++    let build = || {
++        let mut seq = Sequencer::new(1, 1, ReplayMode::None);
++        let id = seq.push(
++            at(10),
++            at(150),
++            Fade::Smooth,
++            0.0,
++            0.0,
++            Box::new(pass() * dc(1.0)),
++        );
++        seq.set_at(at(40), Setting::value(3.0).event(id).right());
++        seq.set_at(at(131), Setting::value(-1.0).event(id).right());
++        let other = seq.push(
++            at(77),
++            at(200),
++            Fade::Smooth,
++            0.0,
++            0.0,
++            Box::new(pass() * dc(0.5)),
++        );
++        seq.set_at(at(190), Setting::value(2.0).event(other).right());
++        seq
++    };
++    let output = check_blocks_with_input(build, &input);
++    for i in 0..300 {
++        let x = i as f32;
++        let a = if i < 10 || i >= 150 {
++            0.0
++        } else if i < 40 {
++            x
++        } else if i < 131 {
++            3.0 * x
++        } else {
++            -x
++        };
++        let b = if i < 77 || i >= 200 {
++            0.0
++        } else if i < 190 {
++            0.5 * x
++        } else {
++            2.0 * x
++        };
++        assert_eq!(output[i], a + b, "sample {i}");
++    }
++}
++
++#[test]
++fn faded_input_event_mid_block() {
++    let input: Vec<f32> = (0..200).map(|i| (i % 17) as f32 - 8.0).collect();
++    let build = || {
++        let mut seq = Sequencer::new(1, 1, ReplayMode::All);
++        let id = seq.push(
++            at(21),
++            at(140),
++            Fade::Power,
++            at(12),
++            at(25),
++            Box::new(pass() * dc(1.0)),
++        );
++        seq.set_at(at(30), Setting::value(2.0).event(id).right());
++        seq.set_at(at(120), Setting::value(0.25).event(id).right());
++        seq
++    };
++    let output = check_blocks_with_input(build, &input);
++    assert_eq!(output[20], 0.0);
++    assert_eq!(output[50], 2.0 * input[50]);
++    assert_eq!(output[150], 0.0);
++}
++
++#[test]
++fn loop_point_inside_block() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::Loop(at(100)));
++        let a = dc_event(&mut seq, 10, 60, 1.0);
++        seq.set_at(at(30), Setting::value(2.0).event(a));
++        let b = dc_event(&mut seq, 70, 130, 10.0);
++        seq.set_at(at(90), Setting::value(20.0).event(b));
++        seq.set_at(at(115), Setting::value(30.0).event(b));
++        seq
++    };
++    let output = check_blocks(build, 500);
++    let first = segments(&[
++        (0.0, 10),
++        (1.0, 20),
++        (2.0, 30),
++        (0.0, 10),
++        (10.0, 20),
++        (20.0, 10),
++    ]);
++    let repeat = segments(&[
++        (20.0, 10),
++        (21.0, 5),
++        (31.0, 15),
++        (2.0, 30),
++        (0.0, 10),
++        (10.0, 20),
++        (20.0, 10),
++    ]);
++    assert_same("first pass", &first, &output[0..100]);
++    for pass in 1..5 {
++        assert_same(
++            &format!("pass {pass}"),
++            &repeat,
++            &output[pass * 100..pass * 100 + 100],
++        );
++    }
++}
++
++#[test]
++fn loop_event_ending_and_restarting_inside_one_block() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::Loop(at(128)));
++        let id = dc_event(&mut seq, 40, 140, 1.0);
++        seq.set_at(at(130), Setting::value(5.0).event(id));
++        seq.set_at(at(50), Setting::value(3.0).event(id));
++        seq
++    };
++    let output = check_blocks(build, 128 * 4);
++    let first = segments(&[(0.0, 40), (1.0, 10), (3.0, 78)]);
++    let repeat = segments(&[(3.0, 2), (5.0, 10), (0.0, 28), (1.0, 10), (3.0, 78)]);
++    assert_same("first pass", &first, &output[0..128]);
++    for pass in 1..4 {
++        assert_same(
++            &format!("pass {pass}"),
++            &repeat,
++            &output[pass * 128..pass * 128 + 128],
++        );
++    }
++}
++
++#[test]
++fn zero_length_events_in_a_loop_render_nothing() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::Loop(at(64)));
++        seq.push(0.0, 0.0, Fade::Smooth, 0.0, 0.0, Box::new(dc(5.0)));
++        seq.push(at(30), at(30), Fade::Smooth, 0.0, 0.0, Box::new(dc(7.0)));
++        seq.push(
++            0.0,
++            f64::INFINITY,
++            Fade::Smooth,
++            0.0,
++            0.0,
++            Box::new(dc(0.0)),
++        );
++        dc_event(&mut seq, 10, 20, 1.0);
++        seq
++    };
++    let (sender, receiver) = std::sync::mpsc::channel();
++    std::thread::spawn(move || {
++        let mut outputs = vec![ticks(&mut build(), 192)];
++        for sizes in BLOCKS {
++            outputs.push(blocks(&mut build(), 192, sizes));
++        }
++        let _ = sender.send(outputs);
++    });
++    let outputs = receiver
++        .recv_timeout(std::time::Duration::from_secs(60))
++        .expect("rendering did not return");
++    let expected = segments(&[(0.0, 10), (1.0, 10), (0.0, 44)]).repeat(3);
++    assert_same("ticks", &expected, &outputs[0]);
++    for (sizes, output) in BLOCKS.iter().zip(&outputs[1..]) {
++        assert_same(&format!("block sizes {sizes:?}"), &expected, output);
++    }
++}
++
++#[test]
++fn loop_without_settings_matches_ticks() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::Loop(at(79)));
++        seq.push(at(12), at(89), Fade::Smooth, 0.0, 0.0, Box::new(dc(1.0)));
++        seq.push(at(3), at(30), Fade::Power, at(10), at(5), Box::new(dc(0.5)));
++        seq
++    };
++    let output = check_blocks(build, 79 * 6);
++    assert_same("pass", &output[79..158], &output[158..237]);
++    assert_eq!(output[1], 0.0);
++    assert_eq!(output[50], 1.0);
++}
++
++#[test]
++fn replay_after_reset_starts_from_pushed_unit() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++    let id = dc_event(&mut seq, 0, 20, 1.0);
++    seq.set_at(at(10), Setting::value(5.0).event(id));
++    let expected = segments(&[(1.0, 10), (5.0, 10), (0.0, 10)]);
++    let first = ticks(&mut seq, 30);
++    seq.reset();
++    let second = blocks(&mut seq, 30, &[64]);
++    seq.reset();
++    let third = ticks(&mut seq, 30);
++    assert_same("first", &expected, &first);
++    assert_same("second", &expected, &second);
++    assert_same("third", &expected, &third);
++}
++
++#[test]
++fn reset_in_the_middle_of_an_event_restarts_it_cleanly() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++    let (unit, log) = probe(1.0);
++    let id = seq.push(0.0, at(40), Fade::Smooth, 0.0, 0.0, unit);
++    seq.set_at(at(10), Setting::value(5.0).event(id));
++    seq.set_at(at(30), Setting::value(6.0).event(id));
++    let first = ticks(&mut seq, 15);
++    seq.reset();
++    let second = blocks(&mut seq, 50, &[16]);
++    assert_same("first", &segments(&[(1.0, 10), (5.0, 5)]), &first);
++    assert_same(
++        "second",
++        &segments(&[(1.0, 10), (5.0, 20), (6.0, 10), (0.0, 10)]),
++        &second,
++    );
++    assert_eq!(entries(&log), vec![(10, 5.0), (10, 5.0), (30, 6.0)]);
++}
++
++#[test]
++fn replay_restarts_stateful_unit() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++        let id = seq.push(
++            at(5),
++            at(300),
++            Fade::Smooth,
++            at(10),
++            at(10),
++            Box::new(saw_hz(330.0) >> lowpole_hz(500.0)),
++        );
++        seq.set_at(at(100), Setting::center(4000.0).event(id).right());
++        seq.set_at(at(150), Setting::value(110.0).event(id).left().left());
++        seq
++    };
++    let mut seq = build();
++    let first = ticks(&mut seq, 320);
++    seq.reset();
++    let second = ticks(&mut seq, 320);
++    assert_same("replay", &first, &second);
++    let mut seq = build();
++    let first_blocks = blocks(&mut seq, 320, &[64]);
++    seq.reset();
++    let second_blocks = blocks(&mut seq, 320, &[13, 51]);
++    assert_same("blocks", &first, &first_blocks);
++    assert_same("blocks replay", &first, &second_blocks);
++}
++
++#[test]
++fn loop_passes_repeat_settings_from_pushed_unit() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::Loop(at(64)));
++    let (unit, log) = probe(1.0);
++    let id = seq.push(at(5), at(40), Fade::Smooth, 0.0, 0.0, unit);
++    seq.set_at(at(20), Setting::value(2.0).event(id));
++    let output = blocks(&mut seq, 64 * 3, &[64]);
++    let pass = segments(&[(0.0, 5), (1.0, 15), (2.0, 20), (0.0, 24)]);
++    assert_same("pass 0", &pass, &output[0..64]);
++    assert_same("pass 1", &pass, &output[64..128]);
++    assert_same("pass 2", &pass, &output[128..192]);
++    assert_eq!(entries(&log), vec![(15, 2.0), (15, 2.0), (15, 2.0)]);
++}
++
++#[test]
++fn loop_straddling_event_keeps_its_settings() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::Loop(at(100)));
++        let id = dc_event(&mut seq, 80, 130, 1.0);
++        seq.set_at(at(115), Setting::value(9.0).event(id));
++        seq.set_at(at(90), Setting::value(4.0).event(id));
++        seq
++    };
++    let output = check_blocks(build, 400);
++    let first = segments(&[(0.0, 80), (1.0, 10), (4.0, 10)]);
++    let repeat = segments(&[(4.0, 15), (9.0, 15), (0.0, 50), (1.0, 10), (4.0, 10)]);
++    assert_same("first pass", &first, &output[0..100]);
++    for pass in 1..4 {
++        assert_same(
++            &format!("pass {pass}"),
++            &repeat,
++            &output[pass * 100..pass * 100 + 100],
++        );
++    }
++}
++
++#[test]
++fn settings_scheduled_while_looping_join_the_loop() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::Loop(at(100)));
++    let id = dc_event(&mut seq, 10, 90, 1.0);
++    let first = blocks(&mut seq, 150, &[50]);
++    seq.set_at(at(70), Setting::value(3.0).event(id));
++    seq.set_at_relative(at(10), Setting::value(2.0).event(id));
++    let rest = ticks(&mut seq, 250);
++    let output = [first, rest].concat();
++    let pass = segments(&[(0.0, 10), (1.0, 50), (2.0, 10), (3.0, 20), (0.0, 10)]);
++    assert_same(
++        "first pass",
++        &segments(&[(0.0, 10), (1.0, 80), (0.0, 10)]),
++        &output[0..100],
++    );
++    assert_same(
++        "second pass",
++        &segments(&[(0.0, 10), (1.0, 50), (2.0, 10), (3.0, 20), (0.0, 10)]),
++        &output[100..200],
++    );
++    assert_same("third pass", &pass, &output[200..300]);
++    assert_same("fourth pass", &pass, &output[300..400]);
++}
++
++#[test]
++fn settings_scheduled_after_event_ended_apply_on_replay() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++    let (unit, log) = probe(1.0);
++    let id = seq.push(0.0, at(20), Fade::Smooth, 0.0, 0.0, unit);
++    let first = ticks(&mut seq, 30);
++    seq.set_at(at(5), Setting::value(6.0).event(id));
++    seq.set_at_relative(-at(15), Setting::value(7.0).event(id));
++    seq.reset();
++    let second = blocks(&mut seq, 30, &[64]);
++    assert_same("first", &segments(&[(1.0, 20), (0.0, 10)]), &first);
++    assert_same(
++        "second",
++        &segments(&[(1.0, 5), (6.0, 10), (7.0, 5), (0.0, 10)]),
++        &second,
++    );
++    assert_eq!(entries(&log), vec![(5, 6.0), (15, 7.0)]);
++}
++
++#[test]
++fn settings_for_future_event_persist_into_replays() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++    let id = dc_event(&mut seq, 50, 80, 1.0);
++    seq.set_at(at(60), Setting::value(4.0).event(id));
++    seq.set_at(at(10), Setting::value(2.0).event(id));
++    let expected = segments(&[(0.0, 50), (2.0, 10), (4.0, 20), (0.0, 20)]);
++    let first = ticks(&mut seq, 100);
++    seq.reset();
++    let second = blocks(&mut seq, 100, &[64]);
++    seq.reset();
++    let third = blocks(&mut seq, 100, &[7]);
++    assert_same("first", &expected, &first);
++    assert_same("second", &expected, &second);
++    assert_same("third", &expected, &third);
++}
++
++#[test]
++fn late_setting_replays_at_its_own_time() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++    let (unit, log) = probe(1.0);
++    let id = seq.push(0.0, at(40), Fade::Smooth, 0.0, 0.0, unit);
++    let first = ticks(&mut seq, 20);
++    seq.set_at(at(5), Setting::value(3.0).event(id));
++    let rest = ticks(&mut seq, 30);
++    seq.reset();
++    let second = blocks(&mut seq, 50, &[64]);
++    assert_same(
++        "first",
++        &segments(&[(1.0, 20), (3.0, 20), (0.0, 10)]),
++        &[first, rest].concat(),
++    );
++    assert_same(
++        "second",
++        &segments(&[(1.0, 5), (3.0, 35), (0.0, 10)]),
++        &second,
++    );
++    assert_eq!(entries(&log), vec![(20, 3.0), (5, 3.0)]);
++}
++
++#[test]
++fn events_without_settings_replay_as_before() {
++    let build = || {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++        seq.push(
++            0.0,
++            at(200),
++            Fade::Smooth,
++            at(30),
++            at(30),
++            Box::new(noise()),
++        );
++        let id = seq.push(at(20), at(150), Fade::Power, 0.0, 0.0, Box::new(dc(0.25)));
++        seq.set_at(at(100), Setting::value(0.75).event(id));
++        seq
++    };
++    let mut seq = build();
++    let first = ticks(&mut seq, 220);
++    seq.reset();
++    let second = blocks(&mut seq, 220, &[64]);
++    assert_same("replay", &first, &second);
++    let mut plain = Sequencer::new(0, 1, ReplayMode::All);
++    plain.push(
++        0.0,
++        at(200),
++        Fade::Smooth,
++        at(30),
++        at(30),
++        Box::new(noise()),
++    );
++    let noise_only = ticks(&mut plain, 20);
++    assert_same("noise", &noise_only, &first[0..20]);
++}
++
++#[test]
++fn removing_sounding_event_silences_it_immediately() {
++    let mut a = Sequencer::new(0, 1, ReplayMode::All);
++    let id_a = dc_event(&mut a, 0, 1000, 1.0);
++    dc_event(&mut a, 0, 1000, 10.0);
++    let mut b = a.clone();
++    let first_a = ticks(&mut a, 30);
++    let first_b = blocks(&mut b, 30, &[30]);
++    a.remove(id_a, 0.0);
++    b.remove(id_a, 0.0);
++    let second_a = ticks(&mut a, 30);
++    let second_b = blocks(&mut b, 30, &[64]);
++    assert_same("first ticks", &segments(&[(11.0, 30)]), &first_a);
++    assert_same("first blocks", &segments(&[(11.0, 30)]), &first_b);
++    assert_same("second ticks", &segments(&[(10.0, 30)]), &second_a);
++    assert_same("second blocks", &segments(&[(10.0, 30)]), &second_b);
++    a.reset();
++    assert_same("replay", &segments(&[(10.0, 20)]), &ticks(&mut a, 20));
++}
++
++#[test]
++fn removal_fades_out_from_now() {
++    let mut reference = Vec::new();
++    for sizes in [
++        None,
++        Some(&[64usize][..]),
++        Some(&[7usize][..]),
++        Some(&[13usize, 51][..]),
++    ] {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++        let id = dc_event(&mut seq, 0, 1000, 1.0);
++        dc_event(&mut seq, 0, 1000, 0.5);
++        let render = |seq: &mut Sequencer, length: usize| match sizes {
++            None => ticks(seq, length),
++            Some(sizes) => blocks(seq, length, sizes),
++        };
++        let first = render(&mut seq, 50);
++        seq.remove(id, at(20));
++        let second = render(&mut seq, 50);
++        let output = [first, second].concat();
++        if sizes.is_none() {
++            reference = output.clone();
++        }
++        assert_same(&format!("{sizes:?}"), &reference, &output);
++        assert_same("before", &segments(&[(1.5, 51)]), &output[0..51]);
++        assert!((output[60] - 1.0).abs() < 1.0e-4);
++        for i in 51..70 {
++            assert!(output[i] < output[i - 1] && output[i] > 0.5, "sample {i}");
++        }
++        assert_same("after", &segments(&[(0.5, 30)]), &output[70..100]);
++        seq.reset();
++        assert_same("replay", &segments(&[(0.5, 30)]), &render(&mut seq, 30));
++    }
++}
++
++#[test]
++fn removal_fade_still_delivers_settings_before_its_end() {
++    for sizes in [None, Some(&[64usize][..]), Some(&[7usize][..])] {
++        let render = |seq: &mut Sequencer, length: usize| match sizes {
++            None => ticks(seq, length),
++            Some(sizes) => blocks(seq, length, sizes),
++        };
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let (unit, log) = probe(1.0);
++        let id = seq.push(0.0, 1.0, Fade::Smooth, 0.0, 0.0, unit);
++        seq.set_at(at(60), Setting::value(2.0).event(id));
++        seq.set_at(at(75), Setting::value(3.0).event(id));
++        let first = render(&mut seq, 50);
++        seq.remove(id, at(20));
++        let output = [first, render(&mut seq, 40)].concat();
++        assert_same("before", &segments(&[(1.0, 51)]), &output[0..51]);
++        assert!(output[59] > 0.5 && output[59] < 1.0, "{sizes:?}");
++        assert!((output[60] - 1.0).abs() < 1.0e-4, "{sizes:?}");
++        assert!(output[69] > 0.0 && output[69] < 0.01, "{sizes:?}");
++        assert_same("after", &segments(&[(0.0, 20)]), &output[70..90]);
++        assert_eq!(entries(&log), vec![(60, 2.0)], "{sizes:?}");
++    }
++}
++
++#[test]
++fn removal_fade_runs_its_full_length() {
++    for sizes in [None, Some(&[64usize][..]), Some(&[11usize][..])] {
++        let render = |seq: &mut Sequencer, length: usize| match sizes {
++            None => ticks(seq, length),
++            Some(sizes) => blocks(seq, length, sizes),
++        };
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = dc_event(&mut seq, 0, 100, 1.0);
++        let first = render(&mut seq, 50);
++        seq.remove(id, at(50));
++        let output = [first, render(&mut seq, 60)].concat();
++        assert_same("before", &segments(&[(1.0, 51)]), &output[0..51]);
++        assert!((output[75] - 0.5).abs() < 1.0e-4, "{sizes:?}");
++        for i in 51..100 {
++            assert!(output[i] < output[i - 1] && output[i] > 0.0, "sample {i}");
++        }
++        assert_same("after", &segments(&[(0.0, 10)]), &output[100..110]);
++
++        let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++        let id = dc_event(&mut seq, 0, 60, 1.0);
++        let first = render(&mut seq, 40);
++        seq.remove(id, at(40));
++        let output = [first, render(&mut seq, 60)].concat();
++        assert!((output[60] - 0.5).abs() < 1.0e-4, "{sizes:?}");
++        for i in 41..80 {
++            assert!(output[i] < output[i - 1] && output[i] > 0.0, "sample {i}");
++        }
++        assert_same("after", &segments(&[(0.0, 20)]), &output[80..100]);
++    }
++}
++
++#[test]
++fn removing_an_event_that_just_ended_does_not_revive_it() {
++    for sizes in [None, Some(&[10usize][..]), Some(&[64usize][..])] {
++        let render = |seq: &mut Sequencer, length: usize| match sizes {
++            None => ticks(seq, length),
++            Some(sizes) => blocks(seq, length, sizes),
++        };
++        let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++        let id = dc_event(&mut seq, 0, 10, 1.0);
++        dc_event(&mut seq, 0, 30, 0.25);
++        let first = render(&mut seq, 10);
++        seq.remove(id, at(20));
++        let second = render(&mut seq, 30);
++        seq.reset();
++        let third = render(&mut seq, 30);
++        assert_same("first", &segments(&[(1.25, 10)]), &first);
++        assert_same("second", &segments(&[(0.25, 20), (0.0, 10)]), &second);
++        assert_same("replay", &segments(&[(0.25, 30)]), &third);
++    }
++}
++
++#[test]
++fn reset_during_removal_fade_drops_the_event() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++    let id = dc_event(&mut seq, 0, 1000, 1.0);
++    dc_event(&mut seq, 0, 1000, 0.5);
++    seq.set_at(at(5), Setting::value(2.0).event(id));
++    let first = ticks(&mut seq, 10);
++    seq.remove(id, at(50));
++    let second = blocks(&mut seq, 10, &[64]);
++    seq.reset();
++    let third = blocks(&mut seq, 30, &[7]);
++    assert_same("first", &segments(&[(1.5, 5), (2.5, 5)]), &first);
++    assert!(second[9] < 2.5 && second[9] > 2.0);
++    assert_same("replay", &segments(&[(0.5, 30)]), &third);
++}
++
++#[test]
++fn removal_fade_inside_loop_is_final() {
++    let build = |sizes: Option<&[usize]>| {
++        let mut seq = Sequencer::new(0, 1, ReplayMode::Loop(at(100)));
++        let id = dc_event(&mut seq, 10, 90, 1.0);
++        dc_event(&mut seq, 80, 120, 2.0);
++        seq.set_at(at(30), Setting::value(3.0).event(id));
++        let render = |seq: &mut Sequencer, length: usize| match sizes {
++            None => ticks(seq, length),
++            Some(sizes) => blocks(seq, length, sizes),
++        };
++        let first = render(&mut seq, 150);
++        seq.remove(id, at(16));
++        let second = render(&mut seq, 250);
++        [first, second].concat()
++    };
++    let output = build(None);
++    for sizes in BLOCKS {
++        assert_same(&format!("{sizes:?}"), &output, &build(Some(sizes)));
++    }
++    assert_same(
++        "first pass",
++        &segments(&[(0.0, 10), (1.0, 20), (3.0, 50), (5.0, 10), (2.0, 10)]),
++        &output[0..100],
++    );
++    assert_same(
++        "second pass start",
++        &segments(&[(2.0, 10), (3.0, 10), (1.0, 10), (3.0, 20)]),
++        &output[100..150],
++    );
++    assert!(output[160] < 3.0 && output[160] > 0.0);
++    assert_same(
++        "second pass end",
++        &segments(&[(0.0, 14), (2.0, 20)]),
++        &output[166..200],
++    );
++    let pass = segments(&[(2.0, 20), (0.0, 60), (2.0, 20)]);
++    assert_same("third pass", &pass, &output[200..300]);
++    assert_same("fourth pass", &pass, &output[300..400]);
++}
++
++#[test]
++fn removed_future_event_never_plays() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++    let id = dc_event(&mut seq, 50, 80, 1.0);
++    dc_event(&mut seq, 60, 70, 2.0);
++    seq.set_at(at(55), Setting::value(4.0).event(id));
++    let first = ticks(&mut seq, 10);
++    seq.remove(id, at(10));
++    let second = blocks(&mut seq, 90, &[64]);
++    seq.reset();
++    let third = ticks(&mut seq, 100);
++    assert_same("first", &segments(&[(0.0, 10)]), &first);
++    assert_same(
++        "second",
++        &segments(&[(0.0, 50), (2.0, 10), (0.0, 30)]),
++        &second,
++    );
++    assert_same(
++        "third",
++        &segments(&[(0.0, 60), (2.0, 10), (0.0, 30)]),
++        &third,
++    );
++}
++
++#[test]
++fn removed_past_event_is_not_replayed() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++    let id = dc_event(&mut seq, 0, 20, 1.0);
++    dc_event(&mut seq, 10, 30, 2.0);
++    let first = ticks(&mut seq, 40);
++    seq.remove(id, 0.0);
++    seq.set_at(at(5), Setting::value(9.0).event(id));
++    seq.reset();
++    let second = ticks(&mut seq, 40);
++    assert_same(
++        "first",
++        &segments(&[(1.0, 10), (3.0, 10), (2.0, 10), (0.0, 10)]),
++        &first,
++    );
++    assert_same(
++        "second",
++        &segments(&[(0.0, 10), (2.0, 20), (0.0, 10)]),
++        &second,
++    );
++}
++
++#[test]
++fn removed_loop_event_is_gone() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::Loop(at(100)));
++    let id = dc_event(&mut seq, 80, 130, 1.0);
++    dc_event(&mut seq, 10, 20, 5.0);
++    let first = blocks(&mut seq, 110, &[64]);
++    seq.remove(id, 0.0);
++    let second = blocks(&mut seq, 190, &[64]);
++    let output = [first, second].concat();
++    let pass = segments(&[(0.0, 10), (5.0, 10), (0.0, 80)]);
++    assert_same(
++        "first pass",
++        &segments(&[(0.0, 10), (5.0, 10), (0.0, 60), (1.0, 20)]),
++        &output[0..100],
++    );
++    assert_same(
++        "second pass",
++        &segments(&[(1.0, 10), (5.0, 10), (0.0, 80)]),
++        &output[100..200],
++    );
++    assert_same("third pass", &pass, &output[200..300]);
++}
++
++#[test]
++fn removing_one_event_keeps_others_addressable() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++    let a = dc_event(&mut seq, 0, 1000, 1.0);
++    let b = dc_event(&mut seq, 0, 1000, 10.0);
++    let c = dc_event(&mut seq, 0, 1000, 100.0);
++    let d = dc_event(&mut seq, 0, 1000, 1000.0);
++    let first = ticks(&mut seq, 5);
++    seq.remove(a, 0.0);
++    seq.set(Setting::value(200.0).event(c));
++    let second = ticks(&mut seq, 5);
++    seq.remove(c, 0.0);
++    seq.set(Setting::value(20.0).event(b));
++    seq.set(Setting::value(2000.0).event(d));
++    let third = blocks(&mut seq, 5, &[64]);
++    seq.remove(d, 0.0);
++    seq.set_at_relative(0.0, Setting::value(30.0).event(b));
++    let fourth = ticks(&mut seq, 5);
++    assert_same("first", &segments(&[(1111.0, 5)]), &first);
++    assert_same("second", &segments(&[(1210.0, 5)]), &second);
++    assert_same("third", &segments(&[(2020.0, 5)]), &third);
++    assert_same("fourth", &segments(&[(30.0, 5)]), &fourth);
++}
++
++#[test]
++fn removed_event_ignores_later_settings() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++    let (unit, log) = probe(1.0);
++    let id = seq.push(0.0, at(50), Fade::Smooth, 0.0, 0.0, unit);
++    seq.set_at(at(10), Setting::value(2.0).event(id));
++    let first = ticks(&mut seq, 20);
++    seq.remove(id, 0.0);
++    seq.set_at(at(30), Setting::value(3.0).event(id));
++    seq.set(Setting::value(4.0).event(id));
++    let second = blocks(&mut seq, 40, &[64]);
++    seq.reset();
++    let third = ticks(&mut seq, 60);
++    assert_same("first", &segments(&[(1.0, 10), (2.0, 10)]), &first);
++    assert_same("second", &segments(&[(0.0, 40)]), &second);
++    assert_same("third", &segments(&[(0.0, 60)]), &third);
++    assert_eq!(entries(&log), vec![(10, 2.0)]);
++}
++
++#[test]
++fn backend_applies_settings_after_commit() {
++    let mut front = Sequencer::new(0, 1, ReplayMode::None);
++    let mut back = front.backend();
++    let id = dc_event(&mut front, 0, 44100, 1.0);
++    front.set_at(at(30), Setting::value(4.0).event(id));
++    front.commit();
++    let first = ticks(&mut back, 50);
++    front.set_at(at(60), Setting::value(9.0).event(id));
++    let second = blocks(&mut back, 20, &[64]);
++    front.commit();
++    let third = blocks(&mut back, 30, &[64]);
++    assert_same("first", &segments(&[(1.0, 30), (4.0, 20)]), &first);
++    assert_same("second", &segments(&[(4.0, 20)]), &second);
++    assert_same("third", &segments(&[(9.0, 30)]), &third);
++}
++
++#[test]
++fn backend_relative_settings_count_from_backend_time() {
++    let mut front = Sequencer::new(0, 1, ReplayMode::None);
++    let mut back = front.backend();
++    let id = dc_event(&mut front, 0, 44100, 1.0);
++    front.commit();
++    let first = ticks(&mut back, 20);
++    front.set_at_relative(at(5), Setting::value(2.0).event(id));
++    front.commit();
++    let second = blocks(&mut back, 20, &[64]);
++    front.set_at_relative(0.0, Setting::value(3.0).event(id));
++    let third = ticks(&mut back, 3);
++    front.commit();
++    let fourth = ticks(&mut back, 3);
++    assert_same(
++        "output",
++        &segments(&[(1.0, 25), (2.0, 18), (3.0, 3)]),
++        &[first, second, third, fourth].concat(),
++    );
++}
++
++#[test]
++fn frontend_set_takes_effect_after_commit() {
++    let mut front = Sequencer::new(0, 1, ReplayMode::None);
++    let mut back = front.backend();
++    let id = dc_event(&mut front, 0, 44100, 1.0);
++    front.commit();
++    let first = ticks(&mut back, 10);
++    front.set(Setting::value(3.0).event(id));
++    let second = ticks(&mut back, 5);
++    front.commit();
++    let third = blocks(&mut back, 10, &[64]);
++    assert_same(
++        "output",
++        &segments(&[(1.0, 15), (3.0, 10)]),
++        &[first, second, third].concat(),
++    );
++}
++
++#[test]
++fn backend_set_applies_at_backend_time() {
++    let mut front = Sequencer::new(0, 1, ReplayMode::All);
++    let mut back = front.backend();
++    let id = dc_event(&mut front, 0, 60, 1.0);
++    front.commit();
++    let first = ticks(&mut back, 10);
++    back.set(Setting::value(3.0).event(id));
++    let second = blocks(&mut back, 70, &[64]);
++    back.reset();
++    let third = ticks(&mut back, 70);
++    assert_same(
++        "first",
++        &[first, second].concat(),
++        &segments(&[(1.0, 10), (3.0, 50), (0.0, 20)]),
++    );
++    assert_same(
++        "replay",
++        &segments(&[(1.0, 10), (3.0, 50), (0.0, 10)]),
++        &third,
++    );
++}
++
++#[test]
++fn backend_inside_net_receives_addressed_settings() {
++    let mut front = Sequencer::new(0, 1, ReplayMode::None);
++    let back = front.backend();
++    let id = dc_event(&mut front, 0, 44100, 1.0);
++    front.commit();
++    let (mut net, node) = Net::wrap_id(Box::new(back));
++    let first = ticks(&mut net, 10);
++    net.set(Setting::value(5.0).node(node).event(id));
++    let second = blocks(&mut net, 10, &[64]);
++    assert_same(
++        "output",
++        &segments(&[(1.0, 10), (5.0, 10)]),
++        &[first, second].concat(),
++    );
++}
++
++#[test]
++fn backend_removes_events_after_commit() {
++    let mut front = Sequencer::new(0, 1, ReplayMode::All);
++    let mut back = front.backend();
++    let a = dc_event(&mut front, 0, 100, 1.0);
++    let b = dc_event(&mut front, 0, 100, 2.0);
++    front.set_at(at(40), Setting::value(4.0).event(b));
++    front.commit();
++    let first = ticks(&mut back, 10);
++    front.remove(a, 0.0);
++    let second = blocks(&mut back, 10, &[64]);
++    front.commit();
++    let third = blocks(&mut back, 90, &[64]);
++    back.reset();
++    let fourth = ticks(&mut back, 50);
++    assert_same(
++        "output",
++        &segments(&[(3.0, 20), (2.0, 20), (4.0, 60), (0.0, 10)]),
++        &[first, second, third].concat(),
++    );
++    assert_same("replay", &segments(&[(2.0, 40), (4.0, 10)]), &fourth);
++}
++
++#[test]
++fn backend_removal_fades_from_backend_time() {
++    let mut front = Sequencer::new(0, 1, ReplayMode::None);
++    let mut back = front.backend();
++    let id = dc_event(&mut front, 0, 1000, 1.0);
++    dc_event(&mut front, 0, 1000, 0.25);
++    front.commit();
++    let first = ticks(&mut back, 20);
++    front.remove(id, at(10));
++    let second = ticks(&mut back, 5);
++    front.commit();
++    let third = blocks(&mut back, 40, &[64]);
++    let output = [first, second, third].concat();
++    assert_same("before", &segments(&[(1.25, 26)]), &output[0..26]);
++    for i in 26..35 {
++        assert!(output[i] < output[i - 1] && output[i] > 0.25, "sample {i}");
++    }
++    assert_same("after", &segments(&[(0.25, 30)]), &output[35..65]);
++}
++
++#[test]
++fn backend_matches_plain_sequencer() {
++    let mut plain = Sequencer::new(0, 1, ReplayMode::Loop(at(150)));
++    let mut front = Sequencer::new(0, 1, ReplayMode::Loop(at(150)));
++    let mut back = front.backend();
++    let mut output_plain = Vec::new();
++    let mut output_back = Vec::new();
++    for round in 0..4 {
++        for seq in [&mut plain, &mut front] {
++            let id = seq.push_relative(
++                at(3 + round),
++                at(90 + round * 7),
++                Fade::Smooth,
++                at(4),
++                at(9),
++                Box::new(dc(1.0 + round as f32)),
++            );
++            seq.set_at_relative(at(20), Setting::value(-1.0).event(id));
++            seq.set_at(at(140), Setting::value(5.0).event(id));
++        }
++        front.commit();
++        output_plain.extend(ticks(&mut plain, 70));
++        output_back.extend(blocks(&mut back, 70, &[64, 6]));
++    }
++    assert_same("backend", &output_plain, &output_back);
++}
++
++#[test]
++fn clone_keeps_scheduled_settings() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::All);
++    let id = dc_event(&mut seq, 10, 90, 1.0);
++    let other = dc_event(&mut seq, 0, 50, 2.0);
++    seq.set_at(at(40), Setting::value(4.0).event(id));
++    seq.set_at(at(20), Setting::value(3.0).event(other));
++    let first = ticks(&mut seq, 30);
++    let mut copy = seq.clone();
++    let rest = ticks(&mut seq, 70);
++    let rest_copy = blocks(&mut copy, 70, &[64]);
++    assert_same("copy", &rest, &rest_copy);
++    assert_same(
++        "output",
++        &segments(&[
++            (2.0, 10),
++            (3.0, 10),
++            (4.0, 20),
++            (7.0, 10),
++            (4.0, 40),
++            (0.0, 10),
++        ]),
++        &[first, rest].concat(),
++    );
++}
++
++#[test]
++fn reset_without_replay_drops_events_and_settings() {
++    let mut seq = Sequencer::new(0, 1, ReplayMode::None);
++    let id = dc_event(&mut seq, 0, 100, 1.0);
++    let later = dc_event(&mut seq, 50, 100, 1.0);
++    seq.set_at(at(10), Setting::value(2.0).event(id));
++    seq.set_at(at(60), Setting::value(3.0).event(later));
++    let first = ticks(&mut seq, 20);
++    seq.reset();
++    seq.set_at(at(5), Setting::value(4.0).event(id));
++    let second = blocks(&mut seq, 100, &[64]);
++    assert_same("first", &segments(&[(1.0, 10), (2.0, 10)]), &first);
++    assert_same("second", &segments(&[(0.0, 100)]), &second);
++}

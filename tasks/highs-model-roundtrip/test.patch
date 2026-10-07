@@ -1,0 +1,1495 @@
+diff --git a/check/CMakeLists.txt b/check/CMakeLists.txt
+index 6f019a7a5c..c2c8cf1eea 100644
+--- a/check/CMakeLists.txt
++++ b/check/CMakeLists.txt
+@@ -62,6 +62,7 @@ if ((NOT FAST_BUILD OR ALL_TESTS) AND NOT (BUILD_EXTRA_UNIT_ONLY))
+       TestLpOrientation.cpp
+       TestLpSolvers.cpp
+       TestLpValidation.cpp
++      TestModelRoundTrip_cb2617.cpp
+       TestMain.cpp
+       TestMipSolver.cpp
+       TestModelProperties.cpp
+diff --git a/check/TestModelRoundTrip_cb2617.cpp b/check/TestModelRoundTrip_cb2617.cpp
+new file mode 100644
+index 0000000000..0cc12cc303
+--- /dev/null
++++ b/check/TestModelRoundTrip_cb2617.cpp
+@@ -0,0 +1,1304 @@
++#include <algorithm>
++#include <cstdio>
++#include <fstream>
++#include <iterator>
++#include <utility>
++
++#include "HCheckConfig.h"
++#include "Highs.h"
++#include "catch.hpp"
++
++const bool dev_run = false;
++const double rt_inf = kHighsInf;
++
++static void quiet(Highs& highs) {
++  if (!dev_run) highs.setOptionValue("output_flag", false);
++}
++
++static void addNamedCol(Highs& highs, const std::string& name,
++                        const double cost, const double lower,
++                        const double upper) {
++  const HighsInt iCol = highs.getNumCol();
++  REQUIRE(highs.addCol(cost, lower, upper, 0, nullptr, nullptr) ==
++          HighsStatus::kOk);
++  REQUIRE(highs.passColName(iCol, name) == HighsStatus::kOk);
++}
++
++static void addNamedRow(Highs& highs, const std::string& name,
++                        const double lower, const double upper,
++                        const std::vector<HighsInt>& index,
++                        const std::vector<double>& value) {
++  const HighsInt iRow = highs.getNumRow();
++  REQUIRE(highs.addRow(lower, upper, HighsInt(index.size()), index.data(),
++                       value.data()) == HighsStatus::kOk);
++  REQUIRE(highs.passRowName(iRow, name) == HighsStatus::kOk);
++}
++
++static void addTwoColumns(Highs& highs) {
++  addNamedCol(highs, "x", 1, 0, 10);
++  addNamedCol(highs, "y", 2, 0, 10);
++}
++
++static void writeTextFile(const std::string& file_name,
++                          const std::string& contents) {
++  std::ofstream out(file_name.c_str());
++  out << contents;
++  out.close();
++}
++
++static std::vector<std::vector<std::pair<HighsInt, double>>> columnEntries(
++    const HighsLp& lp) {
++  HighsSparseMatrix matrix = lp.a_matrix_;
++  matrix.ensureColwise();
++  std::vector<std::vector<std::pair<HighsInt, double>>> entries(lp.num_col_);
++  for (HighsInt iCol = 0; iCol < lp.num_col_; iCol++) {
++    for (HighsInt iEl = matrix.start_[iCol]; iEl < matrix.start_[iCol + 1];
++         iEl++)
++      entries[iCol].push_back({matrix.index_[iEl], matrix.value_[iEl]});
++    std::sort(entries[iCol].begin(), entries[iCol].end());
++  }
++  return entries;
++}
++
++static void requireSameModel(const HighsLp& before, const HighsLp& after) {
++  REQUIRE(after.num_col_ == before.num_col_);
++  REQUIRE(after.num_row_ == before.num_row_);
++  REQUIRE(after.sense_ == before.sense_);
++  REQUIRE(after.offset_ == before.offset_);
++  for (HighsInt iCol = 0; iCol < before.num_col_; iCol++) {
++    REQUIRE(after.col_names_[iCol] == before.col_names_[iCol]);
++    REQUIRE(after.col_cost_[iCol] == before.col_cost_[iCol]);
++    REQUIRE(after.col_lower_[iCol] == before.col_lower_[iCol]);
++    REQUIRE(after.col_upper_[iCol] == before.col_upper_[iCol]);
++  }
++  for (HighsInt iRow = 0; iRow < before.num_row_; iRow++) {
++    REQUIRE(after.row_names_[iRow] == before.row_names_[iRow]);
++    REQUIRE(after.row_lower_[iRow] == before.row_lower_[iRow]);
++    REQUIRE(after.row_upper_[iRow] == before.row_upper_[iRow]);
++  }
++  REQUIRE(after.integrality_.size() == before.integrality_.size());
++  for (size_t iCol = 0; iCol < before.integrality_.size(); iCol++)
++    REQUIRE(after.integrality_[iCol] == before.integrality_[iCol]);
++  REQUIRE(columnEntries(after) == columnEntries(before));
++}
++
++static void requireRowEntries(const HighsLp& lp, const HighsInt iRow,
++                              const std::vector<HighsInt>& index,
++                              const std::vector<double>& value) {
++  HighsSparseMatrix matrix = lp.a_matrix_;
++  matrix.ensureRowwise();
++  const HighsInt from = matrix.start_[iRow];
++  const HighsInt to = matrix.start_[iRow + 1];
++  REQUIRE(to - from == HighsInt(index.size()));
++  for (HighsInt iEl = from; iEl < to; iEl++) {
++    REQUIRE(matrix.index_[iEl] == index[iEl - from]);
++    REQUIRE(matrix.value_[iEl] == value[iEl - from]);
++  }
++}
++
++static void requireIntegralityCount(const HighsLp& lp, const size_t count) {
++  REQUIRE(lp.integrality_.size() == count);
++}
++
++static HighsLp roundTripLp(const HighsLp& lp, const std::string& file_name) {
++  Highs writer;
++  quiet(writer);
++  REQUIRE(writer.passModel(lp) == HighsStatus::kOk);
++  REQUIRE(writer.writeModel(file_name) == HighsStatus::kOk);
++
++  Highs reader;
++  quiet(reader);
++  REQUIRE(reader.readModel(file_name) == HighsStatus::kOk);
++  return reader.getLp();
++}
++
++static void requireValidRangeParses(const std::string& file_name,
++                                    const std::string& body,
++                                    const double lower, const double upper) {
++  writeTextFile(file_name, body);
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.readModel(file_name) == HighsStatus::kOk);
++  const HighsLp& lp = highs.getLp();
++  REQUIRE(lp.num_row_ == 1);
++  REQUIRE(lp.row_lower_[0] == lower);
++  REQUIRE(lp.row_upper_[0] == upper);
++}
++
++static void requireFileIsRejected(const std::string& file_name,
++                                  const std::string& body) {
++  writeTextFile(file_name, body);
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.readModel(file_name) == HighsStatus::kError);
++}
++
++static std::string readTextFile(const std::string& file_name) {
++  std::ifstream in(file_name.c_str());
++  std::string contents((std::istreambuf_iterator<char>(in)),
++                       std::istreambuf_iterator<char>());
++  in.close();
++  return contents;
++}
++
++static std::string lineContaining(const std::string& text,
++                                  const std::string& needle) {
++  size_t at = text.find(needle);
++  REQUIRE(at != std::string::npos);
++  size_t begin = text.rfind('\n', at);
++  begin = begin == std::string::npos ? 0 : begin + 1;
++  size_t end = text.find('\n', at);
++  end = end == std::string::npos ? text.size() : end;
++  return text.substr(begin, end - begin);
++}
++
++static size_t countOccurrences(const std::string& text,
++                               const std::string& needle) {
++  size_t count = 0;
++  size_t at = text.find(needle);
++  while (at != std::string::npos) {
++    count++;
++    at = text.find(needle, at + needle.size());
++  }
++  return count;
++}
++
++TEST_CASE("round-trip-lp-boxed-row", "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addTwoColumns(highs);
++  addNamedRow(highs, "R1", 2, 5, {0, 1}, {1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_boxed_cb2617.lp");
++  REQUIRE(after.num_row_ == 1);
++  REQUIRE(after.row_names_[0] == "R1");
++  REQUIRE(after.row_lower_[0] == 2);
++  REQUIRE(after.row_upper_[0] == 5);
++  requireSameModel(before, after);
++}
++
++TEST_CASE("round-trip-lp-boxed-row-negative-bounds",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addTwoColumns(highs);
++  addNamedRow(highs, "wide", -7.5, -0.25, {0, 1}, {1, -3});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_negative_cb2617.lp");
++  REQUIRE(after.num_row_ == 1);
++  REQUIRE(after.row_names_[0] == "wide");
++  REQUIRE(after.row_lower_[0] == -7.5);
++  REQUIRE(after.row_upper_[0] == -0.25);
++}
++
++TEST_CASE("round-trip-lp-single-variable-range-stays-a-row",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addTwoColumns(highs);
++  addNamedRow(highs, "onlyx", 2, 5, {0}, {1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_single_cb2617.lp");
++  REQUIRE(after.num_row_ == 1);
++  REQUIRE(after.row_lower_[0] == 2);
++  REQUIRE(after.row_upper_[0] == 5);
++  REQUIRE(after.col_lower_[0] == 0);
++  REQUIRE(after.col_upper_[0] == 10);
++}
++
++TEST_CASE("round-trip-lp-free-row", "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addTwoColumns(highs);
++  addNamedRow(highs, "freerow", -rt_inf, rt_inf, {0, 1}, {1, 1});
++  addNamedRow(highs, "R2", -rt_inf, 4, {0, 1}, {1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_free_cb2617.lp");
++  REQUIRE(after.num_row_ == 2);
++  REQUIRE(after.row_names_[0] == "freerow");
++  REQUIRE(after.row_lower_[0] <= -rt_inf);
++  REQUIRE(after.row_upper_[0] >= rt_inf);
++  REQUIRE(after.row_names_[1] == "R2");
++  requireSameModel(before, after);
++}
++
++TEST_CASE("round-trip-lp-equality-row-unchanged", "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addTwoColumns(highs);
++  addNamedRow(highs, "eq", 3, 3, {0, 1}, {1, 1});
++  addNamedRow(highs, "boxed", 1, 6, {0, 1}, {1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_equality_cb2617.lp");
++  REQUIRE(after.num_row_ == 2);
++  REQUIRE(after.row_names_[0] == "eq");
++  REQUIRE(after.row_lower_[0] == 3);
++  REQUIRE(after.row_upper_[0] == 3);
++  REQUIRE(after.row_names_[1] == "boxed");
++  REQUIRE(after.row_lower_[1] == 1);
++  REQUIRE(after.row_upper_[1] == 6);
++  requireSameModel(before, after);
++}
++
++TEST_CASE("round-trip-lp-one-sided-rows-unchanged",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addTwoColumns(highs);
++  addNamedRow(highs, "geq", 2, rt_inf, {0, 1}, {1, 1});
++  addNamedRow(highs, "leq", -rt_inf, 6, {0, 1}, {1, 1});
++  addNamedRow(highs, "boxed", 1, 7, {0, 1}, {1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_one_sided_cb2617.lp");
++  REQUIRE(after.num_row_ == 3);
++  REQUIRE(after.row_names_[0] == "geq");
++  REQUIRE(after.row_lower_[0] == 2);
++  REQUIRE(after.row_upper_[0] >= rt_inf);
++  REQUIRE(after.row_names_[1] == "leq");
++  REQUIRE(after.row_lower_[1] <= -rt_inf);
++  REQUIRE(after.row_upper_[1] == 6);
++  requireSameModel(before, after);
++}
++
++TEST_CASE("read-lp-two-sided-constraint-ascending",
++          "[highs_model_round_trip]") {
++  const std::string file_name = "rt_read_asc_cb2617.lp";
++  writeTextFile(file_name,
++                "min\n obj: x + y\nst\n R1: -2 <= x + y <= 5\nbounds\n x <= "
++                "10\n y <= 10\nend\n");
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.readModel(file_name) == HighsStatus::kOk);
++  const HighsLp& lp = highs.getLp();
++  REQUIRE(lp.num_row_ == 1);
++  REQUIRE(lp.num_col_ == 2);
++  REQUIRE(lp.row_lower_[0] == -2);
++  REQUIRE(lp.row_upper_[0] == 5);
++  REQUIRE(lp.row_names_[0] == "R1");
++}
++
++TEST_CASE("read-lp-two-sided-constraint-descending",
++          "[highs_model_round_trip]") {
++  const std::string file_name = "rt_read_desc_cb2617.lp";
++  writeTextFile(file_name,
++                "min\n obj: x + y\nst\n R1: 5 >= x + y >= -2\nbounds\n x <= "
++                "10\n y <= 10\nend\n");
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.readModel(file_name) == HighsStatus::kOk);
++  const HighsLp& lp = highs.getLp();
++  REQUIRE(lp.num_row_ == 1);
++  REQUIRE(lp.row_lower_[0] == -2);
++  REQUIRE(lp.row_upper_[0] == 5);
++}
++
++TEST_CASE("read-lp-two-sided-constraint-unnamed", "[highs_model_round_trip]") {
++  const std::string file_name = "rt_read_unnamed_cb2617.lp";
++  writeTextFile(file_name,
++                "min\n obj: x + y\nst\n 1 <= x + y <= 4\nend\n");
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.readModel(file_name) == HighsStatus::kOk);
++  const HighsLp& lp = highs.getLp();
++  REQUIRE(lp.num_row_ == 1);
++  REQUIRE(lp.row_lower_[0] == 1);
++  REQUIRE(lp.row_upper_[0] == 4);
++}
++
++TEST_CASE("read-lp-two-sided-constraint-equal-bounds",
++          "[highs_model_round_trip]") {
++  const std::string file_name = "rt_read_equal_cb2617.lp";
++  writeTextFile(file_name, "min\n obj: x + y\nst\n R1: 3 <= x + y <= 3\nend\n");
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.readModel(file_name) == HighsStatus::kOk);
++  const HighsLp& lp = highs.getLp();
++  REQUIRE(lp.num_row_ == 1);
++  REQUIRE(lp.row_lower_[0] == 3);
++  REQUIRE(lp.row_upper_[0] == 3);
++}
++
++TEST_CASE("read-lp-reversed-range-is-an-error", "[highs_model_round_trip]") {
++  requireValidRangeParses("rt_read_ok_asc_cb2617.lp",
++                          "min\n obj: x + y\nst\n R1: 2 <= x + y <= 5\nend\n",
++                          2, 5);
++  requireFileIsRejected("rt_read_reversed_cb2617.lp",
++                        "min\n obj: x + y\nst\n R1: 5 <= x + y <= 2\nend\n");
++}
++
++TEST_CASE("read-lp-mixed-orientation-range-is-an-error",
++          "[highs_model_round_trip]") {
++  requireValidRangeParses("rt_read_ok_asc2_cb2617.lp",
++                          "min\n obj: x + y\nst\n R1: 2 <= x + y <= 5\nend\n",
++                          2, 5);
++  requireFileIsRejected("rt_read_mixed_cb2617.lp",
++                        "min\n obj: x + y\nst\n R1: 2 <= x + y >= 5\nend\n");
++}
++
++TEST_CASE("read-lp-bounds-section-still-bounds-columns",
++          "[highs_model_round_trip]") {
++  const std::string file_name = "rt_read_bounds_cb2617.lp";
++  writeTextFile(file_name,
++                "min\n obj: x + y\nst\n R1: x + y >= 1\n R2: 1 <= x + y <= "
++                "8\nbounds\n 2 <= x <= 5\n -3 <= y <= 3\nend\n");
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.readModel(file_name) == HighsStatus::kOk);
++  const HighsLp& lp = highs.getLp();
++  REQUIRE(lp.num_row_ == 2);
++  REQUIRE(lp.num_col_ == 2);
++  REQUIRE(lp.row_lower_[1] == 1);
++  REQUIRE(lp.row_upper_[1] == 8);
++  REQUIRE(lp.col_lower_[0] == 2);
++  REQUIRE(lp.col_upper_[0] == 5);
++  REQUIRE(lp.col_lower_[1] == -3);
++  REQUIRE(lp.col_upper_[1] == 3);
++}
++
++TEST_CASE("round-trip-lp-semi-integer", "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "x", -1, 0, 4);
++  addNamedCol(highs, "z", -1, 2, 4.5);
++  REQUIRE(highs.changeColIntegrality(1, HighsVarType::kSemiInteger) ==
++          HighsStatus::kOk);
++  addNamedRow(highs, "R1", -rt_inf, 7.3, {0, 1}, {1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_semi_integer_cb2617.lp");
++  requireIntegralityCount(after, 2);
++  REQUIRE(after.integrality_[1] == HighsVarType::kSemiInteger);
++  requireSameModel(before, after);
++}
++
++TEST_CASE("round-trip-lp-semi-continuous", "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "x", -1, 0, 4);
++  addNamedCol(highs, "z", -1, 2, 4.5);
++  addNamedCol(highs, "w", -1, 1, 3.5);
++  REQUIRE(highs.changeColIntegrality(1, HighsVarType::kSemiContinuous) ==
++          HighsStatus::kOk);
++  REQUIRE(highs.changeColIntegrality(2, HighsVarType::kSemiInteger) ==
++          HighsStatus::kOk);
++  addNamedRow(highs, "R1", -rt_inf, 7.3, {0, 1, 2}, {1, 1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_semi_continuous_cb2617.lp");
++  requireIntegralityCount(after, 3);
++  REQUIRE(after.integrality_[1] == HighsVarType::kSemiContinuous);
++  REQUIRE(after.integrality_[2] == HighsVarType::kSemiInteger);
++  requireSameModel(before, after);
++}
++
++TEST_CASE("round-trip-lp-every-integrality", "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "c", 1, 0, 10);
++  addNamedCol(highs, "b", 1, 0, 1);
++  addNamedCol(highs, "g", 1, 0, 9);
++  addNamedCol(highs, "sc", 1, 2, 8);
++  addNamedCol(highs, "si", 1, 3, 7);
++  REQUIRE(highs.changeColIntegrality(1, HighsVarType::kInteger) ==
++          HighsStatus::kOk);
++  REQUIRE(highs.changeColIntegrality(2, HighsVarType::kInteger) ==
++          HighsStatus::kOk);
++  REQUIRE(highs.changeColIntegrality(3, HighsVarType::kSemiContinuous) ==
++          HighsStatus::kOk);
++  REQUIRE(highs.changeColIntegrality(4, HighsVarType::kSemiInteger) ==
++          HighsStatus::kOk);
++  addNamedRow(highs, "R1", 1, 20, {0, 1, 2, 3, 4}, {1, 1, 1, 1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_integrality_cb2617.lp");
++  requireIntegralityCount(after, 5);
++  REQUIRE(after.integrality_[0] == HighsVarType::kContinuous);
++  REQUIRE(after.integrality_[1] == HighsVarType::kInteger);
++  REQUIRE(after.integrality_[2] == HighsVarType::kInteger);
++  REQUIRE(after.integrality_[3] == HighsVarType::kSemiContinuous);
++  REQUIRE(after.integrality_[4] == HighsVarType::kSemiInteger);
++  requireSameModel(before, after);
++}
++
++TEST_CASE("round-trip-lp-objective-sense-and-offset",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addTwoColumns(highs);
++  addNamedCol(highs, "spare", 0, 0, rt_inf);
++  addNamedRow(highs, "R1", -rt_inf, 4, {0, 1}, {1, 1});
++  REQUIRE(highs.changeObjectiveSense(ObjSense::kMaximize) == HighsStatus::kOk);
++  REQUIRE(highs.changeObjectiveOffset(10) == HighsStatus::kOk);
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_sense_cb2617.lp");
++  REQUIRE(after.sense_ == ObjSense::kMaximize);
++  REQUIRE(after.offset_ == 10);
++  REQUIRE(after.num_col_ == 3);
++  requireSameModel(before, after);
++}
++
++TEST_CASE("round-trip-lp-solution-is-unchanged", "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addTwoColumns(highs);
++  addNamedRow(highs, "R1", 2, 5, {0, 1}, {1, 1});
++  REQUIRE(highs.run() == HighsStatus::kOk);
++  const double objective_before = highs.getInfo().objective_function_value;
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_solution_cb2617.lp");
++  Highs resolved;
++  quiet(resolved);
++  REQUIRE(resolved.passModel(after) == HighsStatus::kOk);
++  REQUIRE(resolved.run() == HighsStatus::kOk);
++  REQUIRE(resolved.getInfo().objective_function_value == objective_before);
++  REQUIRE(resolved.getNumRow() == 1);
++}
++
++static const std::string fixed_format_header =
++    "NAME          RTFIXED\n"
++    "ROWS\n"
++    " N  COST\n"
++    " L  R1\n"
++    "COLUMNS\n"
++    "    X         COST      1.0\n"
++    "    X         R1        1.0\n"
++    "    Z         COST      1.0\n"
++    "    Z         R1        1.0\n"
++    "RHS\n"
++    "    RHS       R1        20.0\n"
++    "BOUNDS\n";
++
++static HighsLp readFixedFormat(const std::string& file_name,
++                               const std::string& bounds,
++                               const HighsStatus expected) {
++  writeTextFile(file_name, fixed_format_header + bounds + "ENDATA\n");
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.setOptionValue("mps_parser_type_free", false) ==
++          HighsStatus::kOk);
++  REQUIRE(highs.readModel(file_name) == expected);
++  return highs.getLp();
++}
++
++TEST_CASE("fixed-format-mps-binary-bound", "[highs_model_round_trip]") {
++  const HighsLp lp = readFixedFormat("rt_fixed_bv_cb2617.mps",
++                                     " BV BND       Z\n", HighsStatus::kOk);
++  requireIntegralityCount(lp, 2);
++  REQUIRE(lp.integrality_[1] == HighsVarType::kInteger);
++  REQUIRE(lp.col_lower_[1] == 0);
++  REQUIRE(lp.col_upper_[1] == 1);
++}
++
++TEST_CASE("fixed-format-mps-integer-lower-bound", "[highs_model_round_trip]") {
++  const HighsLp lp = readFixedFormat(
++      "rt_fixed_li_cb2617.mps", " LI BND       Z            3.0\n",
++      HighsStatus::kOk);
++  requireIntegralityCount(lp, 2);
++  REQUIRE(lp.integrality_[1] == HighsVarType::kInteger);
++  REQUIRE(lp.col_lower_[1] == 3);
++  REQUIRE(lp.col_upper_[1] >= rt_inf);
++}
++
++TEST_CASE("fixed-format-mps-integer-upper-bound", "[highs_model_round_trip]") {
++  const HighsLp lp = readFixedFormat(
++      "rt_fixed_ui_cb2617.mps", " UI BND       Z            6.0\n",
++      HighsStatus::kOk);
++  requireIntegralityCount(lp, 2);
++  REQUIRE(lp.integrality_[1] == HighsVarType::kInteger);
++  REQUIRE(lp.col_lower_[1] == 0);
++  REQUIRE(lp.col_upper_[1] == 6);
++}
++
++TEST_CASE("fixed-format-mps-semi-continuous-bound",
++          "[highs_model_round_trip]") {
++  const HighsLp lp = readFixedFormat(
++      "rt_fixed_sc_cb2617.mps", " SC BND       Z            4.5\n",
++      HighsStatus::kOk);
++  requireIntegralityCount(lp, 2);
++  REQUIRE(lp.integrality_[1] == HighsVarType::kSemiContinuous);
++  REQUIRE(lp.col_upper_[1] == 4.5);
++}
++
++TEST_CASE("fixed-format-mps-semi-integer-bound", "[highs_model_round_trip]") {
++  const HighsLp lp = readFixedFormat(
++      "rt_fixed_si_cb2617.mps", " SI BND       Z            4.5\n",
++      HighsStatus::kOk);
++  requireIntegralityCount(lp, 2);
++  REQUIRE(lp.integrality_[1] == HighsVarType::kSemiInteger);
++  REQUIRE(lp.col_upper_[1] == 4.5);
++}
++
++TEST_CASE("fixed-format-mps-minus-infinity-bound-unchanged",
++          "[highs_model_round_trip]") {
++  const HighsLp lp = readFixedFormat(
++      "rt_fixed_mi_cb2617.mps", " MI BND       Z\n BV BND       X\n",
++      HighsStatus::kOk);
++  REQUIRE(lp.col_lower_[1] <= -rt_inf);
++  requireIntegralityCount(lp, 2);
++  REQUIRE(lp.integrality_[0] == HighsVarType::kInteger);
++  REQUIRE(lp.col_lower_[0] == 0);
++  REQUIRE(lp.col_upper_[0] == 1);
++}
++
++TEST_CASE("fixed-format-mps-upper-bound-unchanged", "[highs_model_round_trip]") {
++  const HighsLp lp = readFixedFormat(
++      "rt_fixed_up_cb2617.mps",
++      " UP BND       Z            9.0\n UI BND       X            6.0\n",
++      HighsStatus::kOk);
++  REQUIRE(lp.col_upper_[1] == 9);
++  REQUIRE(lp.col_lower_[1] == 0);
++  requireIntegralityCount(lp, 2);
++  REQUIRE(lp.integrality_[0] == HighsVarType::kInteger);
++  REQUIRE(lp.col_lower_[0] == 0);
++  REQUIRE(lp.col_upper_[0] == 6);
++}
++
++TEST_CASE("fixed-format-mps-unknown-bound-is-an-error",
++          "[highs_model_round_trip]") {
++  writeTextFile("rt_fixed_zz_cb2617.mps",
++                fixed_format_header + " ZZ BND       Z            1.0\n" +
++                    "ENDATA\n");
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.setOptionValue("mps_parser_type_free", false) ==
++          HighsStatus::kOk);
++  REQUIRE(highs.readModel("rt_fixed_zz_cb2617.mps") == HighsStatus::kError);
++}
++
++TEST_CASE("fixed-format-mps-unknown-bound-with-unknown-column-is-an-error",
++          "[highs_model_round_trip]") {
++  writeTextFile("rt_fixed_zz_alien_cb2617.mps",
++                fixed_format_header + " ZZ BND       Y            1.0\n" +
++                    "ENDATA\n");
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.setOptionValue("mps_parser_type_free", false) ==
++          HighsStatus::kOk);
++  REQUIRE(highs.readModel("rt_fixed_zz_alien_cb2617.mps") ==
++          HighsStatus::kError);
++}
++
++static HighsLp roundTripMps(const HighsLp& lp, const std::string& file_name,
++                            const bool free_parser) {
++  Highs writer;
++  quiet(writer);
++  REQUIRE(writer.passModel(lp) == HighsStatus::kOk);
++  REQUIRE(writer.writeModel(file_name) == HighsStatus::kOk);
++
++  Highs reader;
++  quiet(reader);
++  REQUIRE(reader.setOptionValue("mps_parser_type_free", free_parser) ==
++          HighsStatus::kOk);
++  REQUIRE(reader.readModel(file_name) == HighsStatus::kOk);
++  return reader.getLp();
++}
++
++TEST_CASE("round-trip-mps-integer-with-infinite-bounds",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "X", 1, -rt_inf, rt_inf);
++  addNamedCol(highs, "Y", 1, 0, 10);
++  REQUIRE(highs.changeColIntegrality(0, HighsVarType::kInteger) ==
++          HighsStatus::kOk);
++  addNamedRow(highs, "R1", -rt_inf, 20, {0, 1}, {1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp fixed =
++      roundTripMps(before, "rt_mps_intinf_cb2617.mps", false);
++  REQUIRE(fixed.col_lower_[0] <= -rt_inf);
++  REQUIRE(fixed.col_upper_[0] >= rt_inf);
++  requireIntegralityCount(fixed, 2);
++  REQUIRE(fixed.integrality_[0] == HighsVarType::kInteger);
++}
++
++TEST_CASE("round-trip-mps-under-both-parsers", "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "X", 2, 0, 10);
++  addNamedCol(highs, "Y", 3, -4, 9);
++  addNamedCol(highs, "Z", 1, 2, 8);
++  REQUIRE(highs.changeColIntegrality(1, HighsVarType::kInteger) ==
++          HighsStatus::kOk);
++  REQUIRE(highs.changeColIntegrality(2, HighsVarType::kSemiInteger) ==
++          HighsStatus::kOk);
++  addNamedRow(highs, "R1", 2, 5, {0, 1}, {1, 1});
++  addNamedRow(highs, "R2", -rt_inf, 12, {1, 2}, {2, -1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp free_read =
++      roundTripMps(before, "rt_mps_both_free_cb2617.mps", true);
++  requireSameModel(before, free_read);
++  const HighsLp fixed_read =
++      roundTripMps(before, "rt_mps_both_fixed_cb2617.mps", false);
++  requireSameModel(before, fixed_read);
++}
++
++TEST_CASE("round-trip-mps-semi-variable-with-equal-bounds",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "X", 1, 0, 10);
++  addNamedCol(highs, "SC", 1, 3, 3);
++  addNamedCol(highs, "SI", 1, 4, 4);
++  REQUIRE(highs.changeColIntegrality(1, HighsVarType::kSemiContinuous) ==
++          HighsStatus::kOk);
++  REQUIRE(highs.changeColIntegrality(2, HighsVarType::kSemiInteger) ==
++          HighsStatus::kOk);
++  addNamedRow(highs, "R1", -rt_inf, 20, {0, 1, 2}, {1, 1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp free_read =
++      roundTripMps(before, "rt_mps_semifx_free_cb2617.mps", true);
++  requireIntegralityCount(free_read, 3);
++  REQUIRE(free_read.integrality_[1] == HighsVarType::kSemiContinuous);
++  REQUIRE(free_read.integrality_[2] == HighsVarType::kSemiInteger);
++  REQUIRE(free_read.col_lower_[1] == 3);
++  REQUIRE(free_read.col_upper_[1] == 3);
++  REQUIRE(free_read.col_lower_[2] == 4);
++  REQUIRE(free_read.col_upper_[2] == 4);
++
++  const HighsLp fixed_read =
++      roundTripMps(before, "rt_mps_semifx_fixed_cb2617.mps", false);
++  requireIntegralityCount(fixed_read, 3);
++  REQUIRE(fixed_read.integrality_[1] == HighsVarType::kSemiContinuous);
++  REQUIRE(fixed_read.integrality_[2] == HighsVarType::kSemiInteger);
++  REQUIRE(fixed_read.col_lower_[1] == 3);
++  REQUIRE(fixed_read.col_upper_[1] == 3);
++  REQUIRE(fixed_read.col_lower_[2] == 4);
++  REQUIRE(fixed_read.col_upper_[2] == 4);
++}
++
++TEST_CASE("round-trip-mps-unbounded-integer-zero-column",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "X", 1, 0, 10);
++  addNamedCol(highs, "FREEINT", 0, -rt_inf, rt_inf);
++  REQUIRE(highs.changeColIntegrality(1, HighsVarType::kInteger) ==
++          HighsStatus::kOk);
++  addNamedRow(highs, "R1", -rt_inf, 20, {0}, {1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp free_read =
++      roundTripMps(before, "rt_mps_intzero_free_cb2617.mps", true);
++  requireIntegralityCount(free_read, 2);
++  REQUIRE(free_read.integrality_[1] == HighsVarType::kInteger);
++  REQUIRE(free_read.col_lower_[1] <= -rt_inf);
++  REQUIRE(free_read.col_upper_[1] >= rt_inf);
++
++  const HighsLp fixed_read =
++      roundTripMps(before, "rt_mps_intzero_fixed_cb2617.mps", false);
++  requireIntegralityCount(fixed_read, 2);
++  REQUIRE(fixed_read.integrality_[1] == HighsVarType::kInteger);
++}
++
++TEST_CASE("round-trip-lp-objective-name-is-preserved",
++          "[highs_model_round_trip]") {
++  const std::string file_name = "rt_objname_cb2617.lp";
++  writeTextFile(file_name,
++                "min\n PROFIT: x + y\nst\n R1: x + y >= 1\nend\n");
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.readModel(file_name) == HighsStatus::kOk);
++  REQUIRE(highs.getLp().objective_name_ == "PROFIT");
++
++  const HighsLp after = roundTripLp(highs.getLp(), "rt_objname_rt_cb2617.lp");
++  REQUIRE(after.objective_name_ == "PROFIT");
++}
++
++TEST_CASE("round-trip-lp-costless-empty-column-survives",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "x", 1, 0, 10);
++  addNamedCol(highs, "spare", 0, 0, rt_inf);
++  addNamedCol(highs, "y", 2, 0, 10);
++  addNamedRow(highs, "R1", -rt_inf, 4, {0, 2}, {1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_spare_cb2617.lp");
++  REQUIRE(after.num_col_ == 3);
++  REQUIRE(after.col_names_[1] == "spare");
++  REQUIRE(after.col_cost_[1] == 0);
++  requireSameModel(before, after);
++}
++
++TEST_CASE("round-trip-lp-column-order-is-preserved",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "first", 1, 0, 10);
++  addNamedCol(highs, "middle", 0, 0, 10);
++  addNamedCol(highs, "last", 2, 0, 10);
++  addNamedRow(highs, "R1", -rt_inf, 9, {1, 2}, {1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_order_cb2617.lp");
++  REQUIRE(after.num_col_ == 3);
++  REQUIRE(after.col_names_[0] == "first");
++  REQUIRE(after.col_names_[1] == "middle");
++  REQUIRE(after.col_names_[2] == "last");
++  requireSameModel(before, after);
++}
++
++TEST_CASE("read-lp-reversed-descending-range-is-an-error",
++          "[highs_model_round_trip]") {
++  requireValidRangeParses("rt_read_ok_desc_cb2617.lp",
++                          "min\n obj: x + y\nst\n R1: 5 >= x + y >= 2\nend\n",
++                          2, 5);
++  requireFileIsRejected("rt_read_rev_desc_cb2617.lp",
++                        "min\n obj: x + y\nst\n R1: 2 >= x + y >= 5\nend\n");
++}
++
++TEST_CASE("read-lp-opposite-mixed-orientation-range-is-an-error",
++          "[highs_model_round_trip]") {
++  requireValidRangeParses("rt_read_ok_desc2_cb2617.lp",
++                          "min\n obj: x + y\nst\n R1: 5 >= x + y >= 2\nend\n",
++                          2, 5);
++  requireFileIsRejected("rt_read_mixed2_cb2617.lp",
++                        "min\n obj: x + y\nst\n R1: 5 >= x + y <= 2\nend\n");
++}
++
++TEST_CASE("round-trip-mps-objective-sense-and-offset-under-both-parsers",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "X", 3, 0, 10);
++  addNamedCol(highs, "Y", 2, 0, 10);
++  addNamedCol(highs, "Z", 1, 2, 6);
++  REQUIRE(highs.changeColIntegrality(2, HighsVarType::kSemiInteger) ==
++          HighsStatus::kOk);
++  addNamedRow(highs, "R1", -rt_inf, 4, {0, 1, 2}, {1, 1, 1});
++  REQUIRE(highs.changeObjectiveSense(ObjSense::kMaximize) == HighsStatus::kOk);
++  REQUIRE(highs.changeObjectiveOffset(7.5) == HighsStatus::kOk);
++  const HighsLp before = highs.getLp();
++
++  const HighsLp free_read =
++      roundTripMps(before, "rt_mps_obj_free_cb2617.mps", true);
++  REQUIRE(free_read.sense_ == ObjSense::kMaximize);
++  REQUIRE(free_read.offset_ == 7.5);
++  requireIntegralityCount(free_read, 3);
++  REQUIRE(free_read.integrality_[2] == HighsVarType::kSemiInteger);
++
++  const HighsLp fixed_read =
++      roundTripMps(before, "rt_mps_obj_fixed_cb2617.mps", false);
++  REQUIRE(fixed_read.sense_ == ObjSense::kMaximize);
++  REQUIRE(fixed_read.offset_ == 7.5);
++  requireIntegralityCount(fixed_read, 3);
++  REQUIRE(fixed_read.integrality_[2] == HighsVarType::kSemiInteger);
++}
++
++TEST_CASE("round-trip-lp-value-spelled-column-names-survive",
++          "[highs_model_round_trip]") {
++  for (const std::string& name : {std::string("inf"), std::string("infinity"),
++                                  std::string("1"), std::string("9.9")}) {
++    Highs highs;
++    quiet(highs);
++    addNamedCol(highs, "x", 1, 0, 10);
++    addNamedCol(highs, name, 0, 0, rt_inf);
++    addNamedRow(highs, "R1", 2, 5, {0}, {1});
++    const HighsLp before = highs.getLp();
++
++    const HighsLp after = roundTripLp(before, "rt_valname_cb2617.lp");
++    REQUIRE(after.num_col_ == 2);
++    REQUIRE(after.col_names_[1] == name);
++    REQUIRE(after.offset_ == 0);
++    requireSameModel(before, after);
++  }
++}
++
++TEST_CASE("round-trip-lp-value-spelled-column-name-in-the-objective-survives",
++          "[highs_model_round_trip]") {
++  for (const std::string& name : {std::string("inf"), std::string("1"),
++                                  std::string("free")}) {
++    Highs highs;
++    quiet(highs);
++    addNamedCol(highs, "x", 1, 0, 10);
++    addNamedCol(highs, name, 2.5, 0, rt_inf);
++    addNamedRow(highs, "R1", 2, 5, {0}, {1});
++    const HighsLp before = highs.getLp();
++
++    const HighsLp after = roundTripLp(before, "rt_valobj_cb2617.lp");
++    REQUIRE(after.num_col_ == 2);
++    REQUIRE(after.col_names_[1] == name);
++    REQUIRE(after.col_cost_[1] == 2.5);
++    REQUIRE(after.a_matrix_.numNz() == 1);
++    REQUIRE(after.offset_ == 0);
++    requireSameModel(before, after);
++  }
++}
++
++TEST_CASE("round-trip-lp-value-spelled-column-name-in-a-quadratic-term-survives",
++          "[highs_model_round_trip]") {
++  for (const std::string& name : {std::string("inf"), std::string("1")}) {
++    Highs highs;
++    quiet(highs);
++    addNamedCol(highs, "x", 1, 0, 10);
++    addNamedCol(highs, name, 1, 0, rt_inf);
++    addNamedRow(highs, "R1", 2, 5, {0}, {1});
++    HighsModel model;
++    model.lp_ = highs.getLp();
++    HighsHessian& hessian = model.hessian_;
++    hessian.dim_ = 2;
++    hessian.format_ = HessianFormat::kTriangular;
++    hessian.start_ = {0, 1, 2};
++    hessian.index_ = {0, 1};
++    hessian.value_ = {2, 4};
++
++    Highs writer;
++    quiet(writer);
++    REQUIRE(writer.passModel(model) == HighsStatus::kOk);
++    REQUIRE(writer.writeModel("rt_valqp_cb2617.lp") == HighsStatus::kOk);
++
++    Highs reader;
++    quiet(reader);
++    REQUIRE(reader.readModel("rt_valqp_cb2617.lp") == HighsStatus::kOk);
++    const HighsLp& lp = reader.getLp();
++    REQUIRE(lp.num_col_ == 2);
++    REQUIRE(lp.col_names_[1] == name);
++    const HighsHessian& read_hessian = reader.getModel().hessian_;
++    REQUIRE(read_hessian.dim_ == 2);
++    REQUIRE(read_hessian.numNz() == 2);
++  }
++}
++
++TEST_CASE("round-trip-lp-value-spelled-column-name-before-another-term-survives",
++          "[highs_model_round_trip]") {
++  for (const std::string& name : {std::string("1"), std::string("inf")}) {
++    Highs highs;
++    quiet(highs);
++    addNamedCol(highs, name, 0, 0, rt_inf);
++    addNamedCol(highs, "x", 1, 0, 10);
++    addNamedRow(highs, "R1", 2, 5, {0, 1}, {3, 4});
++    const HighsLp before = highs.getLp();
++
++    const HighsLp after = roundTripLp(before, "rt_valfirst_cb2617.lp");
++    REQUIRE(after.num_col_ == 2);
++    REQUIRE(after.col_names_[0] == name);
++    REQUIRE(after.a_matrix_.numNz() == 2);
++    REQUIRE(after.offset_ == 0);
++    requireSameModel(before, after);
++  }
++}
++
++TEST_CASE("round-trip-lp-value-spelled-column-name-in-a-row-survives",
++          "[highs_model_round_trip]") {
++  for (const std::string& name : {std::string("inf"), std::string("1")}) {
++    Highs highs;
++    quiet(highs);
++    addNamedCol(highs, "x", 1, 0, 10);
++    addNamedCol(highs, name, 0, 0, rt_inf);
++    addNamedRow(highs, "R1", 2, 5, {0, 1}, {1, 3});
++    const HighsLp before = highs.getLp();
++
++    const HighsLp after = roundTripLp(before, "rt_valrow_cb2617.lp");
++    REQUIRE(after.num_col_ == 2);
++    REQUIRE(after.col_names_[1] == name);
++    REQUIRE(after.a_matrix_.numNz() == 2);
++    REQUIRE(after.offset_ == 0);
++    requireSameModel(before, after);
++  }
++}
++
++TEST_CASE("round-trip-lp-value-spelled-integrality-names-survive",
++          "[highs_model_round_trip]") {
++  for (const std::string& name : {std::string("inf"), std::string("1")}) {
++    Highs highs;
++    quiet(highs);
++    addNamedCol(highs, "x", 1, 0, 10);
++    addNamedCol(highs, name, 0, 0, rt_inf);
++    REQUIRE(highs.changeColIntegrality(1, HighsVarType::kInteger) ==
++            HighsStatus::kOk);
++    addNamedRow(highs, "R1", 2, 5, {0}, {1});
++    const HighsLp before = highs.getLp();
++
++    const HighsLp after = roundTripLp(before, "rt_valgen_cb2617.lp");
++    REQUIRE(after.num_col_ == 2);
++    REQUIRE(after.col_names_[1] == name);
++    requireIntegralityCount(after, 2);
++    REQUIRE(after.integrality_[1] == HighsVarType::kInteger);
++    requireSameModel(before, after);
++  }
++}
++
++TEST_CASE("round-trip-lp-keyword-named-column-survives",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "x", 1, 0, 10);
++  addNamedCol(highs, "free", 0, 0, 10);
++  addNamedRow(highs, "R1", 2, 5, {0}, {1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp after = roundTripLp(before, "rt_keyword_cb2617.lp");
++  REQUIRE(after.num_col_ == 2);
++  REQUIRE(after.col_names_[1] == "free");
++  requireSameModel(before, after);
++}
++
++TEST_CASE("round-trip-mps-semi-variable-with-infinite-threshold",
++          "[highs_model_round_trip]") {
++  for (const HighsVarType type :
++       {HighsVarType::kSemiContinuous, HighsVarType::kSemiInteger}) {
++    Highs highs;
++    quiet(highs);
++    REQUIRE(highs.setOptionValue("infinite_bound", rt_inf) == HighsStatus::kOk);
++    addNamedCol(highs, "X", 1, 0, 10);
++    addNamedCol(highs, "SEMI", 1, 1, rt_inf);
++    REQUIRE(highs.changeColIntegrality(1, type) == HighsStatus::kOk);
++    addNamedRow(highs, "R1", -rt_inf, 20, {0, 1}, {1, 1});
++    REQUIRE(highs.writeModel("rt_mps_semiinfthr_cb2617.mps") ==
++            HighsStatus::kOk);
++
++    for (const bool free_parser : {true, false}) {
++      Highs reader;
++      quiet(reader);
++      REQUIRE(reader.setOptionValue("infinite_bound", rt_inf) ==
++              HighsStatus::kOk);
++      REQUIRE(reader.setOptionValue("mps_parser_type_free", free_parser) ==
++              HighsStatus::kOk);
++      REQUIRE(reader.readModel("rt_mps_semiinfthr_cb2617.mps") !=
++              HighsStatus::kError);
++      const HighsLp& lp = reader.getLp();
++      requireIntegralityCount(lp, 2);
++      REQUIRE(lp.integrality_[1] == type);
++      REQUIRE(lp.col_lower_[1] == 1);
++      REQUIRE(lp.col_upper_[1] >= rt_inf);
++    }
++  }
++}
++
++TEST_CASE("write-lp-row-forms-are-as-described", "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addTwoColumns(highs);
++  addNamedRow(highs, "ranged", 2, 5, {0, 1}, {1, 1});
++  addNamedRow(highs, "freerow", -rt_inf, rt_inf, {0, 1}, {1, 1});
++  addNamedRow(highs, "geq", 2, rt_inf, {0, 1}, {1, 1});
++  addNamedRow(highs, "leq", -rt_inf, 6, {0, 1}, {1, 1});
++  addNamedRow(highs, "eq", 3, 3, {0, 1}, {1, 1});
++  REQUIRE(highs.writeModel("rt_forms_cb2617.lp") == HighsStatus::kOk);
++  const std::string text = readTextFile("rt_forms_cb2617.lp");
++
++  lineContaining(text, " ranged:");
++  const std::string freerow = lineContaining(text, " freerow:");
++  REQUIRE(countOccurrences(freerow, "<=") + countOccurrences(freerow, ">=") ==
++          2);
++  const std::string ranged = lineContaining(text, " ranged:");
++  REQUIRE(countOccurrences(ranged, "<=") + countOccurrences(ranged, ">=") == 2);
++  const std::string geq = lineContaining(text, " geq:");
++  REQUIRE(countOccurrences(geq, ">=") == 1);
++  REQUIRE(countOccurrences(geq, "<=") == 0);
++  const std::string leq = lineContaining(text, " leq:");
++  REQUIRE(countOccurrences(leq, "<=") == 1);
++  REQUIRE(countOccurrences(leq, ">=") == 0);
++  const std::string eq = lineContaining(text, " eq:");
++  REQUIRE(countOccurrences(eq, " =") == 1);
++  REQUIRE(countOccurrences(eq, "<=") == 0);
++
++  REQUIRE(countOccurrences(text, "rangedlo") == 0);
++  REQUIRE(countOccurrences(text, "rangedup") == 0);
++  REQUIRE(countOccurrences(text, " ranged:") == 1);
++  REQUIRE(countOccurrences(text, " freerow:") == 1);
++}
++
++TEST_CASE("write-mps-free-row-is-an-n-row", "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addTwoColumns(highs);
++  addNamedRow(highs, "freerow", -rt_inf, rt_inf, {0, 1}, {1, 1});
++  addNamedRow(highs, "R2", -rt_inf, 4, {0, 1}, {1, 1});
++  REQUIRE(highs.writeModel("rt_nrow_write_cb2617.mps") == HighsStatus::kOk);
++  const std::string text = readTextFile("rt_nrow_write_cb2617.mps");
++  const std::string row_line = lineContaining(text, "freerow");
++  REQUIRE(countOccurrences(row_line, " N ") == 1);
++
++  for (const bool free_parser : {true, false}) {
++    Highs reader;
++    quiet(reader);
++    REQUIRE(reader.setOptionValue("mps_parser_type_free", free_parser) ==
++            HighsStatus::kOk);
++    REQUIRE(reader.setOptionValue("keep_n_rows", 1) == HighsStatus::kOk);
++    REQUIRE(reader.readModel("rt_nrow_write_cb2617.mps") !=
++            HighsStatus::kError);
++    const HighsLp& lp = reader.getLp();
++    REQUIRE(lp.num_row_ == 2);
++    REQUIRE(lp.row_lower_[0] <= -rt_inf);
++    REQUIRE(lp.row_upper_[0] >= rt_inf);
++  }
++}
++
++TEST_CASE("round-trip-mps-objective-name-under-both-parsers",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addTwoColumns(highs);
++  addNamedCol(highs, "si", 1, 2, 6);
++  REQUIRE(highs.changeColIntegrality(2, HighsVarType::kSemiInteger) ==
++          HighsStatus::kOk);
++  addNamedRow(highs, "R1", 2, 5, {0, 1, 2}, {1, 1, 1});
++  HighsLp before = highs.getLp();
++  before.objective_name_ = "PROFIT";
++
++  const HighsLp free_read =
++      roundTripMps(before, "rt_mps_objname_free_cb2617.mps", true);
++  REQUIRE(free_read.objective_name_ == "PROFIT");
++  requireIntegralityCount(free_read, 3);
++  REQUIRE(free_read.integrality_[2] == HighsVarType::kSemiInteger);
++  const HighsLp fixed_read =
++      roundTripMps(before, "rt_mps_objname_fixed_cb2617.mps", false);
++  REQUIRE(fixed_read.objective_name_ == "PROFIT");
++  requireIntegralityCount(fixed_read, 3);
++  REQUIRE(fixed_read.integrality_[2] == HighsVarType::kSemiInteger);
++}
++
++TEST_CASE("round-trip-mps-costless-empty-column-survives",
++          "[highs_model_round_trip]") {
++  Highs highs;
++  quiet(highs);
++  addNamedCol(highs, "first", 1, 0, 10);
++  addNamedCol(highs, "spare", 0, 0, 10);
++  addNamedCol(highs, "last", 2, 0, 10);
++  addNamedCol(highs, "si", 1, 2, 6);
++  REQUIRE(highs.changeColIntegrality(3, HighsVarType::kSemiInteger) ==
++          HighsStatus::kOk);
++  addNamedRow(highs, "R1", -rt_inf, 9, {0, 2, 3}, {1, 1, 1});
++  const HighsLp before = highs.getLp();
++
++  const HighsLp free_read =
++      roundTripMps(before, "rt_mps_spare_free_cb2617.mps", true);
++  REQUIRE(free_read.num_col_ == 4);
++  REQUIRE(free_read.col_names_[1] == "spare");
++  REQUIRE(free_read.integrality_[3] == HighsVarType::kSemiInteger);
++  requireSameModel(before, free_read);
++
++  const HighsLp fixed_read =
++      roundTripMps(before, "rt_mps_spare_fixed_cb2617.mps", false);
++  REQUIRE(fixed_read.num_col_ == 4);
++  REQUIRE(fixed_read.col_names_[1] == "spare");
++  REQUIRE(fixed_read.integrality_[3] == HighsVarType::kSemiInteger);
++  requireSameModel(before, fixed_read);
++}
++
++TEST_CASE("round-trip-mps-semi-variable-with-infinite-bound",
++          "[highs_model_round_trip]") {
++  const double large_bound = 1e100;
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.setOptionValue("infinite_bound", large_bound) ==
++          HighsStatus::kOk);
++  addNamedCol(highs, "X", 1, 0, 10);
++  addNamedCol(highs, "SC", 1, 1, rt_inf);
++  REQUIRE(highs.changeColIntegrality(1, HighsVarType::kSemiContinuous) ==
++          HighsStatus::kOk);
++  addNamedRow(highs, "R1", -rt_inf, 20, {0, 1}, {1, 1});
++  REQUIRE(highs.writeModel("rt_mps_semiinf_cb2617.mps") == HighsStatus::kOk);
++
++  for (const bool free_parser : {true, false}) {
++    Highs reader;
++    quiet(reader);
++    REQUIRE(reader.setOptionValue("infinite_bound", large_bound) ==
++            HighsStatus::kOk);
++    REQUIRE(reader.setOptionValue("mps_parser_type_free", free_parser) ==
++            HighsStatus::kOk);
++    REQUIRE(reader.readModel("rt_mps_semiinf_cb2617.mps") !=
++            HighsStatus::kError);
++    const HighsLp& lp = reader.getLp();
++    requireIntegralityCount(lp, 2);
++    REQUIRE(lp.integrality_[1] == HighsVarType::kSemiContinuous);
++    REQUIRE(lp.col_lower_[1] == 1);
++    REQUIRE(lp.col_upper_[1] >= large_bound);
++  }
++}
++
++static const std::string free_row_with_ranges_mps =
++    "NAME          NROWRNG\n"
++    "ROWS\n"
++    " N  COST\n"
++    " N  FREE1\n"
++    " L  R1\n"
++    "COLUMNS\n"
++    "    X         COST      1.0\n"
++    "    X         FREE1     3.0\n"
++    "    X         R1        1.0\n"
++    "RHS\n"
++    "    RHS       R1        4.0\n"
++    "    RHS       FREE1     1.0\n"
++    "RANGES\n"
++    "    RANGE     FREE1     2.0\n"
++    "ENDATA\n";
++
++TEST_CASE("mps-discarded-free-row-ignores-its-range",
++          "[highs_model_round_trip]") {
++  for (const bool free_parser : {true, false}) {
++    writeTextFile("rt_nrow_range_drop_cb2617.mps", free_row_with_ranges_mps);
++    Highs highs;
++    quiet(highs);
++    REQUIRE(highs.setOptionValue("mps_parser_type_free", free_parser) ==
++            HighsStatus::kOk);
++    REQUIRE(highs.setOptionValue("keep_n_rows", -1) == HighsStatus::kOk);
++    REQUIRE(highs.readModel("rt_nrow_range_drop_cb2617.mps") !=
++            HighsStatus::kError);
++    const HighsLp& lp = highs.getLp();
++    REQUIRE(lp.num_row_ == 1);
++    REQUIRE(lp.row_names_[0] == "R1");
++    REQUIRE(lp.row_lower_[0] <= -rt_inf);
++    REQUIRE(lp.row_upper_[0] == 4);
++    REQUIRE(lp.offset_ == 0);
++  }
++}
++
++TEST_CASE("mps-kept-free-row-ignores-its-range", "[highs_model_round_trip]") {
++  for (const bool free_parser : {true, false}) {
++    writeTextFile("rt_nrow_range_cb2617.mps", free_row_with_ranges_mps);
++    Highs highs;
++    quiet(highs);
++    REQUIRE(highs.setOptionValue("mps_parser_type_free", free_parser) ==
++            HighsStatus::kOk);
++    REQUIRE(highs.setOptionValue("keep_n_rows", 1) == HighsStatus::kOk);
++    REQUIRE(highs.readModel("rt_nrow_range_cb2617.mps") != HighsStatus::kError);
++    const HighsLp& lp = highs.getLp();
++    REQUIRE(lp.num_row_ == 2);
++    REQUIRE(lp.row_names_[0] == "FREE1");
++    REQUIRE(lp.row_lower_[0] <= -rt_inf);
++    REQUIRE(lp.row_upper_[0] >= rt_inf);
++  }
++}
++
++static const std::string free_row_with_rhs_mps =
++    "NAME          NROWRHS\n"
++    "ROWS\n"
++    " N  COST\n"
++    " N  FREE1\n"
++    " L  R1\n"
++    "COLUMNS\n"
++    "    X         COST      1.0\n"
++    "    X         FREE1     3.0\n"
++    "    X         R1        1.0\n"
++    "RHS\n"
++    "    RHS       R1        4.0\n"
++    "    RHS       FREE1     7.0\n"
++    "ENDATA\n";
++
++TEST_CASE("mps-kept-free-row-ignores-its-right-hand-side",
++          "[highs_model_round_trip]") {
++  for (const bool free_parser : {true, false}) {
++    writeTextFile("rt_nrow_rhs_cb2617.mps", free_row_with_rhs_mps);
++    Highs highs;
++    quiet(highs);
++    REQUIRE(highs.setOptionValue("mps_parser_type_free", free_parser) ==
++            HighsStatus::kOk);
++    REQUIRE(highs.setOptionValue("keep_n_rows", 1) == HighsStatus::kOk);
++    REQUIRE(highs.readModel("rt_nrow_rhs_cb2617.mps") != HighsStatus::kError);
++    const HighsLp& lp = highs.getLp();
++    REQUIRE(lp.num_row_ == 2);
++    REQUIRE(lp.row_names_[0] == "FREE1");
++    REQUIRE(lp.row_lower_[0] <= -rt_inf);
++    REQUIRE(lp.row_upper_[0] >= rt_inf);
++  }
++}
++
++TEST_CASE("mps-discarded-free-row-ignores-its-right-hand-side",
++          "[highs_model_round_trip]") {
++  for (const bool free_parser : {true, false}) {
++    writeTextFile("rt_nrow_rhs_drop_cb2617.mps", free_row_with_rhs_mps);
++    Highs highs;
++    quiet(highs);
++    REQUIRE(highs.setOptionValue("mps_parser_type_free", free_parser) ==
++            HighsStatus::kOk);
++    REQUIRE(highs.setOptionValue("keep_n_rows", -1) == HighsStatus::kOk);
++    REQUIRE(highs.readModel("rt_nrow_rhs_drop_cb2617.mps") !=
++            HighsStatus::kError);
++    const HighsLp& lp = highs.getLp();
++    REQUIRE(lp.num_row_ == 1);
++    REQUIRE(lp.row_names_[0] == "R1");
++    REQUIRE(lp.row_upper_[0] == 4);
++    REQUIRE(lp.offset_ == 0);
++  }
++}
++
++static const std::string free_row_mps =
++    "NAME          FREEROW\n"
++    "ROWS\n"
++    " N  COST\n"
++    " N  FREE1\n"
++    " L  R1\n"
++    "COLUMNS\n"
++    "    X         COST      1.0\n"
++    "    X         FREE1     3.0\n"
++    "    X         R1        1.0\n"
++    "RHS\n"
++    "    RHS       R1        4.0\n"
++    "ENDATA\n";
++
++static HighsLp readWithKeepNRows(const std::string& file_name,
++                                 const bool free_parser,
++                                 const HighsInt keep_n_rows) {
++  writeTextFile(file_name, free_row_mps);
++  Highs highs;
++  quiet(highs);
++  REQUIRE(highs.setOptionValue("mps_parser_type_free", free_parser) ==
++          HighsStatus::kOk);
++  REQUIRE(highs.setOptionValue("keep_n_rows", keep_n_rows) == HighsStatus::kOk);
++  // Discarding a free row leaves its COLUMNS entries referring to a row the
++  // fixed format reader no longer knows, which it reports as a warning
++  REQUIRE(highs.readModel(file_name) != HighsStatus::kError);
++  return highs.getLp();
++}
++
++TEST_CASE("mps-free-row-kept-under-both-parsers",
++          "[highs_model_round_trip]") {
++  const HighsLp free_drop =
++      readWithKeepNRows("rt_nrow_drop_free_cb2617.mps", true, -1);
++  REQUIRE(free_drop.num_row_ == 1);
++  const HighsLp fixed_drop =
++      readWithKeepNRows("rt_nrow_drop_fixed_cb2617.mps", false, -1);
++  REQUIRE(fixed_drop.num_row_ == 1);
++
++  const HighsLp free_read =
++      readWithKeepNRows("rt_nrow_keep_free_cb2617.mps", true, 1);
++  REQUIRE(free_read.num_row_ == 2);
++  REQUIRE(free_read.row_names_[0] == "FREE1");
++  REQUIRE(free_read.row_lower_[0] <= -rt_inf);
++  REQUIRE(free_read.row_upper_[0] >= rt_inf);
++  REQUIRE(free_read.a_matrix_.numNz() == 2);
++  requireRowEntries(free_read, 0, {0}, {3});
++  requireRowEntries(free_read, 1, {0}, {1});
++
++  const HighsLp fixed_read =
++      readWithKeepNRows("rt_nrow_keep_fixed_cb2617.mps", false, 1);
++  REQUIRE(fixed_read.num_row_ == free_read.num_row_);
++  REQUIRE(fixed_read.row_lower_[0] <= -rt_inf);
++  REQUIRE(fixed_read.row_upper_[0] >= rt_inf);
++  REQUIRE(fixed_read.a_matrix_.numNz() == free_read.a_matrix_.numNz());
++}
++
++TEST_CASE("mps-free-row-entries-dropped-under-both-parsers",
++          "[highs_model_round_trip]") {
++  const HighsLp free_read =
++      readWithKeepNRows("rt_nrow_entries_free_cb2617.mps", true, 0);
++  REQUIRE(free_read.num_row_ == 2);
++  REQUIRE(free_read.a_matrix_.numNz() == 1);
++  REQUIRE(free_read.row_names_[0] == "FREE1");
++  requireRowEntries(free_read, 0, {}, {});
++  REQUIRE(free_read.row_names_[1] == "R1");
++  requireRowEntries(free_read, 1, {0}, {1});
++
++  const HighsLp fixed_read =
++      readWithKeepNRows("rt_nrow_entries_fixed_cb2617.mps", false, 0);
++  REQUIRE(fixed_read.num_row_ == free_read.num_row_);
++  REQUIRE(fixed_read.a_matrix_.numNz() == free_read.a_matrix_.numNz());
++  REQUIRE(fixed_read.row_names_[0] == "FREE1");
++  requireRowEntries(fixed_read, 0, {}, {});
++  REQUIRE(fixed_read.row_names_[1] == "R1");
++  requireRowEntries(fixed_read, 1, {0}, {1});
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000000..b154cdde2b
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,167 @@
++#!/bin/bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++cd "$(dirname "$0")" || exit 1
++if [ -n "$OUTPUT_PATH" ]; then mkdir -p "$(dirname "$OUTPUT_PATH")"; fi
++
++TAG="[highs_model_round_trip]"
++BUILD_LOG=$(mktemp)
++
++cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release -DALL_TESTS=ON \
++  > "$BUILD_LOG" 2>&1
++cmake --build build -j >> "$BUILD_LOG" 2>&1
++BUILD_STATUS=$?
++
++NEW_TESTS="round-trip-lp-boxed-row
++round-trip-lp-boxed-row-negative-bounds
++round-trip-lp-single-variable-range-stays-a-row
++round-trip-lp-free-row
++round-trip-lp-equality-row-unchanged
++round-trip-lp-one-sided-rows-unchanged
++read-lp-two-sided-constraint-ascending
++read-lp-two-sided-constraint-descending
++read-lp-two-sided-constraint-unnamed
++read-lp-two-sided-constraint-equal-bounds
++read-lp-reversed-range-is-an-error
++read-lp-mixed-orientation-range-is-an-error
++round-trip-lp-objective-name-is-preserved
++round-trip-lp-costless-empty-column-survives
++round-trip-lp-column-order-is-preserved
++read-lp-reversed-descending-range-is-an-error
++read-lp-opposite-mixed-orientation-range-is-an-error
++read-lp-bounds-section-still-bounds-columns
++round-trip-lp-semi-integer
++round-trip-lp-semi-continuous
++round-trip-lp-every-integrality
++round-trip-lp-objective-sense-and-offset
++round-trip-lp-solution-is-unchanged
++fixed-format-mps-binary-bound
++fixed-format-mps-integer-lower-bound
++fixed-format-mps-integer-upper-bound
++fixed-format-mps-semi-continuous-bound
++fixed-format-mps-semi-integer-bound
++fixed-format-mps-minus-infinity-bound-unchanged
++fixed-format-mps-upper-bound-unchanged
++fixed-format-mps-unknown-bound-is-an-error
++fixed-format-mps-unknown-bound-with-unknown-column-is-an-error
++round-trip-mps-integer-with-infinite-bounds
++round-trip-mps-under-both-parsers
++round-trip-mps-semi-variable-with-equal-bounds
++round-trip-mps-unbounded-integer-zero-column
++mps-kept-free-row-ignores-its-right-hand-side
++mps-discarded-free-row-ignores-its-range
++mps-kept-free-row-ignores-its-range
++round-trip-mps-objective-sense-and-offset-under-both-parsers
++mps-discarded-free-row-ignores-its-right-hand-side
++mps-free-row-kept-under-both-parsers
++mps-free-row-entries-dropped-under-both-parsers
++round-trip-lp-keyword-named-column-survives
++round-trip-lp-value-spelled-column-names-survive
++round-trip-lp-value-spelled-column-name-in-the-objective-survives
++round-trip-lp-value-spelled-column-name-in-a-quadratic-term-survives
++round-trip-lp-value-spelled-column-name-before-another-term-survives
++round-trip-lp-value-spelled-column-name-in-a-row-survives
++round-trip-lp-value-spelled-integrality-names-survive
++round-trip-mps-semi-variable-with-infinite-threshold
++write-lp-row-forms-are-as-described
++write-mps-free-row-is-an-n-row
++round-trip-mps-objective-name-under-both-parsers
++round-trip-mps-costless-empty-column-survives
++round-trip-mps-semi-variable-with-infinite-bound"
++
++write_build_failure_xml() {
++  local out="$1"
++  local detail
++  detail=$(tail -c 4000 "$BUILD_LOG" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' \
++    -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')
++  {
++    echo '<?xml version="1.0" encoding="UTF-8"?>'
++    echo '<testsuites>'
++    if [ "$MODE" = "new" ]; then
++      local n
++      n=$(printf '%s\n' "$NEW_TESTS" | wc -l)
++      echo "  <testsuite name=\"unit_tests\" tests=\"$n\" failures=\"$n\" errors=\"0\">"
++      printf '%s\n' "$NEW_TESTS" | while IFS= read -r name; do
++        [ -z "$name" ] && continue
++        echo "    <testcase classname=\"unit_tests\" name=\"$name\"><failure message=\"build failed\"><![CDATA[$detail]]></failure></testcase>"
++      done
++    else
++      echo '  <testsuite name="unit_tests" tests="1" failures="1" errors="0">'
++      echo "    <testcase classname=\"unit_tests\" name=\"compilation\"><failure message=\"build failed\"><![CDATA[$detail]]></failure></testcase>"
++    fi
++    echo '  </testsuite>'
++    echo '</testsuites>'
++  } > "$out"
++}
++
++if [ $BUILD_STATUS -ne 0 ]; then
++  cat "$BUILD_LOG" >&2
++  if [ -n "$OUTPUT_PATH" ]; then write_build_failure_xml "$OUTPUT_PATH"; fi
++  exit 1
++fi
++
++cd build || exit 1
++STATUS=0
++
++if [ "$MODE" = "base" ]; then
++  if [ -n "$OUTPUT_PATH" ]; then
++    ./bin/unit_tests "~$TAG" -r junit -o "$OUTPUT_PATH"
++  else
++    ./bin/unit_tests "~$TAG"
++  fi
++  STATUS=$?
++else
++  # Each new test runs in its own process. A test that makes the base binary
++  # abort would otherwise take the rest of the run with it, leaving those
++  # cases with no result at all
++  PARTS=$(mktemp -d)
++  INDEX=0
++  while IFS= read -r name; do
++    [ -z "$name" ] && continue
++    INDEX=$((INDEX + 1))
++    CASE_XML="$PARTS/$INDEX.xml"
++    CASE_LOG="$PARTS/$INDEX.log"
++    ./bin/unit_tests "$name" -r junit -o "$CASE_XML" > "$CASE_LOG" 2>&1
++    CASE_STATUS=$?
++    [ "$CASE_STATUS" -ne 0 ] && STATUS=1
++    if ! grep -q '<testcase' "$CASE_XML" 2>/dev/null; then
++      detail=$(tail -c 2000 "$CASE_LOG" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g'         -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')
++      printf '    <testcase classname="unit_tests.global" name="%s"><failure message="test did not report a result"><![CDATA[%s]]></failure></testcase>
++'         "$name" "$detail" > "$CASE_XML"
++      STATUS=1
++    fi
++  done <<EOF
++$NEW_TESTS
++EOF
++  if [ -n "$OUTPUT_PATH" ]; then
++    {
++      echo '<?xml version="1.0" encoding="UTF-8"?>'
++      echo '<testsuites>'
++      echo '  <testsuite name="unit_tests">'
++      for part in "$PARTS"/*.xml; do
++        sed -e '/<?xml/d' -e '/<testsuites/d' -e '/<\/testsuites>/d'             -e '/<testsuite /d' -e '/<\/testsuite>/d' "$part"
++      done
++      echo '  </testsuite>'
++      echo '</testsuites>'
++    } > "$OUTPUT_PATH"
++  fi
++  rm -rf "$PARTS"
++fi
++
++if [ -n "$OUTPUT_PATH" ] && ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  write_build_failure_xml "$OUTPUT_PATH"
++fi
++
++exit $STATUS

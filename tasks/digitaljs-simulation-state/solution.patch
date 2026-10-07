@@ -1,0 +1,788 @@
+diff --git a/src/cells/dff.mjs b/src/cells/dff.mjs
+index 92dc8b8..bcdb7e3 100644
+--- a/src/cells/dff.mjs
++++ b/src/cells/dff.mjs
+@@ -114,7 +114,17 @@ export const Dff = Box.define('Dff', {
+             return apply_sr(data.in);
+         } else return apply_sr(this.get('outputSignals').out);
+     },
++    _saveState() {
++        return { last_clk: this.last_clk | 0 };
++    },
++    _checkState(state) {
++        return typeof state === 'object' && state !== null && [-1, 0, 1].includes(state.last_clk);
++    },
++    _loadState(state) {
++        this.last_clk = state.last_clk;
++    },
+     _gateParams: Box.prototype._gateParams.concat(['polarity', 'bits', 'initial', 'arst_value', 'srst_value', 'enable_srst', 'no_data']),
++    _operationHelpers: Box.prototype._operationHelpers.concat(['_saveState', '_checkState', '_loadState']),
+     _unsupportedPropChanges: Box.prototype._unsupportedPropChanges.concat(['polarity', 'bits', 'initial', 'arst_value', 'srst_value', 'enable_srst', 'no_data']),
+     _gateKind: 'stateful'
+ });
+diff --git a/src/cells/fsm.mjs b/src/cells/fsm.mjs
+index 78a39e8..1a5b720 100644
+--- a/src/cells/fsm.mjs
++++ b/src/cells/fsm.mjs
+@@ -175,10 +175,28 @@ export const FSM = Box.define('FSM', {
+         }
+         return { out: next_output() };
+     },
++    _saveState() {
++        return { current_state: this.get('current_state'), next_trans: this.get('next_trans'), last_clk: this.last_clk | 0 };
++    },
++    _checkState(state) {
++        if (typeof state !== 'object' || state === null || ![-1, 0, 1].includes(state.last_clk))
++            return false;
++        const current_state = state.current_state;
++        if (!Number.isInteger(current_state) || current_state < 0 || current_state >= this.get('states'))
++            return false;
++        const links = this.transitions.get(current_state) || [];
++        return state.next_trans === undefined || links.some(trans => trans.id === state.next_trans);
++    },
++    _loadState(state) {
++        this.set('current_state', state.current_state);
++        this.set('next_trans', state.next_trans);
++        this.last_clk = state.last_clk;
++    },
+     markup: Box.prototype.markup.concat(Box.prototype.markupZoom),
+     _gateParams: Box.prototype._gateParams.concat(['bits', 'polarity', 'states', 'init_state', 'trans_table']),
+     _unsupportedPropChanges: Box.prototype._unsupportedPropChanges.concat(['bits', 'polarity', 'states', 'init_state', 'trans_table']),
+     _presentationParams: Box.prototype._presentationParams.concat(['current_state', 'next_trans']),
++    _operationHelpers: Box.prototype._operationHelpers.concat(['_saveState', '_checkState', '_loadState']),
+     _gateKind: 'stateful'
+ });
+ 
+diff --git a/src/cells/memory.mjs b/src/cells/memory.mjs
+index fb7f101..c5342ed 100644
+--- a/src/cells/memory.mjs
++++ b/src/cells/memory.mjs
+@@ -249,6 +249,37 @@ export const Memory = Box.define('Memory', {
+             className: 'portsplit',
+             selector: 'portsplit'
+         }], Box.prototype.markupZoom),
++    _saveState() {
++        return { memdata: this.memdata.toJSON(), last_clk: Object.assign({}, this.last_clk) };
++    },
++    _checkState(state) {
++        if (typeof state !== 'object' || state === null || !Array.isArray(state.memdata) ||
++            typeof state.last_clk !== 'object' || state.last_clk === null)
++            return false;
++        const clocks = Object.keys(this.last_clk);
++        if (Object.keys(state.last_clk).length != clocks.length ||
++            !clocks.every(clkname => [-1, 0, 1].includes(state.last_clk[clkname])))
++            return false;
++        try {
++            const memdata = Mem3vl.fromJSON(this.get('bits'), state.memdata);
++            return memdata.words == this.memdata.words &&
++                JSON.stringify(memdata.toJSON()) == JSON.stringify(state.memdata);
++        } catch (e) {
++            return false;
++        }
++    },
++    _loadState(state) {
++        const memdata = Mem3vl.fromJSON(this.get('bits'), state.memdata);
++        let restored = false;
++        for (let addr = 0; addr < this.memdata.words; addr++) {
++            const val = memdata.get(addr);
++            if (this.memdata.get(addr).eq(val)) continue;
++            this.memdata.set(addr, val);
++            restored = true;
++        }
++        this.last_clk = Object.assign({}, state.last_clk);
++        if (restored) this.trigger('memRestore');
++    },
+     getGateParams() {
+         // hack to get memdata back
+         const params = Box.prototype.getGateParams.apply(this, arguments);
+@@ -257,7 +288,7 @@ export const Memory = Box.define('Memory', {
+     },
+     _gateParams: Box.prototype._gateParams.concat(['bits', 'abits', 'rdports', 'wrports', 'words', 'offset']),
+     _unsupportedPropChanges: Box.prototype._unsupportedPropChanges.concat(['bits', 'abits', 'rdports', 'wrports', 'words', 'offset']),
+-    _operationHelpers: Box.prototype._operationHelpers.concat(['_memrdports', '_memwrports', '_memports', '_calcaddr']),
++    _operationHelpers: Box.prototype._operationHelpers.concat(['_memrdports', '_memwrports', '_memports', '_calcaddr', '_saveState', '_checkState', '_loadState']),
+     _gateKind: 'stateful'
+ });
+ export const MemoryView = BoxView.extend({
+@@ -406,10 +437,12 @@ export const MemoryView = BoxView.extend({
+             displayMarkings(sigs);
+         };
+         model.on("memChange", mem_change_cb);
++        model.on("memRestore", updateStuff);
+         model.on("change:inputSignals", input_change_cb);
+         this.paper.trigger('open:memorycontent', div, () => {
+             div.remove();
+             model.off("memChange", mem_change_cb);
++            model.off("memRestore", updateStuff);
+             model.off("change:inputSignals", input_change_cb);
+         });
+         return false;
+diff --git a/src/circuit.mjs b/src/circuit.mjs
+index 0692a9d..2c99ea0 100644
+--- a/src/circuit.mjs
++++ b/src/circuit.mjs
+@@ -8,9 +8,12 @@ import * as engines from './engines.mjs';
+ import * as tools from './tools.mjs';
+ import * as transform from './transform.mjs';
+ import { SynchEngine } from './engines/synch.mjs';
++import { jointGraphModel, prepareLoadState } from './engines/state.mjs';
+ 
+ export { cells, tools, engines, transform };
+-    
++
++const canRun = engine => engine.start !== SynchEngine.prototype.start;
++
+ export function getCellType(tp) {
+     const types = {
+         '$not': cells.Not,
+@@ -70,19 +73,70 @@ export function getCellType(tp) {
+ }
+         
+ export class HeadlessCircuit {
+-    constructor(data, {cellsNamespace = {}, engine = SynchEngine, engineOptions = {}, defaultCombinationalPropagation} = {}) {
++    constructor(data, {cellsNamespace = {}, engine = SynchEngine, engineOptions = {}, defaultCombinationalPropagation, state} = {}) {
+         this._cells = Object.assign(cells, cellsNamespace);
+         this._defaultCombinationalPropagation = defaultCombinationalPropagation;
+         this._display3vl = new Display3vl();
+         this._display3vl.addDisplay(new help.Display3vlASCII());
+         this._graph = this._makeGraph(data, data.subcircuits);
++        this._monitors = new Map();
++        this._alarms = new Map();
++        this._observed = new Map();
++        if (state !== undefined)
++            prepareLoadState(this._graph, state, jointGraphModel);
+         engineOptions.cells = this._cells;
+         this._engine = new engine(this._graph, engineOptions);
++        if (state !== undefined)
++            this._engine.loadState(state);
+         this.makeLabelIndex();
++        this._listenToEngine();
++    }
++    _listenToEngine() {
+         this.listenTo(this._engine, 'postUpdateGates', (tick, count) => {
+             this.trigger('postUpdateGates', tick, count);
+         });
+     }
++    async switchEngine(engine, engineOptions = {}) {
++        const running = this.running;
++        const interval = canRun(this._engine) ? this._engine.interval : undefined;
++        await this.stop();
++        const oldEngine = this._engine;
++        const state = await oldEngine.saveState();
++        const captured = Array.from(this._monitors.values());
++        const pending = await oldEngine.pendingMonitorValues(captured.map(entry => entry.engineId));
++        const inputs = this.getInputCells().map(cell => [cell, cell.get('outputSignals').out]);
++        const newEngine = new engine(this._graph, Object.assign({}, engineOptions, { cells: this._cells }));
++        const loaded = newEngine.loadState(state);
++        const entries = Array.from(this._monitors.values());
++        for (const entry of entries)
++            oldEngine.unmonitor(entry.engineId);
++        this.stopListening(oldEngine);
++        oldEngine.shutdown();
++        this._engine = newEngine;
++        for (const [graph, count] of this._observed)
++            for (let i = 0; i < count; i++) newEngine.observeGraph(graph);
++        for (const entry of entries) {
++            entry.initial = entry.initial && !captured.includes(entry);
++            entry.engineId = newEngine.monitor(entry.cell, entry.port, entry.callback, Object.assign({}, entry.options, { initial: entry.initial }));
++        }
++        newEngine.queueMonitorValues(pending
++            .filter(([k]) => entries.includes(captured[k]))
++            .map(([k, sig]) => [captured[k].engineId, sig]));
++        for (const [cell, sig] of inputs)
++            if (!sig.eq(cell.get('outputSignals').out)) cell.setInput(sig);
++        for (const entry of this._alarms.values())
++            entry.engineId = undefined;
++        this._armAlarms(state.tick);
++        if (interval !== undefined && canRun(newEngine))
++            newEngine.interval = interval;
++        this._listenToEngine();
++        await loaded;
++        await newEngine.synchronize();
++        if (running && canRun(newEngine)) {
++            if (this._runningFast) this.startFast();
++            else this.start();
++        }
++    }
+     addDisplay(display) {
+         this._display3vl.addDisplay(display);
+         this.trigger('display:add', display);
+@@ -188,6 +242,19 @@ export class HeadlessCircuit {
+     synchronize() {
+         return this._engine.synchronize();
+     }
++    saveState() {
++        return this._engine.saveState();
++    }
++    loadState(state) {
++        try {
++            prepareLoadState(this._graph, state, jointGraphModel);
++            const loaded = this._engine.loadState(state);
++            this._armAlarms(state.tick);
++            return loaded;
++        } catch (e) {
++            return Promise.reject(e);
++        }
++    }
+     get hasPendingEvents() {
+         return this._engine.hasPendingEvents;
+     }
+@@ -197,11 +264,13 @@ export class HeadlessCircuit {
+     start() {
+         if (this.hasWarnings())
+             return; //todo: print/show error
++        this._runningFast = false;
+         return this._engine.start();
+     }
+     startFast() {
+         if (this.hasWarnings())
+             return; //todo: print/show error
++        this._runningFast = true;
+         return this._engine.startFast();
+     }
+     stop(opts) {
+@@ -335,22 +404,62 @@ export class HeadlessCircuit {
+         return this.monitor(gate, src.port, callback, options);
+     }
+     monitor(cell, port, callback, options = {}) {
+-        return this._engine.monitor(cell, port, callback, options);
++        const monitorId = {};
++        const entry = { cell, port, options, initial: options.triggerValues == undefined };
++        entry.callback = (tick, sig) => {
++            if (entry.initial) entry.initial = false;
++            else if (options.oneShot) this._monitors.delete(monitorId);
++            return callback(tick, sig);
++        };
++        this._monitors.set(monitorId, entry);
++        entry.engineId = this._engine.monitor(cell, port, entry.callback, options);
++        return monitorId;
+     }
+     unmonitor(monitorId) {
+-        this._engine.unmonitor(monitorId);
++        const entry = this._monitors.get(monitorId);
++        if (entry === undefined) return;
++        this._monitors.delete(monitorId);
++        this._engine.unmonitor(entry.engineId);
++    }
++    _observe(graph) {
++        this._observed.set(graph, (this._observed.get(graph) || 0) + 1);
++        this._engine.observeGraph(graph);
++    }
++    _unobserve(graph) {
++        const count = this._observed.get(graph) || 0;
++        if (count == 0) return;
++        if (count == 1) this._observed.delete(graph);
++        else this._observed.set(graph, count - 1);
++        this._engine.unobserveGraph(graph);
+     }
+     observeGraph(path = []) {
+-        this._engine.observeGraph(this.getLabelIndex(path).graph);
++        this._observe(this.getLabelIndex(path).graph);
+     }
+     unobserveGraph(path = []) {
+-        this._engine.observeGraph(this.getLabelIndex(path).graph);
++        this._unobserve(this.getLabelIndex(path).graph);
+     }
+     alarm(tick, callback, options = {}) {
+-        return this._engine.alarm(tick, callback, options);
++        const alarmId = {};
++        const entry = { tick, options };
++        entry.callback = () => {
++            this._alarms.delete(alarmId);
++            return callback();
++        };
++        this._alarms.set(alarmId, entry);
++        entry.engineId = this._engine.alarm(tick, entry.callback, options);
++        return alarmId;
+     }
+     unalarm(alarmId) {
+-        this._engine.unalarm(alarmId);
++        const entry = this._alarms.get(alarmId);
++        if (entry === undefined) return;
++        this._alarms.delete(alarmId);
++        if (entry.engineId !== undefined)
++            this._engine.unalarm(entry.engineId);
++    }
++    _armAlarms(tick) {
++        for (const entry of this._alarms.values())
++            if (entry.engineId === undefined && entry.tick > tick)
++                entry.engineId = this._engine.alarm(entry.tick, entry.callback, entry.options);
+     }
+ };
+ 
+diff --git a/src/engines/state.mjs b/src/engines/state.mjs
+new file mode 100644
+index 0000000..2ef025c
+--- /dev/null
++++ b/src/engines/state.mjs
+@@ -0,0 +1,94 @@
++"use strict";
++
++import { Vector3vl } from '3vl';
++
++export function signalsToJSON(sigs) {
++    const ret = {};
++    for (const [port, sig] of Object.entries(sigs))
++        ret[port] = sig.toBin();
++    return ret;
++}
++
++export function signalsFromJSON(data) {
++    const ret = {};
++    for (const [port, bin] of Object.entries(data))
++        ret[port] = Vector3vl.fromBin(bin, bin.length);
++    return ret;
++}
++
++function sameSignalShape(sigs, data) {
++    if (typeof data !== 'object' || data === null) return false;
++    const ports = Object.keys(sigs);
++    if (ports.length != Object.keys(data).length) return false;
++    return ports.every(port => typeof data[port] === 'string' && data[port].length == sigs[port].bits && /^[01x]*$/.test(data[port]));
++}
++
++export const jointGraphModel = {
++    gates: (graph) => graph.getElements(),
++    subgraph: (gate) => gate.get('type') == 'Subcircuit' ? gate.get('graph') : undefined
++};
++
++export function saveGraphState(graph, model, path = [], paths = new Map()) {
++    const devices = Object.create(null);
++    for (const gate of model.gates(graph)) {
++        const devpath = path.concat([gate.id]);
++        paths.set(gate, devpath);
++        const dev = {
++            type: gate.get('type'),
++            inputSignals: signalsToJSON(gate.get('inputSignals')),
++            outputSignals: signalsToJSON(gate.get('outputSignals'))
++        };
++        if (gate._saveState) dev.state = gate._saveState();
++        const subgraph = model.subgraph(gate);
++        if (subgraph) dev.devices = saveGraphState(subgraph, model, devpath, paths);
++        devices[gate.id] = dev;
++    }
++    return devices;
++}
++
++export function savePendingState(queue, paths) {
++    const pending = [];
++    for (const tick of Array.from(queue.keys()).sort((a, b) => a - b)) {
++        for (const [gate, sigs] of queue.get(tick)) {
++            if (!paths.has(gate)) continue;
++            pending.push({ tick, device: paths.get(gate), inputSignals: signalsToJSON(sigs) });
++        }
++    }
++    return pending;
++}
++
++function matchGraphState(graph, devices, model, path, entries, byPath) {
++    const gates = model.gates(graph);
++    if (typeof devices !== 'object' || devices === null || Object.keys(devices).length != gates.length)
++        throw new Error("Saved state does not match the circuit at [" + path.join(', ') + "]");
++    for (const gate of gates) {
++        const devpath = path.concat([gate.id]);
++        const dev = devices[gate.id];
++        if (!dev || dev.type != gate.get('type') ||
++            !sameSignalShape(gate.get('inputSignals'), dev.inputSignals) ||
++            !sameSignalShape(gate.get('outputSignals'), dev.outputSignals) ||
++            (gate._checkState && !gate._checkState(dev.state)))
++            throw new Error("Saved state does not match the circuit at [" + devpath.join(', ') + "]");
++        entries.push([gate, dev]);
++        byPath.set(JSON.stringify(devpath), gate);
++        const subgraph = model.subgraph(gate);
++        if (subgraph) matchGraphState(subgraph, dev.devices, model, devpath, entries, byPath);
++        else if (dev.devices !== undefined)
++            throw new Error("Saved state does not match the circuit at [" + devpath.join(', ') + "]");
++    }
++}
++
++export function prepareLoadState(graph, state, model) {
++    if (typeof state !== 'object' || state === null || !Number.isInteger(state.tick) || state.tick < 0 || !Array.isArray(state.pending))
++        throw new Error("Invalid saved state");
++    const entries = [];
++    const byPath = new Map();
++    matchGraphState(graph, state.devices, model, [], entries, byPath);
++    const pending = state.pending.map(({ tick, device, inputSignals }) => {
++        const gate = byPath.get(JSON.stringify(device));
++        if (!gate || !Number.isInteger(tick) || tick < state.tick || !sameSignalShape(gate.get('inputSignals'), inputSignals))
++            throw new Error("Invalid pending evaluation in saved state");
++        return { tick, gate, inputSignals: signalsFromJSON(inputSignals) };
++    });
++    return { entries, pending };
++}
+diff --git a/src/engines/synch.mjs b/src/engines/synch.mjs
+index dfc502f..392fad2 100644
+--- a/src/engines/synch.mjs
++++ b/src/engines/synch.mjs
+@@ -3,6 +3,7 @@ import * as joint from '@joint/core';
+ import FastPriorityQueue from 'fastpriorityqueue';
+ import * as help from '../help.mjs';
+ import { BaseEngine } from './base.mjs';
++import { jointGraphModel, saveGraphState, savePendingState, prepareLoadState, signalsFromJSON } from './state.mjs';
+ 
+ export class SynchEngine extends BaseEngine {
+     constructor(graph, {cells}) {
+@@ -69,7 +70,9 @@ export class SynchEngine extends BaseEngine {
+         super._addGraph(graph);
+     }
+     _enqueue(gate) {
+-        const k = (this._tick + gate.get('propagation')) | 0;
++        this._enqueueAt((this._tick + gate.get('propagation')) | 0, gate, gate.get('inputSignals'));
++    }
++    _enqueueAt(k, gate, sigs) {
+         const sq = (() => {
+             const q = this._queue.get(k);
+             if (q !== undefined) return q;
+@@ -78,7 +81,39 @@ export class SynchEngine extends BaseEngine {
+             this._pq.add(k);
+             return q1;
+         })();
+-        sq.set(gate, gate.get('inputSignals'));
++        sq.set(gate, sigs);
++    }
++    saveState() {
++        const paths = new Map();
++        const devices = saveGraphState(this._graph, jointGraphModel, [], paths);
++        const pending = savePendingState(this._queue, paths);
++        return Promise.resolve({ tick: this._tick, devices, pending });
++    }
++    loadState(state) {
++        let entries, pending;
++        try {
++            ({ entries, pending } = prepareLoadState(this._graph, state, jointGraphModel));
++        } catch (e) {
++            return Promise.reject(e);
++        }
++        for (const [gate, dev] of entries)
++            gate.set('outputSignals', signalsFromJSON(dev.outputSignals));
++        for (const [gate, dev] of entries)
++            gate.set('inputSignals', signalsFromJSON(dev.inputSignals));
++        for (const [gate, dev] of entries)
++            if (gate._loadState) gate._loadState(dev.state);
++        this._queue = new Map();
++        this._pq = new FastPriorityQueue();
++        for (const { tick, gate, inputSignals } of pending)
++            this._enqueueAt(tick, gate, inputSignals);
++        this._tick = state.tick;
++        for (const tick of this._alarmQueue.keys()) {
++            if (tick <= this._tick || this._queue.has(tick - 1)) continue;
++            this._queue.set(tick - 1, new Map());
++            this._pq.add(tick - 1);
++        }
++        this._monitorChecks = new Map();
++        return Promise.resolve();
+     }
+     updateGatesNext() {
+         const k = this._pq.poll() | 0;
+@@ -143,15 +178,26 @@ export class SynchEngine extends BaseEngine {
+     }
+     unobserveGraph(graph) {
+     }
+-    monitor(gate, port, callback, {triggerValues, stopOnTrigger, oneShot}) {
++    monitor(gate, port, callback, {triggerValues, stopOnTrigger, oneShot, initial = true}) {
+         const cb = (gate, sigs) => {
+             const sig = sigs[port];
+             this._monitorChecks.set(cb, {gate, sig, cb, callback, triggerValues, stopOnTrigger, oneShot});
+         };
+         gate.on('change:outputSignals', cb);
+-        if (triggerValues == undefined)
++        if (triggerValues == undefined && initial)
+             callback(this._tick, gate.get('outputSignals')[port]);
+-        return { gate: gate, callback: cb };
++        return { gate: gate, port: port, callback: cb };
++    }
++    pendingMonitorValues(monitorIds) {
++        const positions = new Map(monitorIds.map((monitorId, k) => [monitorId.callback, k]));
++        const pending = [];
++        for (const { cb, sig } of this._monitorChecks.values())
++            if (positions.has(cb)) pending.push([positions.get(cb), sig]);
++        return Promise.resolve(pending);
++    }
++    queueMonitorValues(values) {
++        for (const [monitorId, sig] of values)
++            monitorId.callback(monitorId.gate, { [monitorId.port]: sig });
+     }
+     unmonitor(monitorId) {
+         monitorId.gate.off('change:outputSignals', monitorId.callback);
+@@ -166,9 +212,10 @@ export class SynchEngine extends BaseEngine {
+         if (!this._alarmQueue.has(tick))
+             this._alarmQueue.set(tick, new Set());
+         this._alarmQueue.get(tick).add(cb);
+-        this._pq.add(tick-1);
+-        if (!this._queue.has(tick-1))
++        if (!this._queue.has(tick-1)) {
+             this._queue.set(tick-1, new Map());
++            this._pq.add(tick-1);
++        }
+         return cb;
+     }
+     unalarm(alarmId) {
+diff --git a/src/engines/worker-worker.mjs b/src/engines/worker-worker.mjs
+index ec31c21..a0855b3 100644
+--- a/src/engines/worker-worker.mjs
++++ b/src/engines/worker-worker.mjs
+@@ -2,6 +2,12 @@
+ import * as cells from '../cells.mjs';
+ import FastPriorityQueue from 'fastpriorityqueue';
+ import { Vector3vl } from '3vl';
++import { saveGraphState, savePendingState, prepareLoadState, signalsFromJSON } from './state.mjs';
++
++const stateModel = {
++    gates: (graph) => graph.getGates(),
++    subgraph: (gate) => gate.isSubcircuit ? gate.get('subgraph') : undefined
++};
+ 
+ const specialGates = new Set(['Subcircuit', 'Input', 'Output', 'Button', 'Lamp', 'NumEntry', 'NumDisplay']);
+ 
+@@ -310,14 +316,14 @@ class WorkerEngineWorker {
+         gate.memdata.set(addr, Vector3vl.fromClonable(data));
+         this._enqueue(gate);
+     }
+-    monitor(graphId, gateId, port, monitorId, {triggerValues, stopOnTrigger, oneShot, synchronous }) {
++    monitor(graphId, gateId, port, monitorId, {triggerValues, stopOnTrigger, oneShot, synchronous, initial = true }) {
+         if (triggerValues != undefined)
+             for (const k of triggerValues.keys())
+                 triggerValues[k] = Vector3vl.fromClonable(triggerValues[k]);
+         const gate = this._graphs[graphId].getGate(gateId);
+         this._monitors[monitorId] = { gate, port, triggerValues, stopOnTrigger, oneShot, synchronous };
+         gate.monitor(port, monitorId);
+-        if (triggerValues == undefined)
++        if (triggerValues == undefined && initial)
+             postMessage({ type: 'monitorValue', args: [monitorId, this._tick, gate.get('outputSignals')[port]] });
+     }
+     unmonitor(monitorId) {
+@@ -333,9 +339,10 @@ class WorkerEngineWorker {
+         if (!this._alarmQueue.has(tick))
+             this._alarmQueue.set(tick, new Set());
+         this._alarmQueue.get(tick).add(alarmId);
+-        this._pq.add(tick-1);
+-        if (!this._queue.has(tick-1))
++        if (!this._queue.has(tick-1)) {
+             this._queue.set(tick-1, new Map());
++            this._pq.add(tick-1);
++        }
+     }
+     unalarm(alarmId) {
+         const alarm = this._alarms[alarmId];
+@@ -347,7 +354,9 @@ class WorkerEngineWorker {
+         delete this._alarms[alarmId];
+     }
+     _enqueue(gate) {
+-        const k = (this._tick + gate.get('propagation')) | 0;
++        this._enqueueAt((this._tick + gate.get('propagation')) | 0, gate, Object.assign({}, gate.get('inputSignals')));
++    }
++    _enqueueAt(k, gate, sigs) {
+         const sq = (() => {
+             const q = this._queue.get(k);
+             if (q !== undefined) return q;
+@@ -356,7 +365,57 @@ class WorkerEngineWorker {
+             this._pq.add(k);
+             return q1;
+         })();
+-        sq.set(gate, Object.assign({}, gate.get('inputSignals')));
++        sq.set(gate, sigs);
++    }
++    _rootGraph() {
++        return Object.values(this._graphs).find(graph => graph.subcircuit === null);
++    }
++    saveState(reqid) {
++        const paths = new Map();
++        const devices = saveGraphState(this._rootGraph(), stateModel, [], paths);
++        const pending = savePendingState(this._queue, paths);
++        this._sendAck(reqid, { tick: this._tick, devices, pending });
++    }
++    loadState(reqid, state) {
++        let entries, pending;
++        try {
++            ({ entries, pending } = prepareLoadState(this._rootGraph(), state, stateModel));
++        } catch (e) {
++            this._sendAck(reqid, { error: e.message });
++            return;
++        }
++        for (const [gate, dev] of entries)
++            this._setGateOutputSignals(gate, signalsFromJSON(dev.outputSignals));
++        for (const [gate, dev] of entries)
++            for (const [port, sig] of Object.entries(signalsFromJSON(dev.inputSignals)))
++                this._setGateInputSignal(gate, port, sig);
++        for (const [gate, dev] of entries)
++            if (gate._loadState) gate._loadState(dev.state);
++        this._queue = new Map();
++        this._pq = new FastPriorityQueue();
++        for (const { tick, gate, inputSignals } of pending)
++            this._enqueueAt(tick, gate, inputSignals);
++        this._tick = state.tick;
++        for (const tick of this._alarmQueue.keys()) {
++            if (tick <= this._tick || this._queue.has(tick - 1)) continue;
++            this._queue.set(tick - 1, new Map());
++            this._pq.add(tick - 1);
++        }
++        this._monitorChecks = Object.create(null);
++        this._toUpdate = new Map();
++        this._toUpdateParam = new Map();
++        this._sendAck(reqid, { tick: this._tick, pendingEvents: this._hasPendingEvents() });
++    }
++    pendingMonitorValues(reqid, monitorIds) {
++        const positions = new Map(monitorIds.map((monitorId, k) => [String(monitorId), k]));
++        const pending = [];
++        for (const [monitorId, sig] of Object.entries(this._monitorChecks))
++            if (positions.has(monitorId)) pending.push([positions.get(monitorId), sig]);
++        this._sendAck(reqid, pending);
++    }
++    queueMonitorValues(values) {
++        for (const [monitorId, sig] of values)
++            this._monitorChecks[monitorId] = Vector3vl.fromClonable(sig);
+     }
+     _postMonitors() {
+         for (const [monitorId, sig] of Object.entries(this._monitorChecks)) {
+diff --git a/src/engines/worker.mjs b/src/engines/worker.mjs
+index 35d0726..d4704ac 100644
+--- a/src/engines/worker.mjs
++++ b/src/engines/worker.mjs
+@@ -4,6 +4,7 @@ import { BaseEngine } from './base.mjs';
+ import { Vector3vl } from '3vl';
+ import * as cells from '../cells.mjs';
+ import Worker from 'web-worker';
++import { jointGraphModel, prepareLoadState, signalsFromJSON } from './state.mjs';
+ 
+ export class WorkerEngine extends BaseEngine {
+     constructor(graph, { workerURL }) {
+@@ -17,6 +18,8 @@ export class WorkerEngine extends BaseEngine {
+         this._promises = Object.create(null);
+         this._alarms = Object.create(null);
+         this._uniqueCounter = 0;
++        this._loading = 0;
++        this._retired = false;
+         this._worker = workerURL ? new Worker(workerURL, {type:'module'}) : new Worker(new URL('./worker-worker.mjs', import.meta.url), {type:'module'});
+         this._worker.onmessage = (e) => this._handleMessage(e.data);
+         this.interval = 10;
+@@ -114,13 +117,57 @@ export class WorkerEngine extends BaseEngine {
+         return this._tickCache;
+     }
+     shutdown() {
+-        this._worker.terminate();
++        this.stopListening();
++        this._retired = true;
++        this._terminateWhenIdle();
++    }
++    _terminateWhenIdle() {
++        if (Object.keys(this._promises).length == 0)
++            this._worker.terminate();
+     }
+     synchronize() {
+         const [reqid, promise] = this._generatePromise();
+         this._worker.postMessage({ type: 'ping', args: [reqid, true] });
+         return promise;
+     }
++    saveState() {
++        const [reqid, promise] = this._generatePromise();
++        this._worker.postMessage({ type: 'saveState', arg: reqid });
++        return promise;
++    }
++    loadState(state) {
++        let entries;
++        try {
++            ({ entries } = prepareLoadState(this._graph, state, jointGraphModel));
++        } catch (e) {
++            return Promise.reject(e);
++        }
++        const [reqid, promise] = this._generatePromise();
++        this._worker.postMessage({ type: 'loadState', args: [reqid, state] });
++        this._loading++;
++        for (const [gate, dev] of entries) {
++            gate.set('outputSignals', signalsFromJSON(dev.outputSignals));
++            gate.set('inputSignals', signalsFromJSON(dev.inputSignals));
++        }
++        for (const [gate, dev] of entries)
++            if (gate._loadState) gate._loadState(dev.state);
++        this._tickCache = state.tick;
++        this._pendingEventsCache = state.pending.length > 0;
++        return promise.then(({ error, tick, pendingEvents }) => {
++            this._loading--;
++            if (error) throw new Error(error);
++            this._tickCache = tick;
++            this._pendingEventsCache = pendingEvents;
++        });
++    }
++    pendingMonitorValues(monitorIds) {
++        const [reqid, promise] = this._generatePromise();
++        this._worker.postMessage({ type: 'pendingMonitorValues', args: [reqid, monitorIds] });
++        return promise.then(pending => pending.map(([k, sig]) => [k, Vector3vl.fromClonable(sig)]));
++    }
++    queueMonitorValues(values) {
++        this._worker.postMessage({ type: 'queueMonitorValues', arg: values });
++    }
+     updateGatesNext({ synchronous = false } = {}) {
+         if (this._running)
+             throw new Error("updateGatesNext while running");
+@@ -201,6 +248,7 @@ export class WorkerEngine extends BaseEngine {
+         delete this._alarms[alarmId];
+     }
+     _handleMessage(msg) {
++        if (this._retired && msg.type != 'ack') return;
+         const name = '_handle_' + msg.type;
+         if ('arg' in msg)
+             this[name](msg.arg);
+@@ -210,6 +258,7 @@ export class WorkerEngine extends BaseEngine {
+             this[name]();
+     }
+     _handle_update(tick, pendingEvents, updates) {
++        if (this._loading) return;
+         let changeRunning = this._pendingEventsCache != pendingEvents;
+         this._tickCache = tick;
+         this._pendingEventsCache = pendingEvents;
+@@ -232,6 +281,7 @@ export class WorkerEngine extends BaseEngine {
+         this.trigger('changeRunning');
+     }
+     _handle_gateTrigger(graphId, gateId, event, args) {
++        if (this._loading) return;
+         if (event == "memChange")
+             args[1] = Vector3vl.fromClonable(args[1]);
+         const gate = this._findGateByIds(graphId, gateId);
+@@ -239,6 +289,7 @@ export class WorkerEngine extends BaseEngine {
+         gate.trigger(event, ...args);
+     }
+     _handle_gateSet(graphId, gateId, name, value) {
++        if (this._loading) return;
+         const gate = this._findGateByIds(graphId, gateId);
+         if (gate === undefined) return;
+         gate.set(name, value);
+@@ -291,6 +342,7 @@ export class WorkerEngine extends BaseEngine {
+         }
+         this._promises[reqid](value);
+         delete this._promises[reqid];
++        if (this._retired) this._terminateWhenIdle();
+     }
+ };
+ 
+diff --git a/src/index.mjs b/src/index.mjs
+index b941b9b..4b92a1a 100644
+--- a/src/index.mjs
++++ b/src/index.mjs
+@@ -94,6 +94,9 @@ export class Circuit extends HeadlessCircuit {
+         this._layoutEngine = layoutEngine
+         this._windowCallback = windowCallback;
+         this._subcircuitButtons = this._mergeSubcircuitButtons(subcircuitButtons);
++    }
++    _listenToEngine() {
++        super._listenToEngine();
+         this.listenTo(this._engine, 'changeRunning', () => {
+             this.trigger('changeRunning');
+         });
+@@ -147,7 +150,7 @@ export class Circuit extends HeadlessCircuit {
+         paper.unfreeze();
+     }
+     _makePaper(elem, graph) {
+-        this._engine.observeGraph(graph);
++        this._observe(graph);
+         const opts = joint.util.merge({ el: elem, model: graph }, paperOptions);
+         const paper = new joint.dia.Paper(opts);
+         paper.$el.addClass('djs');
+@@ -203,7 +206,7 @@ export class Circuit extends HeadlessCircuit {
+             const paper = this._makePaper(pdiv, graph);
+             paper.once('render:done', () => {
+                 this._windowCallback('Subcircuit', subcircuitModal, () => {
+-                    this._engine.unobserveGraph(graph);
++                    this._unobserve(graph);
+                     paper.remove();
+                     subcircuitModal.remove();
+                 });

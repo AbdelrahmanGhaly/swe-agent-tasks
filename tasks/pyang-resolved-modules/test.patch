@@ -1,0 +1,2175 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..3e92a95
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,66 @@
++#!/bin/sh
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/results.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++rm -f "$OUTPUT_PATH"
++
++cd "$(dirname "$0")" || exit 1
++. ./env.sh
++export JSON2XML=json2xml
++export YANG2HTML=yang2html
++export YANG2DSDL="env PYANG=$PYANG $W/bin/yang2dsdl"
++
++BASETEMP="$(mktemp -d)"
++
++if [ "$MODE" = "new" ]; then
++  TESTS="test/test_resolve/test_resolved_output_3ff91a.py"
++else
++  TESTS="test/test_makefile_suite_3ff91a.py"
++  umask 0000
++  ACCESS=test/test_bad/access.yang
++  if [ -f "$ACCESS" ] && [ ! -O "$ACCESS" ]; then
++    cp "$ACCESS" "$ACCESS.$$" && mv -f "$ACCESS.$$" "$ACCESS"
++  fi
++fi
++
++LOG="$BASETEMP.log"
++python -m pytest "$TESTS" -v -p no:cacheprovider --basetemp="$BASETEMP" \
++    --junitxml="$OUTPUT_PATH" > "$LOG" 2>&1
++EXIT_CODE=$?
++cat "$LOG"
++rm -rf "$BASETEMP"
++
++if [ ! -f "$OUTPUT_PATH" ] || ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  python - "$OUTPUT_PATH" "$LOG" <<'PYEOF'
++import sys
++from xml.sax.saxutils import escape, quoteattr
++with open(sys.argv[2], errors='replace') as f:
++    output = f.read()
++with open(sys.argv[1], 'w') as f:
++    f.write('<?xml version="1.0" encoding="utf-8"?>\n'
++            '<testsuites><testsuite name="pytest" tests="1" failures="1" '
++            'errors="0" time="0">\n'
++            '<testcase classname="test.sh" name="collection">\n'
++            '<failure message=%s>%s</failure>\n'
++            '</testcase>\n</testsuite></testsuites>\n'
++            % (quoteattr('pytest did not report any test results'),
++               escape(output)))
++PYEOF
++  rm -f "$LOG"
++  exit 1
++fi
++rm -f "$LOG"
++
++exit $EXIT_CODE
+diff --git a/test/test_makefile_suite_3ff91a.py b/test/test_makefile_suite_3ff91a.py
+new file mode 100644
+index 0000000..31638eb
+--- /dev/null
++++ b/test/test_makefile_suite_3ff91a.py
+@@ -0,0 +1,25 @@
++import os
++import subprocess
++
++import pytest
++
++TEST_DIR = os.path.dirname(os.path.abspath(__file__))
++
++DIRS = sorted(d for d in os.listdir(TEST_DIR)
++              if os.path.isfile(os.path.join(TEST_DIR, d, 'Makefile')))
++
++
++def run_make(cwd, target):
++    proc = subprocess.run(['make', target], cwd=cwd,
++                          capture_output=True, text=True)
++    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-4000:]
++
++
++@pytest.mark.parametrize('target', ['selftest', 'mtest'])
++def test_toplevel_target(target):
++    run_make(TEST_DIR, target)
++
++
++@pytest.mark.parametrize('directory', DIRS)
++def test_directory(directory):
++    run_make(os.path.join(TEST_DIR, directory), 'test')
+diff --git a/test/test_resolve/test_resolved_output_3ff91a.py b/test/test_resolve/test_resolved_output_3ff91a.py
+new file mode 100644
+index 0000000..9da6410
+--- /dev/null
++++ b/test/test_resolve/test_resolved_output_3ff91a.py
+@@ -0,0 +1,2066 @@
++import os
++import subprocess
++import sys
++
++import pytest
++
++from pyang import context, plugin, repository, syntax, util, xpath_parser
++
++SCHEMA_ONLY = ('choice', 'case', 'input', 'output')
++
++LIB = """
++module lib {
++  yang-version 1.1;
++  namespace "urn:lib";
++  prefix lib;
++  typedef percent { type uint8 { range "0..100"; } }
++  identity base-kind;
++  identity fast { base base-kind; }
++  identity slow { base base-kind; }
++  feature extra;
++  feature turbo;
++  extension hint { argument text; }
++  container settings {
++    leaf level { type uint8; }
++    leaf-list names { type string; }
++  }
++}
++"""
++
++GRP = """
++module grp {
++  yang-version 1.1;
++  namespace "urn:grp";
++  prefix g;
++  import lib { prefix l; }
++  typedef label { type string { length "1..16"; } }
++  identity color;
++  identity red { base color; }
++  identity dark-red { base red; }
++  list registry {
++    key "name";
++    leaf name { type string; }
++    leaf value { type int32; }
++  }
++  grouping basic {
++    leaf name { type label; }
++    leaf speed { type l:percent; }
++  }
++  grouping styled {
++    leaf paint { type identityref { base color; } default red; }
++    leaf mood { type identityref { base l:base-kind; } default l:slow; }
++    leaf ok {
++      type boolean;
++      must "derived-from-or-self(../paint, 'red') and derived-from(../mood, 'l:base-kind')";
++    }
++  }
++  grouping wired {
++    leaf target { type leafref { path "/g:registry[g:name = current()/../key]/g:value"; } }
++    leaf key { type string; }
++    leaf boosted { type string; if-feature "l:turbo or not l:extra"; }
++    leaf guarded { type string; if-feature "not (l:turbo and l:extra)"; }
++    leaf noted { type string; l:hint "kept" { l:hint "inner"; } }
++  }
++  grouping scoped {
++    typedef small { type int16 { range "-10..10"; } }
++    leaf s { type small; }
++    container box {
++      typedef tiny { type uint8 { range "1..3"; } }
++      leaf t { type tiny; }
++    }
++  }
++  grouping outer {
++    uses basic;
++    container more {
++      uses styled;
++    }
++  }
++  grouping painted {
++    uses styled {
++      refine paint { default dark-red; }
++    }
++  }
++}
++"""
++
++
++class _Opts(object):
++    def __getattr__(self, _name):
++        return None
++
++
++_plugins_ready = []
++
++
++def compile_module(path, filename, features=None, deviations=()):
++    if not _plugins_ready:
++        plugin.init([])
++        _plugins_ready.append(True)
++    repo = repository.FileRepository(str(path), use_env=False)
++    ctx = context.Context(repo)
++    ctx.opts = _Opts()
++    ctx.opts.features = []
++    ctx.opts.deviations = []
++    ctx.trim_yin = False
++    for modulename, names in (features or {}).items():
++        ctx.features[modulename] = names
++    fmt = 'yin' if filename.endswith('.yin') else 'yang'
++    with open(os.path.join(str(path), filename)) as fd:
++        module = ctx.add_module(filename, fd.read(), in_format=fmt)
++    for filename_ in deviations:
++        with open(os.path.join(str(path), filename_)) as fd:
++            ctx.deviation_modules.append(ctx.add_module(filename_, fd.read()))
++    ctx.validate()
++    module.prune()
++    return ctx, module
++
++
++def run_pyang(path, *args):
++    return subprocess.run(
++        [sys.executable, '-m', 'pyang.scripts.pyang_tool',
++         '-p', str(path)] + list(args),
++        capture_output=True, text=True, cwd=str(path))
++
++
++def module_name(stmt, prefix):
++    src = stmt.i_orig_module
++    if prefix is None or prefix == src.i_prefix:
++        return src.i_modulename
++    return src.i_prefixes.get(prefix, ('?' + prefix, None))[0]
++
++
++def qualify(stmt, identifier):
++    prefix, name = util.split_identifier(identifier)
++    return '%s:%s' % (module_name(stmt, prefix), name)
++
++
++def context_node(node):
++    while node.keyword in SCHEMA_ONLY:
++        node = node.parent
++    return node
++
++
++def data_children(node):
++    result = []
++    for child in getattr(node, 'i_children', []):
++        if child.keyword in SCHEMA_ONLY:
++            result.extend(data_children(child))
++        else:
++            result.append(child)
++    return result
++
++
++def node_path(node):
++    parts = []
++    while node.keyword not in ('module', 'submodule'):
++        if node.keyword in ('input', 'output'):
++            parts.append(node.keyword)
++        elif node.keyword not in ('choice', 'case'):
++            parts.append('%s:%s' % (node.i_module.i_modulename, node.arg))
++        node = node.parent
++    return '/' + '/'.join(reversed(parts))
++
++
++def default_value(type_stmt, stmt):
++    spec = getattr(type_stmt, 'i_type_spec', None)
++    if spec is not None and spec.name == 'identityref':
++        return qualify(stmt, stmt.arg)
++    return stmt.arg
++
++
++def restriction_signature(stmt):
++    if stmt.keyword == 'if-feature':
++        return (stmt.keyword, str(feature_signature(
++            stmt, syntax.parse_if_feature_expr(stmt.arg))))
++    substmts = tuple(
++        restriction_signature(s) for s in stmt.substmts
++        if s.keyword not in ('description', 'reference', 'error-message',
++                             'error-app-tag', 'value', 'position'))
++    if stmt.keyword in ('enum', 'bit'):
++        explicit = stmt.search_one('value' if stmt.keyword == 'enum'
++                                   else 'position')
++        effective = getattr(stmt, 'i_value' if stmt.keyword == 'enum'
++                            else 'i_position', None)
++        if effective is None and explicit is not None:
++            effective = explicit.arg
++        return (stmt.keyword, stmt.arg, str(effective), substmts)
++    return (stmt.keyword, stmt.arg, substmts)
++
++
++def bounds(stmt, spec, attr):
++    values = []
++    for lo, hi in getattr(spec, attr):
++        if hi is None:
++            hi = lo
++        values.append(tuple(
++            str(getattr(spec.base, v, v) if v in ('min', 'max') else v)
++            for v in (lo, hi)))
++    return (stmt.keyword, tuple(values), tuple(
++        restriction_signature(s) for s in stmt.substmts
++        if util.is_prefixed(s.raw_keyword)))
++
++
++def type_signature(type_stmt):
++    restrictions = {}
++    patterns = []
++    while True:
++        frame = {}
++        for s in type_stmt.substmts:
++            if s.keyword == 'type':
++                frame.setdefault('member', []).append(type_signature(s))
++            elif s.keyword == 'base':
++                frame.setdefault('base', []).append(qualify(s, s.arg))
++            elif s.keyword == 'pattern':
++                patterns.append(restriction_signature(s))
++            elif (s.keyword in ('range', 'length') and hasattr(
++                    getattr(type_stmt, 'i_type_spec', None),
++                    s.keyword + 's')):
++                frame.setdefault(s.keyword, []).append(bounds(
++                    s, type_stmt.i_type_spec, s.keyword + 's'))
++            elif s.keyword not in ('path', 'description', 'reference'):
++                frame.setdefault(s.keyword, []).append(restriction_signature(s))
++        for keyword, values in frame.items():
++            restrictions.setdefault(keyword, tuple(values))
++        typedef = getattr(type_stmt, 'i_typedef', None)
++        if typedef is None:
++            return (type_stmt.arg, tuple(sorted(restrictions.items())),
++                    tuple(sorted(patterns, key=repr)))
++        type_stmt = typedef.search_one('type')
++
++
++def typedef_chain(type_stmt):
++    while True:
++        typedef = getattr(type_stmt, 'i_typedef', None)
++        if typedef is None:
++            return
++        yield typedef
++        type_stmt = typedef.search_one('type')
++
++
++def commutative(op, operands):
++    flat = []
++    for e in operands:
++        if isinstance(e, tuple) and e[:len(op)] == op:
++            flat.extend(e[len(op):])
++        else:
++            flat.append(e)
++    return op + tuple(sorted(flat, key=repr))
++
++
++def feature_signature(stmt, expr):
++    if isinstance(expr, str):
++        return qualify(stmt, expr)
++    op, first, second = expr
++    if op == 'not':
++        return (op, feature_signature(stmt, first))
++    return commutative((op,), (feature_signature(stmt, first),
++                               feature_signature(stmt, second)))
++
++
++def current_filter(q):
++    preds = []
++    while q[0] == 'path':
++        preds.insert(0, q[3])
++        q = q[2]
++    if q[0] == 'path_expr':
++        q = q[1]
++    if isinstance(q, list):
++        head = current_filter(q[0])
++        if head is None:
++            return None
++        steps = head + q[1:]
++    elif q[0] == 'function_call' and q[1] == 'current':
++        steps = []
++    else:
++        return None
++    return steps + [('step', 'self', ('node_type', 'node'), preds)]
++
++
++def expression_meaning(stmt, start):
++    def child(node, prefix, name):
++        if node is None:
++            return None
++        if prefix is None and start.keyword == 'module':
++            modulename = start.i_modulename
++        elif prefix is None:
++            modulename = start.i_module.i_modulename
++        else:
++            modulename = module_name(stmt, prefix)
++        if node == 'root':
++            top = stmt.i_orig_module.i_ctx.get_module(modulename)
++            candidates = data_children(top) if top is not None else []
++        else:
++            candidates = data_children(node)
++        for c in candidates:
++            if c.arg == name and c.i_module.i_modulename == modulename:
++                return c
++        return None
++
++    def steps(node, path):
++        shape = []
++        for step in path:
++            if step[0] != 'step':
++                shape.append(meaning(step, node))
++                node = None
++                continue
++            axis, test, preds = step[1], step[2], step[3]
++            if axis == 'parent' and test == ('node_type', 'node'):
++                if node in (None, 'root') or node.keyword == 'module':
++                    node = None
++                else:
++                    parent = context_node(node.parent)
++                    node = 'root' if parent.keyword == 'module' else parent
++                shape.append(tuple(meaning(p, node) for p in preds) or '..')
++            elif axis == 'self' and test == ('node_type', 'node'):
++                shape.append(tuple(meaning(p, node) for p in preds))
++            elif axis == 'child' and isinstance(test, tuple) and test[0] == 'name':
++                node = child(node, test[1], test[2])
++                shape.append(tuple(meaning(p, node) for p in preds))
++            else:
++                shape.append((axis, str(test),
++                              tuple(meaning(p, None) for p in preds)))
++                node = None
++        return node, shape
++
++    def located(node, shape):
++        if node == 'root':
++            return ('node', '/')
++        if node is not None:
++            return ('node', node_path(node), tuple(s for s in shape if s and s != '..'))
++        return ('unresolved', tuple(shape))
++
++    def meaning(q, node):
++        if isinstance(q, list):
++            head = current_filter(q[0])
++            if head is not None:
++                return located(*steps(start, head + q[1:]))
++            return ('filter', meaning(q[0], node), tuple(steps(None, q[1:])[1]))
++        kind = q[0]
++        if kind == 'bool':
++            return commutative((kind, q[1]), (meaning(q[2], node),
++                                              meaning(q[3], node)))
++        if kind in ('comp', 'arith'):
++            return (kind, q[1], meaning(q[2], node), meaning(q[3], node))
++        if kind == 'negative':
++            return (kind, meaning(q[1], node))
++        if kind == 'union':
++            return (kind, tuple(meaning(m, node) for m in q[1]))
++        if kind == 'relative':
++            return located(*steps(node, q[1]))
++        if kind == 'absolute':
++            return located(*steps('root', q[1]))
++        if kind == 'path_expr':
++            if q[1][0] == 'function_call' and q[1][1] == 'current':
++                return ('node', node_path(start), ())
++            return meaning(q[1], node)
++        if kind == 'path':
++            head = current_filter(q)
++            if head is not None:
++                return located(*steps(start, head))
++            return ('filter', meaning(q[2], node), meaning(q[3], None))
++        if kind == 'function_call':
++            args = [meaning(a, node) for a in q[2]]
++            if (q[1] in ('derived-from', 'derived-from-or-self')
++                    and len(q[2]) == 2 and q[2][1][0] == 'path_expr'
++                    and q[2][1][1][0] == 'literal'):
++                args[1] = ('identity',
++                           qualify(stmt, q[2][1][1][1][1:-1].strip()))
++            return ('call', q[1], tuple(args))
++        if kind == 'literal':
++            return ('literal', q[1][1:-1])
++        if kind == 'number':
++            return ('number', float(q[1]))
++        return q
++
++    return meaning(xpath_parser.parse(stmt.arg), start)
++
++
++def conjuncts(expr):
++    if expr[:2] == ('bool', 'and'):
++        return [c for e in expr[2:] for c in conjuncts(e)]
++    return [expr]
++
++
++def when_meanings(module, node):
++    result = []
++    for s in node.search('when'):
++        if getattr(s, 'i_origin', None) == 'uses':
++            start = context_node(node.parent)
++        else:
++            start = context_node(node)
++        result.extend(conjuncts(expression_meaning(s, start)))
++    augment = merged_augment(module, node)
++    if augment is not None:
++        start = context_node(node.parent)
++        for s in augment.search('when'):
++            result.extend(conjuncts(expression_meaning(s, start)))
++    return sorted(str(m) for m in result)
++
++
++def merged_augment(module, node):
++    augment = getattr(node, 'i_augment', None)
++    if augment is None:
++        return None
++    if (augment.parent.keyword == 'uses'
++            or augment.i_target_node.i_module.i_modulename == module.i_modulename):
++        return augment
++    return None
++
++
++def feature_conjuncts(expr):
++    if not isinstance(expr, str) and expr[0] == 'and':
++        return [c for e in expr[1:] for c in feature_conjuncts(e)]
++    return [expr]
++
++
++def feature_meanings(module, node):
++    stmts = list(node.search('if-feature'))
++    augment = getattr(node, 'i_augment', None)
++    if augment is not None:
++        stmts.extend(augment.search('if-feature'))
++    result = []
++    for s in stmts:
++        signature = feature_signature(s, syntax.parse_if_feature_expr(s.arg))
++        result.extend(str(c) for c in feature_conjuncts(signature))
++    return sorted(set(result))
++
++
++def extension_signature(stmt):
++    return (stmt.keyword, stmt.arg,
++            tuple(extension_signature(s) for s in stmt.substmts))
++
++
++def describe(module, node):
++    entry = {'path': node_path(node), 'keyword': node.keyword,
++             'config': getattr(node, 'i_config', None)}
++    for keyword in ('mandatory', 'presence', 'status', 'units',
++                    'min-elements', 'max-elements'):
++        s = node.search_one(keyword)
++        if s is not None:
++            entry[keyword] = s.arg
++    key = node.search_one('key')
++    if key is not None:
++        entry['key'] = [util.split_identifier(k)[1] for k in key.arg.split()]
++    entry['unique'] = sorted(
++        ' '.join('/'.join(util.split_identifier(p)[1] for p in part.split('/'))
++                 for part in u.arg.split())
++        for u in node.search('unique'))
++    type_stmt = node.search_one('type')
++    defaults = [default_value(type_stmt, s) for s in node.search('default')]
++    if type_stmt is not None:
++        entry['type'] = type_signature(type_stmt)
++        pointer = getattr(node, 'i_leafref_ptr', None)
++        if pointer:
++            entry['leafref'] = node_path(pointer[0])
++        for typedef in typedef_chain(type_stmt):
++            if 'units' not in entry and typedef.search_one('units'):
++                entry['units'] = typedef.search_one('units').arg
++            if not defaults:
++                defaults = [default_value(typedef.search_one('type'), s)
++                            for s in typedef.search('default')]
++    if node.keyword == 'choice':
++        cases = [c.arg for c in node.i_children]
++        defaults = [d for d in defaults if d in cases]
++    entry['default'] = sorted(defaults)
++    entry['if-feature'] = feature_meanings(module, node)
++    entry['when'] = when_meanings(module, node)
++    entry['must'] = sorted(str(expression_meaning(s, context_node(node)))
++                           for s in node.search('must'))
++    entry['extensions'] = sorted(
++        str(extension_signature(s)) for s in node.substmts
++        if util.is_prefixed(s.raw_keyword))
++    return entry
++
++
++def schema(module):
++    entries = []
++
++    def walk(node, inherited):
++        for child in getattr(node, 'i_children', []):
++            if (child.i_module.i_modulename != module.i_modulename
++                    or hasattr(child, 'i_target_node')):
++                continue
++            if child.keyword in ('input', 'output') and not child.i_children:
++                continue
++            entry = describe(module, child)
++            for key in ('if-feature', 'when'):
++                entry[key] = sorted(set(entry[key]) | set(inherited[key]))
++            entries.append(entry)
++            walk(child, entry)
++
++    walk(module, {'if-feature': [], 'when': []})
++    for augment in [a for a in module.substmts
++                    if a.keyword != 'deviation' and hasattr(a, 'i_target_node')]:
++        target = getattr(augment, 'i_target_node', None)
++        if target is not None and target.i_module.i_modulename != module.i_modulename:
++            whens = [str(c) for s in augment.search('when')
++                     for c in conjuncts(expression_meaning(s, context_node(target)))]
++            features = [str(c) for s in augment.search('if-feature')
++                        for c in feature_conjuncts(feature_signature(
++                            s, syntax.parse_if_feature_expr(s.arg)))]
++            entries.append({'augment': node_path(target)})
++            walk(augment, {'if-feature': features, 'when': whens})
++    return entries
++
++
++def statements_of(stmt):
++    result = [stmt]
++    for s in stmt.substmts:
++        result.extend(statements_of(s))
++    return result
++
++
++def resolve(tmp_path, fmt, modules, main='main.yang', options=(),
++            features=None, deviations=()):
++    source = tmp_path / 'source'
++    source.mkdir()
++    for name, text in modules.items():
++        (source / name).write_text(text)
++    _ctx, original = compile_module(source, main, features, deviations)
++    proc = run_pyang(source, '-f', fmt, '--%s-resolve' % fmt,
++                     *(list(options) + [main]))
++    assert proc.returncode == 0, proc.stderr
++    printed = tmp_path / 'printed'
++    printed.mkdir()
++    for name, text in modules.items():
++        if name != main:
++            (printed / name).write_text(text)
++    filename = main.rsplit('.', 1)[0] + '.' + fmt
++    (printed / filename).write_text(proc.stdout)
++    ctx, result = compile_module(printed, filename, features)
++    return original, result, ctx.errors, proc.stdout
++
++
++def assert_resolved(tmp_path, fmt, modules, **kwargs):
++    original, result, errors, text = resolve(tmp_path, fmt, modules, **kwargs)
++    assert [(str(p), tag, args) for (p, tag, args) in errors] == []
++    assert schema(result) == schema(original)
++    keywords = [s.keyword for s in statements_of(result)]
++    assert 'uses' not in keywords
++    assert 'grouping' not in keywords
++    return result, text
++
++
++FORMATS = pytest.mark.parametrize('fmt', ['yang', 'yin'])
++
++
++def main_module(body, imports=''):
++    return """
++module main {
++  yang-version 1.1;
++  namespace "urn:main";
++  prefix m;
++  %s
++  %s
++}
++""" % (imports, body)
++
++
++@FORMATS
++def test_local_grouping_is_inlined(tmp_path, fmt):
++    body = """
++  grouping pair {
++    leaf left { type string; }
++    leaf right { type int32; mandatory true; }
++  }
++  container top {
++    uses pair;
++    leaf after { type boolean; }
++  }
++"""
++    result, _text = assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++    top = result.search_one('container', 'top')
++    assert [c.arg for c in top.i_children] == ['left', 'right', 'after']
++
++
++@FORMATS
++def test_imported_grouping_keeps_types(tmp_path, fmt):
++    body = """
++  container top {
++    uses g:basic;
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_nested_groupings_across_modules(tmp_path, fmt):
++    body = """
++  container top {
++    uses g:outer;
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_top_level_uses(tmp_path, fmt):
++    body = """
++  leaf mode { type string; }
++  uses g:basic {
++    when "mode = 'on'";
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_rpc_action_and_notification_content(tmp_path, fmt):
++    body = """
++  grouping args {
++    leaf force { type boolean; when "../../id > 0"; }
++  }
++  container jobs {
++    list job {
++      key "id";
++      leaf id { type int32; }
++      action restart {
++        input { uses args; }
++        output { leaf done { type boolean; } }
++      }
++    }
++  }
++  rpc run {
++    input { uses g:basic; }
++  }
++  notification fired {
++    uses g:basic;
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_refinements_are_applied(tmp_path, fmt):
++    body = """
++  leaf gate { type int8; }
++  container top {
++    uses g:basic {
++      refine name {
++        default "fixed";
++        must "string-length(.) > ../../gate";
++        description "refined";
++      }
++      refine speed {
++        mandatory true;
++        config false;
++        if-feature "l:extra";
++      }
++    }
++    list items {
++      key "id";
++      max-elements 4;
++      leaf id { type int8; }
++      uses g:basic {
++        refine name { default "row"; }
++      }
++    }
++  }
++"""
++    imports = 'import grp { prefix g; } import lib { prefix l; }'
++    modules = {'main.yang': main_module(body, imports),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_scoped_typedefs_follow_their_nodes(tmp_path, fmt):
++    body = """
++  typedef small { type string; }
++  leaf plain { type small; }
++  container one { uses g:scoped; }
++  container two { uses g:scoped; }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_typedefs_with_same_name_in_different_groupings(tmp_path, fmt):
++    body = """
++  grouping first {
++    typedef code { type uint8 { range "1..2"; } }
++    leaf a { type code; }
++  }
++  grouping second {
++    typedef code { type string { length "3"; } }
++    leaf b { type code; }
++  }
++  container top {
++    uses first;
++    uses second;
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_moved_typedef_does_not_clash_with_nested_typedef(tmp_path, fmt):
++    other = """
++module other {
++  yang-version 1.1;
++  namespace "urn:other";
++  prefix o;
++  grouping level {
++    typedef code { type int8 { range "1..5"; } }
++    leaf lv { type code; }
++  }
++}
++"""
++    body = """
++  container a {
++    uses o:level;
++  }
++  container b {
++    typedef code { type string { length "2"; } }
++    leaf other { type code; }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import other { prefix o; }'),
++               'other.yang': other}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_extension_statements_stay_on_nodes(tmp_path, fmt):
++    other = """
++module other {
++  yang-version 1.1;
++  namespace "urn:other";
++  prefix o;
++  typedef level { type int8; }
++}
++"""
++    body = """
++  leaf depth { type l:level; }
++  container top {
++    uses g:wired;
++  }
++"""
++    imports = 'import grp { prefix g; } import other { prefix l; }'
++    modules = {'main.yang': main_module(body, imports),
++               'grp.yang': GRP, 'lib.yang': LIB, 'other.yang': other}
++    result, _text = assert_resolved(tmp_path, fmt, modules)
++    noted = result.search_one('container', 'top').search_one('leaf', 'noted')
++    assert [s.arg for s in noted.substmts if s.keyword == ('lib', 'hint')] == ['kept']
++    hint = noted.search_one(('lib', 'hint'))
++    assert [s.arg for s in hint.substmts] == ['inner']
++
++
++@FORMATS
++def test_extensions_nested_in_schema_properties_are_preserved(tmp_path, fmt):
++    body = """
++  grouping checked {
++    leaf code {
++      type string {
++        pattern '[a-z]+' {
++          l:hint "pattern" { l:hint "pattern-inner"; }
++        }
++      }
++      must "string-length(.) > 0" {
++        l:hint "must" { l:hint "must-inner"; }
++      }
++    }
++    leaf level {
++      type uint8 {
++        range "1..9" { l:hint "range"; }
++      }
++    }
++    leaf mode {
++      type enumeration {
++        enum on { l:hint "enum" { l:hint "enum-inner"; } }
++        enum off;
++      }
++    }
++  }
++  container top { uses checked; }
++"""
++    modules = {'main.yang': main_module(body, 'import lib { prefix l; }'),
++               'lib.yang': LIB}
++    result, _text = assert_resolved(tmp_path, fmt, modules)
++    code = result.search_one('container', 'top').search_one('leaf', 'code')
++    pattern = code.search_one('type').search_one('pattern')
++    must = code.search_one('must')
++    assert extension_signature(pattern.search_one(('lib', 'hint'))) == (
++        ('lib', 'hint'), 'pattern',
++        ((('lib', 'hint'), 'pattern-inner', ()),))
++    assert extension_signature(must.search_one(('lib', 'hint'))) == (
++        ('lib', 'hint'), 'must',
++        ((('lib', 'hint'), 'must-inner', ()),))
++    top = result.search_one('container', 'top')
++    level = top.search_one('leaf', 'level').search_one('type')
++    assert extension_signature(
++        level.search_one('range').search_one(('lib', 'hint'))) == (
++        ('lib', 'hint'), 'range', ())
++    mode = top.search_one('leaf', 'mode').search_one('type')
++    assert extension_signature(
++        mode.search_one('enum', 'on').search_one(('lib', 'hint'))) == (
++        ('lib', 'hint'), 'enum', ((('lib', 'hint'), 'enum-inner', ()),))
++
++
++@FORMATS
++def test_when_on_uses_keeps_its_meaning(tmp_path, fmt):
++    body = """
++  container top {
++    leaf flag { type string; }
++    uses g:basic {
++      when "flag = 'on'";
++    }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_when_on_uses_where_names_repeat(tmp_path, fmt):
++    body = """
++  grouping inner {
++    container box {
++      leaf flag { type string; }
++    }
++  }
++  container top {
++    leaf flag { type string; }
++    uses inner {
++      when "flag = 'x'";
++    }
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_when_on_uses_inside_case(tmp_path, fmt):
++    body = """
++  container top {
++    leaf flag { type string; }
++    choice pick {
++      case one {
++        uses g:basic {
++          when "flag = 'one'";
++        }
++      }
++      case two {
++        leaf other { type string; }
++      }
++    }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_when_on_uses_that_brings_a_choice(tmp_path, fmt):
++    body = """
++  grouping options {
++    choice mode {
++      leaf fast { type empty; }
++      leaf slow { type empty; }
++    }
++    leaf level { type uint8; }
++  }
++  container top {
++    leaf flag { type string; }
++    uses options {
++      when "flag = 'set'";
++    }
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_own_when_is_combined_with_uses_when(tmp_path, fmt):
++    body = """
++  grouping guarded {
++    leaf value {
++      type int32;
++      when "../limit > 0";
++    }
++  }
++  container top {
++    leaf limit { type int32; }
++    leaf flag { type string; }
++    uses guarded {
++      when "flag = 'on' or limit < 0";
++    }
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_nested_uses_conditions_are_all_preserved(tmp_path, fmt):
++    body = """
++  grouping inner {
++    leaf made {
++      type string;
++      when "../gate = 'inner'";
++    }
++  }
++  grouping middle {
++    uses inner { when "gate = 'middle'"; }
++  }
++  grouping outer {
++    uses middle { when "gate = 'outer'"; }
++  }
++  container top {
++    leaf gate { type string; }
++    uses outer { when "gate = 'top'"; }
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_augment_when_moves_to_augmented_nodes(tmp_path, fmt):
++    body = """
++  container top {
++    leaf flag { type string; }
++  }
++  augment "/m:top" {
++    when "flag = 'aug'";
++    leaf extra { type string; }
++    container more {
++      leaf deep { type string; }
++    }
++  }
++"""
++    result, _text = assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++    assert result.search('augment') == []
++
++
++@FORMATS
++def test_augment_into_choice(tmp_path, fmt):
++    body = """
++  container sel {
++    leaf on { type boolean; }
++    choice pick {
++      default first;
++      leaf first { type string; }
++    }
++  }
++  augment "/m:sel/m:pick" {
++    when "on = 'true'";
++    leaf second { type string; }
++    case third {
++      leaf third-a { type int8; }
++    }
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_uses_inside_own_augment(tmp_path, fmt):
++    body = """
++  container top {
++    leaf gate { type int32; }
++  }
++  augment "/m:top" {
++    when "gate < 100";
++    uses g:basic {
++      when "gate = 5";
++    }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_augment_into_node_created_by_uses(tmp_path, fmt):
++    body = """
++  container top {
++    leaf flag { type string; }
++    uses g:outer;
++  }
++  augment "/m:top/m:more" {
++    when "derived-from-or-self(paint, 'g:red') or current()/../flag = 'q'";
++    leaf added { type string; }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_predicates_and_current_in_moved_when(tmp_path, fmt):
++    body = """
++  grouping pick {
++    leaf chosen { type string; }
++  }
++  container top {
++    leaf wanted { type string; }
++    list entry {
++      key "id";
++      leaf id { type string; }
++      leaf enabled { type boolean; }
++    }
++    uses pick {
++      when "count(entry[id = current()/wanted][enabled = 'true']) > 0 and string-length(current()) >= 0";
++    }
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_grouping_in_expressions_is_preserved(tmp_path, fmt):
++    body = """
++  grouping calc {
++    leaf result { type int32; }
++  }
++  container top {
++    leaf a { type int32; }
++    leaf b { type int32; }
++    uses calc {
++      when "(a > 1 or b > 1) and -(a + 1) * 2 < b - (a - b) and not(a = b)";
++    }
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_more_expression_shapes_in_moved_conditions(tmp_path, fmt):
++    body = """
++  grouping measured {
++    leaf tally {
++      type uint8;
++      must "count(../a | ../b) <= 2 and re-match(../label, '[a-z]+')";
++      must "count(ancestor-or-self::node()) > 1";
++    }
++  }
++  container top {
++    leaf label { type string; }
++    leaf a { type uint8; }
++    leaf b { type uint8; }
++    uses measured {
++      when "count(a | b) > 0 and re-match(label, 'on|off')";
++    }
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_standard_functions_and_filters_in_moved_conditions(tmp_path, fmt):
++    body = """
++  grouping checked {
++    leaf score {
++      type int32;
++      must "sum(../rows/row[enabled = 'true']/weight) <= 100 and count(../rows/row[position() = last()]) = 1";
++    }
++  }
++  container top {
++    leaf name { type string; }
++    container rows {
++      list row {
++        key "id";
++        leaf id { type string; }
++        leaf enabled { type boolean; }
++        leaf weight { type int32; }
++      }
++    }
++    uses checked {
++      when "starts-with(name, 'a') and contains(concat(name, '-x'), 'b') and string-length(normalize-space(translate(name, 'ab', 'AB'))) > number('1') and boolean(rows/row[id = substring-before(current()/name, '-')])";
++    }
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_typedef_restrictions_on_other_scalar_types(tmp_path, fmt):
++    kinds = """
++module kinds {
++  yang-version 1.1;
++  namespace "urn:kinds";
++  prefix k;
++  typedef port { type uint16 { range "1..65535"; } default 80; }
++  typedef low-port { type port { range "1..1023"; } }
++  typedef offset { type int32 { range "-1000..1000"; } units "ms"; }
++  typedef count32 { type uint32 { range "0..4000000000"; } }
++  typedef flag { type boolean; default "true"; }
++  typedef marker { type empty; }
++  typedef small { type int8 { range "-5..5"; } }
++  grouping settings {
++    leaf port { type low-port; }
++    leaf delay { type offset; default -5; }
++    leaf total { type count32; }
++    leaf enabled { type flag; }
++    leaf present { type marker; }
++    leaf-list steps { type small { range "0..5"; } }
++  }
++}
++"""
++    body = """
++  container top { uses k:settings; }
++"""
++    modules = {'main.yang': main_module(body, 'import kinds { prefix k; }'),
++               'kinds.yang': kinds}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_identities_from_grouping_module(tmp_path, fmt):
++    body = """
++  container top {
++    uses g:styled;
++  }
++  container shade {
++    uses g:painted;
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++def test_default_from_a_deviation_keeps_its_identity(tmp_path):
++    dev = """
++module dev {
++  yang-version 1.1;
++  namespace "urn:dev";
++  prefix d;
++  import main { prefix mm; }
++  import grp { prefix gd; }
++  deviation "/mm:top/mm:paint" {
++    deviate replace { default gd:dark-red; }
++  }
++}
++"""
++    body = """
++  container top {
++    uses g:styled;
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB, 'dev.yang': dev}
++    assert_resolved(tmp_path, 'yang', modules,
++                    options=('--deviation-module', 'dev.yang'),
++                    deviations=('dev.yang',))
++
++
++@FORMATS
++def test_identity_values_through_a_typedef(tmp_path, fmt):
++    other = """
++module other {
++  yang-version 1.1;
++  namespace "urn:other";
++  prefix o;
++  identity shape;
++  identity round { base shape; }
++  identity square { base shape; }
++  typedef shaped { type identityref { base shape; } default round; }
++  grouping form {
++    leaf kind { type shaped; default square; }
++    leaf fallback { type shaped; }
++    leaf-list kinds { type identityref { base o:shape; } default o:round; }
++  }
++}
++"""
++    body = """
++  container top { uses o:form; }
++"""
++    modules = {'main.yang': main_module(body, 'import other { prefix o; }'),
++               'other.yang': other}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_feature_references_from_grouping_module(tmp_path, fmt):
++    body = """
++  leaf level { type lb:percent; }
++  container top {
++    uses g:wired;
++  }
++"""
++    imports = 'import grp { prefix g; } import lib { prefix lb; }'
++    modules = {'main.yang': main_module(body, imports),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_prefix_already_used_for_another_module(tmp_path, fmt):
++    body = """
++  leaf local { type l:percent; }
++  container top {
++    uses g:styled;
++    uses g:basic;
++  }
++"""
++    imports = 'import grp { prefix g; } import other { prefix l; }'
++    other = """
++module other {
++  yang-version 1.1;
++  namespace "urn:other";
++  prefix o;
++  typedef percent { type string; }
++}
++"""
++    modules = {'main.yang': main_module(body, imports),
++               'grp.yang': GRP, 'lib.yang': LIB, 'other.yang': other}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_import_used_only_by_uses_is_removed(tmp_path, fmt):
++    only = """
++module only {
++  yang-version 1.1;
++  namespace "urn:only";
++  prefix o;
++  grouping plain {
++    leaf label { type string; }
++  }
++}
++"""
++    body = """
++  container top { uses o:plain; }
++"""
++    modules = {'main.yang': main_module(body, 'import only { prefix o; }'),
++               'only.yang': only}
++    result, _text = assert_resolved(tmp_path, fmt, modules)
++    assert result.search('import') == []
++
++
++@FORMATS
++def test_import_needed_by_resolved_content_is_added(tmp_path, fmt):
++    body = """
++  container top { uses g:wired; }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    result, _text = assert_resolved(tmp_path, fmt, modules)
++    assert sorted(i.arg for i in result.search('import')) == ['grp', 'lib']
++
++
++@FORMATS
++def test_leafref_with_prefixed_path(tmp_path, fmt):
++    body = """
++  container top { uses gr:wired; }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix gr; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_augment_of_other_module_stays_augment(tmp_path, fmt):
++    body = """
++  augment "/l:settings" {
++    when "l:level > 2";
++    uses g:basic;
++    leaf own { type string; }
++  }
++"""
++    imports = 'import grp { prefix g; } import lib { prefix l; }'
++    modules = {'main.yang': main_module(body, imports),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    result, _text = assert_resolved(tmp_path, fmt, modules)
++    augments = result.search('augment')
++    assert len(augments) == 1
++    assert [c.arg for c in augments[0].i_children] == ['name', 'speed', 'own']
++
++
++@FORMATS
++def test_external_augment_keeps_if_feature_condition(tmp_path, fmt):
++    body = """
++  feature local;
++  augment "/l:settings" {
++    if-feature local;
++    leaf added { type string; }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import lib { prefix l; }'),
++               'lib.yang': LIB}
++    result, _text = assert_resolved(tmp_path, fmt, modules)
++    augments = result.search('augment')
++    assert len(augments) == 1
++    added = [c for c in augments[0].i_children if c.arg == 'added'][0]
++    assert feature_meanings(result, added) == ['main:local']
++
++
++@FORMATS
++def test_definition_dependencies_are_preserved(tmp_path, fmt):
++    body = """
++  feature prerequisite;
++  feature dependent { if-feature prerequisite; }
++  identity root;
++  identity child { base root; }
++  leaf kind {
++    type identityref { base root; }
++    default child;
++    if-feature dependent;
++  }
++"""
++    result, _text = assert_resolved(tmp_path, fmt,
++                                    {'main.yang': main_module(body)})
++    feature = result.search_one('feature', 'dependent')
++    condition = feature.search_one('if-feature')
++    assert condition is not None
++    assert feature_signature(
++        condition,
++        syntax.parse_if_feature_expr(condition.arg)) == 'main:prerequisite'
++    base = result.search_one('identity', 'child').search_one('base')
++    assert qualify(base, base.arg) == 'main:root'
++
++
++@FORMATS
++def test_import_used_only_by_augment_target(tmp_path, fmt):
++    body = """
++  augment "/l:settings" {
++    leaf own { type string; }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import lib { prefix l; }'),
++               'lib.yang': LIB}
++    result, _text = assert_resolved(tmp_path, fmt, modules)
++    assert [i.arg for i in result.search('import')] == ['lib']
++
++
++@FORMATS
++def test_unique_constraint_moved_out_of_a_grouping(tmp_path, fmt):
++    body = """
++  grouping rows {
++    list row {
++      key "id";
++      unique "sub/a sub/b";
++      leaf id { type string; }
++      container sub {
++        leaf a { type string; }
++        leaf b { type string; }
++      }
++    }
++  }
++  container top { uses rows; }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_extensions_under_combined_conditions_are_preserved(tmp_path, fmt):
++    body = """
++  grouping made {
++    leaf value {
++      type string;
++      when "../flag = 'own'" { l:hint "own"; }
++    }
++  }
++  container top {
++    leaf flag { type string; }
++  }
++  augment "/m:top" {
++    when "flag != 'aug'" { l:hint "augment" { l:hint "nested"; } }
++    uses made {
++      when "flag != 'uses'" { l:hint "uses"; }
++    }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import lib { prefix l; }'),
++               'lib.yang': LIB}
++    result, _text = assert_resolved(tmp_path, fmt, modules)
++    value = result.search_one('container', 'top').search_one('leaf', 'value')
++    whens = value.search('when')
++    assert len(whens) == 1
++    assert sorted(str(extension_signature(e)) for e in whens[0].substmts
++                  if util.is_prefixed(e.raw_keyword)) == sorted(str(s) for s in [
++        (('lib', 'hint'), 'own', ()),
++        (('lib', 'hint'), 'augment', ((('lib', 'hint'), 'nested', ()),)),
++        (('lib', 'hint'), 'uses', ())])
++
++
++@FORMATS
++def test_anydata_and_anyxml_from_a_grouping(tmp_path, fmt):
++    body = """
++  grouping carried {
++    anydata payload { mandatory true; }
++    anyxml legacy { config false; }
++    leaf after { type string; }
++  }
++  container top { uses carried; }
++"""
++    result, _text = assert_resolved(tmp_path, fmt,
++                                    {'main.yang': main_module(body)})
++    top = result.search_one('container', 'top')
++    assert [c.arg for c in top.i_children] == ['payload', 'legacy', 'after']
++
++
++@FORMATS
++def test_disabled_features_are_removed(tmp_path, fmt):
++    body = """
++  feature local;
++  container top {
++    leaf always { type string; }
++    leaf maybe { type string; if-feature local; }
++    uses g:wired;
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    result, text = assert_resolved(
++        tmp_path, fmt, modules,
++        options=('--features', 'main:', '--features', 'lib:'),
++        features={'main': [], 'lib': []})
++    top = result.search_one('container', 'top')
++    assert 'maybe' not in [c.arg for c in top.i_children]
++    assert 'maybe' not in text
++
++
++@FORMATS
++def test_deviations_are_applied(tmp_path, fmt):
++    dev = """
++module dev {
++  yang-version 1.1;
++  namespace "urn:dev";
++  prefix d;
++  import main { prefix mm; }
++  import lib { prefix ll; }
++  deviation "/mm:top/mm:name" {
++    deviate not-supported;
++  }
++  deviation "/mm:top/mm:speed" {
++    deviate replace {
++      type uint8 { range "10..20"; }
++    }
++  }
++  deviation "/mm:top/mm:note" {
++    deviate add {
++      must "/ll:settings/ll:level > 1 and ../mm:speed != 15";
++      default "none";
++    }
++  }
++}
++"""
++    body = """
++  container top {
++    uses g:basic;
++    leaf note { type string; }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB, 'dev.yang': dev}
++    result, _text = assert_resolved(
++        tmp_path, fmt, modules,
++        options=('--deviation-module', 'dev.yang'), deviations=('dev.yang',))
++    top = result.search_one('container', 'top')
++    assert [c.arg for c in top.i_children] == ['speed', 'note']
++
++
++@FORMATS
++def test_nodes_added_by_other_modules_are_not_printed(tmp_path, fmt):
++    dev = """
++module dev {
++  yang-version 1.1;
++  namespace "urn:dev";
++  prefix d;
++  import main { prefix mm; }
++  augment "/mm:top" {
++    leaf extra { type int8; }
++  }
++  deviation "/mm:top/mm:note" {
++    deviate add { units "chars"; }
++  }
++}
++"""
++    body = """
++  container top {
++    uses g:basic;
++    leaf note { type string; }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB, 'dev.yang': dev}
++    result, _text = assert_resolved(
++        tmp_path, fmt, modules,
++        options=('--deviation-module', 'dev.yang'), deviations=('dev.yang',))
++    top = result.search_one('container', 'top')
++    assert [c.arg for c in top.i_children] == ['name', 'speed', 'note']
++
++
++@FORMATS
++def test_foreign_subtree_is_not_printed(tmp_path, fmt):
++    dev = """
++module dev {
++  yang-version 1.1;
++  namespace "urn:dev";
++  prefix d;
++  import main { prefix mm; }
++  augment "/mm:top" {
++    container branch {
++      leaf tag { type string; }
++      list rows {
++        key "id";
++        leaf id { type int8; }
++        container deep { leaf value { type string; } }
++      }
++    }
++  }
++  deviation "/mm:top/mm:inner/mm:note" {
++    deviate add { units "chars"; }
++  }
++}
++"""
++    body = """
++  container top {
++    container inner {
++      leaf note { type string; }
++    }
++  }
++"""
++    modules = {'main.yang': main_module(body), 'dev.yang': dev}
++    result, text = assert_resolved(
++        tmp_path, fmt, modules,
++        options=('--deviation-module', 'dev.yang'), deviations=('dev.yang',))
++    top = result.search_one('container', 'top')
++    assert [c.arg for c in top.i_children] == ['inner']
++    for name in ('branch', 'tag', 'rows', 'deep'):
++        assert name not in text
++    note = top.search_one('container', 'inner').search_one('leaf', 'note')
++    assert note.search_one('units').arg == 'chars'
++
++
++@FORMATS
++def test_pruned_children_of_operations_are_not_printed(tmp_path, fmt):
++    dev = """
++module dev {
++  yang-version 1.1;
++  namespace "urn:dev";
++  prefix d;
++  import main { prefix mm; }
++  deviation "/mm:run/mm:input/mm:dropped" {
++    deviate not-supported;
++  }
++  deviation "/mm:jobs/mm:job/mm:restart/mm:output/mm:gone" {
++    deviate not-supported;
++  }
++}
++"""
++    body = """
++  feature extra;
++  container jobs {
++    list job {
++      key "id";
++      leaf id { type int32; }
++      action restart {
++        input {
++          leaf force { type boolean; }
++          leaf hidden { type string; if-feature extra; }
++        }
++        output {
++          leaf done { type boolean; }
++          leaf gone { type string; }
++        }
++      }
++    }
++  }
++  rpc run {
++    input {
++      leaf kept { type string; }
++      leaf dropped { type string; }
++    }
++    output { leaf code { type int32; } }
++  }
++"""
++    modules = {'main.yang': main_module(body), 'dev.yang': dev}
++    result, _text = assert_resolved(
++        tmp_path, fmt, modules, features={'main': []},
++        options=('--features', 'main:', '--deviation-module', 'dev.yang'),
++        deviations=('dev.yang',))
++    run = result.search_one('rpc', 'run')
++    assert [c.arg for c in run.search_one('input').i_children] == ['kept']
++    job = result.search_one('container', 'jobs').search_one('list', 'job')
++    restart = job.search_one('action', 'restart')
++    assert [c.arg for c in restart.search_one('input').i_children] == ['force']
++    assert [c.arg for c in restart.search_one('output').i_children] == ['done']
++
++
++@FORMATS
++def test_operation_parts_emptied_by_pruning_are_not_printed(tmp_path, fmt):
++    dev = """
++module dev {
++  yang-version 1.1;
++  namespace "urn:dev";
++  prefix d;
++  import main { prefix mm; }
++  deviation "/mm:run/mm:output/mm:code" {
++    deviate not-supported;
++  }
++}
++"""
++    body = """
++  feature extra;
++  container jobs {
++    list job {
++      key "id";
++      leaf id { type int32; }
++      action restart {
++        input {
++          leaf force { type boolean; if-feature extra; }
++        }
++        output {
++          leaf done { type boolean; }
++        }
++      }
++    }
++  }
++  rpc run {
++    input {
++      leaf hidden { type string; if-feature extra; }
++    }
++    output {
++      leaf code { type int32; }
++    }
++  }
++"""
++    modules = {'main.yang': main_module(body), 'dev.yang': dev}
++    result, _text = assert_resolved(
++        tmp_path, fmt, modules, features={'main': []},
++        options=('--features', 'main:', '--deviation-module', 'dev.yang'),
++        deviations=('dev.yang',))
++    job = result.search_one('container', 'jobs').search_one('list', 'job')
++    restart = job.search_one('action', 'restart')
++    assert [c.arg for c in restart.search_one('output').i_children] == ['done']
++
++
++@FORMATS
++def test_conditions_of_a_kept_augment_and_its_uses(tmp_path, fmt):
++    body = """
++  feature local;
++  grouping added {
++    leaf marked {
++      type string;
++      when "../l:level > 1";
++    }
++  }
++  augment "/l:settings" {
++    when "l:level > 0";
++    if-feature local;
++    uses added {
++      when "l:level < 9";
++    }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import lib { prefix l; }'),
++               'lib.yang': LIB}
++    result, _text = assert_resolved(tmp_path, fmt, modules)
++    augment = result.search_one('augment')
++    marked = augment.search_one('leaf', 'marked')
++    assert len(marked.search('when')) == 1
++    added = [c for c in augment.i_children if c.arg == 'marked'][0]
++    assert feature_meanings(result, added) == ['main:local']
++
++
++@FORMATS
++def test_augment_if_feature_moves_to_augmented_nodes(tmp_path, fmt):
++    body = """
++  feature local;
++  container top {
++    leaf flag { type string; }
++    container box {
++      leaf inner { type string; }
++    }
++    choice pick {
++      leaf first { type string; }
++    }
++  }
++  augment "/m:top" {
++    if-feature local;
++    when "flag = 'on'";
++    leaf added { type string; }
++    leaf both { type string; if-feature "l:extra"; }
++    uses g:outer {
++      if-feature "l:turbo";
++      augment "more" {
++        if-feature "not l:extra";
++        leaf deeper { type string; }
++      }
++    }
++  }
++  augment "/m:top/m:pick" {
++    if-feature "l:turbo or local";
++    leaf second { type string; }
++    case third {
++      leaf third-a { type int8; }
++    }
++  }
++  augment "/m:top/m:box" {
++    if-feature "l:turbo and not l:extra";
++    container nested {
++      leaf value { type string; }
++    }
++  }
++"""
++    imports = 'import grp { prefix g; } import lib { prefix l; }'
++    modules = {'main.yang': main_module(body, imports), 'grp.yang': GRP,
++               'lib.yang': LIB}
++    result, _text = assert_resolved(tmp_path, fmt, modules)
++    assert result.search('augment') == []
++
++
++@FORMATS
++def test_selected_features_keep_enabled_branches(tmp_path, fmt):
++    body = """
++  feature local;
++  feature fancy;
++  container top {
++    leaf a { type string; if-feature local; }
++    leaf b { type string; if-feature fancy; }
++    leaf c { type string; if-feature "local and not l:extra"; }
++    leaf d { type string; if-feature "l:extra or fancy"; }
++    choice mode {
++      case on { if-feature "l:turbo"; leaf fast { type empty; } }
++      case off { if-feature "not l:turbo"; leaf slow { type empty; } }
++    }
++    uses g:wired;
++    uses g:basic { if-feature fancy; }
++    uses g:styled { if-feature "local or fancy"; }
++  }
++  augment "/m:top" {
++    if-feature "l:turbo";
++    leaf aug-on { type string; }
++  }
++  augment "/m:top" {
++    if-feature "fancy";
++    leaf aug-off { type string; }
++  }
++  augment "/l:settings" {
++    if-feature "local";
++    uses g:basic { if-feature "not l:extra"; }
++  }
++"""
++    imports = 'import grp { prefix g; } import lib { prefix l; }'
++    modules = {'main.yang': main_module(body, imports),
++               'grp.yang': GRP, 'lib.yang': LIB}
++    result, _text = assert_resolved(
++        tmp_path, fmt, modules,
++        options=('--features', 'main:local', '--features', 'lib:turbo'),
++        features={'main': ['local'], 'lib': ['turbo']})
++    top = result.search_one('container', 'top')
++    assert [c.arg for c in data_children(top)] == [
++        'a', 'c', 'fast', 'target', 'key', 'boosted', 'guarded', 'noted',
++        'paint', 'mood', 'ok', 'aug-on']
++    printed = set(s.arg for s in statements_of(result)
++                  if s.keyword in ('leaf', 'case'))
++    assert printed.isdisjoint(['b', 'd', 'off', 'slow', 'aug-off'])
++    augments = result.search('augment')
++    assert len(augments) == 1
++    assert [c.arg for c in augments[0].i_children] == ['name', 'speed']
++
++
++@FORMATS
++def test_deviated_properties_of_every_kind(tmp_path, fmt):
++    dev = """
++module dev {
++  yang-version 1.1;
++  namespace "urn:dev";
++  prefix d;
++  import main { prefix mm; }
++  import grp { prefix g; }
++  deviation "/mm:top/mm:cfg" {
++    deviate replace { config false; }
++  }
++  deviation "/mm:top/mm:req" {
++    deviate add {
++      mandatory true;
++      must "count(/g:registry) >= 0";
++    }
++  }
++  deviation "/mm:top/mm:rows" {
++    deviate add {
++      min-elements 1;
++      unique "sub/a sub/b";
++    }
++    deviate replace { max-elements 5; }
++  }
++  deviation "/mm:top/mm:tags" {
++    deviate add { min-elements 2; max-elements 3; }
++  }
++  deviation "/mm:top/mm:note" {
++    deviate delete {
++      units "chars";
++      default "x";
++      must "string-length(.) > 0";
++    }
++  }
++  deviation "/mm:top/mm:more/mm:paint" {
++    deviate replace { default g:dark-red; }
++  }
++  deviation "/mm:top/mm:name" {
++    deviate add { default "zz"; }
++  }
++}
++"""
++    body = """
++  container top {
++    uses g:basic;
++    leaf note {
++      type string;
++      units "chars";
++      default "x";
++      must "string-length(.) > 0";
++    }
++    container cfg { leaf inner { type string; } }
++    leaf req { type string; }
++    list rows {
++      key "id";
++      max-elements 10;
++      leaf id { type string; }
++      container sub {
++        leaf a { type string; }
++        leaf b { type string; }
++      }
++    }
++    leaf-list tags { type string; }
++    container more { uses g:styled; }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import grp { prefix g; }'),
++               'grp.yang': GRP, 'lib.yang': LIB, 'dev.yang': dev}
++    result, _text = assert_resolved(
++        tmp_path, fmt, modules,
++        options=('--deviation-module', 'dev.yang'), deviations=('dev.yang',))
++    top = result.search_one('container', 'top')
++    assert top.search_one('container', 'cfg').search_one('leaf', 'inner').i_config is False
++    assert top.search_one('list', 'rows').search_one('max-elements').arg == '5'
++    note = top.search_one('leaf', 'note')
++    assert note.search_one('units') is None
++    assert note.search_one('default') is None
++    assert note.search('must') == []
++
++
++@FORMATS
++def test_imported_grouping_keeps_type_families(tmp_path, fmt):
++    kinds = """
++module kinds {
++  yang-version 1.1;
++  namespace "urn:kinds";
++  prefix k;
++  import lib { prefix l; }
++  grouping families {
++    typedef mode {
++      type enumeration {
++        enum off { value 0; }
++        enum on { value 7; description "on"; }
++        enum auto { value -3; }
++      }
++      default on;
++    }
++    leaf mix {
++      type union {
++        type l:percent;
++        type int32 { range "-5..-1 | 200..300"; }
++        type mode;
++        type enumeration { enum none { value 42; } }
++      }
++    }
++    leaf m { type mode; }
++    leaf flags {
++      type bits {
++        bit read { position 3; }
++        bit write { position 0; }
++        bit exec;
++      }
++      default "read exec";
++    }
++    leaf amount { type decimal64 { fraction-digits 3; range "-1.5..2.25"; } }
++    leaf code {
++      type string {
++        length "2..8";
++        pattern '[a-z]+"x\\d*';
++        pattern 'bad.*' { modifier invert-match; error-message "no \\"bad\\""; }
++      }
++    }
++    leaf loose { type leafref { path "/l:settings/l:level"; require-instance false; } }
++    leaf ptr { type instance-identifier { require-instance false; } }
++    leaf blob { type binary { length "0..4 | 10"; } }
++  }
++}
++"""
++    body = """
++  typedef mode { type string; }
++  leaf plain { type mode; }
++  container top { uses l:families; }
++"""
++    modules = {'main.yang': main_module(body, 'import kinds { prefix l; }'),
++               'kinds.yang': kinds, 'lib.yang': LIB}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_moved_typedef_keeps_the_typedefs_it_depends_on(tmp_path, fmt):
++    body = """
++  container c {
++    typedef outer { type string { length "1..5"; } }
++    grouping g {
++      typedef inner { type outer { length "2..4"; } }
++      typedef deeper { type inner; default "abc"; }
++      leaf x { type deeper; }
++      container d { leaf y { type inner; } }
++    }
++    uses g;
++  }
++  list items {
++    key "id";
++    typedef code { type uint8 { range "1..9"; } }
++    leaf id { type code; }
++    grouping h {
++      typedef wrapped { type union { type code; type string { length "1"; } } }
++      leaf w { type wrapped; }
++    }
++    uses h;
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_typedef_chains_narrow_64_bit_ranges(tmp_path, fmt):
++    wide = """
++module wide {
++  yang-version 1.1;
++  namespace "urn:wide";
++  prefix w;
++  typedef big {
++    type int64 { range "-9000000000..9000000000"; }
++    units "bytes";
++    default 5;
++  }
++  typedef bigger { type big { range "-100..9000000000"; } units "kilobytes"; }
++  typedef count {
++    type uint64 { range "1..18446744073709551615"; }
++    units "items";
++    default 1;
++  }
++  grouping sizes {
++    typedef local { type bigger { range "0..1000"; } default 10; }
++    leaf size { type local; }
++    leaf total { type count { range "1..99"; } default 3; }
++    leaf-list samples { type w:big { range "min..-1 | 1..max"; } units "bytes"; }
++  }
++}
++"""
++    body = """
++  typedef local { type string; }
++  leaf plain { type local; }
++  container top { uses w:sizes; }
++"""
++    modules = {'main.yang': main_module(body, 'import wide { prefix w; }'),
++               'wide.yang': wide}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++SHAPES = """
++module shapes {
++  yang-version 1.1;
++  namespace "urn:shapes";
++  prefix sh;
++  grouping flagged {
++    container enabled {
++      presence "turns the feature on";
++      leaf mode { type string; status deprecated; }
++    }
++    leaf legacy { type string; status obsolete; }
++    list old-rows {
++      key "id";
++      status deprecated;
++      leaf id { type string; status deprecated; }
++    }
++  }
++  grouping counted {
++    list rows {
++      key "id";
++      min-elements 1;
++      max-elements 8;
++      leaf id { type string; }
++      leaf-list tags { type string; min-elements 2; max-elements 4; }
++    }
++    leaf-list codes { type int8; min-elements 0; max-elements unbounded; }
++  }
++}
++"""
++
++
++@FORMATS
++def test_presence_and_status_in_imported_grouping(tmp_path, fmt):
++    body = """
++  container one { uses s:flagged; }
++"""
++    modules = {'main.yang': main_module(body, 'import shapes { prefix s; }'),
++               'shapes.yang': SHAPES}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_element_counts_in_imported_grouping(tmp_path, fmt):
++    body = """
++  container two {
++    uses s:counted {
++      refine rows { max-elements 5; }
++    }
++  }
++"""
++    modules = {'main.yang': main_module(body, 'import shapes { prefix s; }'),
++               'shapes.yang': SHAPES}
++    assert_resolved(tmp_path, fmt, modules)
++
++
++@FORMATS
++def test_module_without_groupings(tmp_path, fmt):
++    body = """
++  typedef count { type uint16; }
++  container top {
++    presence "enabled";
++    leaf total { type count; default 3; }
++    list rows {
++      key "a b";
++      unique "c";
++      min-elements 1;
++      leaf a { type string; }
++      leaf b { type string; }
++      leaf c { type string; status deprecated; }
++    }
++  }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++
++
++@FORMATS
++def test_output_without_option_is_unchanged(tmp_path, fmt):
++    body = """
++  grouping pair { leaf left { type string; } }
++  container top { uses pair; }
++"""
++    assert_resolved(tmp_path, fmt, {'main.yang': main_module(body)})
++    source = tmp_path / 'source'
++    proc = run_pyang(source, '-f', fmt, 'main.yang')
++    assert proc.returncode == 0, proc.stderr
++    (tmp_path / ('plain.' + fmt)).write_text(proc.stdout)
++    _ctx, module = compile_module(tmp_path, 'plain.' + fmt)
++    keywords = [s.keyword for s in statements_of(module)]
++    assert 'uses' in keywords
++    assert 'grouping' in keywords
++
++
++def test_options_are_listed_in_help(tmp_path):
++    proc = run_pyang(tmp_path, '--help')
++    assert '--yang-resolve' in proc.stdout
++    assert '--yin-resolve' in proc.stdout

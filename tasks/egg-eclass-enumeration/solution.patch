@@ -1,0 +1,441 @@
+diff --git a/src/enumerate.rs b/src/enumerate.rs
+new file mode 100644
+index 0000000..980cb7a
+--- /dev/null
++++ b/src/enumerate.rs
+@@ -0,0 +1,378 @@
++use crate::no_std_prelude::*;
++use core::cmp::Ordering;
++
++use crate::util::{HashMap, HashSet};
++use crate::{
++    Analysis, CostFunction, EGraph, ENodeOrVar, Id, Language, Pattern, PatternAst, RecExpr, Var,
++};
++
++/// The terms of one e-class reached along one particular ancestor path.
++struct Generator<L: Language, C> {
++    class: Id,
++    path: Vec<Id>,
++    frontier: Vec<(usize, Vec<usize>, C, RecExpr<L>)>,
++    queued: HashSet<(usize, Vec<usize>)>,
++    produced: Vec<(C, RecExpr<L>)>,
++    seen: HashSet<Vec<L>>,
++    seeded: bool,
++}
++
++/** An iterator over the expressions represented by an e-class, cheapest first.
++
++Created by [`Extractor::exprs`](crate::Extractor::exprs). Terms are produced on
++demand, so taking a few of them does not enumerate the whole e-class.
++
++```
++use egg::*;
++
++let mut egraph = EGraph::<SymbolLang, ()>::default();
++let a = egraph.add_expr(&"(f x)".parse().unwrap());
++let b = egraph.add_expr(&"(g x)".parse().unwrap());
++egraph.union(a, b);
++egraph.rebuild();
++
++let mut extractor = Extractor::new(&egraph, AstSize);
++let found = extractor.exprs(a).count();
++assert_eq!(found, 2);
++```
++**/
++pub struct Exprs<'a, CF, L, N>
++where
++    CF: CostFunction<L>,
++    L: Language,
++    N: Analysis<L>,
++{
++    egraph: &'a EGraph<L, N>,
++    cost_function: &'a mut CF,
++    gens: Vec<Generator<L, CF::Cost>>,
++    index: HashMap<(Id, Vec<Id>), usize>,
++    root: usize,
++    next: usize,
++}
++
++impl<'a, CF, L, N> Iterator for Exprs<'a, CF, L, N>
++where
++    CF: CostFunction<L>,
++    L: Language,
++    N: Analysis<L>,
++{
++    type Item = (CF::Cost, RecExpr<L>);
++
++    fn next(&mut self) -> Option<Self::Item> {
++        let root = self.root;
++        let at = self.next;
++        self.next += 1;
++        self.nth_term(root, at)
++    }
++}
++
++impl<'a, CF, L, N> core::fmt::Debug for Exprs<'a, CF, L, N>
++where
++    CF: CostFunction<L>,
++    L: Language,
++    N: Analysis<L>,
++{
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("Exprs").field("next", &self.next).finish()
++    }
++}
++
++/// Order two scored terms: by cost, then by the node sequence so that equal
++/// costs still give a deterministic order.
++fn compare_terms<L: Language, C: PartialOrd>(
++    left: (&C, &RecExpr<L>),
++    right: (&C, &RecExpr<L>),
++) -> Ordering {
++    match left.0.partial_cmp(right.0).unwrap() {
++        Ordering::Equal => left.1.as_ref().cmp(right.1.as_ref()),
++        other => other,
++    }
++}
++
++/// Build the term `node(children...)` by copying each child's nodes into one
++/// buffer and rewriting its child indices to point at the copies.
++fn splice<L: Language>(node: &L, children: &[RecExpr<L>]) -> RecExpr<L> {
++    let mut nodes: Vec<L> = Vec::new();
++    let mut roots: Vec<Id> = Vec::with_capacity(children.len());
++    for child in children {
++        let offset = nodes.len();
++        for sub in child.as_ref() {
++            let mut copy = sub.clone();
++            copy.update_children(|id| Id::from(usize::from(id) + offset));
++            nodes.push(copy);
++        }
++        roots.push(Id::from(nodes.len() - 1));
++    }
++    let mut root = node.clone();
++    let mut taken = 0;
++    root.update_children(|_| {
++        let id = roots[taken];
++        taken += 1;
++        id
++    });
++    nodes.push(root);
++    RecExpr::from(nodes)
++}
++
++impl<'a, CF, L, N> Exprs<'a, CF, L, N>
++where
++    CF: CostFunction<L>,
++    L: Language,
++    N: Analysis<L>,
++{
++    pub(crate) fn new(
++        egraph: &'a EGraph<L, N>,
++        cost_function: &'a mut CF,
++        eclass: Id,
++    ) -> Self {
++        let mut exprs = Exprs {
++            egraph,
++            cost_function,
++            gens: Vec::new(),
++            index: HashMap::default(),
++            root: 0,
++            next: 0,
++        };
++        let canonical = exprs.egraph.find(eclass);
++        exprs.root = exprs.generator(canonical, Vec::new());
++        exprs
++    }
++
++    /// Find or create the generator for `class` reached along `path`.
++    fn generator(&mut self, class: Id, path: Vec<Id>) -> usize {
++        let mut key = path.clone();
++        key.sort_unstable();
++        if let Some(&found) = self.index.get(&(class, key.clone())) {
++            return found;
++        }
++        let slot = self.gens.len();
++        self.gens.push(Generator {
++            class,
++            path,
++            frontier: Vec::new(),
++            queued: HashSet::default(),
++            produced: Vec::new(),
++            seen: HashSet::default(),
++            seeded: false,
++        });
++        self.index.insert((class, key), slot);
++        slot
++    }
++
++    /// The `n`th cheapest term of a generator, computing more terms if needed.
++    fn nth_term(&mut self, gi: usize, n: usize) -> Option<(CF::Cost, RecExpr<L>)> {
++        while self.gens[gi].produced.len() <= n {
++            if !self.advance(gi) {
++                return None;
++            }
++        }
++        Some(self.gens[gi].produced[n].clone())
++    }
++
++    /// The e-nodes of a generator's class, with children canonicalised.
++    fn class_nodes(&self, gi: usize) -> Vec<L> {
++        let class = self.gens[gi].class;
++        self.egraph[class]
++            .nodes
++            .iter()
++            .map(|node| node.clone().map_children(|id| self.egraph.find(id)))
++            .collect()
++    }
++
++    /// Assemble the term for one candidate, or `None` if some child position
++    /// has no term at the requested index.
++    fn build(&mut self, gi: usize, node: &L, picks: &[usize]) -> Option<(CF::Cost, RecExpr<L>)> {
++        let mut child_path = self.gens[gi].path.clone();
++        child_path.push(self.gens[gi].class);
++        let mut parts: Vec<RecExpr<L>> = Vec::with_capacity(picks.len());
++        for (slot, &child) in node.children().iter().enumerate() {
++            let child_gen = self.generator(child, child_path.clone());
++            let term = self.nth_term(child_gen, picks[slot])?;
++            parts.push(term.1);
++        }
++        let expr = splice(node, &parts);
++        let cost = self.cost_function.cost_rec(&expr);
++        Some((cost, expr))
++    }
++
++    /// Push one candidate onto a generator's frontier if it is new and buildable.
++    fn offer(&mut self, gi: usize, node_idx: usize, picks: Vec<usize>) {
++        if !self.gens[gi].queued.insert((node_idx, picks.clone())) {
++            return;
++        }
++        let nodes = self.class_nodes(gi);
++        let node = nodes[node_idx].clone();
++        if let Some((cost, expr)) = self.build(gi, &node, &picks) {
++            self.gens[gi].frontier.push((node_idx, picks, cost, expr));
++        }
++    }
++
++    /// Produce one more term for `gi`, returning false when it is exhausted.
++    fn advance(&mut self, gi: usize) -> bool {
++        if self.gens[gi].path.contains(&self.gens[gi].class) {
++            return false;
++        }
++        if !self.gens[gi].seeded {
++            self.gens[gi].seeded = true;
++            let nodes = self.class_nodes(gi);
++            for (idx, node) in nodes.iter().enumerate() {
++                self.offer(gi, idx, vec![0; node.children().len()]);
++            }
++        }
++
++        loop {
++            if self.gens[gi].frontier.is_empty() {
++                return false;
++            }
++            let mut best = 0;
++            for i in 1..self.gens[gi].frontier.len() {
++                let a = &self.gens[gi].frontier[i];
++                let b = &self.gens[gi].frontier[best];
++                if compare_terms((&a.2, &a.3), (&b.2, &b.3)) == Ordering::Less {
++                    best = i;
++                }
++            }
++            let (node_idx, picks, cost, expr) = self.gens[gi].frontier.remove(best);
++
++            for slot in 0..picks.len() {
++                let mut next = picks.clone();
++                next[slot] += 1;
++                self.offer(gi, node_idx, next);
++            }
++
++            if self.gens[gi].seen.insert(expr.as_ref().to_vec()) {
++                self.gens[gi].produced.push((cost, expr));
++                return true;
++            }
++        }
++    }
++}
++
++/** An iterator over the expressions of an e-class that match a pattern.
++
++Created by [`Extractor::exprs_matching`](crate::Extractor::exprs_matching). The
++surviving terms keep the order [`Exprs`] would give them.
++
++```
++use egg::*;
++
++let mut egraph = EGraph::<SymbolLang, ()>::default();
++let a = egraph.add_expr(&"(f x)".parse().unwrap());
++let b = egraph.add_expr(&"(g x)".parse().unwrap());
++egraph.union(a, b);
++egraph.rebuild();
++
++let pattern: Pattern<SymbolLang> = "(f ?v)".parse().unwrap();
++let mut extractor = Extractor::new(&egraph, AstSize);
++let found: Vec<String> = extractor
++    .exprs_matching(a, &pattern)
++    .map(|(_, e)| e.to_string())
++    .collect();
++assert_eq!(found, vec!["(f x)".to_string()]);
++```
++**/
++pub struct MatchingExprs<'a, CF, L, N>
++where
++    CF: CostFunction<L>,
++    L: Language,
++    N: Analysis<L>,
++{
++    inner: Exprs<'a, CF, L, N>,
++    pattern: PatternAst<L>,
++}
++
++impl<'a, CF, L, N> Iterator for MatchingExprs<'a, CF, L, N>
++where
++    CF: CostFunction<L>,
++    L: Language,
++    N: Analysis<L>,
++{
++    type Item = (CF::Cost, RecExpr<L>);
++
++    fn next(&mut self) -> Option<Self::Item> {
++        loop {
++            let (cost, expr) = self.inner.next()?;
++            if pattern_matches(&self.pattern, &expr) {
++                return Some((cost, expr));
++            }
++        }
++    }
++}
++
++impl<'a, CF, L, N> core::fmt::Debug for MatchingExprs<'a, CF, L, N>
++where
++    CF: CostFunction<L>,
++    L: Language,
++    N: Analysis<L>,
++{
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        f.debug_struct("MatchingExprs").finish()
++    }
++}
++
++pub(crate) fn matching_exprs<'a, CF, L, N>(
++    egraph: &'a EGraph<L, N>,
++    cost_function: &'a mut CF,
++    eclass: Id,
++    pattern: &Pattern<L>,
++) -> MatchingExprs<'a, CF, L, N>
++where
++    CF: CostFunction<L>,
++    L: Language,
++    N: Analysis<L>,
++{
++    MatchingExprs {
++        inner: Exprs::new(egraph, cost_function, eclass),
++        pattern: pattern.ast.clone(),
++    }
++}
++
++/// Whether `expr` matches `pattern`, with each pattern variable bound to one
++/// subterm throughout.
++fn pattern_matches<L: Language>(pattern: &PatternAst<L>, expr: &RecExpr<L>) -> bool {
++    let mut binding: HashMap<Var, Id> = HashMap::default();
++    let proot = Id::from(pattern.as_ref().len() - 1);
++    let eroot = Id::from(expr.as_ref().len() - 1);
++    match_at(pattern, proot, expr, eroot, &mut binding)
++}
++
++fn match_at<L: Language>(
++    pattern: &PatternAst<L>,
++    at: Id,
++    expr: &RecExpr<L>,
++    on: Id,
++    binding: &mut HashMap<Var, Id>,
++) -> bool {
++    match &pattern.as_ref()[usize::from(at)] {
++        ENodeOrVar::Var(var) => match binding.get(var) {
++            Some(&bound) => same_subterm(expr, bound, on),
++            None => {
++                binding.insert(*var, on);
++                true
++            }
++        },
++        ENodeOrVar::ENode(node) => {
++            let here = &expr.as_ref()[usize::from(on)];
++            if !node.matches(here) {
++                return false;
++            }
++            node.children()
++                .iter()
++                .zip(here.children())
++                .all(|(&next, &under)| match_at(pattern, next, expr, under, binding))
++        }
++    }
++}
++
++/// Whether the two subterms of `expr` rooted at `left` and `right` are equal.
++fn same_subterm<L: Language>(expr: &RecExpr<L>, left: Id, right: Id) -> bool {
++    let a = &expr.as_ref()[usize::from(left)];
++    let b = &expr.as_ref()[usize::from(right)];
++    if !a.matches(b) {
++        return false;
++    }
++    a.children()
++        .iter()
++        .zip(b.children())
++        .all(|(&x, &y)| same_subterm(expr, x, y))
++}
+diff --git a/src/extract.rs b/src/extract.rs
+index 9f77a91..dc3764a 100644
+--- a/src/extract.rs
++++ b/src/extract.rs
+@@ -231,6 +231,32 @@ where
+         (cost, expr)
+     }
+ 
++    /// Iterate over the expressions represented by the given e-class, cheapest
++    /// first.
++    ///
++    /// Terms are produced on demand, so taking a few of them does not
++    /// enumerate the whole e-class.
++    pub fn exprs(&mut self, eclass: Id) -> crate::Exprs<'_, CF, L, N> {
++        crate::Exprs::new(self.egraph, &mut self.cost_function, eclass)
++    }
++
++    /// Collect the `k` cheapest expressions represented by the given e-class.
++    ///
++    /// Fewer than `k` are returned when the e-class represents fewer.
++    pub fn find_k_best(&mut self, eclass: Id, k: usize) -> Vec<(CF::Cost, RecExpr<L>)> {
++        self.exprs(eclass).take(k).collect()
++    }
++
++    /// Iterate over the expressions represented by the given e-class that match
++    /// `pattern`, cheapest first.
++    pub fn exprs_matching(
++        &mut self,
++        eclass: Id,
++        pattern: &crate::Pattern<L>,
++    ) -> crate::MatchingExprs<'_, CF, L, N> {
++        crate::enumerate::matching_exprs(self.egraph, &mut self.cost_function, eclass, pattern)
++    }
++
+     /// Find the cheapest e-node in the given e-class.
+     pub fn find_best_node(&self, eclass: Id) -> &L {
+         let canonical = self.egraph.find(eclass);
+diff --git a/src/lib.rs b/src/lib.rs
+index 38f9a6d..4073a2c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -71,6 +71,7 @@ pub mod tutorials;
+ mod dot;
+ mod eclass;
+ mod egraph;
++pub(crate) mod enumerate;
+ mod explain;
+ mod extract;
+ mod language;
+@@ -126,6 +127,7 @@ pub use {
+         Explanation, FlatExplanation, FlatTerm, Justification, TreeExplanation, TreeTerm,
+         UnionEqualities,
+     },
++    enumerate::{Exprs, MatchingExprs},
+     extract::*,
+     language::*,
+     multipattern::*,

@@ -1,0 +1,1105 @@
+diff --git a/vivisect/__init__.py b/vivisect/__init__.py
+index 3d4db8d0..21b91f17 100644
+--- a/vivisect/__init__.py
++++ b/vivisect/__init__.py
+@@ -2376,15 +2376,12 @@ class VivWorkspace(e_mem.MemoryObject, viv_base.VivWorkspaceCore):
+ 
+         # Determine if there are any pointers we need make
+         # xrefs for...
+-        offset = 0
+-        for p in vs.vsGetPrims():
+-            if isinstance(p, vs_prims.v_ptr):
+-                vptr = p.vsGetValue()
++        for offset, indent, fname, field in vs.vsGetPrintInfo():
++            if isinstance(field, vs_prims.v_ptr):
++                vptr = field.vsGetValue()
+                 if self.isValidPointer(vptr):
+                     self.addXref(va+offset, vptr, v_const.REF_PTR)
+ 
+-            offset += len(p)
+-
+         return vs
+ 
+     def getUserStructNames(self):
+@@ -2419,7 +2416,7 @@ class VivWorkspace(e_mem.MemoryObject, viv_base.VivWorkspaceCore):
+             vw.setUserStructSource( src )
+         '''
+         # First, we make sure it compiles...
+-        ctor = vs_cparse.ctorFromCSource( ssrc )
++        ctor = vs_cparse.ctorFromCSource(ssrc, psize=self.psize or 4, bigend=self.bigend)
+         # Then, build one to get the name from it...
+         vs = ctor()
+         cname = vs.vsGetTypeName()
+diff --git a/vivisect/base.py b/vivisect/base.py
+index 8ba9457e..c983f5f8 100644
+--- a/vivisect/base.py
++++ b/vivisect/base.py
+@@ -734,7 +734,7 @@ class VivWorkspaceCore(viv_impapi.ImportApi):
+         # All meta values in the "ustruct" namespace are user defined
+         # structure defintions in C.
+         sname = name.split(':')[1]
+-        ctor = vs_cparse.ctorFromCSource(ssrc)
++        ctor = vs_cparse.ctorFromCSource(ssrc, psize=self.psize or 4, bigend=self.bigend)
+         self.vsbuilder.addVStructCtor(sname, ctor)
+ 
+     def _mcb_GUID(self, name, guid):
+diff --git a/vstruct/__init__.py b/vstruct/__init__.py
+index 247a7c0b..ffd83211 100644
+--- a/vstruct/__init__.py
++++ b/vstruct/__init__.py
+@@ -145,6 +145,10 @@ class VStruct(vs_prims.v_base):
+     def _vsInitFastFields(self):
+         fields = self.vsGetFastParseFields()
+         self._vs_fastfields = fields
++        if any(f._vs_fmt is None for f in fields):
++            self._vs_fastfmt = None
++            return
++
+         fmt = ''.join([ f._vs_fmt for f in fields ])
+         endian = '<'
+         if fmt.find('>') != -1:
+@@ -171,6 +175,7 @@ class VStruct(vs_prims.v_base):
+         if fast:
+             if self._vs_fastfields is None:
+                 self._vsInitFastFields()
++        if fast and self._vs_fastfmt is not None:
+             values = struct.unpack_from( self._vs_fastfmt, sbytes, offset )
+             # Ephemeral list comprehension for speed
+             [ self._vs_fastfields[i].vsSetValue( values[i] ) for i in range(len(values)) ]
+@@ -200,6 +205,7 @@ class VStruct(vs_prims.v_base):
+         if fast:
+             if self._vs_fastfields is None:
+                 self._vsInitFastFields()
++        if fast and self._vs_fastfmt is not None:
+             ffvals = [ ff.vsGetValue() for ff in self._vs_fastfields ]
+             return struct.pack(self._vs_fastfmt, *ffvals)
+ 
+diff --git a/vstruct/bitfield.py b/vstruct/bitfield.py
+index cce89151..3c6428ad 100644
+--- a/vstruct/bitfield.py
++++ b/vstruct/bitfield.py
+@@ -120,3 +120,61 @@ class VBitField(VStruct):
+             valu <<= (8 - bitrem)
+ 
+         return binascii.unhexlify(('%.' + str(bytelen * 2) + 'x') % valu)
++
++
++class v_cbits(vs_prim.v_bytes):
++    '''
++    The storage bytes of one run of C bit-fields.  Bit 0 is the least
++    significant bit of the first byte, or its most significant bit when
++    big endian.
++    '''
++    def __init__(self, size=0, bigend=False):
++        vs_prim.v_bytes.__init__(self, size=size)
++        self._vs_bigend = bigend
++
++    def _vsBitShift(self, bitoff, width):
++        if self._vs_bigend:
++            return self._vs_length * 8 - bitoff - width
++        return bitoff
++
++    def vsGetBits(self, bitoff, width):
++        order = 'big' if self._vs_bigend else 'little'
++        bits = int.from_bytes(self._vs_value, order)
++        return (bits >> self._vsBitShift(bitoff, width)) & ((1 << width) - 1)
++
++    def vsSetBits(self, bitoff, width, value):
++        order = 'big' if self._vs_bigend else 'little'
++        bits = int.from_bytes(self._vs_value, order)
++        shift = self._vsBitShift(bitoff, width)
++        mask = ((1 << width) - 1) << shift
++        bits = (bits & ~mask) | ((value << shift) & mask)
++        self._vs_value = bits.to_bytes(self._vs_length, order)
++
++
++class v_cbitfield(vs_prim.v_prim):
++    '''
++    A named C bit-field.  It takes no bytes of its own and reads and writes
++    its bits in the v_cbits storage it was created with.
++    '''
++    def __init__(self, store, bitoff, width, signed=False):
++        vs_prim.v_prim.__init__(self)
++        self._vs_store = store
++        self._vs_bitoff = bitoff
++        self._vs_bitwidth = width
++        self._vs_signed = signed
++        self._vs_length = 0
++
++    def vsParse(self, fbytes, offset=0):
++        return offset
++
++    def vsEmit(self):
++        return b''
++
++    def vsGetValue(self):
++        value = self._vs_store.vsGetBits(self._vs_bitoff, self._vs_bitwidth)
++        if self._vs_signed and value >> (self._vs_bitwidth - 1):
++            value -= 1 << self._vs_bitwidth
++        return value
++
++    def vsSetValue(self, value):
++        self._vs_store.vsSetBits(self._vs_bitoff, self._vs_bitwidth, value)
+diff --git a/vstruct/cparse.py b/vstruct/cparse.py
+index 8a4767ef..6f6b568a 100644
+--- a/vstruct/cparse.py
++++ b/vstruct/cparse.py
+@@ -1,128 +1,835 @@
++import struct
++
+ from pycparser import c_parser
+ import pycparser.c_ast as c_ast
+ 
+ import vstruct
++import vstruct.bitfield as vs_bits
+ import vstruct.primitives as vs_prim
+ 
++
++def _roundup(value, align):
++    return -(-value // align) * align
++
++
++def _freshName(prefix, taken):
++    num = 0
++    while '%s%d' % (prefix, num) in taken:
++        num += 1
++    name = '%s%d' % (prefix, num)
++    taken.add(name)
++    return name
++
++
++def _cdiv(a, b):
++    q = abs(a) // abs(b)
++    return q if (a < 0) == (b < 0) else -q
++
++
++def _cmod(a, b):
++    return a - _cdiv(a, b) * b
++
++
++_binops = {
++    '+': lambda a, b: a + b,
++    '-': lambda a, b: a - b,
++    '*': lambda a, b: a * b,
++    '/': _cdiv,
++    '%': _cmod,
++    '<<': lambda a, b: a << b,
++    '>>': lambda a, b: a >> b,
++    '&': lambda a, b: a & b,
++    '|': lambda a, b: a | b,
++    '^': lambda a, b: a ^ b,
++    '==': lambda a, b: int(a == b),
++    '!=': lambda a, b: int(a != b),
++    '<': lambda a, b: int(a < b),
++    '>': lambda a, b: int(a > b),
++    '<=': lambda a, b: int(a <= b),
++    '>=': lambda a, b: int(a >= b),
++}
++
++_unops = {
++    '-': lambda a: -a,
++    '+': lambda a: a,
++    '~': lambda a: ~a,
++    '!': lambda a: int(not a),
++}
++
++_intclasses = {
++    (1, True): vs_prim.v_int8,
++    (1, False): vs_prim.v_uint8,
++    (2, True): vs_prim.v_int16,
++    (2, False): vs_prim.v_uint16,
++    (4, True): vs_prim.v_int32,
++    (4, False): vs_prim.v_uint32,
++    (8, True): vs_prim.v_int64,
++    (8, False): vs_prim.v_uint64,
++}
++
++
++def _intval(text):
++    text = text.rstrip('uUlL')
++    if text[:2] in ('0x', '0X'):
++        return int(text[2:], 16)
++    if text[:2] in ('0b', '0B'):
++        return int(text[2:], 2)
++    if len(text) > 1 and text[0] == '0':
++        return int(text[1:], 8)
++    return int(text)
++
++
++def _charval(text):
++    quote = text.index("'")
++    chars = text[quote + 1:-1].encode('latin-1').decode('unicode_escape')
++    if quote:
++        return ord(chars[-1])
++    value = 0
++    for char in chars:
++        value = ((value << 8) | (ord(char) & 0xff)) & 0xffffffff
++    if len(chars) == 1 and value & 0x80:
++        return value - 0x100
++    if value & 0x80000000:
++        return value - (1 << 32)
++    return value
++
++
++class v_cstr(vs_prim.v_str):
++    '''
++    A C char array.  It reads as a string up to its first NUL, keeps its size
++    when assigned, and parses and emits all of its bytes, so structures
++    holding one skip the struct.pack fast path.
++    '''
++    def __init__(self, size=4):
++        vs_prim.v_str.__init__(self, size=size)
++        self._vs_fmt = None
++
++    def vsSetValue(self, val):
++        vs_prim.v_str.vsSetValue(self, val)
++        self._vs_value = self._vs_value[:self._vs_length]
++
++
++class v_cfloat(vs_prim.v_float):
++    '''
++    A C float.  It emits the bytes it parsed until it is assigned, so NaN
++    payloads survive, and it skips the struct.pack fast path.
++    '''
++    def __init__(self, bigend=False):
++        vs_prim.v_float.__init__(self, bigend=bigend)
++        self._vs_cfmt = self._vs_fmt
++        self._vs_fmt = None
++        self._vs_raw = None
++
++    def vsSetValue(self, value):
++        vs_prim.v_float.vsSetValue(self, value)
++        self._vs_raw = None
++
++    def vsParse(self, fbytes, offset=0):
++        end = offset + self._vs_length
++        self._vs_raw = bytes(fbytes[offset:end])
++        self._vs_value = struct.unpack(self._vs_cfmt, self._vs_raw)[0]
++        return end
++
++    def vsEmit(self):
++        if self._vs_raw is not None:
++            return self._vs_raw
++        return struct.pack(self._vs_cfmt, self._vs_value)
++
++
++class v_cdouble(v_cfloat):
++    _vs_length = 8
++
++
++def _commit(vs):
++    union = vs.__dict__.get('_vs_cunion')
++    if union is not None and not union.__dict__.get('_vs_cbusy'):
++        union._vsCommit(vs.__dict__['_vs_cmember'])
++
++
++def _adopt(field, union, member):
++    field.__dict__['_vs_cunion'] = union
++    field.__dict__['_vs_cmember'] = member
++    if isinstance(field, (CStruct, vstruct.VArray)):
++        for fname, fobj in field.vsGetFields():
++            _adopt(fobj, union, member)
++
++
++class _CMember:
++    '''
++    Mixed into the primitives C structures are built from.  Inside a union a
++    write made through any of them, even one kept from vsGetField, is
++    committed to the union at once.
++    '''
++    def vsSetValue(self, value):
++        ret = super().vsSetValue(value)
++        _commit(self)
++        return ret
++
++    def vsParse(self, fbytes, offset=0):
++        ret = super().vsParse(fbytes, offset=offset)
++        _commit(self)
++        return ret
++
++
++_cclasses = {}
++
++
++def _cprim(cls):
++    if cls not in _cclasses:
++        _cclasses[cls] = type(cls.__name__, (_CMember, cls), {})
++    return _cclasses[cls]
++
++
++class CStruct(vstruct.VStruct):
++    '''
++    A structure built from C source.  Inside a union its writes are committed
++    to the union at once.
++    '''
++    def vsSetField(self, name, value):
++        old = self._vs_values.get(name)
++        ret = vstruct.VStruct.vsSetField(self, name, value)
++        union = self.__dict__.get('_vs_cunion')
++        if union is not None and self._vs_values[name] is not old:
++            _adopt(self._vs_values[name], union, self.__dict__['_vs_cmember'])
++            _commit(self)
++        return ret
++
++
++class CUnion(vstruct.VUnion):
++    '''
++    A union built from C source.  Its members are views of one byte string:
++    a write through any of them is copied into it at once, and every member
++    is then read back from it.
++    '''
++    def __init__(self, bigend=False):
++        vstruct.VUnion.__init__(self, bigend=bigend)
++        self._vs_fmt = None
++        self._vs_ubytes = b''
++
++    def vsGetFastParseFields(self):
++        return [self]
++
++    def vsGetOffset(self, name, offset=0):
++        fname, _, rest = name.partition('.')
++        field = self._vs_values.get(fname)
++        if field is None:
++            raise Exception('Invalid Field Specified!')
++        if rest:
++            return field.vsGetOffset(rest, offset=offset)
++        return offset
++
++    def vsEmit(self, fast=False):
++        return self._vs_ubytes.ljust(len(self), b'\x00')[:len(self)]
++
++    def vsParse(self, sbytes, offset=0, fast=False):
++        end = offset + len(self)
++        self._vsShare(bytes(sbytes[offset:end]))
++        return end
++
++    def vsSetField(self, name, value):
++        old = self._vs_values.get(name)
++        ret = vstruct.VStruct.vsSetField(self, name, value)
++        field = self._vs_values[name]
++        if field is not old:
++            _adopt(field, self, field)
++            self._vsCommit(field)
++        return ret
++
++    def _vsCommit(self, member):
++        mbytes = member.vsEmit()
++        self._vsShare(mbytes + self.vsEmit()[len(mbytes):])
++
++    def _vsShare(self, ubytes):
++        busy = self.__dict__.get('_vs_cbusy')
++        self.__dict__['_vs_cbusy'] = True
++        try:
++            self._vs_ubytes = ubytes
++            for fname, fobj in self.vsGetFields():
++                fobj.vsParse(ubytes)
++        finally:
++            self.__dict__['_vs_cbusy'] = busy
++        _commit(self)
++
++
++class CType:
++
++    def __init__(self, size, align, ctor, signed=False, ischar=False, tclass='int', target=None):
++        self.size = size
++        self.align = align
++        self.ctor = ctor
++        self.signed = signed
++        self.ischar = ischar
++        self.tclass = tclass
++        self.target = target
++
++    def build(self, bigend):
++        if self.ctor is None:
++            raise Exception('C type has no storage layout')
++        return self.ctor(bigend)
++
++
++class CArray(CType):
++
++    def __init__(self, elem, count):
++        CType.__init__(self, elem.size * count, elem.align, None, tclass='array')
++        self.elem = elem
++        self.count = count
++
++    def build(self, bigend):
++        if self.elem.ischar:
++            return _cprim(v_cstr)(size=self.count)
++        return vstruct.VArray([self.elem.build(bigend) for i in range(self.count)])
++
++
++class CRecord(CType):
++
++    def __init__(self, kind, name):
++        CType.__init__(self, 0, 1, None, tclass='record')
++        self.kind = kind
++        self.name = name
++        self.items = None
++        self.members = {}
++        self.defnode = None
++
++    def build(self, bigend):
++        if self.items is None:
++            raise Exception('Incomplete type: %s %s' % (self.kind, self.name))
++
++        if self.kind == 'union':
++            vs = CUnion(bigend=bigend)
++        else:
++            vs = CStruct(bigend=bigend)
++        vs._vs_name = self.name
++
++        for item in self.items:
++            if item[0] == 'pad':
++                vs.vsAddField(item[1], _cprim(vs_prim.v_bytes)(size=item[2]))
++            elif item[0] == 'field':
++                vs.vsAddField(item[1], item[2].build(bigend))
++            else:
++                store = _cprim(vs_bits.v_cbits)(size=item[2], bigend=bigend)
++                for fname, bitoff, width, signed in item[3]:
++                    vs.vsAddField(fname, _cprim(vs_bits.v_cbitfield)(store, bitoff, width, signed))
++                vs.vsAddField(item[1], store)
++
++        if self.kind == 'union':
++            for fname, fobj in vs.vsGetFields():
++                _adopt(fobj, vs, fobj.__dict__.get('_vs_store', fobj))
++        return vs
++
++
+ class StructParser:
+ 
+     def __init__(self, psize=4, bigend=False):
+ 
+         self.psize = psize
+-        self.pclass = vs_prim.v_ptr32
+-
+-        self.cls_parsers = {
+-            c_ast.Decl:             self.c_getVsDecl,
+-            c_ast.Struct:           self.c_getVsStruct,
+-            c_ast.FileAST:          self.c_getFileAst,
+-            c_ast.PtrDecl:          self.c_getPointer,
+-            #c_ast.FuncDecl:         self.c_getFuncDecl,
+-            c_ast.Constant:         self.c_getConstant,
+-            c_ast.TypeDecl:         self.c_getVsType,
+-            c_ast.ArrayDecl:        self.c_getVsArray,
+-            c_ast.IdentifierType:   self.c_getIdentType,
+-        }
+-
+-        self.vs_ctypes = {
+-            ('char',):                  vs_prim.v_int8,
+-            ('unsigned','char'):        vs_prim.v_uint8,
+-
+-            ('short',):                 vs_prim.v_int16,
+-            ('short','int'):            vs_prim.v_int16,
+-
+-            ('unsigned', 'short',):     vs_prim.v_uint16,
+-            ('unsigned', 'short','int'):vs_prim.v_uint16,
+-
+-            ('int',):                   vs_prim.v_int32,
+-            ('unsigned','int',):        vs_prim.v_uint32,
+-
+-            ('long',):                  vs_prim.v_int32,
+-            ('long','int'):             vs_prim.v_int32,
+-
+-            ('unsigned','long',):       vs_prim.v_uint32,
+-            ('unsigned','long','int'):  vs_prim.v_uint32,
+-        }
+-
+-        if psize == 8:
+-            self.pclass = vs_prim.v_ptr64
+-            self.vs_ctypes.update({
+-                ('long',):                    vs_prim.v_int64,
+-                ('long', 'int'):              vs_prim.v_int64,
+-                ('long', 'long'):             vs_prim.v_int64,
+-
+-                ('unsigned', 'long',):        vs_prim.v_uint64,
+-                ('unsigned', 'long', 'int'):  vs_prim.v_uint64,
+-                ('unsigned', 'long', 'long'): vs_prim.v_uint64,
+-            })
+-
+-    def _getVsChildElements(self, astelem):
+-        return [ self._getVsElement( c ) for c in astelem[1].children() ]
+-
+-    def _getVsElement(self, astelem):
+-        # An ast element comes as a tuple of namething, realstuff
+-        namething,elem = astelem
+-        p = self.cls_parsers.get( elem.__class__ )
+-        if p is None:
+-            raise Exception('OMG NO PARSER FOR: %r' % elem)
+-        return p( astelem )
+-
+-    def c_getPointer(self, pdecl):
+-        vsclass = self._getVsChildElements( pdecl )[ 0 ]
+-        return self.pclass
+-
+-    def c_getVsArray(self, ardecl):
+-        cls, size = self._getVsChildElements(ardecl)
+-        # Special case char arrays into v_bytes
+-        if cls == vs_prim.v_int8:
+-            return lambda: vs_prim.v_str(size=size)
+-
+-        return lambda: vstruct.VArray( [ cls() for i in range(size) ] )
+-
+-    def c_getIdentType(self, itelem):
+-        ename, einst = itelem
+-        c = self.vs_ctypes.get(tuple(einst.names))
+-        if not c:
+-            raise Exception('Un-plumbed type: %r' % (einst.names,))
+-        return c
+-
+-    def c_getVsType(self, idelem):
+-        ename, einst = idelem
+-        cls = self._getVsChildElements(idelem)[0]
+-        return cls
+-
+-    def c_getVsDecl(self, decelem):
+-        decname = decelem[1].name
+-        return decname,self._getVsChildElements(decelem)[0]
+-
+-    def c_getVsStruct(self, selem):
+-        sname,sinst = selem
+-        def bstruct():
+-            vs = vstruct.VStruct()
+-            vs._vs_name = sinst.name
+-            for cname,chclass in self._getVsChildElements( selem ):
+-                vobj = chclass()
+-                vs.vsAddField(cname, vobj)
+-            return vs
+-        return bstruct
+-
+-    def c_getFileAst(self, elem):
+-        return self._getVsChildElements(elem)
+-
+-    def c_getConstant(self, celem):
+-        return int(celem[1].value)
+-
+-    def c_getFuncDecl(self, felem):
+-        raise NotImplementedError("Implement function declaration parsing!")
++        self.bigend = bigend
++
++        self.typedefs = {}
++        self.tags = {}
++        self.consts = {}
++        self.objects = {}
++        self.defs = []
++
++        self.pclass = _cprim(vs_prim.v_ptr64 if psize == 8 else vs_prim.v_ptr32)
++        self.enumtype = self._intType(4, 4, True)
++        self.sizetype = self._intType(psize, psize, False)
++
++    def _intType(self, size, align, signed, ischar=False):
++        cls = _cprim(_intclasses[(size, signed)])
++        return CType(size, align, lambda bigend: cls(bigend=bigend), signed=signed, ischar=ischar)
++
++    def _floatType(self, size):
++        cls = _cprim(v_cfloat if size == 4 else v_cdouble)
++        return CType(size, min(size, self.psize), lambda bigend: cls(bigend=bigend), tclass='float')
++
++    def _pointerTo(self, target):
++        pclass = self.pclass
++        return CType(self.psize, self.psize, lambda bigend: pclass(bigend=bigend), tclass='ptr', target=target)
++
++    def _scalar(self, names):
++        if len(names) == 1 and names[0] in self.typedefs:
++            return self.typedefs[names[0]]
++
++        signed = 'signed' in names
++        unsigned = 'unsigned' in names
++        longs = names.count('long')
++        rest = [n for n in names if n not in ('signed', 'unsigned', 'long', 'int')]
++        if signed and unsigned:
++            raise Exception('Un-plumbed type: %r' % (names,))
++
++        if rest == ['char'] and not longs:
++            return self._intType(1, 1, not unsigned, ischar=not (signed or unsigned))
++
++        if rest == ['short'] and not longs:
++            return self._intType(2, 2, not unsigned)
++
++        if rest == ['_Bool'] and not (longs or signed or unsigned):
++            return self._intType(1, 1, False)
++
++        if rest == ['float'] and not (longs or signed or unsigned):
++            return self._floatType(4)
++
++        if rest == ['double'] and not (longs or signed or unsigned):
++            return self._floatType(8)
++
++        if rest:
++            raise Exception('Un-plumbed type: %r' % (names,))
++
++        if longs == 0:
++            return self._intType(4, 4, not unsigned)
++        if longs == 1:
++            return self._intType(self.psize, self.psize, not unsigned)
++        if longs == 2:
++            return self._intType(8, min(8, self.psize), not unsigned)
++        raise Exception('Un-plumbed type: %r' % (names,))
++
++    def _resolve(self, node, name=None, top=False):
++        if isinstance(node, (c_ast.TypeDecl, c_ast.Typename)):
++            return self._resolve(node.type, name=name, top=top)
++
++        if isinstance(node, c_ast.PtrDecl):
++            self._declare(node.type, top=top)
++            return self._pointerTo(node.type)
++
++        if isinstance(node, c_ast.ArrayDecl):
++            elem = self._resolve(node.type, top=top)
++            count = 0
++            if node.dim is not None:
++                count = self._const(node.dim)
++            if count < 0 or (elem.size or 0) * count >> (self.psize * 8 - 1):
++                raise Exception('Invalid array size: %d' % count)
++            return CArray(elem, count)
++
++        if isinstance(node, c_ast.IdentifierType):
++            return self._scalar(node.names)
++
++        if isinstance(node, (c_ast.Struct, c_ast.Union)):
++            return self._record(node, name=name, top=top)
++
++        if isinstance(node, c_ast.Enum):
++            return self._enum(node)
++
++        if isinstance(node, c_ast.FuncDecl):
++            self._declare(node, top=top)
++            return CType(None, None, None, tclass='func')
++
++        raise Exception('OMG NO PARSER FOR: %r' % (node,))
++
++    def _declare(self, node, top=False, proto=False):
++        funcs = []
++        while isinstance(node, (c_ast.TypeDecl, c_ast.Typename, c_ast.PtrDecl, c_ast.ArrayDecl, c_ast.FuncDecl)):
++            if isinstance(node, c_ast.FuncDecl) and node.args is not None:
++                funcs.insert(0, node)
++            node = node.type
++
++        if isinstance(node, (c_ast.Struct, c_ast.Union)):
++            self._record(node, top=top, proto=proto)
++        elif isinstance(node, c_ast.Enum):
++            self._enum(node, proto=proto)
++
++        for func in funcs:
++            for param in func.args.params:
++                if isinstance(param, (c_ast.Decl, c_ast.Typename)):
++                    self._declare(param.type, proto=True)
++
++    def _enum(self, node, proto=False):
++        if node.values is not None:
++            nextval = 0
++            for enumerator in node.values.enumerators:
++                if enumerator.value is not None:
++                    nextval = self._const(enumerator.value)
++                if not (proto and enumerator.name in self.consts):
++                    self.consts[enumerator.name] = nextval
++                nextval += 1
++        return self.enumtype
++
++    def _record(self, node, name=None, top=False, proto=False):
++        kind = 'union' if isinstance(node, c_ast.Union) else 'struct'
++
++        rec = None
++        if node.name is not None:
++            rec = self.tags.get((kind, node.name))
++
++        if rec is None:
++            rec = CRecord(kind, node.name)
++            if node.name is not None:
++                self.tags[(kind, node.name)] = rec
++
++        if node.decls is not None and rec.defnode is not node:
++            if proto and rec.items is not None:
++                return rec
++            if rec.name is None:
++                rec.name = name
++            rec.defnode = node
++            self._layout(rec, node.decls)
++            if top:
++                self.defs.append(rec)
++
++        return rec
++
++    def _layout(self, rec, decls):
++        placed = []
++        bitpos = 0
++        align = 1
++        taken = {decl.name for decl in decls if decl.name is not None}
++        rec.members = {}
++
++        for decl in decls:
++            ctype = self._resolve(decl.type)
++            anonymous = isinstance(decl.type, (c_ast.Struct, c_ast.Union)) and decl.type.name is None
++            if decl.name is None and decl.bitsize is None and not anonymous:
++                continue
++            if ctype.size is None or getattr(ctype, 'items', True) is None:
++                raise Exception('Member has no storage layout: %s' % decl.name)
++
++            if decl.bitsize is not None:
++                width = self._const(decl.bitsize)
++                unit = ctype.align * 8
++                if rec.kind == 'union':
++                    pos = 0
++                    bitpos = max(bitpos, width)
++                else:
++                    span = ((bitpos % unit) + width + unit - 1) // unit
++                    if width == 0 or span > (ctype.size * 8) // unit:
++                        bitpos = _roundup(bitpos, unit)
++                    pos = bitpos
++                    bitpos += width
++
++                if decl.name is not None and width:
++                    align = max(align, ctype.align)
++                    placed.append(('bits', decl.name, pos, width, ctype.signed))
++                    rec.members[decl.name] = ctype
++                continue
++
++            fname = decl.name
++            if fname is None:
++                fname = _freshName('_anon', taken)
++            rec.members[fname] = ctype
++
++            if rec.kind == 'union':
++                offset = 0
++                bitpos = max(bitpos, ctype.size * 8)
++            else:
++                offset = _roundup(-(-bitpos // 8), ctype.align)
++                bitpos = (offset + ctype.size) * 8
++
++            align = max(align, ctype.align)
++            placed.append(('field', fname, offset, ctype))
++
++        rec.align = align
++        rec.size = _roundup(-(-bitpos // 8), align)
++
++        if rec.kind == 'union':
++            rec.items = self._unionItems(rec, placed, taken)
++        else:
++            rec.items = self._structItems(rec, placed, taken)
++
++    def _unionItems(self, rec, placed, taken):
++        items = []
++        widest = 0
++        for place in placed:
++            if place[0] == 'field':
++                items.append(('field', place[1], place[3]))
++                widest = max(widest, place[3].size)
++            else:
++                nbytes = -(-place[3] // 8)
++                items.append(('bits', _freshName('_bits', taken), nbytes, [(place[1], 0, place[3], place[4])]))
++                widest = max(widest, nbytes)
++
++        if rec.size > widest:
++            items.append(('pad', _freshName('_pad', taken), rec.size))
++        return items
++
++    def _structItems(self, rec, placed, taken):
++        items = []
++        end = 0
++
++        i = 0
++        while i < len(placed):
++            if placed[i][0] == 'field':
++                fname, offset, ctype = placed[i][1:]
++                start, stop = offset, offset + ctype.size
++                group = ('field', fname, ctype)
++                i += 1
++            else:
++                run = [placed[i]]
++                stop = -(-(placed[i][2] + placed[i][3]) // 8)
++                i += 1
++                while i < len(placed) and placed[i][0] == 'bits' and placed[i][2] // 8 < stop:
++                    run.append(placed[i])
++                    stop = max(stop, -(-(placed[i][2] + placed[i][3]) // 8))
++                    i += 1
++                start = run[0][2] // 8
++                bits = [(p[1], p[2] - start * 8, p[3], p[4]) for p in run]
++                group = ('bits', _freshName('_bits', taken), stop - start, bits)
++
++            if start > end:
++                items.append(('pad', _freshName('_pad', taken), start - end))
++            items.append(group)
++            end = stop
++
++        if rec.size > end:
++            items.append(('pad', _freshName('_pad', taken), rec.size - end))
++        return items
++
++    def _const(self, node):
++        if isinstance(node, c_ast.Constant):
++            if node.value.lstrip('uUL8').startswith("'"):
++                return _charval(node.value)
++            if node.type in ('float', 'double', 'long double'):
++                text = node.value.rstrip('fFlL')
++                return float.fromhex(text) if text[:2] in ('0x', '0X') else float(text)
++            return _intval(node.value)
++
++        if isinstance(node, c_ast.ID):
++            if node.name not in self.consts:
++                raise Exception('Unknown constant: %s' % node.name)
++            return self.consts[node.name]
++
++        if isinstance(node, c_ast.Cast):
++            return self._convert(self._const(node.expr), self._resolve(node.to_type))
++
++        if isinstance(node, c_ast.UnaryOp):
++            if node.op in ('sizeof', '_Alignof'):
++                if isinstance(node.expr, c_ast.Typename):
++                    ctype = self._resolve(node.expr)
++                else:
++                    ctype = self._exprType(node.expr)
++                if ctype.size is None or getattr(ctype, 'items', True) is None:
++                    raise Exception('%s of a type without a size' % node.op)
++                return ctype.size if node.op == 'sizeof' else ctype.align
++            if node.op == '!':
++                return int(not self._const(node.expr))
++            ctype = self._exprType(node)
++            return self._convert(_unops[node.op](self._convert(self._const(node.expr), ctype)), ctype)
++
++        if isinstance(node, c_ast.TernaryOp):
++            branch = node.iftrue if self._const(node.cond) else node.iffalse
++            return self._convert(self._const(branch), self._exprType(node))
++
++        if isinstance(node, c_ast.BinaryOp):
++            if node.op == '&&':
++                return int(bool(self._const(node.left)) and bool(self._const(node.right)))
++            if node.op == '||':
++                return int(bool(self._const(node.left)) or bool(self._const(node.right)))
++            left = self._const(node.left)
++            right = self._const(node.right)
++            if node.op in ('<<', '>>'):
++                ctype = self._exprType(node)
++                return self._convert(_binops[node.op](self._convert(left, ctype), int(right)), ctype)
++            ctype = self._arith(self._exprType(node.left), self._exprType(node.right), node.op)
++            left = self._convert(left, ctype)
++            right = self._convert(right, ctype)
++            if node.op == '/' and ctype.tclass == 'float':
++                return left / right
++            value = _binops[node.op](left, right)
++            if node.op in ('==', '!=', '<', '>', '<=', '>='):
++                return value
++            return self._convert(value, ctype)
++
++        raise Exception('Unsupported constant expression: %r' % (node,))
++
++    def _convert(self, value, ctype):
++        if ctype.tclass == 'float':
++            return float(value)
++        bits = ctype.size * 8
++        value = int(value) & ((1 << bits) - 1)
++        if ctype.signed and value >> (bits - 1):
++            value -= 1 << bits
++        return value
++
++    def _leaves(self, ctype):
++        if ctype.tclass == 'array':
++            return ctype.count * self._leaves(ctype.elem)
++        if ctype.tclass == 'record':
++            members = list(ctype.members.values())
++            if ctype.kind == 'union':
++                members = members[:1]
++            return sum(self._leaves(member) for member in members) or 1
++        return 1
++
++    def _initCount(self, elem, init):
++        if isinstance(init, c_ast.Constant) and init.type == 'string':
++            return self._literalType(init).count
++        if not isinstance(init, c_ast.InitList):
++            raise Exception('Invalid array initializer')
++
++        leaves = self._leaves(elem)
++        count = index = filled = 0
++        for item in init.exprs:
++            if isinstance(item, c_ast.NamedInitializer):
++                index, filled = self._const(item.name[0]), 0
++                item = item.expr
++            whole = isinstance(item, c_ast.InitList) or (
++                elem.tclass == 'array' and isinstance(item, c_ast.Constant) and item.type == 'string')
++            if whole or leaves == 1:
++                index, filled = index + (filled > 0) + 1, 0
++            else:
++                filled += 1
++                if filled == leaves:
++                    index, filled = index + 1, 0
++            count = max(count, index + (filled > 0))
++        return count
++
++    def _charType(self, prefix):
++        if prefix == 'u':
++            return self._intType(2, 2, False)
++        if prefix == 'U':
++            return self._intType(4, 4, False)
++        if prefix == 'L':
++            return self.enumtype
++        return self._intType(1, 1, True, ischar=True)
++
++    def _literalType(self, node):
++        text = node.value
++        if text.lstrip('uUL8').startswith("'"):
++            if text[0] in 'uU' and text[1] != '8':
++                return self._charType(text[0])
++            return self.enumtype
++
++        if node.type == 'string':
++            quote = text.index('"')
++            chars = text[quote + 1:-1].encode('latin-1').decode('unicode_escape')
++            return CArray(self._charType(text[:quote]), len(chars) + 1)
++
++        if node.type == 'long double':
++            raise Exception('long double is not supported')
++        if node.type in ('float', 'double'):
++            return self._floatType(4 if node.type == 'float' else 8)
++
++        digits = text.rstrip('uUlL')
++        suffix = text[len(digits):].lower()
++        value = _intval(text)
++        decimal = not (len(digits) > 1 and digits[0] == '0')
++        ranks = (4, self.psize, 8)[suffix.count('l'):]
++        for size in ranks:
++            bits = size * 8
++            if 'u' not in suffix and value < 1 << (bits - 1):
++                return self._intType(size, min(size, self.psize), True)
++            if ('u' in suffix or not decimal) and value < 1 << bits:
++                return self._intType(size, min(size, self.psize), False)
++        raise Exception('Integer constant is too large: %s' % text)
++
++    def _decay(self, ctype):
++        if ctype.tclass == 'array':
++            return self._pointerTo(ctype.elem)
++        if ctype.tclass == 'func':
++            return self._pointerTo(ctype)
++        return ctype
++
++    def _promote(self, ctype):
++        if ctype.tclass == 'int' and ctype.size < 4:
++            return self.enumtype
++        return ctype
++
++    def _arith(self, left, right, op):
++        left = self._decay(left)
++        right = self._decay(right)
++        if left.tclass == 'ptr' and right.tclass == 'ptr':
++            if op == '-':
++                return self._intType(self.psize, self.psize, True)
++            return left
++        if left.tclass == 'ptr':
++            return left
++        if right.tclass == 'ptr':
++            return right
++        if 'float' in (left.tclass, right.tclass):
++            return max([t for t in (left, right) if t.tclass == 'float'], key=lambda t: t.size)
++
++        left = self._promote(left)
++        right = self._promote(right)
++        size = max(left.size, right.size)
++        if left.size == right.size:
++            signed = left.signed and right.signed
++        else:
++            signed = (left if left.size > right.size else right).signed
++        return self._intType(size, min(size, self.psize), signed)
++
++    def _referent(self, ctype):
++        if ctype.tclass == 'array':
++            return ctype.elem
++        if ctype.tclass == 'ptr' and ctype.target is not None:
++            if isinstance(ctype.target, CType):
++                return ctype.target
++            return self._resolve(ctype.target)
++        raise Exception('Only pointers and arrays can be dereferenced')
++
++    def _exprType(self, node):
++        if isinstance(node, c_ast.Constant):
++            return self._literalType(node)
++
++        if isinstance(node, c_ast.ID):
++            if node.name in self.objects:
++                return self.objects[node.name]
++            if node.name in self.consts:
++                return self.enumtype
++            raise Exception('Unknown identifier: %s' % node.name)
++
++        if isinstance(node, c_ast.Cast):
++            return self._resolve(node.to_type)
++
++        if isinstance(node, c_ast.UnaryOp):
++            if node.op in ('sizeof', '_Alignof'):
++                return self.sizetype
++            if node.op == '!':
++                return self.enumtype
++            operand = self._exprType(node.expr)
++            if node.op == '&':
++                return self._pointerTo(operand)
++            if node.op == '*':
++                return self._referent(self._decay(operand))
++            return self._promote(operand)
++
++        if isinstance(node, c_ast.BinaryOp):
++            if node.op in ('==', '!=', '<', '>', '<=', '>=', '&&', '||'):
++                return self.enumtype
++            left = self._exprType(node.left)
++            if node.op in ('<<', '>>'):
++                return self._promote(left)
++            return self._arith(left, self._exprType(node.right), node.op)
++
++        if isinstance(node, c_ast.TernaryOp):
++            return self._arith(self._exprType(node.iftrue), self._exprType(node.iffalse), '?')
++
++        if isinstance(node, c_ast.ArrayRef):
++            return self._referent(self._decay(self._exprType(node.name)))
++
++        if isinstance(node, c_ast.StructRef):
++            base = self._exprType(node.name)
++            if node.type == '->':
++                base = self._referent(self._decay(base))
++            if base.tclass != 'record' or node.field.name not in base.members:
++                raise Exception('No member named %s' % node.field.name)
++            return base.members[node.field.name]
++
++        if isinstance(node, c_ast.ExprList):
++            return self._exprType(node.exprs[-1])
++
++        raise Exception('Unsupported constant expression: %r' % (node,))
++
++    def _ctor(self, rec):
++        return lambda: rec.build(self.bigend)
+ 
+     def parseStructSource(self, src):
+         src = preProcessSource( src )
+         parser = c_parser.CParser()
+         ast = parser.parse(src)
+-        #ast.show()
+ 
+-        for child in ast.children():
+-            xname, decl =  self._getVsElement( child )
+-            yield decl
++        for ext in ast.ext:
++            if isinstance(ext, c_ast.Typedef):
++                self.typedefs[ext.name] = self._resolve(ext.type, name=ext.name, top=True)
++            elif isinstance(ext, c_ast.Decl):
++                ctype = self._resolve(ext.type, top=True)
++                if ext.name is not None and ctype.tclass != 'func':
++                    if ctype.tclass == 'array' and not ctype.count and ext.init is not None:
++                        ctype = CArray(ctype.elem, self._initCount(ctype.elem, ext.init))
++                    self.objects[ext.name] = ctype
++            elif isinstance(ext, c_ast.FuncDef):
++                self._resolve(ext.decl.type, top=True)
++
++        for rec in self.defs:
++            yield self._ctor(rec)
+ 
+ def preProcessSource( src ):
+     '''
+@@ -135,11 +842,11 @@ def preProcessSource( src ):
+ 
+ def ctorFromCSource(src, psize=4, bigend=False):
+     '''
+-    Parse and return a callable constructor for the
+-    input C structure source.
++    Parse and return a callable constructor for the last structure
++    or union defined at the top level of the input C source.
+     '''
+     p = StructParser(psize=psize, bigend=bigend)
+-    return list(p.parseStructSource( src ))[0]
++    return list(p.parseStructSource( src ))[-1]
+ 
+ def vsFromCSource(src, psize=4, bigend=False):
+     '''

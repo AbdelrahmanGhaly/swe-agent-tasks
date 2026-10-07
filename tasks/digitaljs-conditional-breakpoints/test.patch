@@ -1,0 +1,733 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..8e27711
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,90 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() { echo "usage: $0 [--output_path <path>] base|new" >&2; exit 2; }
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new) MODE="$1"; MODE_COUNT=$((MODE_COUNT + 1)); shift ;;
++    --output_path) shift; [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }; OUTPUT_PATH="$1"; shift ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    *) echo "unknown argument: $1" >&2; usage ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")"
++ROOT="$(pwd)"
++[ -n "$OUTPUT_PATH" ] || OUTPUT_PATH="$ROOT/junit-$MODE.xml"
++case "$OUTPUT_PATH" in /*) ;; *) OUTPUT_PATH="$ROOT/$OUTPUT_PATH" ;; esac
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++rm -f "$OUTPUT_PATH"
++
++NEW_TESTS="tests/stop_conditions_3e4e16.test.mjs"
++JEST_JUNIT_REPORTER="$(npm root -g)/jest-junit"
++export JEST_JUNIT_OUTPUT_FILE="$OUTPUT_PATH"
++export JEST_JUNIT_REPORT_TEST_SUITE_ERRORS=true
++
++write_failure() {
++  cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites name="jest tests" tests="1" failures="1" errors="0" time="0">
++<testsuite name="$MODE" tests="1" failures="1" errors="0" time="0">
++<testcase classname="$MODE" name="$1" time="0">
++<failure message="$1">$2</failure>
++</testcase>
++</testsuite>
++</testsuites>
++XMLEOF
++}
++
++rm -rf lib
++if ! BUILD_LOG="$(./node_modules/.bin/babel src -d lib 2>&1)"; then
++  printf '%s\n' "$BUILD_LOG" >&2
++  write_failure "library build" "$(printf '%s' "$BUILD_LOG" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++  exit 1
++fi
++
++JEST_LOG="$(mktemp)"
++if [ "$MODE" = "base" ]; then
++  # The generated suite reuses identical test names within a describe block; the environment
++  # numbers repeated names so every result is reported under its own name.
++  # The two constant-operand arithmetic families (10,344 of the suite's 11,880 cases) are left
++  # out: they only cover the constant arithmetic cells and the constant-folding transform, which
++  # this change does not touch, and one of them draws its constants at random.
++  # Math.random is seeded, so the randomized logic table checks draw the same inputs on every run.
++  timeout 1500 ./node_modules/.bin/jest tests/index.test.mjs --ci --forceExit \
++    --testEnvironment "$ROOT/tests/unique_names_970a20.js" \
++    --setupFiles "$ROOT/tests/seeded_random_d654a5.js" \
++    -t '^(?!.*(with constant|bits constant)).*$' \
++    --reporters=default --reporters="$JEST_JUNIT_REPORTER" 2>&1 | tee "$JEST_LOG"
++  STATUS=${PIPESTATUS[0]}
++  # jest reports the cases left out by -t as skipped; keep only the cases that ran in the report.
++  if [ -f "$OUTPUT_PATH" ]; then
++    node -e '
++      const fs = require("fs");
++      const file = process.argv[1];
++      let dropped = 0;
++      const xml = fs.readFileSync(file, "utf8")
++        .replace(/\n\s*<testcase [^>]*>\s*<skipped\/>\s*<\/testcase>/g, () => { dropped++; return ""; });
++      fs.writeFileSync(file, xml
++        .replace(/ tests="(\d+)"/g, (m, n) => ` tests="${n - dropped}"`)
++        .replace(/ skipped="(\d+)"/g, (m, n) => ` skipped="${n - dropped}"`));
++    ' "$OUTPUT_PATH"
++  fi
++else
++  timeout 1500 ./node_modules/.bin/jest "$NEW_TESTS" --ci --forceExit \
++    --reporters=default --reporters="$JEST_JUNIT_REPORTER" 2>&1 | tee "$JEST_LOG"
++  STATUS=${PIPESTATUS[0]}
++fi
++
++if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  write_failure "jest run" "jest exited with status $STATUS without reporting any test. Last lines of its output:
++$(tail -n 60 "$JEST_LOG" | tr -d '\000-\010\013\014\016-\037' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++  [ "$STATUS" -ne 0 ] || STATUS=1
++fi
++rm -f "$JEST_LOG"
++exit "$STATUS"
+diff --git a/tests/seeded_random_d654a5.js b/tests/seeded_random_d654a5.js
+new file mode 100644
+index 0000000..c62bcbe
+--- /dev/null
++++ b/tests/seeded_random_d654a5.js
+@@ -0,0 +1,8 @@
++let seed = 0x6b8b4567;
++
++Math.random = () => {
++    seed = (seed + 0x6d2b79f5) | 0;
++    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
++    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
++    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
++};
+diff --git a/tests/stop_conditions_3e4e16.test.mjs b/tests/stop_conditions_3e4e16.test.mjs
+new file mode 100644
+index 0000000..0af0ad0
+--- /dev/null
++++ b/tests/stop_conditions_3e4e16.test.mjs
+@@ -0,0 +1,589 @@
++"use strict";
++
++import { HeadlessCircuit } from '../lib/circuit.mjs';
++import { Circuit } from '../lib/index.mjs';
++import { Vector3vl } from '3vl';
++import { SynchEngine } from '../lib/engines/synch.mjs';
++import { BrowserSynchEngine } from '../lib/engines/browsersynch.mjs';
++import { WorkerEngine } from '../lib/engines/worker.mjs';
++
++jest.mock('jquery', () => { const $ = () => $; return $; });
++jest.mock('jquery-ui/ui/widgets/dialog.js', () => ({}));
++jest.mock('jquery-ui/themes/base/all.css', () => ({}));
++jest.mock('../lib/style.css.js', () => ({}), { virtual: true });
++
++console.assert = (stmt, msg) => { if (!stmt) throw new Error(msg); };
++
++jest.setTimeout(60000);
++
++const workerURL = new URL('../lib/engines/worker-worker.js', require('url').pathToFileURL(__filename).toString());
++const engineOptions = { workerURL };
++const engines = [["synch", SynchEngine], ["worker", WorkerEngine], ["browser", BrowserSynchEngine]];
++
++const clone = x => JSON.parse(JSON.stringify(x));
++const sig = bin => Vector3vl.fromBin(bin, bin.length);
++
++const live = [];
++afterEach(() => {
++    while (live.length) live.pop().shutdown();
++});
++
++function build(data, engine, Class = HeadlessCircuit) {
++    const circuit = new Class(clone(data), { engine, engineOptions });
++    live.push(circuit);
++    circuit.observeGraph();
++    return circuit;
++}
++
++function record(circuit) {
++    const hits = [];
++    circuit.on('breakpoint', (id, tick) => hits.push([id, tick]));
++    return hits;
++}
++
++async function step(circuit, script, from, to, next = false) {
++    await circuit.synchronize();
++    for (let s = from; s < to; s++) {
++        for (const [at, id, bin] of script)
++            if (at == s) circuit.setInput(id, sig(bin));
++        if (next) await circuit.updateGatesNext({ synchronous: true });
++        else await circuit.updateGates({ synchronous: true });
++    }
++    await circuit.synchronize();
++}
++
++async function truth(data, script, steps, condition, next = false) {
++    const twin = build(data, SynchEngine);
++    const values = [[undefined, condition(twin)]];
++    for (let s = 0; s < steps; s++) {
++        for (const [at, id, bin] of script)
++            if (at == s) twin.setInput(id, sig(bin));
++        if (next) await twin.updateGatesNext();
++        else await twin.updateGates();
++        values.push([twin.tick - 1, condition(twin)]);
++    }
++    return values;
++}
++
++function firings(values, id) {
++    const out = [];
++    for (let i = 1; i < values.length; i++)
++        if (values[i][1] && !values[i - 1][1]) out.push([id, values[i][0]]);
++    return out;
++}
++
++function accepted(circuit, ...conditions) {
++    return conditions.flatMap(condition => {
++        try {
++            return [circuit.addBreakpoint(condition)];
++        } catch (e) {
++            return [];
++        }
++    });
++}
++
++const port = (circuit, label, name, where = []) => {
++    const cell = circuit.findDeviceByLabel(label, where);
++    const dir = cell.getPort(name).dir;
++    return cell.get(dir == 'in' ? 'inputSignals' : 'outputSignals')[name].toBin();
++};
++
++const COUNT = {
++    devices: {
++        clk: { type: 'Clock', label: 'clk', propagation: 2 },
++        ff: { type: 'Dff', label: 'ff', bits: 4, polarity: { clock: true }, initial: '0000' },
++        one: { type: 'Constant', label: 'one', constant: '0001' },
++        add: { type: 'Addition', label: 'add', bits: { in1: 4, in2: 4, out: 4 }, propagation: 1 },
++        q: { type: 'Output', label: 'q', net: 'q', bits: 4 }
++    },
++    connectors: [
++        { from: { id: 'clk', port: 'out' }, to: { id: 'ff', port: 'clk' } },
++        { from: { id: 'ff', port: 'out' }, to: { id: 'add', port: 'in1' } },
++        { from: { id: 'one', port: 'out' }, to: { id: 'add', port: 'in2' } },
++        { from: { id: 'add', port: 'out' }, to: { id: 'ff', port: 'in' } },
++        { from: { id: 'ff', port: 'out' }, to: { id: 'q', port: 'in' } }
++    ]
++};
++
++const GATES = {
++    devices: {
++        a: { type: 'Input', label: 'a', net: 'a', bits: 1 },
++        b: { type: 'Input', label: 'b', net: 'b', bits: 1 },
++        n: { type: 'Not', label: 'n', bits: 1, propagation: 3 },
++        g: { type: 'And', label: 'g', bits: 1, propagation: 2 },
++        m: { type: 'Output', label: 'm', net: 'm', bits: 1 },
++        o: { type: 'Output', label: 'o', net: 'o', bits: 1 }
++    },
++    connectors: [
++        { from: { id: 'a', port: 'out' }, to: { id: 'n', port: 'in' } },
++        { from: { id: 'n', port: 'out' }, to: { id: 'g', port: 'in1' } },
++        { from: { id: 'b', port: 'out' }, to: { id: 'g', port: 'in2' } },
++        { from: { id: 'n', port: 'out' }, to: { id: 'm', port: 'in' } },
++        { from: { id: 'g', port: 'out' }, to: { id: 'o', port: 'in' } }
++    ]
++};
++
++const PINS = {
++    devices: {
++        en: { type: 'Input', label: 'en', net: 'en', bits: 1 },
++        clk: { type: 'Input', label: 'clk', net: 'clk', bits: 1 },
++        d: { type: 'Input', label: 'd', net: 'd', bits: 4 },
++        y: { type: 'Output', label: 'y', net: 'y', bits: 4 }
++    },
++    connectors: [
++        { from: { id: 'd', port: 'out' }, to: { id: 'y', port: 'in' } }
++    ]
++};
++
++const MEM = {
++    devices: {
++        ra: { type: 'Input', label: 'ra', net: 'ra', bits: 2 },
++        sa: { type: 'Input', label: 'sa', net: 'sa', bits: 2 },
++        mem: { type: 'Memory', label: 'mem', bits: 4, abits: 2, words: 4, propagation: 2, rdports: [{}, {}], wrports: [], memdata: ['0001', '0010', '0011', '0100'] },
++        c: { type: 'Output', label: 'c', net: 'c', bits: 4 },
++        s: { type: 'Output', label: 's', net: 's', bits: 4 }
++    },
++    connectors: [
++        { from: { id: 'ra', port: 'out' }, to: { id: 'mem', port: 'rd0addr' } },
++        { from: { id: 'sa', port: 'out' }, to: { id: 'mem', port: 'rd1addr' } },
++        { from: { id: 'mem', port: 'rd0data' }, to: { id: 'c', port: 'in' } },
++        { from: { id: 'mem', port: 'rd1data' }, to: { id: 's', port: 'in' } }
++    ]
++};
++
++const TWINS = {
++    devices: {
++        clk: { type: 'Input', label: 'clk', net: 'clk', bits: 1 },
++        d1: { type: 'Input', label: 'd1', net: 'd1', bits: 4 },
++        d2: { type: 'Input', label: 'd2', net: 'd2', bits: 4 },
++        dev4: { type: 'Subcircuit', label: 'r1', celltype: 'reg' },
++        dev5: { type: 'Subcircuit', label: 'r2', celltype: 'reg' },
++        q1: { type: 'Output', label: 'q1', net: 'q1', bits: 4 },
++        q2: { type: 'Output', label: 'q2', net: 'q2', bits: 4 }
++    },
++    connectors: [
++        { from: { id: 'clk', port: 'out' }, to: { id: 'dev4', port: 'clk' } },
++        { from: { id: 'clk', port: 'out' }, to: { id: 'dev5', port: 'clk' } },
++        { from: { id: 'd1', port: 'out' }, to: { id: 'dev4', port: 'd' } },
++        { from: { id: 'd2', port: 'out' }, to: { id: 'dev5', port: 'd' } },
++        { from: { id: 'dev4', port: 'q' }, to: { id: 'q1', port: 'in' } },
++        { from: { id: 'dev5', port: 'q' }, to: { id: 'q2', port: 'in' } }
++    ],
++    subcircuits: {
++        reg: {
++            devices: {
++                clk: { type: 'Input', label: 'clk', net: 'clk', bits: 1 },
++                d: { type: 'Input', label: 'd', net: 'd', bits: 4 },
++                ff: { type: 'Dff', label: 'ff', bits: 4, polarity: { clock: true } },
++                dev7: { type: 'Subcircuit', label: 'inv', celltype: 'invert' },
++                q: { type: 'Output', label: 'q', net: 'q', bits: 4 }
++            },
++            connectors: [
++                { from: { id: 'clk', port: 'out' }, to: { id: 'ff', port: 'clk' } },
++                { from: { id: 'd', port: 'out' }, to: { id: 'dev7', port: 'i' } },
++                { from: { id: 'dev7', port: 'o' }, to: { id: 'ff', port: 'in' } },
++                { from: { id: 'ff', port: 'out' }, to: { id: 'q', port: 'in' } }
++            ]
++        },
++        invert: {
++            devices: {
++                i: { type: 'Input', label: 'i', net: 'i', bits: 4 },
++                n: { type: 'Not', label: 'n', bits: 4, propagation: 2 },
++                o: { type: 'Output', label: 'o', net: 'o', bits: 4 }
++            },
++            connectors: [
++                { from: { id: 'i', port: 'out' }, to: { id: 'n', port: 'in' } },
++                { from: { id: 'n', port: 'out' }, to: { id: 'o', port: 'in' } }
++            ]
++        }
++    }
++};
++
++const TWINS_SCRIPT = [[0, 'clk', '0'], [0, 'd1', '0011'], [0, 'd2', '1100'], [3, 'clk', '1'], [6, 'clk', '0'], [8, 'd1', '0101'], [9, 'clk', '1'], [12, 'clk', '0'], [14, 'd2', '0110'], [15, 'clk', '1'], [18, 'clk', '0'], [21, 'clk', '1']];
++
++const SHARED_LABELS = {
++    dup1: { type: 'Input', label: 'dup', net: 'dup1', bits: 1 },
++    dup2: { type: 'Input', label: 'dup', net: 'dup2', bits: 1 },
++    dev8: { type: 'Subcircuit', label: 'pair', celltype: 'reg' },
++    dev9: { type: 'Subcircuit', label: 'pair', celltype: 'reg' }
++};
++
++describe.each(engines)('stepping on %s', (_n, engine) => {
++    test('a breakpoint fires after the tick in which its condition becomes true and reports that tick', async () => {
++        const c = build(COUNT, engine);
++        const hits = record(c);
++        const id = c.addBreakpoint("q == 'b0011");
++        await step(c, [], 0, 40);
++        const expected = firings(await truth(COUNT, [], 40, t => t.getOutput('q').toBin() == '0011'), id);
++        expect(expected.length).toBe(1);
++        expect(hits).toEqual(expected);
++        expect(typeof id).toBe('number');
++    });
++
++    test('a condition that stays true fires once, and again only after it was false at a check', async () => {
++        const c = build(COUNT, engine);
++        const hits = record(c);
++        const id = c.addBreakpoint("q[0] == 'b1");
++        await step(c, [], 0, 60);
++        const expected = firings(await truth(COUNT, [], 60, t => t.getOutput('q').toBin().endsWith('1')), id);
++        expect(expected.length).toBeGreaterThan(3);
++        expect(hits).toEqual(expected);
++    });
++
++    test('a condition already true when the breakpoint is added fires only after it has been false', async () => {
++        const c = build(GATES, engine);
++        const hits = record(c);
++        await step(c, [[0, 'a', '0'], [0, 'b', '1']], 0, 8);
++        const id = c.addBreakpoint("m == 'b1");
++        await step(c, [[10, 'a', '1'], [16, 'a', '0']], 8, 24);
++        expect(hits).toEqual([[id, 19]]);
++    });
++
++    test('ticks without events count as checks when stepping one tick at a time', async () => {
++        const c = build(PINS, engine);
++        const hits = record(c);
++        const id = c.addBreakpoint("en == 'b1");
++        await step(c, [[0, 'en', '0'], [5, 'en', '1'], [7, 'en', '0'], [9, 'en', '1']], 0, 12);
++        expect(hits).toEqual([[id, 5], [id, 9]]);
++    });
++
++    test('rose and fell compare with the previous check even when the rest of the condition is false', async () => {
++        const c = build(PINS, engine);
++        const hits = record(c);
++        const up = c.addBreakpoint("en == 'b1 && rose(clk)");
++        const down = c.addBreakpoint("en == 'b1 && fell(clk)");
++        const script = [[0, 'en', '0'], [0, 'clk', '0'], [2, 'clk', '1'], [4, 'en', '1'], [6, 'clk', '0'], [8, 'clk', '1'], [10, 'en', '0'], [12, 'clk', '0'], [13, 'en', '1']];
++        await step(c, script, 0, 16);
++        expect(hits).toEqual([[down, 6], [up, 8]]);
++    });
++
++    test('a change to or from an undefined bit is not an edge', async () => {
++        const c = build(PINS, engine);
++        const hits = record(c);
++        const up = c.addBreakpoint("rose(clk)");
++        const down = c.addBreakpoint("fell(clk)");
++        const script = [[0, 'clk', 'x'], [2, 'clk', '1'], [4, 'clk', 'x'], [6, 'clk', '0'], [8, 'clk', '1'], [10, 'clk', '0']];
++        await step(c, script, 0, 12);
++        expect(hits).toEqual([[up, 8], [down, 10]]);
++    });
++
++    test('rose and fell also work on a one-bit selection', async () => {
++        const c = build(PINS, engine);
++        const hits = record(c);
++        const up = c.addBreakpoint("rose(d[2])");
++        const down = c.addBreakpoint("fell(y[0])");
++        await step(c, [[0, 'd', '0000'], [2, 'd', '0100'], [4, 'd', '0101'], [6, 'd', '0000']], 0, 8);
++        expect(hits).toEqual([[up, 2], [down, 6]]);
++    });
++
++    test('rose and fell follow a clock while stepping from event to event', async () => {
++        const c = build(COUNT, engine);
++        const hits = record(c);
++        const up = c.addBreakpoint("rose(clk)");
++        await step(c, [], 0, 30, true);
++        const values = [];
++        const twin = build(COUNT, SynchEngine);
++        let previous = port(twin, 'clk', 'out');
++        for (let s = 0; s < 30; s++) {
++            await twin.updateGatesNext();
++            const now = port(twin, 'clk', 'out');
++            if (previous == '0' && now == '1') values.push([up, twin.tick - 1]);
++            previous = now;
++        }
++        expect(values.length).toBeGreaterThan(5);
++        expect(hits).toEqual(values);
++    });
++
++    test('an x in a literal matches any value', async () => {
++        const c = build(COUNT, engine);
++        const hits = record(c);
++        const id = c.addBreakpoint("q == 'b1x0x");
++        await step(c, [], 0, 80);
++        const expected = firings(await truth(COUNT, [], 80, t => /^1.0.$/.test(t.getOutput('q').toBin())), id);
++        expect(expected.length).toBeGreaterThan(1);
++        expect(hits).toEqual(expected);
++    });
++
++    test('an x in a literal also matches an undefined bit', async () => {
++        const c = build(PINS, engine);
++        const hits = record(c);
++        const id = c.addBreakpoint("d == 'b1x0x");
++        await step(c, [[0, 'd', '0000'], [2, 'd', '1x0x'], [4, 'd', '0000'], [6, 'd', 'x101'], [8, 'd', '1x01']], 0, 10);
++        expect(hits).toEqual([[id, 2], [id, 8]]);
++    });
++
++    test('an undefined bit of a signal never equals 0 or 1', async () => {
++        const c = build(PINS, engine);
++        const hits = record(c);
++        const zero = c.addBreakpoint("d[1] == 'b0");
++        const notZero = c.addBreakpoint("d[1] != 'b0");
++        const one = c.addBreakpoint("d[1] == 'b1");
++        await step(c, [[0, 'd', '0000'], [2, 'd', '00x0'], [4, 'd', '0010'], [6, 'd', '0000']], 0, 8);
++        expect(hits).toEqual([[zero, 0], [notZero, 2], [one, 4], [zero, 6]]);
++    });
++
++    test('bit i counts from the least significant bit, and a range compares like a number whichever end is written first', async () => {
++        const c = build(PINS, engine);
++        const hits = record(c);
++        const top = accepted(c, "d[3:2] == 'b10", "d[2:3] == 'b10");
++        const low = c.addBreakpoint("d[0] == 'b1");
++        const mid = accepted(c, "y[2:1] != 'b00", "y[1:2] != 'b00");
++        await step(c, [[0, 'd', '0000'], [2, 'd', '1000'], [4, 'd', '0001'], [6, 'd', '0100']], 0, 8);
++        expect(top.length).toBeGreaterThan(0);
++        expect(mid.length).toBeGreaterThan(0);
++        for (const id of top) expect(hits.filter(hit => hit[0] == id)).toEqual([[id, 2]]);
++        expect(hits.filter(hit => hit[0] == low)).toEqual([[low, 4]]);
++        for (const id of mid) expect(hits.filter(hit => hit[0] == id)).toEqual([[id, 6]]);
++    });
++
++    test('a device name alone means an input device output, an output device input or the only output', async () => {
++        const c = build(GATES, engine);
++        const hits = record(c);
++        const input = c.addBreakpoint("a == 'b1");
++        const output = c.addBreakpoint("o == 'b1");
++        const gate = c.addBreakpoint("n == 'b0");
++        const named = c.addBreakpoint("g:in2 == 'b1 && g:in1 == 'b1");
++        await step(c, [[0, 'a', '0'], [0, 'b', '0'], [6, 'b', '1'], [12, 'a', '1']], 0, 20);
++        expect(hits).toEqual([[input, 12], [gate, 15], [named, 6], [output, 8]].sort((x, y) => x[1] - y[1]));
++    });
++
++    test('names reach devices inside subcircuits by their labels', async () => {
++        const c = build(TWINS, engine);
++        const hits = record(c);
++        const inner = c.addBreakpoint("r1.ff == 'b1010");
++        const deeper = c.addBreakpoint("r2.inv.n:in == 'b0110");
++        const port2 = c.addBreakpoint("r2.inv.o == 'b1001");
++        await step(c, TWINS_SCRIPT, 0, 24);
++        const expected = [
++            ...firings(await truth(TWINS, TWINS_SCRIPT, 24, t => port(t, 'ff', 'out', ['r1']) == '1010'), inner),
++            ...firings(await truth(TWINS, TWINS_SCRIPT, 24, t => port(t, 'n', 'in', ['r2', 'inv']) == '0110'), deeper),
++            ...firings(await truth(TWINS, TWINS_SCRIPT, 24, t => port(t, 'o', 'in', ['r2', 'inv']) == '1001'), port2)
++        ].sort((x, y) => x[1] - y[1] || x[0] - y[0]);
++        expect(expected.length).toBe(3);
++        expect(hits).toEqual(expected);
++    });
++
++    test('parentheses group a condition against the usual precedence', async () => {
++        const c = build(PINS, engine);
++        const hits = record(c);
++        const grouped = c.addBreakpoint("(en == 'b1 || clk == 'b1) && d[0] == 'b0");
++        const plain = c.addBreakpoint("en == 'b1 || clk == 'b1 && d[0] == 'b0");
++        const script = [[0, 'en', '0'], [0, 'clk', '0'], [0, 'd', '0001'], [2, 'en', '1'], [4, 'd', '0000'], [6, 'en', '0'], [8, 'clk', '1'], [10, 'd', '0001'], [12, 'd', '0000']];
++        await step(c, script, 0, 14);
++        expect(hits).toEqual([[plain, 2], [grouped, 4], [grouped, 8], [plain, 8], [grouped, 12], [plain, 12]]);
++    });
++
++    test('!, && and || combine conditions with the usual precedence', async () => {
++        const c = build(PINS, engine);
++        const hits = record(c);
++        const id = c.addBreakpoint("en == 'b1 || clk == 'b1 && !(d[0] == 'b1)");
++        const script = [[0, 'en', '0'], [0, 'clk', '0'], [0, 'd', '0001'], [2, 'clk', '1'], [4, 'd', '0000'], [6, 'clk', '0'], [8, 'en', '1'], [8, 'd', '0001'], [10, 'en', '0'], [12, 'clk', '1'], [12, 'd', '0000']];
++        await step(c, script, 0, 14);
++        expect(hits).toEqual([[id, 4], [id, 8], [id, 12]]);
++    });
++
++    test('breakpoints that fire after the same tick fire in the order they were added', async () => {
++        const c = build(PINS, engine);
++        const hits = record(c);
++        const a = c.addBreakpoint("rose(en)");
++        const b = c.addBreakpoint("d == 'b0101");
++        const e = c.addBreakpoint("y[0] == 'b1");
++        await step(c, [[0, 'en', '0'], [0, 'd', '0000'], [3, 'd', '0101'], [3, 'en', '1']], 0, 5);
++        expect(hits).toEqual([[a, 3], [b, 3], [e, 3]]);
++    });
++
++    test('a removed breakpoint no longer fires, and removing an unknown id does nothing', async () => {
++        const c = build(PINS, engine);
++        const hits = record(c);
++        const gone = c.addBreakpoint("en == 'b1");
++        const kept = c.addBreakpoint("en == 'b1");
++        await step(c, [[0, 'en', '0']], 0, 2);
++        c.removeBreakpoint(gone);
++        c.removeBreakpoint(gone + kept + 100);
++        await step(c, [[2, 'en', '1']], 2, 4);
++        expect(hits).toEqual([[kept, 2]]);
++    });
++
++    test('stepping goes on after a breakpoint fires', async () => {
++        const c = build(COUNT, engine);
++        const twin = build(COUNT, engine);
++        const hits = record(c);
++        c.addBreakpoint("q == 'b0010");
++        await step(c, [], 0, 30);
++        await step(twin, [], 0, 30);
++        expect(hits.length).toBe(1);
++        expect(c.tick).toBe(30);
++        expect(c.getOutput('q').toBin()).toBe(twin.getOutput('q').toBin());
++    });
++});
++
++describe.each(engines)('refusing conditions on %s', (_n, engine) => {
++    const cases = [
++        ['an unknown device', "nope == 'b1"],
++        ['an unknown subcircuit', "r9.ff == 'b0000"],
++        ['an unknown port', "r1.ff:nope == 'b0"],
++        ['a device with several outputs and no port', "mem == 'b0000"],
++        ['a name shared by two devices', "dup == 'b0"],
++        ['a subcircuit name shared by two subcircuits', "pair.ff == 'b0000"],
++        ['a literal of the wrong width', "q1 == 'b101"],
++        ['a selection past the top bit', "q1[4] == 'b1"],
++        ['a range past the top bit', "q1[4:2] == 'b000"],
++        ['an edge of a wide signal', "rose(q1)"],
++        ['a falling edge of a wide signal', "fell(q1)"],
++        ['an edge of a wide selection', "rose(q1[2:1])"],
++        ['a dangling operator', "q1 == 'b1100 &&"],
++        ['a missing literal', "q1 =="],
++        ['an unbalanced parenthesis', "(q1 == 'b1100"],
++        ['a literal with a digit that is not binary', "q1 == 'b1120"],
++        ['two comparisons with no operator between them', "q1 == 'b1100 q2 == 'b0011"]
++    ];
++
++    test.each(cases)('%s throws and adds no breakpoint', async (_label, condition) => {
++        const data = clone(TWINS);
++        Object.assign(data.devices, clone(MEM.devices), clone(SHARED_LABELS));
++        data.connectors.push(...clone(MEM.connectors));
++        const c = build(data, engine);
++        const hits = record(c);
++        expect(() => c.addBreakpoint(condition)).toThrow();
++        const id = c.addBreakpoint("q1 == 'b1100");
++        await step(c, TWINS_SCRIPT, 0, 12);
++        expect(hits.map(hit => hit[0])).toEqual([id]);
++    });
++});
++
++describe('a running simulation on the worker engine', () => {
++    function nextStop(c) {
++        return new Promise(resolve => c.once('breakpoint', resolve)).then(() => c.synchronize());
++    }
++
++    test.each([['start'], ['startFast']])('stops right after the tick in which a condition becomes true (%s)', async (mode) => {
++        const c = build(COUNT, WorkerEngine);
++        const twin = build(COUNT, SynchEngine);
++        const hits = record(c);
++        const id = c.addBreakpoint("q == 'b0110");
++        if (mode == 'start') c.interval = 1;
++        const stopped = nextStop(c);
++        c[mode]();
++        await stopped;
++        const expected = firings(await truth(COUNT, [], 60, t => t.getOutput('q').toBin() == '0110'), id)[0];
++        expect(c.running).toBe(false);
++        expect(hits).toEqual([expected]);
++        expect(c.tick).toBe(expected[1] + 1);
++        await step(twin, [], 0, expected[1] + 1);
++        expect(c.getOutput('q').toBin()).toBe(twin.getOutput('q').toBin());
++    });
++
++    test('stops on a condition about a subcircuit nobody observes', async () => {
++        const c = build(TWINS, WorkerEngine);
++        const hits = record(c);
++        c.setInput('clk', sig('0'));
++        c.setInput('d1', sig('0011'));
++        c.setInput('d2', sig('1100'));
++        await step(c, [], 0, 3);
++        const id = c.addBreakpoint("r2.inv.n:in == 'b1100");
++        c.setInput('d2', sig('0110'));
++        await step(c, [], 3, 4);
++        c.setInput('d2', sig('1100'));
++        c.interval = 1;
++        const stopped = nextStop(c);
++        c.start();
++        await stopped;
++        expect(hits).toEqual([[id, 4]]);
++        expect(c.tick).toBe(5);
++    });
++
++    test('can run again after a stop, and the same breakpoint stops it the next time its condition becomes true', async () => {
++        const c = build(COUNT, WorkerEngine);
++        const hits = record(c);
++        const id = c.addBreakpoint("q[1] == 'b1 && q[0] == 'b1");
++        const first = nextStop(c);
++        c.startFast();
++        await first;
++        const firstStop = c.tick;
++        const second = nextStop(c);
++        c.startFast();
++        await second;
++        const expected = firings(await truth(COUNT, [], 80, t => t.getOutput('q').toBin().endsWith('11')), id);
++        expect(hits).toEqual(expected.slice(0, 2));
++        expect(firstStop).toBe(expected[0][1] + 1);
++        expect(c.tick).toBe(expected[1][1] + 1);
++        expect(c.running).toBe(false);
++    });
++});
++
++describe('a running simulation on the browser engine', () => {
++    test('stops right after the tick in which a condition becomes true', async () => {
++        jest.useFakeTimers({ doNotFake: ['Date', 'hrtime', 'nextTick', 'performance', 'queueMicrotask', 'requestAnimationFrame', 'cancelAnimationFrame', 'requestIdleCallback', 'cancelIdleCallback', 'setImmediate', 'clearImmediate', 'setTimeout', 'clearTimeout'] });
++        try {
++            const c = build(COUNT, BrowserSynchEngine);
++            const hits = record(c);
++            const id = c.addBreakpoint("q == 'b0101");
++            c.interval = 7;
++            await c.start();
++            await new Promise(resolve => setTimeout(resolve, 0));
++            jest.advanceTimersByTime(7 * 200);
++            const expected = firings(await truth(COUNT, [], 60, t => t.getOutput('q').toBin() == '0101'), id)[0];
++            expect(c.running).toBe(false);
++            expect(hits).toEqual([expected]);
++            expect(c.tick).toBe(expected[1] + 1);
++            jest.advanceTimersByTime(7 * 50);
++            expect(c.tick).toBe(expected[1] + 1);
++        } finally {
++            jest.useRealTimers();
++        }
++    });
++
++    test('stops right after the tick in which a condition becomes true when running fast', async () => {
++        const idle = new Map();
++        let next = 1;
++        global.requestIdleCallback = callback => {
++            idle.set(next, callback);
++            return next++;
++        };
++        global.cancelIdleCallback = handle => idle.delete(handle);
++        const c = build(COUNT, BrowserSynchEngine);
++        try {
++            const hits = record(c);
++            const id = c.addBreakpoint("q == 'b0101");
++            c.startFast();
++            for (let round = 0; round < 100 && idle.size > 0; round++) {
++                const [handle, callback] = idle.entries().next().value;
++                idle.delete(handle);
++                let budget = 3;
++                callback({ didTimeout: false, timeRemaining: () => budget-- > 0 ? 1 : 0 });
++            }
++            const expected = firings(await truth(COUNT, [], 60, t => t.getOutput('q').toBin() == '0101', true), id)[0];
++            expect(c.running).toBe(false);
++            expect(hits).toEqual([expected]);
++            expect(c.tick).toBe(expected[1] + 1);
++        } finally {
++            c.stop();
++            delete global.requestIdleCallback;
++            delete global.cancelIdleCallback;
++        }
++    });
++});
++
++describe.each(engines)('Circuit on %s', (_n, engine) => {
++    test('has the same breakpoints as a headless circuit', async () => {
++        const c = build(COUNT, engine, Circuit);
++        const hits = record(c);
++        const id = c.addBreakpoint("q == 'b0100");
++        await step(c, [], 0, 40);
++        const expected = firings(await truth(COUNT, [], 40, t => t.getOutput('q').toBin() == '0100'), id);
++        expect(hits).toEqual(expected);
++    });
++
++    test('removes breakpoints like a headless circuit', async () => {
++        const c = build(COUNT, engine, Circuit);
++        const hits = record(c);
++        const gone = c.addBreakpoint("q == 'b0100");
++        const kept = c.addBreakpoint("q == 'b0100");
++        c.removeBreakpoint(gone);
++        c.removeBreakpoint(gone + kept + 100);
++        await step(c, [], 0, 40);
++        const expected = firings(await truth(COUNT, [], 40, t => t.getOutput('q').toBin() == '0100'), kept);
++        expect(expected.length).toBeGreaterThan(0);
++        expect(hits).toEqual(expected);
++    });
++});
+diff --git a/tests/unique_names_970a20.js b/tests/unique_names_970a20.js
+new file mode 100644
+index 0000000..158aecf
+--- /dev/null
++++ b/tests/unique_names_970a20.js
+@@ -0,0 +1,22 @@
++const { TestEnvironment } = require('jest-environment-node');
++
++class UniqueNamesEnvironment extends TestEnvironment {
++    constructor(config, context) {
++        super(config, context);
++        this.seenNames = new Map();
++    }
++
++    handleTestEvent(event, state) {
++        if (event.name !== 'add_test') return;
++        const block = state.currentDescribeBlock;
++        const test = block.children[block.children.length - 1];
++        const names = [test.name];
++        for (let b = block; b && b.parent; b = b.parent) names.unshift(b.name);
++        const fullName = names.join(' ');
++        const count = (this.seenNames.get(fullName) || 0) + 1;
++        this.seenNames.set(fullName, count);
++        if (count > 1) test.name = `${test.name} (${count})`;
++    }
++}
++
++module.exports = UniqueNamesEnvironment;

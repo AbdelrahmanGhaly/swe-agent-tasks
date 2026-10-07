@@ -1,0 +1,947 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..ae78ce1
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,45 @@
++#!/bin/sh
++set -u
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++cd "$(dirname "$0")"
++
++JUNIT=""
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  JUNIT="--junitxml=$OUTPUT_PATH"
++fi
++
++NEW_TESTS="tests/media_packetization_ee3b3d_test.py"
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "$NEW_TESTS" -p no:cacheprovider $JUNIT
++  exit $?
++fi
++
++# Base mode runs the media path: tests/a2dp_test.py, tests/avdtp_test.py,
++# tests/avrcp_test.py and tests/codecs_test.py are the modules that import
++# bumble/a2dp.py, bumble/avdtp.py and bumble/rtp.py.
++#
++# The rest of the suite is left out because it depends on the environment rather
++# than on this area: the android-netsim transport cases need the gRPC extra, the
++# usb cases need a working libusb, and several host cases use millisecond
++# timeouts.
++python -m pytest \
++  tests/a2dp_test.py \
++  tests/avdtp_test.py \
++  tests/avrcp_test.py \
++  tests/codecs_test.py \
++  -p no:cacheprovider $JUNIT
++exit $?
+diff --git a/tests/a2dp_test.py b/tests/a2dp_test.py
+index 8638294..1bf1af7 100644
+--- a/tests/a2dp_test.py
++++ b/tests/a2dp_test.py
+@@ -418,9 +418,11 @@ async def test_sbc_packet_source():
+     data = Data((header + payload) * 2)
+ 
+     packet_source = a2dp.SbcPacketSource(data.read, 23)
+-    async for packet in packet_source.packets:
+-        assert packet.sequence_number == 0
+-        assert packet.timestamp == 0
++    packets = [packet async for packet in packet_source.packets]
++
++    for index, packet in enumerate(packets):
++        assert packet.sequence_number == index
++        assert packet.timestamp == index * 16
+         assert packet.payload == b'\x01' + header + payload
+ 
+ 
+diff --git a/tests/media_packetization_ee3b3d_test.py b/tests/media_packetization_ee3b3d_test.py
+new file mode 100644
+index 0000000..1175830
+--- /dev/null
++++ b/tests/media_packetization_ee3b3d_test.py
+@@ -0,0 +1,871 @@
++# Copyright 2021-2022 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# -----------------------------------------------------------------------------
++# Imports
++# -----------------------------------------------------------------------------
++import struct
++
++import pytest
++
++from bumble import a2dp, avdtp
++from bumble.core import InvalidArgumentError, InvalidPacketError
++from bumble.rtp import MediaPacket
++
++
++# -----------------------------------------------------------------------------
++# Helpers
++# -----------------------------------------------------------------------------
++class Reader:
++    def __init__(self, data: bytes) -> None:
++        self.data = data
++        self.offset = 0
++
++    async def read(self, size: int) -> bytes:
++        chunk = self.data[self.offset : self.offset + size]
++        self.offset += len(chunk)
++        return chunk
++
++
++class FakeChannel:
++    def __init__(self, mtu: int) -> None:
++        self.peer_mtu = mtu
++        self.sent: list[bytes] = []
++
++    def write(self, data) -> None:
++        self.sent.append(bytes(data))
++
++
++class FakeMessage:
++    message_type = 0
++
++    def __init__(self, payload: bytes, signal_identifier: int = 1) -> None:
++        self.payload = payload
++        self.signal_identifier = signal_identifier
++
++    def __str__(self) -> str:
++        return f'FakeMessage({len(self.payload)})'
++
++
++def sbc_header(sampling_frequency=0, blocks_code=0, channel_mode=0, subbands_8=1,
++               bitpool=10, allocation_method=0) -> bytes:
++    return bytes(
++        [
++            a2dp.SBC_SYNC_WORD,
++            (sampling_frequency << 6)
++            | (blocks_code << 4)
++            | (channel_mode << 2)
++            | (allocation_method << 1)
++            | subbands_8,
++            bitpool,
++            0x00,
++        ]
++    )
++
++
++def sbc_frame_bytes(fill: int = 1, **kwargs) -> bytes:
++    header = sbc_header(**kwargs)
++    (*_, length) = a2dp.sbc_frame_parameters(header)
++    return header + bytes((fill + i) & 0xFF for i in range(length - 4))
++
++
++def sbc_stream(count: int, **kwargs) -> bytes:
++    return b''.join(
++        sbc_frame_bytes(fill=index + 1, **kwargs) for index in range(count)
++    )
++
++
++def frame_data_from_packets(packets) -> bytes:
++    return b''.join(packet.payload[1:] for packet in packets)
++
++
++async def collect_packets(stream: bytes, mtu: int) -> list[MediaPacket]:
++    source = a2dp.SbcPacketSource(Reader(stream).read, mtu)
++    return [packet async for packet in source.packets]
++
++
++def raw_payload_header(frame_count, fragmented=False, start=False, last=False) -> bytes:
++    return bytes(
++        [
++            (0x80 if fragmented else 0)
++            | (0x40 if start else 0)
++            | (0x20 if last else 0)
++            | (frame_count & 0x0F)
++        ]
++    )
++
++
++def payload_header_fields(payload: bytes) -> tuple[int, int, int, int]:
++    header = payload[0]
++    return (
++        (header >> 7) & 1,
++        (header >> 6) & 1,
++        (header >> 5) & 1,
++        header & 0x0F,
++    )
++
++
++def send_avdtp(mtu: int, payload: bytes, transaction_label: int = 3) -> list[bytes]:
++    protocol = avdtp.Protocol.__new__(avdtp.Protocol)
++    protocol.l2cap_channel = FakeChannel(mtu)
++    avdtp.Protocol.send_message(protocol, transaction_label, FakeMessage(payload))
++    return protocol.l2cap_channel.sent
++
++
++def avdtp_packet_type(pdu: bytes) -> int:
++    return (pdu[0] >> 2) & 3
++
++
++# -----------------------------------------------------------------------------
++# RTP header parsing
++# -----------------------------------------------------------------------------
++def test_media_packet_csrc_list_round_trip():
++    csrc_list = [0x11111111, 0x22222222, 0x33333333]
++    packet = MediaPacket(2, 0, 0, 0, 7, 1234, 0xAABBCCDD, csrc_list, 96, b'payload')
++
++    parsed = MediaPacket.from_bytes(bytes(packet))
++
++    assert parsed.csrc_list == csrc_list
++    assert parsed.payload == b'payload'
++
++
++def test_media_packet_csrc_list_maximum():
++    csrc_list = [0x01000000 + i for i in range(15)]
++    packet = MediaPacket(2, 0, 0, 0, 1, 0, 0, csrc_list, 96, b'x')
++
++    parsed = MediaPacket.from_bytes(bytes(packet))
++
++    assert parsed.csrc_list == csrc_list
++    assert parsed.payload == b'x'
++
++
++def test_media_packet_header_extension_excluded_from_payload():
++    packet = MediaPacket(
++        2, 0, 1, 0, 5, 99, 0, [], 96, b'audio', 0xBEDE, b'\x01\x02\x03\x04'
++    )
++
++    parsed = MediaPacket.from_bytes(bytes(packet))
++
++    assert parsed.payload == b'audio'
++    assert parsed.extension_profile == 0xBEDE
++    assert parsed.extension_data == b'\x01\x02\x03\x04'
++
++
++def test_media_packet_header_extension_multiple_words():
++    extension_data = bytes(range(12))
++    packet = MediaPacket(2, 0, 1, 0, 5, 99, 0, [], 96, b'audio', 0x1234, extension_data)
++
++    raw = bytes(packet)
++    parsed = MediaPacket.from_bytes(raw)
++
++    assert struct.unpack_from('>H', raw, 14)[0] == 3
++    assert parsed.extension_data == extension_data
++    assert parsed.payload == b'audio'
++
++
++def test_media_packet_header_extension_empty():
++    packet = MediaPacket(2, 0, 1, 0, 5, 99, 0, [], 96, b'audio', 0x1234, b'')
++
++    parsed = MediaPacket.from_bytes(bytes(packet))
++
++    assert parsed.extension_data == b''
++    assert parsed.payload == b'audio'
++
++
++def test_media_packet_header_extension_with_csrc_list():
++    packet = MediaPacket(
++        2, 0, 1, 0, 5, 99, 0, [0xAAAAAAAA, 0xBBBBBBBB], 96, b'audio', 0x1234, b'\x09' * 4
++    )
++
++    parsed = MediaPacket.from_bytes(bytes(packet))
++
++    assert parsed.csrc_list == [0xAAAAAAAA, 0xBBBBBBBB]
++    assert parsed.extension_data == b'\x09' * 4
++    assert parsed.payload == b'audio'
++
++
++def test_media_packet_truncated_header_extension_rejected():
++    packet = MediaPacket(2, 0, 1, 0, 5, 99, 0, [], 96, b'audio', 0x1234, b'\x01' * 8)
++    raw = bytes(packet)
++
++    with pytest.raises(InvalidPacketError):
++        MediaPacket.from_bytes(raw[:18])
++
++
++def test_media_packet_shorter_than_the_fixed_header_rejected():
++    with pytest.raises(InvalidPacketError):
++        MediaPacket.from_bytes(bytes(11))
++
++
++def test_media_packet_missing_declared_csrc_rejected():
++    with pytest.raises(InvalidPacketError):
++        MediaPacket.from_bytes(bytes([0x81, 0]) + bytes(10))
++
++
++def test_media_packet_extension_header_cut_short_rejected():
++    packet = MediaPacket(2, 0, 1, 0, 5, 99, 0, [], 96, b'audio', 0x1234, b'\x01' * 4)
++
++    with pytest.raises(InvalidPacketError):
++        MediaPacket.from_bytes(bytes(packet)[:14])
++
++
++def test_media_packet_extension_header_cut_short_after_csrc_rejected():
++    packet = MediaPacket(
++        2, 0, 1, 0, 5, 99, 0, [0xAAAAAAAA], 96, b'audio', 0x1234, b'\x01' * 4
++    )
++
++    with pytest.raises(InvalidPacketError):
++        MediaPacket.from_bytes(bytes(packet)[:18])
++
++
++def test_media_packet_padding_size_beyond_one_octet_rejected():
++    with pytest.raises(InvalidArgumentError):
++        bytes(MediaPacket(2, 1, 0, 0, 0, 0, 0, [], 96, b'', padding_size=256))
++
++
++def test_media_packet_extension_data_must_be_whole_words():
++    with pytest.raises(InvalidArgumentError):
++        bytes(
++            MediaPacket(2, 0, 1, 0, 5, 99, 0, [], 96, b'audio', 0x1234, b'\x01\x02')
++        )
++
++
++def test_media_packet_padding_excluded_from_payload():
++    packet = MediaPacket(2, 1, 0, 0, 5, 99, 0, [], 96, b'audio', padding_size=4)
++
++    raw = bytes(packet)
++    parsed = MediaPacket.from_bytes(raw)
++
++    assert raw[-1] == 4
++    assert parsed.payload == b'audio'
++    assert parsed.padding_size == 4
++
++
++def test_media_packet_padding_round_trip():
++    packet = MediaPacket(2, 1, 0, 0, 5, 99, 0, [], 96, b'audio', padding_size=1)
++
++    raw = bytes(packet)
++
++    assert MediaPacket.from_bytes(raw).payload == b'audio'
++    assert bytes(MediaPacket.from_bytes(raw)) == raw
++
++
++def test_media_packet_padding_and_extension_together():
++    packet = MediaPacket(
++        2, 1, 1, 0, 5, 99, 0, [0xCCCCCCCC], 96, b'audio', 0x4321, b'\x07' * 4, 3
++    )
++
++    raw = bytes(packet)
++    parsed = MediaPacket.from_bytes(raw)
++
++    assert parsed.csrc_list == [0xCCCCCCCC]
++    assert parsed.extension_data == b'\x07' * 4
++    assert parsed.payload == b'audio'
++    assert bytes(parsed) == raw
++
++
++def test_media_packet_zero_padding_size_rejected():
++    with pytest.raises(InvalidArgumentError):
++        bytes(MediaPacket(2, 1, 0, 0, 5, 99, 0, [], 96, b'audio', padding_size=0))
++
++
++def test_media_packet_padding_octets_are_preserved():
++    raw = (
++        bytes([0xA0, 96, 0, 5, 0, 0, 0, 99, 0, 0, 0, 0])
++        + b'audio'
++        + bytes([0xAA, 0xBB, 0x03])
++    )
++
++    parsed = MediaPacket.from_bytes(raw)
++
++    assert parsed.payload == b'audio'
++    assert parsed.padding_size == 3
++    assert bytes(parsed) == raw
++
++
++def test_media_packet_zero_padding_count_on_the_wire_rejected():
++    raw = bytes([0xA0, 96, 0, 5, 0, 0, 0, 99, 0, 0, 0, 0]) + b'ab' + bytes([0])
++
++    with pytest.raises(InvalidPacketError):
++        MediaPacket.from_bytes(raw)
++
++
++def test_media_packet_padding_larger_than_packet_rejected():
++    raw = bytes([0xA0, 96, 0, 5, 0, 0, 0, 99, 0, 0, 0, 0]) + b'ab' + bytes([9])
++
++    with pytest.raises(InvalidPacketError):
++        MediaPacket.from_bytes(raw)
++
++
++# -----------------------------------------------------------------------------
++# SBC frame length
++# -----------------------------------------------------------------------------
++def test_sbc_frame_length_rounds_up_mono():
++    assert a2dp.sbc_frame_length(4, 1, 4, 3, a2dp.SBC_MONO_CHANNEL_MODE) == 8
++
++
++def test_sbc_frame_length_rounds_up_joint_stereo():
++    assert a2dp.sbc_frame_length(4, 2, 4, 3, a2dp.SBC_JOINT_STEREO_CHANNEL_MODE) == 10
++
++
++def test_sbc_frame_length_rounds_up_joint_stereo_fractional():
++    assert a2dp.sbc_frame_length(8, 2, 4, 3, a2dp.SBC_JOINT_STEREO_CHANNEL_MODE) == 15
++
++
++def test_sbc_frame_length_exact_multiples_unchanged():
++    assert a2dp.sbc_frame_length(8, 1, 16, 19, a2dp.SBC_MONO_CHANNEL_MODE) == 46
++    assert a2dp.sbc_frame_length(8, 2, 16, 35, a2dp.SBC_JOINT_STEREO_CHANNEL_MODE) == 83
++
++
++def test_sbc_frame_length_rounds_up_stereo():
++    assert a2dp.sbc_frame_length(4, 2, 4, 3, a2dp.SBC_STEREO_CHANNEL_MODE) == 10
++
++
++def test_sbc_frame_length_matches_dual_channel():
++    assert a2dp.sbc_frame_length(8, 2, 8, 5, a2dp.SBC_DUAL_CHANNEL_MODE) == 22
++
++
++def test_sbc_frame_parameters_decodes_the_whole_header():
++    header = sbc_header(
++        sampling_frequency=2, blocks_code=1, channel_mode=3, subbands_8=1, bitpool=24
++    )
++
++    (
++        sampling_frequency,
++        blocks,
++        channel_mode,
++        allocation_method,
++        subbands,
++        bitpool,
++        length,
++    ) = a2dp.sbc_frame_parameters(header)
++
++    assert sampling_frequency == a2dp.SBC_SAMPLING_FREQUENCIES[2]
++    assert blocks == 8
++    assert channel_mode == a2dp.SBC_JOINT_STEREO_CHANNEL_MODE
++    assert allocation_method == 0
++    assert subbands == 8
++    assert bitpool == 24
++    assert length == a2dp.sbc_frame_length(
++        8, 2, 8, 24, a2dp.SBC_JOINT_STEREO_CHANNEL_MODE
++    )
++
++
++def test_sbc_frame_parameters_decodes_a_second_header_shape():
++    header = sbc_header(
++        sampling_frequency=1,
++        blocks_code=2,
++        channel_mode=1,
++        subbands_8=0,
++        bitpool=16,
++        allocation_method=1,
++    )
++
++    (
++        sampling_frequency,
++        blocks,
++        channel_mode,
++        allocation_method,
++        subbands,
++        bitpool,
++        length,
++    ) = a2dp.sbc_frame_parameters(header)
++
++    assert sampling_frequency == a2dp.SBC_SAMPLING_FREQUENCIES[1]
++    assert blocks == 12
++    assert channel_mode == a2dp.SBC_DUAL_CHANNEL_MODE
++    assert allocation_method == 1
++    assert subbands == 4
++    assert bitpool == 16
++    assert length == a2dp.sbc_frame_length(
++        4, 2, 12, 16, a2dp.SBC_DUAL_CHANNEL_MODE
++    )
++
++
++@pytest.mark.parametrize(
++    'sampling_frequency, blocks_code, channel_mode, subbands_8, bitpool',
++    [
++        (0, 0, a2dp.SBC_MONO_CHANNEL_MODE, 0, 8),
++        (1, 1, a2dp.SBC_DUAL_CHANNEL_MODE, 1, 12),
++        (2, 2, a2dp.SBC_STEREO_CHANNEL_MODE, 0, 20),
++        (3, 3, a2dp.SBC_JOINT_STEREO_CHANNEL_MODE, 1, 32),
++    ],
++)
++def test_sbc_frame_parameters_decodes_every_field_combination(
++    sampling_frequency, blocks_code, channel_mode, subbands_8, bitpool
++):
++    header = sbc_header(
++        sampling_frequency=sampling_frequency,
++        blocks_code=blocks_code,
++        channel_mode=channel_mode,
++        subbands_8=subbands_8,
++        bitpool=bitpool,
++    )
++    channels = 1 if channel_mode == a2dp.SBC_MONO_CHANNEL_MODE else 2
++    subbands = 8 if subbands_8 else 4
++    blocks = 4 * (1 + blocks_code)
++
++    decoded = a2dp.sbc_frame_parameters(header)
++
++    assert decoded == (
++        a2dp.SBC_SAMPLING_FREQUENCIES[sampling_frequency],
++        blocks,
++        channel_mode,
++        0,
++        subbands,
++        bitpool,
++        a2dp.sbc_frame_length(subbands, channels, blocks, bitpool, channel_mode),
++    )
++
++
++async def test_sbc_parser_uses_rounded_up_frame_length():
++    stream = sbc_stream(3, bitpool=3, blocks_code=0, subbands_8=0)
++    parser = a2dp.SbcParser(Reader(stream).read)
++
++    frames = [frame async for frame in parser.frames]
++
++    assert len(frames) == 3
++    assert all(len(frame.payload) == 8 for frame in frames)
++
++
++# -----------------------------------------------------------------------------
++# SBC packetization
++# -----------------------------------------------------------------------------
++def test_sbc_media_payload_header_bits():
++    assert a2dp.sbc_media_payload_header(5) == bytes([0x05])
++    assert a2dp.sbc_media_payload_header(
++        3, fragmented=True, start=True
++    ) == bytes([0xC3])
++    assert a2dp.sbc_media_payload_header(
++        1, fragmented=True, last=True
++    ) == bytes([0xA1])
++
++
++def test_sbc_media_payload_header_rejects_an_uncountable_frame_count():
++    with pytest.raises(InvalidArgumentError):
++        a2dp.sbc_media_payload_header(16)
++
++
++async def test_sbc_packet_source_emits_trailing_frames():
++    packets = await collect_packets(sbc_stream(4), 672)
++
++    assert len(packets) == 1
++    assert payload_header_fields(packets[0].payload) == (0, 0, 0, 4)
++
++
++async def test_sbc_packet_source_emits_single_frame_stream():
++    packets = await collect_packets(sbc_stream(1), 672)
++
++    assert len(packets) == 1
++    assert payload_header_fields(packets[0].payload) == (0, 0, 0, 1)
++
++
++async def test_sbc_packet_source_carries_every_frame():
++    packets = await collect_packets(sbc_stream(40), 100)
++
++    assert sum(payload_header_fields(p.payload)[3] for p in packets) == 40
++
++
++async def test_sbc_packet_source_preserves_every_frame_byte():
++    stream = sbc_stream(23)
++
++    packets = await collect_packets(stream, 100)
++
++    assert frame_data_from_packets(packets) == stream
++
++
++async def test_sbc_packet_source_preserves_bytes_of_a_fragmented_frame():
++    stream = sbc_frame_bytes(fill=7, bitpool=50, blocks_code=3, channel_mode=3)
++
++    packets = await collect_packets(stream, 40)
++
++    assert frame_data_from_packets(packets) == stream
++
++
++async def test_sbc_packet_source_caps_frames_per_payload():
++    packets = await collect_packets(sbc_stream(20), 4096)
++
++    assert [payload_header_fields(p.payload)[3] for p in packets] == [15, 5]
++
++
++async def test_sbc_packet_source_timestamps_count_samples():
++    packets = await collect_packets(sbc_stream(12), 100)
++    frames_per_packet = payload_header_fields(packets[0].payload)[3]
++
++    assert packets[0].timestamp == 0
++    assert packets[1].timestamp == frames_per_packet * 32
++
++
++async def test_sbc_packet_source_timestamps_follow_actual_sample_counts():
++    long_frame = sbc_frame_bytes(fill=1, blocks_code=3)
++    short_frame = sbc_frame_bytes(fill=2, blocks_code=0)
++    mtu = 13 + len(long_frame) + len(short_frame) - 1
++
++    packets = await collect_packets(long_frame + short_frame, mtu)
++
++    assert len(packets) == 2
++    assert packets[0].timestamp == 0
++    assert packets[1].timestamp == 16 * 8
++
++
++async def test_sbc_packet_source_timestamps_are_monotonic():
++    packets = await collect_packets(sbc_stream(30), 100)
++    timestamps = [packet.timestamp for packet in packets]
++
++    assert timestamps == sorted(timestamps)
++    assert len(set(timestamps)) == len(timestamps)
++
++
++async def test_sbc_packet_source_fragments_oversized_frame():
++    packets = await collect_packets(
++        sbc_stream(1, bitpool=50, blocks_code=3, channel_mode=3), 40
++    )
++
++    assert len(packets) > 1
++    assert all(payload_header_fields(p.payload)[0] == 1 for p in packets)
++
++
++async def test_sbc_packet_source_fragment_flags():
++    packets = await collect_packets(
++        sbc_stream(1, bitpool=50, blocks_code=3, channel_mode=3), 40
++    )
++    flags = [payload_header_fields(p.payload)[:3] for p in packets]
++
++    assert flags[0] == (1, 1, 0)
++    assert flags[-1] == (1, 0, 1)
++    assert all(flag == (1, 0, 0) for flag in flags[1:-1])
++
++
++async def test_sbc_packet_source_fragment_counter_counts_down_to_one():
++    packets = await collect_packets(
++        sbc_stream(1, bitpool=50, blocks_code=3, channel_mode=3), 40
++    )
++    counters = [payload_header_fields(p.payload)[3] for p in packets]
++
++    assert counters == list(range(len(packets), 0, -1))
++
++
++async def test_sbc_packet_source_fragments_share_one_timestamp():
++    packets = await collect_packets(
++        sbc_stream(1, bitpool=50, blocks_code=3, channel_mode=3), 40
++    )
++
++    assert len({packet.timestamp for packet in packets}) == 1
++
++
++async def test_sbc_packet_source_rejects_a_frame_needing_too_many_fragments():
++    with pytest.raises(InvalidArgumentError):
++        await collect_packets(
++            sbc_stream(1, bitpool=250, blocks_code=3, channel_mode=3), 40
++        )
++
++
++async def test_sbc_packet_source_rejects_an_mtu_with_no_room_for_frames():
++    with pytest.raises(InvalidArgumentError):
++        await collect_packets(sbc_stream(1), 13)
++
++
++async def test_sbc_packet_source_rejects_an_mtu_below_the_rtp_header():
++    with pytest.raises(InvalidArgumentError):
++        await collect_packets(sbc_stream(1), 8)
++
++
++async def test_sbc_packet_source_flushes_accumulated_frames_before_fragmenting():
++    stream = sbc_stream(2, bitpool=4) + sbc_frame_bytes(
++        bitpool=50, blocks_code=3, channel_mode=3
++    )
++    packets = await collect_packets(stream, 40)
++
++    assert payload_header_fields(packets[0].payload)[0] == 0
++    assert payload_header_fields(packets[0].payload)[3] == 2
++    assert payload_header_fields(packets[1].payload)[0] == 1
++
++
++# -----------------------------------------------------------------------------
++# SBC payload reassembly
++# -----------------------------------------------------------------------------
++def test_sbc_payload_assembler_unfragmented_payload():
++    collected: list[a2dp.SbcFrame] = []
++    assembler = a2dp.SbcPayloadAssembler(collected.extend)
++
++    assembler.on_payload(a2dp.sbc_media_payload_header(3) + sbc_stream(3))
++
++    assert len(collected) == 3
++
++
++def test_sbc_payload_assembler_delivers_one_group_per_callback():
++    calls: list = []
++    assembler = a2dp.SbcPayloadAssembler(calls.append)
++
++    assembler.on_payload(a2dp.sbc_media_payload_header(3) + sbc_stream(3))
++
++    assert len(calls) == 1
++    assert len(calls[0]) == 3
++
++
++def test_sbc_payload_assembler_rejects_frame_count_mismatch():
++    assembler = a2dp.SbcPayloadAssembler(lambda frames: None)
++
++    with pytest.raises(InvalidPacketError):
++        assembler.on_payload(a2dp.sbc_media_payload_header(2) + sbc_stream(3))
++
++
++def test_sbc_payload_assembler_rejects_a_frame_count_above_the_payload():
++    assembler = a2dp.SbcPayloadAssembler(lambda frames: None)
++
++    with pytest.raises(InvalidPacketError):
++        assembler.on_payload(a2dp.sbc_media_payload_header(4) + sbc_stream(3))
++
++
++def test_sbc_payload_assembler_rejects_empty_payload():
++    assembler = a2dp.SbcPayloadAssembler(lambda frames: None)
++
++    with pytest.raises(InvalidPacketError):
++        assembler.on_payload(b'')
++
++
++def test_sbc_payload_assembler_ignores_continuation_without_start():
++    collected: list[a2dp.SbcFrame] = []
++    assembler = a2dp.SbcPayloadAssembler(collected.extend)
++
++    assembler.on_payload(
++        a2dp.sbc_media_payload_header(1, fragmented=True, last=True) + b'\x00\x01'
++    )
++
++    assert collected == []
++
++
++def test_sbc_payload_assembler_rejects_a_terminal_start_declaring_more():
++    assembler = a2dp.SbcPayloadAssembler(lambda frames: None)
++
++    with pytest.raises(InvalidPacketError):
++        assembler.on_payload(
++            raw_payload_header(2, fragmented=True, start=True, last=True)
++            + sbc_frame_bytes()
++        )
++
++
++def test_sbc_payload_assembler_ignores_a_middle_continuation_without_start():
++    collected: list[a2dp.SbcFrame] = []
++    assembler = a2dp.SbcPayloadAssembler(collected.extend)
++
++    assembler.on_payload(
++        a2dp.sbc_media_payload_header(2, fragmented=True) + b'\x00\x01'
++    )
++
++    assert collected == []
++
++
++def test_sbc_payload_assembler_rejects_a_start_declaring_zero():
++    assembler = a2dp.SbcPayloadAssembler(lambda frames: None)
++
++    with pytest.raises(InvalidPacketError):
++        assembler.on_payload(
++            raw_payload_header(0, fragmented=True, start=True) + bytes([0])
++        )
++
++
++def test_sbc_payload_assembler_rejects_a_non_final_start_declaring_one():
++    assembler = a2dp.SbcPayloadAssembler(lambda frames: None)
++
++    with pytest.raises(InvalidPacketError):
++        assembler.on_payload(
++            raw_payload_header(1, fragmented=True, start=True) + bytes([0])
++        )
++
++
++def test_sbc_payload_assembler_rejects_a_final_counter_without_last():
++    assembler = a2dp.SbcPayloadAssembler(lambda frames: None)
++    assembler.on_payload(
++        a2dp.sbc_media_payload_header(2, fragmented=True, start=True) + bytes([0])
++    )
++
++    with pytest.raises(InvalidPacketError):
++        assembler.on_payload(
++            raw_payload_header(1, fragmented=True) + bytes([0])
++        )
++
++
++def test_sbc_payload_assembler_rejects_a_skipped_countdown():
++    assembler = a2dp.SbcPayloadAssembler(lambda frames: None)
++    assembler.on_payload(
++        a2dp.sbc_media_payload_header(4, fragmented=True, start=True) + bytes([0])
++    )
++
++    with pytest.raises(InvalidPacketError):
++        assembler.on_payload(
++            a2dp.sbc_media_payload_header(2, fragmented=True) + bytes([0])
++        )
++
++
++def test_sbc_payload_assembler_rejects_a_repeated_countdown():
++    assembler = a2dp.SbcPayloadAssembler(lambda frames: None)
++    assembler.on_payload(
++        a2dp.sbc_media_payload_header(3, fragmented=True, start=True) + b'\x00'
++    )
++
++    with pytest.raises(InvalidPacketError):
++        assembler.on_payload(
++            a2dp.sbc_media_payload_header(3, fragmented=True) + b'\x00'
++        )
++
++
++def test_sbc_payload_assembler_rejects_bad_countdown():
++    assembler = a2dp.SbcPayloadAssembler(lambda frames: None)
++    assembler.on_payload(
++        a2dp.sbc_media_payload_header(3, fragmented=True, start=True) + b'\x00'
++    )
++
++    with pytest.raises(InvalidPacketError):
++        assembler.on_payload(
++            a2dp.sbc_media_payload_header(7, fragmented=True) + b'\x00'
++        )
++
++
++async def test_sbc_payload_assembler_round_trips_fragments():
++    collected: list[a2dp.SbcFrame] = []
++    assembler = a2dp.SbcPayloadAssembler(collected.extend)
++    packets = await collect_packets(
++        sbc_stream(1, bitpool=50, blocks_code=3, channel_mode=3), 40
++    )
++
++    for packet in packets:
++        assembler.on_payload(packet.payload)
++
++    assert len(collected) == 1
++    assert collected[0].bitpool == 50
++
++
++async def test_sbc_payload_assembler_restores_frame_payloads_exactly():
++    collected: list[a2dp.SbcFrame] = []
++    assembler = a2dp.SbcPayloadAssembler(collected.extend)
++    expected = [sbc_frame_bytes(fill=index + 1) for index in range(5)]
++    packets = await collect_packets(b''.join(expected), 100)
++
++    for packet in packets:
++        assembler.on_payload(packet.payload)
++
++    assert [frame.payload for frame in collected] == expected
++
++
++async def test_sbc_payload_assembler_restores_a_fragmented_frame_exactly():
++    collected: list[a2dp.SbcFrame] = []
++    assembler = a2dp.SbcPayloadAssembler(collected.extend)
++    expected = sbc_frame_bytes(fill=9, bitpool=50, blocks_code=3, channel_mode=3)
++    packets = await collect_packets(expected, 40)
++
++    for packet in packets:
++        assembler.on_payload(packet.payload)
++
++    assert len(collected) == 1
++    assert collected[0].payload == expected
++    assert collected[0].bitpool == 50
++    assert collected[0].block_count == 16
++    assert collected[0].subband_count == 8
++    assert collected[0].channel_mode == a2dp.SBC_JOINT_STEREO_CHANNEL_MODE
++
++
++async def test_sbc_payload_assembler_round_trips_a_whole_stream():
++    collected: list[a2dp.SbcFrame] = []
++    assembler = a2dp.SbcPayloadAssembler(collected.extend)
++    packets = await collect_packets(sbc_stream(23), 100)
++
++    for packet in packets:
++        assembler.on_payload(packet.payload)
++
++    assert len(collected) == 23
++
++
++# -----------------------------------------------------------------------------
++# AVDTP signalling fragmentation
++# -----------------------------------------------------------------------------
++def test_avdtp_message_filling_a_single_packet_is_not_fragmented():
++    sent = send_avdtp(48, bytes(46))
++
++    assert len(sent) == 1
++    assert avdtp_packet_type(sent[0]) == avdtp.Protocol.PacketType.SINGLE_PACKET
++    assert sent[0][2:] == bytes(46)
++
++
++def test_avdtp_fragmentation_carries_every_byte_in_the_fewest_packets():
++    payload = bytes(range(256)) * 3
++    sent = send_avdtp(48, payload)
++    expected = 1 + -(-(len(payload) - (48 - 3)) // (48 - 1))
++
++    carried = sent[0][3:] + b''.join(pdu[1:] for pdu in sent[1:])
++    types = [avdtp_packet_type(pdu) for pdu in sent]
++
++    assert carried == payload
++    assert len(sent) == expected
++    assert types[0] == avdtp.Protocol.PacketType.START_PACKET
++    assert types[-1] == avdtp.Protocol.PacketType.END_PACKET
++    assert all(
++        packet_type == avdtp.Protocol.PacketType.CONTINUE_PACKET
++        for packet_type in types[1:-1]
++    )
++
++
++def test_avdtp_fragmentation_declares_the_packet_count():
++    payload = bytes(range(256)) * 3
++    sent = send_avdtp(48, payload)
++    expected = 1 + -(-(len(payload) - (48 - 3)) // (48 - 1))
++
++    assert sent[0][2] == expected
++    assert sent[0][2] == len(sent)
++
++
++def test_avdtp_continuation_packets_use_the_full_mtu():
++    sent = send_avdtp(48, bytes(range(256)) * 3)
++
++    assert all(len(pdu) == 48 for pdu in sent[1:-1])
++
++
++def test_avdtp_message_needing_too_many_fragments_is_rejected():
++    with pytest.raises(InvalidArgumentError):
++        send_avdtp(20, bytes(20 * 300))
++
++
++def test_avdtp_unusable_mtu_is_rejected():
++    with pytest.raises(InvalidArgumentError):
++        send_avdtp(3, bytes(10))
++
++
++
++def test_avdtp_single_packet_message_reassembles():
++    collected: list[tuple[int, avdtp.Message]] = []
++    assembler = avdtp.MessageAssembler(
++        lambda label, message: collected.append((label, message))
++    )
++    payload = bytes(range(46))
++
++    for pdu in send_avdtp(48, payload, transaction_label=5):
++        assembler.on_pdu(pdu)
++
++    assert len(collected) == 1
++    assert collected[0][1].payload == payload
++
++
++# -----------------------------------------------------------------------------
++# Other codec packet sources
++# -----------------------------------------------------------------------------
++async def test_aac_packet_source_timestamps_count_samples():
++    header = b'\xff\xf0\x10\x00\x01\xa0\x00'
++    payload = b'\x00' * 6
++    source = a2dp.AacPacketSource(Reader((header + payload) * 3).read, 672)
++
++    packets = [packet async for packet in source.packets]
++
++    assert packets[0].timestamp == 0
++    assert packets[1].timestamp == 1024
++    assert packets[2].timestamp == 2048

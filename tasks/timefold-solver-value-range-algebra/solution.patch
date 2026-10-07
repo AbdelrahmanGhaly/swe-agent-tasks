@@ -1,0 +1,1534 @@
+diff --git a/core/src/main/java/ai/timefold/solver/core/api/domain/valuerange/ValueRangeFactory.java b/core/src/main/java/ai/timefold/solver/core/api/domain/valuerange/ValueRangeFactory.java
+index 1965897241..750712dde6 100644
+--- a/core/src/main/java/ai/timefold/solver/core/api/domain/valuerange/ValueRangeFactory.java
++++ b/core/src/main/java/ai/timefold/solver/core/api/domain/valuerange/ValueRangeFactory.java
+@@ -7,13 +7,23 @@ import java.time.LocalDateTime;
+ import java.time.LocalTime;
+ import java.time.temporal.Temporal;
+ import java.time.temporal.TemporalUnit;
++import java.util.Collection;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Set;
++import java.util.SortedSet;
+ 
+ import ai.timefold.solver.core.impl.domain.valuerange.BigDecimalValueRange;
+ import ai.timefold.solver.core.impl.domain.valuerange.BigIntegerValueRange;
+ import ai.timefold.solver.core.impl.domain.valuerange.BooleanValueRange;
++import ai.timefold.solver.core.impl.domain.valuerange.DifferenceValueRange;
+ import ai.timefold.solver.core.impl.domain.valuerange.IntValueRange;
++import ai.timefold.solver.core.impl.domain.valuerange.IntersectionValueRange;
++import ai.timefold.solver.core.impl.domain.valuerange.ListValueRange;
+ import ai.timefold.solver.core.impl.domain.valuerange.LongValueRange;
++import ai.timefold.solver.core.impl.domain.valuerange.SetValueRange;
+ import ai.timefold.solver.core.impl.domain.valuerange.TemporalValueRange;
++import ai.timefold.solver.core.impl.domain.valuerange.UnionValueRange;
+ 
+ import org.jspecify.annotations.NullMarked;
+ 
+@@ -177,4 +187,87 @@ public final class ValueRangeFactory {
+         return new TemporalValueRange<>(from, to, incrementUnitAmount, incrementUnitType);
+     }
+ 
++    /**
++     * Build a {@link ValueRange} of the values of a collection, in the iteration order of the collection.
++     *
++     * @param values a {@link Set} must be a {@link SortedSet} or a {@link LinkedHashSet}, so that its order is defined
++     */
++    public static <T> ValueRange<T> createCollectionValueRange(Collection<T> values) {
++        if (values == null) {
++            throw new IllegalArgumentException("The values must not be null.");
++        }
++        if (values instanceof Set<T> set) {
++            if (!(set instanceof SortedSet<T> || set instanceof LinkedHashSet<T>)) {
++                throw new IllegalArgumentException("The values (%s) must be a %s or a %s, because a %s has no defined order."
++                        .formatted(set.getClass().getSimpleName(), SortedSet.class.getSimpleName(),
++                                LinkedHashSet.class.getSimpleName(), Set.class.getSimpleName()));
++            }
++            requireNoNullElement(set);
++            return new SetValueRange<>(set);
++        }
++        requireNoNullElement(values);
++        return new ListValueRange<>(List.copyOf(values));
++    }
++
++    private static void requireNoNullElement(Collection<?> values) {
++        for (var value : values) {
++            if (value == null) {
++                throw new IllegalArgumentException("The values must not contain a null element.");
++            }
++        }
++    }
++
++    /**
++     * Build a {@link ValueRange} of the values of the first value range,
++     * followed by the values of every later value range which no earlier value range contains.
++     * Each value range keeps its own order.
++     *
++     * @param valueRanges at least one
++     */
++    @SafeVarargs
++    public static <T> ValueRange<T> createUnionValueRange(ValueRange<T>... valueRanges) {
++        return new UnionValueRange<>(toMemberList(valueRanges));
++    }
++
++    /**
++     * Build a {@link ValueRange} of the values of the first value range, in its order,
++     * which every other value range contains.
++     *
++     * @param valueRanges at least one
++     */
++    @SafeVarargs
++    public static <T> ValueRange<T> createIntersectionValueRange(ValueRange<T>... valueRanges) {
++        return new IntersectionValueRange<>(toMemberList(valueRanges));
++    }
++
++    /**
++     * Build a {@link ValueRange} of the values of a value range, in its order,
++     * which the excluded value range does not contain.
++     */
++    public static <T> ValueRange<T> createDifferenceValueRange(ValueRange<T> valueRange,
++            ValueRange<T> excludedValueRange) {
++        return new DifferenceValueRange<>(requireMember(valueRange), requireMember(excludedValueRange));
++    }
++
++    @SafeVarargs
++    private static <T> List<ValueRange<T>> toMemberList(ValueRange<T>... valueRanges) {
++        if (valueRanges == null) {
++            throw new IllegalArgumentException("The valueRanges must not be null.");
++        }
++        if (valueRanges.length == 0) {
++            throw new IllegalArgumentException("The valueRanges must contain at least one value range.");
++        }
++        for (var valueRange : valueRanges) {
++            requireMember(valueRange);
++        }
++        return List.of(valueRanges);
++    }
++
++    private static <T> ValueRange<T> requireMember(ValueRange<T> valueRange) {
++        if (valueRange == null) {
++            throw new IllegalArgumentException("The valueRange must not be null.");
++        }
++        return valueRange;
++    }
++
+ }
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/AbstractCompositionValueRange.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/AbstractCompositionValueRange.java
+new file mode 100644
+index 0000000000..e3e0615c8e
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/AbstractCompositionValueRange.java
+@@ -0,0 +1,229 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.NoSuchElementException;
++import java.util.Set;
++import java.util.SortedSet;
++import java.util.random.RandomGenerator;
++
++import ai.timefold.solver.core.api.domain.valuerange.ValueRange;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Finite;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Leaf;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Node;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Or;
++import ai.timefold.solver.core.impl.domain.valuerange.sort.SortableValueRange;
++import ai.timefold.solver.core.impl.heuristic.selector.common.decorator.SelectionSorter;
++import ai.timefold.solver.core.impl.domain.valuerange.sort.ValueRangeSorter;
++import ai.timefold.solver.core.impl.domain.valuerange.util.ValueRangeIterator;
++import ai.timefold.solver.core.impl.solver.random.RandomUtils;
++
++import org.jspecify.annotations.NullMarked;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * A {@link ValueRange} built from other value ranges.
++ */
++@NullMarked
++public abstract sealed class AbstractCompositionValueRange<T> extends AbstractValueRange<T>
++        permits UnionValueRange, IntersectionValueRange, DifferenceValueRange {
++
++    static <T> ValueSequence<T> sequenceOf(ValueRange<T> valueRange) {
++        if (valueRange instanceof AbstractCompositionValueRange<T> composition) {
++            return composition.getSequence();
++        } else if (valueRange instanceof ProgressionBacked<T> progressionBacked) {
++            return new ProgressionSequence<>(progressionBacked.progression());
++        } else if (valueRange instanceof NullAllowingValueRange<T> nullAllowing) {
++            return ConcatSequence.of(List.of(ListSequence.ofRange(nullOnlyRange()),
++                    sequenceOf(nullAllowing.getChildValueRange())));
++        }
++        return ListSequence.ofRange(valueRange);
++    }
++
++    static <T> Node<T> nodeOf(ValueRange<T> valueRange) {
++        if (valueRange instanceof AbstractCompositionValueRange<T> composition) {
++            return composition.node();
++        } else if (valueRange instanceof ProgressionBacked<T> progressionBacked) {
++            return new Leaf<>(progressionBacked.progression());
++        } else if (valueRange instanceof NullAllowingValueRange<T> nullAllowing) {
++            return new Or<>(List.of(new Finite<>(nullOnlyRange()), nodeOf(nullAllowing.getChildValueRange())));
++        }
++        return new Finite<>(valueRange);
++    }
++
++    private static <T> ValueRange<T> nullOnlyRange() {
++        return new NullAllowingValueRange<>(EmptyValueRange.<T> instance());
++    }
++
++    protected final List<ValueRange<T>> memberList;
++    private @Nullable ValueSequence<T> sequence;
++
++    protected AbstractCompositionValueRange(List<ValueRange<T>> memberList) {
++        this.memberList = List.copyOf(memberList);
++    }
++
++    protected abstract ValueSequence<T> buildSequence();
++
++    abstract Node<T> node();
++
++    protected abstract String getOperatorSymbol();
++
++    protected final ValueSequence<T> getSequence() {
++        if (sequence == null) {
++            sequence = buildSequence();
++        }
++        return sequence;
++    }
++
++    @Override
++    public long getSize() {
++        return getSequence().size();
++    }
++
++    @Override
++    public T get(long index) {
++        var size = getSize();
++        if (index < 0L || index >= size) {
++            throw new IndexOutOfBoundsException("The index (" + index + ") must be >= 0 and < size ("
++                    + size + ").");
++        }
++        return getSequence().get(index);
++    }
++
++    @Override
++    public ValueRange<T> sort(ValueRangeSorter<T> sorter) {
++        var probeSorter = new NullFilteringSorter<>(sorter);
++        for (var member : memberList) {
++            requireSortableMember(member, probeSorter);
++        }
++        var sortableList = new ArrayList<T>((int) getSize());
++        var nullProduced = false;
++        var iterator = getSequence().iterator();
++        while (iterator.hasNext()) {
++            var value = iterator.next();
++            if (value == null) {
++                nullProduced = true;
++            } else {
++                sortableList.add(value);
++            }
++        }
++        sorter.sort(sortableList);
++        var sortedValueRange = new ListValueRange<>(sortableList);
++        return nullProduced ? new NullAllowingValueRange<>(sortedValueRange) : sortedValueRange;
++    }
++
++    /**
++     * Sorting a member is what decides whether that member can be sorted,
++     * so a member which declines raises its own error and the caller sees that error.
++     * The member is sorted through a sorter which drops null first, because a member may hold null
++     * and only the values the composition produces, without null, reach the caller's own sorter.
++     */
++    @SuppressWarnings({ "rawtypes", "unchecked" })
++    private static <T> void requireSortableMember(ValueRange<T> member, ValueRangeSorter<T> sorter) {
++        if (member instanceof AbstractCompositionValueRange<T> composition) {
++            for (var nestedMember : composition.memberList) {
++                requireSortableMember(nestedMember, sorter);
++            }
++        } else if (member instanceof SortableValueRange sortableMember) {
++            sortableMember.sort(sorter);
++        } else {
++            throw new UnsupportedOperationException();
++        }
++    }
++
++    private record NullFilteringSorter<T>(ValueRangeSorter<T> delegate) implements ValueRangeSorter<T> {
++
++        @Override
++        public void sort(List<T> selectionList) {
++            var nonNullList = new ArrayList<T>(selectionList.size());
++            for (var value : selectionList) {
++                if (value != null) {
++                    nonNullList.add(value);
++                }
++            }
++            delegate.sort(nonNullList);
++        }
++
++        @Override
++        public SortedSet<T> sort(Set<T> selectionSet) {
++            var nonNullSet = new LinkedHashSet<T>();
++            for (var value : selectionSet) {
++                if (value != null) {
++                    nonNullSet.add(value);
++                }
++            }
++            return delegate.sort(nonNullSet);
++        }
++
++        @Override
++        public SelectionSorter<?, T> getInnerSorter() {
++            return delegate.getInnerSorter();
++        }
++
++    }
++
++    @Override
++    public Iterator<T> createOriginalIterator() {
++        return getSequence().iterator();
++    }
++
++    @Override
++    public Iterator<T> createRandomIterator(RandomGenerator workingRandom) {
++        return new RandomCompositionValueRangeIterator(workingRandom);
++    }
++
++    private final class RandomCompositionValueRangeIterator extends ValueRangeIterator<T> {
++
++        private final RandomGenerator workingRandom;
++        private final long size = getSize();
++
++        private RandomCompositionValueRangeIterator(RandomGenerator workingRandom) {
++            this.workingRandom = workingRandom;
++        }
++
++        @Override
++        public boolean hasNext() {
++            return size > 0L;
++        }
++
++        @Override
++        public T next() {
++            if (size <= 0L) {
++                throw new NoSuchElementException();
++            }
++            return getSequence().get(RandomUtils.nextLong(workingRandom, size));
++        }
++
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (this == o) {
++            return true;
++        }
++        return o != null && getClass() == o.getClass() &&
++                memberList.equals(((AbstractCompositionValueRange<?>) o).memberList);
++    }
++
++    @Override
++    public int hashCode() {
++        var hash = 1;
++        hash = 31 * hash + getClass().hashCode();
++        return 31 * hash + memberList.hashCode();
++    }
++
++    @Override
++    public String toString() {
++        var builder = new StringBuilder();
++        for (var member : memberList) {
++            if (!builder.isEmpty()) {
++                builder.append(getOperatorSymbol());
++            }
++            builder.append(member);
++        }
++        return builder.toString();
++    }
++
++}
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/AbstractValueRange.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/AbstractValueRange.java
+index e29b17e3c4..b0486be118 100644
+--- a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/AbstractValueRange.java
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/AbstractValueRange.java
+@@ -15,8 +15,9 @@ import org.jspecify.annotations.NullMarked;
+  */
+ @NullMarked
+ public abstract sealed class AbstractValueRange<T> implements ValueRange<T>, SortableValueRange<T>
+-        permits BigDecimalValueRange, BigIntegerValueRange, BooleanValueRange, CompositeValueRange, EmptyValueRange,
+-        IntValueRange, ListValueRange, LongValueRange, NullAllowingValueRange, SetValueRange, TemporalValueRange {
++        permits AbstractCompositionValueRange, BigDecimalValueRange, BigIntegerValueRange, BooleanValueRange,
++        CompositeValueRange, EmptyValueRange, IntValueRange, ListValueRange, LongValueRange, NullAllowingValueRange,
++        SetValueRange, TemporalValueRange {
+ 
+     @Override
+     public boolean isEmpty() {
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/BigDecimalValueRange.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/BigDecimalValueRange.java
+index fbd2649eac..d96e11fb88 100644
+--- a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/BigDecimalValueRange.java
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/BigDecimalValueRange.java
+@@ -13,11 +13,12 @@ import org.jspecify.annotations.NullMarked;
+ import org.jspecify.annotations.Nullable;
+ 
+ @NullMarked
+-public final class BigDecimalValueRange extends AbstractValueRange<BigDecimal> {
++public final class BigDecimalValueRange extends AbstractValueRange<BigDecimal> implements ProgressionBacked<BigDecimal> {
+ 
+     private final BigDecimal from;
+     private final BigDecimal to;
+     private final BigDecimal incrementUnit;
++    private @Nullable NumericProgression<BigDecimal> progression;
+ 
+     /**
+      * All parameters must have the same {@link BigDecimal#scale()}.
+@@ -73,6 +74,14 @@ public final class BigDecimalValueRange extends AbstractValueRange<BigDecimal> {
+         return to.unscaledValue().subtract(from.unscaledValue()).divide(incrementUnit.unscaledValue()).longValue();
+     }
+ 
++    @Override
++    public NumericProgression<BigDecimal> progression() {
++        if (progression == null) {
++            progression = NumericProgression.ofBigDecimal(from, to, incrementUnit);
++        }
++        return progression;
++    }
++
+     @Override
+     public BigDecimal get(long index) {
+         if (index < 0L || index >= getSize()) {
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/BigIntegerValueRange.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/BigIntegerValueRange.java
+index 598740ffa6..5d82041fd4 100644
+--- a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/BigIntegerValueRange.java
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/BigIntegerValueRange.java
+@@ -12,11 +12,12 @@ import org.jspecify.annotations.NullMarked;
+ import org.jspecify.annotations.Nullable;
+ 
+ @NullMarked
+-public final class BigIntegerValueRange extends AbstractValueRange<BigInteger> {
++public final class BigIntegerValueRange extends AbstractValueRange<BigInteger> implements ProgressionBacked<BigInteger> {
+ 
+     private final BigInteger from;
+     private final BigInteger to;
+     private final BigInteger incrementUnit;
++    private @Nullable NumericProgression<BigInteger> progression;
+ 
+     /**
+      * @param from never null, inclusive minimum
+@@ -56,6 +57,14 @@ public final class BigIntegerValueRange extends AbstractValueRange<BigInteger> {
+         return to.subtract(from).divide(incrementUnit).longValue();
+     }
+ 
++    @Override
++    public NumericProgression<BigInteger> progression() {
++        if (progression == null) {
++            progression = NumericProgression.ofBigInteger(from, to, incrementUnit);
++        }
++        return progression;
++    }
++
+     @Override
+     public BigInteger get(long index) {
+         if (index < 0L || index >= getSize()) {
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ConcatSequence.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ConcatSequence.java
+new file mode 100644
+index 0000000000..521641662a
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ConcatSequence.java
+@@ -0,0 +1,87 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Node;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Or;
++
++import org.jspecify.annotations.NullMarked;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * The values of several disjoint sequences, one sequence after the other.
++ */
++@NullMarked
++final class ConcatSequence<T> implements ValueSequence<T> {
++
++    static <T> ValueSequence<T> of(List<ValueSequence<T>> segments) {
++        var nonEmptySegments = new ArrayList<ValueSequence<T>>(segments.size());
++        for (var segment : segments) {
++            if (segment.size() > 0L) {
++                nonEmptySegments.add(segment);
++            }
++        }
++        if (nonEmptySegments.size() == 1) {
++            return nonEmptySegments.get(0);
++        }
++        return new ConcatSequence<>(nonEmptySegments);
++    }
++
++    private final List<ValueSequence<T>> segments;
++    private final long[] offsets;
++    private final long size;
++    private final Or<T> node;
++
++    private ConcatSequence(List<ValueSequence<T>> segments) {
++        this.segments = segments;
++        this.offsets = new long[segments.size()];
++        var total = 0L;
++        for (var i = 0; i < segments.size(); i++) {
++            offsets[i] = total;
++            total = Math.addExact(total, segments.get(i).size());
++        }
++        this.size = total;
++        this.node = new Or<>(segments.stream().map(ValueSequence::node).toList());
++    }
++
++    @Override
++    public long size() {
++        return size;
++    }
++
++    @Override
++    public T get(long position) {
++        var segmentIndex = segments.size() - 1;
++        while (segmentIndex > 0 && offsets[segmentIndex] > position) {
++            segmentIndex--;
++        }
++        return segments.get(segmentIndex).get(position - offsets[segmentIndex]);
++    }
++
++    @Override
++    public long positionOf(@Nullable T value) {
++        for (var i = 0; i < segments.size(); i++) {
++            var position = segments.get(i).positionOf(value);
++            if (position >= 0L) {
++                return offsets[i] + position;
++            }
++        }
++        return -1L;
++    }
++
++    @Override
++    public long countInPrefix(Node<T> other, long prefixLength) {
++        var count = 0L;
++        for (var i = 0; i < segments.size() && offsets[i] < prefixLength; i++) {
++            count += segments.get(i).countInPrefix(other, prefixLength - offsets[i]);
++        }
++        return count;
++    }
++
++    @Override
++    public Node<T> node() {
++        return node;
++    }
++
++}
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/DifferenceValueRange.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/DifferenceValueRange.java
+new file mode 100644
+index 0000000000..f71c8d4608
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/DifferenceValueRange.java
+@@ -0,0 +1,43 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import java.util.List;
++
++import ai.timefold.solver.core.api.domain.valuerange.ValueRange;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.All;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Minus;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Node;
++
++import org.jspecify.annotations.NullMarked;
++import org.jspecify.annotations.Nullable;
++
++@NullMarked
++public final class DifferenceValueRange<T> extends AbstractCompositionValueRange<T> {
++
++    private final Minus<T> node;
++
++    public DifferenceValueRange(ValueRange<T> valueRange, ValueRange<T> excludedValueRange) {
++        super(List.of(valueRange, excludedValueRange));
++        this.node = new Minus<>(nodeOf(valueRange), nodeOf(excludedValueRange));
++    }
++
++    @Override
++    protected ValueSequence<T> buildSequence() {
++        return FilteredSequence.of(sequenceOf(memberList.get(0)), new Minus<>(new All<>(), nodeOf(memberList.get(1))));
++    }
++
++    @Override
++    Node<T> node() {
++        return node;
++    }
++
++    @Override
++    public boolean contains(@Nullable T value) {
++        return memberList.get(0).contains(value) && !memberList.get(1).contains(value);
++    }
++
++    @Override
++    protected String getOperatorSymbol() {
++        return "\\";
++    }
++
++}
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/FilteredSequence.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/FilteredSequence.java
+new file mode 100644
+index 0000000000..6fb4e6fe9b
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/FilteredSequence.java
+@@ -0,0 +1,93 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.And;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Node;
++
++import org.jspecify.annotations.NullMarked;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * The values of a base sequence, in their order, which a set expression contains.
++ */
++@NullMarked
++final class FilteredSequence<T> implements ValueSequence<T> {
++
++    static <T> ValueSequence<T> of(ValueSequence<T> base, Node<T> keep) {
++        if (base instanceof ListSequence<T> listSequence) {
++            var kept = new ArrayList<T>();
++            for (var value : listSequence.getValues()) {
++                if (ValueSetAlgebra.contains(keep, value)) {
++                    kept.add(value);
++                }
++            }
++            return ListSequence.ofDistinctValues(kept);
++        }
++        return new FilteredSequence<>(base, keep);
++    }
++
++    private final ValueSequence<T> base;
++    private final Node<T> keep;
++    private final And<T> node;
++    private long size = -1L;
++
++    private FilteredSequence(ValueSequence<T> base, Node<T> keep) {
++        this.base = base;
++        this.keep = keep;
++        this.node = new And<>(List.of(base.node(), keep));
++    }
++
++    @Override
++    public long size() {
++        if (size < 0L) {
++            size = base.countInPrefix(keep, base.size());
++        }
++        return size;
++    }
++
++    @Override
++    public T get(long position) {
++        return base.get(basePositionOfKept(position));
++    }
++
++    private long basePositionOfKept(long position) {
++        var low = 0L;
++        var high = base.size() - 1L;
++        while (low < high) {
++            var middle = (low + high) >>> 1;
++            if (base.countInPrefix(keep, middle + 1L) > position) {
++                high = middle;
++            } else {
++                low = middle + 1L;
++            }
++        }
++        return low;
++    }
++
++    @Override
++    public long positionOf(@Nullable T value) {
++        var basePosition = base.positionOf(value);
++        if (basePosition < 0L || !ValueSetAlgebra.contains(keep, value)) {
++            return -1L;
++        }
++        return base.countInPrefix(keep, basePosition);
++    }
++
++    @Override
++    public long countInPrefix(Node<T> other, long prefixLength) {
++        var length = Math.min(prefixLength, size());
++        if (length <= 0L) {
++            return 0L;
++        }
++        var baseLength = basePositionOfKept(length - 1L) + 1L;
++        return base.countInPrefix(new And<>(List.of(keep, other)), baseLength);
++    }
++
++    @Override
++    public Node<T> node() {
++        return node;
++    }
++
++}
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/IntValueRange.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/IntValueRange.java
+index 898f3120f1..7b6ba775c2 100644
+--- a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/IntValueRange.java
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/IntValueRange.java
+@@ -11,11 +11,12 @@ import org.jspecify.annotations.NullMarked;
+ import org.jspecify.annotations.Nullable;
+ 
+ @NullMarked
+-public final class IntValueRange extends AbstractValueRange<Integer> {
++public final class IntValueRange extends AbstractValueRange<Integer> implements ProgressionBacked<Integer> {
+ 
+     private final int from;
+     private final int to;
+     private final int incrementUnit;
++    private @Nullable NumericProgression<Integer> progression;
+ 
+     /**
+      * @param from inclusive minimum
+@@ -54,6 +55,14 @@ public final class IntValueRange extends AbstractValueRange<Integer> {
+         return (to - (long) from) / incrementUnit;
+     }
+ 
++    @Override
++    public NumericProgression<Integer> progression() {
++        if (progression == null) {
++            progression = NumericProgression.ofInt(from, to, incrementUnit);
++        }
++        return progression;
++    }
++
+     @Override
+     public boolean contains(@Nullable Integer value) {
+         if (value == null || value < from || value >= to) {
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/IntersectionValueRange.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/IntersectionValueRange.java
+new file mode 100644
+index 0000000000..164e41ad65
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/IntersectionValueRange.java
+@@ -0,0 +1,54 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import java.util.List;
++
++import ai.timefold.solver.core.api.domain.valuerange.ValueRange;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.And;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Node;
++
++import org.jspecify.annotations.NullMarked;
++import org.jspecify.annotations.Nullable;
++
++@NullMarked
++public final class IntersectionValueRange<T> extends AbstractCompositionValueRange<T> {
++
++    private final And<T> node;
++
++    public IntersectionValueRange(List<ValueRange<T>> memberList) {
++        super(memberList);
++        this.node = new And<>(this.memberList.stream().map(AbstractCompositionValueRange::nodeOf).toList());
++    }
++
++    @Override
++    protected ValueSequence<T> buildSequence() {
++        var firstSequence = sequenceOf(memberList.get(0));
++        if (memberList.size() == 1) {
++            return firstSequence;
++        }
++        var otherNodes = memberList.subList(1, memberList.size()).stream()
++                .map(AbstractCompositionValueRange::nodeOf)
++                .toList();
++        return FilteredSequence.of(firstSequence, new And<>(otherNodes));
++    }
++
++    @Override
++    Node<T> node() {
++        return node;
++    }
++
++    @Override
++    public boolean contains(@Nullable T value) {
++        for (var member : memberList) {
++            if (!member.contains(value)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    @Override
++    protected String getOperatorSymbol() {
++        return "∩";
++    }
++
++}
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ListSequence.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ListSequence.java
+new file mode 100644
+index 0000000000..97d34e0734
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ListSequence.java
+@@ -0,0 +1,95 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++
++import ai.timefold.solver.core.api.domain.valuerange.ValueRange;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Finite;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Node;
++
++import org.jspecify.annotations.NullMarked;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * A sequence which holds its distinct values in memory, in the order they were first produced.
++ */
++@NullMarked
++final class ListSequence<T> implements ValueSequence<T> {
++
++    static <T> ListSequence<T> ofRange(ValueRange<T> valueRange) {
++        var values = new ArrayList<T>();
++        var positionMap = new HashMap<T, Long>();
++        var iterator = valueRange.createOriginalIterator();
++        while (iterator.hasNext()) {
++            var value = iterator.next();
++            if (positionMap.putIfAbsent(value, (long) values.size()) == null) {
++                values.add(value);
++            }
++        }
++        return new ListSequence<>(values, positionMap, new Finite<>(valueRange));
++    }
++
++    static <T> ListSequence<T> ofDistinctValues(List<T> values) {
++        var positionMap = new HashMap<T, Long>();
++        for (var value : values) {
++            positionMap.put(value, (long) positionMap.size());
++        }
++        return new ListSequence<>(values, positionMap, new Finite<>(new ListValueRange<>(values)));
++    }
++
++    private final List<T> values;
++    private final Map<T, Long> positionMap;
++    private final Finite<T> finite;
++
++    private ListSequence(List<T> values, Map<T, Long> positionMap, Finite<T> finite) {
++        this.values = values;
++        this.positionMap = positionMap;
++        this.finite = finite;
++    }
++
++    List<T> getValues() {
++        return values;
++    }
++
++    @Override
++    public long size() {
++        return values.size();
++    }
++
++    @Override
++    public T get(long position) {
++        return values.get((int) position);
++    }
++
++    @Override
++    public long positionOf(@Nullable T value) {
++        var position = positionMap.get(value);
++        return position == null ? -1L : position;
++    }
++
++    @Override
++    public long countInPrefix(Node<T> node, long prefixLength) {
++        var end = (int) Math.min(prefixLength, values.size());
++        var count = 0L;
++        for (var i = 0; i < end; i++) {
++            if (ValueSetAlgebra.contains(node, values.get(i))) {
++                count++;
++            }
++        }
++        return count;
++    }
++
++    @Override
++    public Node<T> node() {
++        return finite;
++    }
++
++    @Override
++    public Iterator<T> iterator() {
++        return values.iterator();
++    }
++
++}
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/LongValueRange.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/LongValueRange.java
+index 52125c2a99..8dc40580dc 100644
+--- a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/LongValueRange.java
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/LongValueRange.java
+@@ -11,11 +11,12 @@ import org.jspecify.annotations.NullMarked;
+ import org.jspecify.annotations.Nullable;
+ 
+ @NullMarked
+-public final class LongValueRange extends AbstractValueRange<Long> {
++public final class LongValueRange extends AbstractValueRange<Long> implements ProgressionBacked<Long> {
+ 
+     private final long from;
+     private final long to;
+     private final long incrementUnit;
++    private @Nullable NumericProgression<Long> progression;
+ 
+     /**
+      * @param from inclusive minimum
+@@ -59,6 +60,14 @@ public final class LongValueRange extends AbstractValueRange<Long> {
+         return (to - from) / incrementUnit;
+     }
+ 
++    @Override
++    public NumericProgression<Long> progression() {
++        if (progression == null) {
++            progression = NumericProgression.ofLong(from, to, incrementUnit);
++        }
++        return progression;
++    }
++
+     @Override
+     public boolean contains(@Nullable Long value) {
+         if (value == null || value < from || value >= to) {
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/NumericProgression.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/NumericProgression.java
+new file mode 100644
+index 0000000000..fedba480c6
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/NumericProgression.java
+@@ -0,0 +1,168 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import java.math.BigDecimal;
++import java.math.BigInteger;
++import java.util.function.Function;
++
++import org.jspecify.annotations.NullMarked;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * The values {@code origin + index * step} for every index below {@code count},
++ * expressed as unscaled integers so that the ranges of all numeric types share one arithmetic.
++ */
++@NullMarked
++final class NumericProgression<T> {
++
++    record Numeric(BigInteger unscaled, int scale) {
++    }
++
++    static NumericProgression<Integer> ofInt(int from, int to, int incrementUnit) {
++        return new NumericProgression<>(BigInteger.valueOf(from), BigInteger.valueOf(incrementUnit),
++                (to - (long) from) / incrementUnit, 0, BigInteger::intValueExact,
++                value -> new Numeric(BigInteger.valueOf(value), 0));
++    }
++
++    static NumericProgression<Long> ofLong(long from, long to, long incrementUnit) {
++        return new NumericProgression<>(BigInteger.valueOf(from), BigInteger.valueOf(incrementUnit),
++                (to - from) / incrementUnit, 0, BigInteger::longValueExact,
++                value -> new Numeric(BigInteger.valueOf(value), 0));
++    }
++
++    static NumericProgression<BigInteger> ofBigInteger(BigInteger from, BigInteger to, BigInteger incrementUnit) {
++        return new NumericProgression<>(from, incrementUnit, to.subtract(from).divide(incrementUnit).longValue(), 0,
++                Function.identity(), value -> new Numeric(value, 0));
++    }
++
++    static NumericProgression<BigDecimal> ofBigDecimal(BigDecimal from, BigDecimal to, BigDecimal incrementUnit) {
++        var scale = from.scale();
++        return new NumericProgression<>(from.unscaledValue(), incrementUnit.unscaledValue(),
++                to.unscaledValue().subtract(from.unscaledValue()).divide(incrementUnit.unscaledValue()).longValue(),
++                scale, unscaled -> new BigDecimal(unscaled, scale),
++                value -> new Numeric(value.unscaledValue(), value.scale()));
++    }
++
++    private final BigInteger origin;
++    private final BigInteger step;
++    private final long count;
++    private final int scale;
++    private final Function<BigInteger, T> decoder;
++    private final Function<T, Numeric> encoder;
++
++    private NumericProgression(BigInteger origin, BigInteger step, long count, int scale,
++            Function<BigInteger, T> decoder, Function<T, Numeric> encoder) {
++        this.origin = origin;
++        this.step = step;
++        this.count = count;
++        this.scale = scale;
++        this.decoder = decoder;
++        this.encoder = encoder;
++    }
++
++    long getCount() {
++        return count;
++    }
++
++    T valueAt(long index) {
++        return decoder.apply(origin.add(step.multiply(BigInteger.valueOf(index))));
++    }
++
++    long indexOf(@Nullable T value) {
++        if (value == null) {
++            return -1L;
++        }
++        var numeric = encoder.apply(value);
++        var commonScale = Math.max(scale, numeric.scale());
++        var difference = rescale(numeric.unscaled(), numeric.scale(), commonScale)
++                .subtract(rescale(origin, scale, commonScale));
++        if (difference.signum() < 0) {
++            return -1L;
++        }
++        var quotientAndRemainder = difference.divideAndRemainder(rescale(step, scale, commonScale));
++        if (quotientAndRemainder[1].signum() != 0) {
++            return -1L;
++        }
++        var index = quotientAndRemainder[0];
++        return index.compareTo(BigInteger.valueOf(count)) < 0 ? index.longValue() : -1L;
++    }
++
++    boolean contains(@Nullable T value) {
++        return indexOf(value) >= 0L;
++    }
++
++    NumericProgression<T> prefix(long length) {
++        if (length >= count) {
++            return this;
++        }
++        return new NumericProgression<>(origin, step, Math.max(length, 0L), scale, decoder, encoder);
++    }
++
++    /**
++     * @return the progression made of the values of this progression which the other progression also contains,
++     *         in the representation of this progression
++     */
++    NumericProgression<T> restrict(NumericProgression<T> other) {
++        var commonScale = Math.max(scale, other.scale);
++        var thisOrigin = rescale(origin, scale, commonScale);
++        var thisStep = rescale(step, scale, commonScale);
++        var otherOrigin = rescale(other.origin, other.scale, commonScale);
++        var otherStep = rescale(other.step, other.scale, commonScale);
++        var gcd = thisStep.gcd(otherStep);
++        var offset = otherOrigin.subtract(thisOrigin);
++        if (offset.mod(gcd).signum() != 0) {
++            return empty();
++        }
++        var modulus = otherStep.divide(gcd);
++        var residue = modulus.equals(BigInteger.ONE) ? BigInteger.ZERO
++                : offset.divide(gcd).multiply(thisStep.divide(gcd).modInverse(modulus)).mod(modulus);
++        var lowerBound = ceilDiv(offset, thisStep).max(BigInteger.ZERO);
++        var otherEnd = otherOrigin.add(otherStep.multiply(BigInteger.valueOf(other.count)));
++        var upperBound = ceilDiv(otherEnd.subtract(thisOrigin), thisStep).min(BigInteger.valueOf(count));
++        if (lowerBound.compareTo(upperBound) >= 0) {
++            return empty();
++        }
++        var start = lowerBound.add(residue.subtract(lowerBound).mod(modulus));
++        if (start.compareTo(upperBound) >= 0) {
++            return empty();
++        }
++        var restrictedCount = upperBound.subtract(BigInteger.ONE).subtract(start).divide(modulus).add(BigInteger.ONE);
++        return new NumericProgression<>(origin.add(step.multiply(start)), step.multiply(modulus),
++                restrictedCount.longValue(), scale, decoder, encoder);
++    }
++
++    private NumericProgression<T> empty() {
++        return new NumericProgression<>(origin, step, 0L, scale, decoder, encoder);
++    }
++
++    private static BigInteger rescale(BigInteger unscaled, int fromScale, int toScale) {
++        return unscaled.multiply(BigInteger.TEN.pow(toScale - fromScale));
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (this == o) {
++            return true;
++        }
++        return o instanceof NumericProgression<?> that &&
++                count == that.count &&
++                scale == that.scale &&
++                origin.equals(that.origin) &&
++                step.equals(that.step);
++    }
++
++    @Override
++    public int hashCode() {
++        var hash = 1;
++        hash = 31 * hash + Long.hashCode(count);
++        hash = 31 * hash + Integer.hashCode(scale);
++        hash = 31 * hash + origin.hashCode();
++        return 31 * hash + step.hashCode();
++    }
++
++    private static BigInteger ceilDiv(BigInteger dividend, BigInteger positiveDivisor) {
++        var quotientAndRemainder = dividend.divideAndRemainder(positiveDivisor);
++        return quotientAndRemainder[1].signum() > 0 ? quotientAndRemainder[0].add(BigInteger.ONE)
++                : quotientAndRemainder[0];
++    }
++
++}
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ProgressionBacked.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ProgressionBacked.java
+new file mode 100644
+index 0000000000..abc891d51c
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ProgressionBacked.java
+@@ -0,0 +1,16 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import ai.timefold.solver.core.api.domain.valuerange.ValueRange;
++
++import org.jspecify.annotations.NullMarked;
++
++/**
++ * A {@link ValueRange} whose values form a {@link NumericProgression}.
++ */
++@NullMarked
++sealed interface ProgressionBacked<T> extends ValueRange<T>
++        permits BigDecimalValueRange, BigIntegerValueRange, IntValueRange, LongValueRange {
++
++    NumericProgression<T> progression();
++
++}
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ProgressionSequence.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ProgressionSequence.java
+new file mode 100644
+index 0000000000..55943da490
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ProgressionSequence.java
+@@ -0,0 +1,45 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Leaf;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Node;
++
++import org.jspecify.annotations.NullMarked;
++import org.jspecify.annotations.Nullable;
++
++@NullMarked
++final class ProgressionSequence<T> implements ValueSequence<T> {
++
++    private final NumericProgression<T> progression;
++    private final Leaf<T> leaf;
++
++    ProgressionSequence(NumericProgression<T> progression) {
++        this.progression = progression;
++        this.leaf = new Leaf<>(progression);
++    }
++
++    @Override
++    public long size() {
++        return progression.getCount();
++    }
++
++    @Override
++    public T get(long position) {
++        return progression.valueAt(position);
++    }
++
++    @Override
++    public long positionOf(@Nullable T value) {
++        return progression.indexOf(value);
++    }
++
++    @Override
++    public long countInPrefix(Node<T> node, long prefixLength) {
++        return ValueSetAlgebra.count(progression.prefix(prefixLength), node);
++    }
++
++    @Override
++    public Node<T> node() {
++        return leaf;
++    }
++
++}
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/SetValueRange.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/SetValueRange.java
+index ec39c4b20f..9b14962b33 100644
+--- a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/SetValueRange.java
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/SetValueRange.java
+@@ -43,9 +43,24 @@ public final class SetValueRange<T> extends AbstractValueRange<T> {
+ 
+     @Override
+     public boolean contains(@Nullable T value) {
++        if (value == null) {
++            return containsNull();
++        }
+         return set.contains(value);
+     }
+ 
++    /**
++     * A set which rejects a null lookup, such as a {@link java.util.SortedSet} whose order is undefined for null,
++     * does not hold null either, so the rejection answers the question.
++     */
++    private boolean containsNull() {
++        try {
++            return set.contains(null);
++        } catch (NullPointerException | ClassCastException e) {
++            return false;
++        }
++    }
++
+     @Override
+     public ValueRange<T> sort(ValueRangeSorter<T> sorter) {
+         var sortedSet = sorter.sort(set);
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/UnionValueRange.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/UnionValueRange.java
+new file mode 100644
+index 0000000000..30a18dfa56
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/UnionValueRange.java
+@@ -0,0 +1,62 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import ai.timefold.solver.core.api.domain.valuerange.ValueRange;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.All;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Minus;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Node;
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Or;
++
++import org.jspecify.annotations.NullMarked;
++import org.jspecify.annotations.Nullable;
++
++@NullMarked
++public final class UnionValueRange<T> extends AbstractCompositionValueRange<T> {
++
++    private final Or<T> node;
++
++    public UnionValueRange(List<ValueRange<T>> memberList) {
++        super(memberList);
++        this.node = new Or<>(this.memberList.stream().map(AbstractCompositionValueRange::nodeOf).toList());
++    }
++
++    @Override
++    protected ValueSequence<T> buildSequence() {
++        var segments = new ArrayList<ValueSequence<T>>(memberList.size());
++        var earlierNodes = new ArrayList<Node<T>>(memberList.size());
++        for (var member : memberList) {
++            var memberSequence = sequenceOf(member);
++            if (earlierNodes.isEmpty()) {
++                segments.add(memberSequence);
++            } else {
++                segments.add(FilteredSequence.of(memberSequence,
++                        new Minus<>(new All<>(), new Or<>(List.copyOf(earlierNodes)))));
++            }
++            earlierNodes.add(nodeOf(member));
++        }
++        return ConcatSequence.of(segments);
++    }
++
++    @Override
++    Node<T> node() {
++        return node;
++    }
++
++    @Override
++    public boolean contains(@Nullable T value) {
++        for (var member : memberList) {
++            if (member.contains(value)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    @Override
++    protected String getOperatorSymbol() {
++        return "∪";
++    }
++
++}
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ValueSequence.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ValueSequence.java
+new file mode 100644
+index 0000000000..55a8a08428
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ValueSequence.java
+@@ -0,0 +1,64 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import java.util.Iterator;
++import java.util.NoSuchElementException;
++
++import ai.timefold.solver.core.impl.domain.valuerange.ValueSetAlgebra.Node;
++import ai.timefold.solver.core.impl.domain.valuerange.util.ValueRangeIterator;
++
++import org.jspecify.annotations.NullMarked;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * The values of a composed value range in their produced order.
++ */
++@NullMarked
++sealed interface ValueSequence<T> permits ProgressionSequence, ListSequence, FilteredSequence, ConcatSequence {
++
++    long size();
++
++    T get(long position);
++
++    /**
++     * @return the position of the value, or a negative number if the sequence does not produce it
++     */
++    long positionOf(@Nullable T value);
++
++    /**
++     * @return how many of the first {@code prefixLength} values of this sequence the node contains
++     */
++    long countInPrefix(Node<T> node, long prefixLength);
++
++    Node<T> node();
++
++    default Iterator<T> iterator() {
++        return new PositionIterator<>(this);
++    }
++
++    final class PositionIterator<T> extends ValueRangeIterator<T> {
++
++        private final ValueSequence<T> sequence;
++        private final long size;
++        private long position = 0L;
++
++        PositionIterator(ValueSequence<T> sequence) {
++            this.sequence = sequence;
++            this.size = sequence.size();
++        }
++
++        @Override
++        public boolean hasNext() {
++            return position < size;
++        }
++
++        @Override
++        public T next() {
++            if (position >= size) {
++                throw new NoSuchElementException();
++            }
++            return sequence.get(position++);
++        }
++
++    }
++
++}
+diff --git a/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ValueSetAlgebra.java b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ValueSetAlgebra.java
+new file mode 100644
+index 0000000000..ce006ec89b
+--- /dev/null
++++ b/core/src/main/java/ai/timefold/solver/core/impl/domain/valuerange/ValueSetAlgebra.java
+@@ -0,0 +1,213 @@
++package ai.timefold.solver.core.impl.domain.valuerange;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++
++import ai.timefold.solver.core.api.domain.valuerange.ValueRange;
++
++import org.jspecify.annotations.NullMarked;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * Set expressions over value ranges, and the number of values of a {@link NumericProgression}
++ * which such an expression contains, computed without visiting the values of the progression.
++ */
++@NullMarked
++final class ValueSetAlgebra {
++
++    sealed interface Node<T> permits Leaf, Finite, All, And, Or, Minus {
++    }
++
++    record Leaf<T>(NumericProgression<T> progression) implements Node<T> {
++    }
++
++    record Finite<T>(ValueRange<T> valueRange) implements Node<T> {
++    }
++
++    record All<T>() implements Node<T> {
++    }
++
++    record And<T>(List<Node<T>> members) implements Node<T> {
++    }
++
++    record Or<T>(List<Node<T>> members) implements Node<T> {
++    }
++
++    record Minus<T>(Node<T> included, Node<T> excluded) implements Node<T> {
++    }
++
++    private record CountKey(NumericProgression<?> progression, Node<?> node) {
++    }
++
++    private ValueSetAlgebra() {
++    }
++
++    static <T> boolean contains(Node<T> node, @Nullable T value) {
++        return switch (node) {
++            case Leaf<T> leaf -> leaf.progression().contains(value);
++            case Finite<T> finite -> finite.valueRange().contains(value);
++            case All<T> all -> true;
++            case And<T> and -> and.members().stream().allMatch(member -> contains(member, value));
++            case Or<T> or -> or.members().stream().anyMatch(member -> contains(member, value));
++            case Minus<T> minus -> contains(minus.included(), value) && !contains(minus.excluded(), value);
++        };
++    }
++
++    static <T> long count(NumericProgression<T> progression, Node<T> node) {
++        return count(progression, node, new HashMap<>());
++    }
++
++    /**
++     * Equal subexpressions recur across the segments of a union,
++     * so every result is memoized for the duration of the top-level count.
++     */
++    private static <T> long count(NumericProgression<T> progression, Node<T> node, Map<CountKey, Long> memo) {
++        if (progression.getCount() == 0L) {
++            return 0L;
++        }
++        var key = new CountKey(progression, node);
++        var memoized = memo.get(key);
++        if (memoized != null) {
++            return memoized;
++        }
++        var count = switch (node) {
++            case Leaf<T> leaf -> progression.restrict(leaf.progression()).getCount();
++            case Finite<T> finite -> countFinite(progression, finite, List.of());
++            case All<T> all -> progression.getCount();
++            case And<T> and -> countIntersection(progression, and.members(), memo);
++            case Or<T> or -> countUnion(progression, or.members(), memo);
++            case Minus<T> minus -> count(progression, minus.included(), memo)
++                    - count(progression, new And<>(List.of(minus.included(), minus.excluded())), memo);
++        };
++        memo.put(key, count);
++        return count;
++    }
++
++    private static <T> long countUnion(NumericProgression<T> progression, List<Node<T>> members,
++            Map<CountKey, Long> memo) {
++        var distinctMembers = distinct(members);
++        if (distinctMembers.isEmpty()) {
++            return 0L;
++        }
++        for (var member : distinctMembers) {
++            if (coversAll(progression, member)) {
++                return progression.getCount();
++            }
++        }
++        var first = distinctMembers.get(0);
++        if (distinctMembers.size() == 1) {
++            return count(progression, first, memo);
++        }
++        var rest = new Or<>(distinctMembers.subList(1, distinctMembers.size()));
++        return count(progression, first, memo) + count(progression, rest, memo)
++                - count(progression, new And<>(List.of(first, rest)), memo);
++    }
++
++    private static <T> long countIntersection(NumericProgression<T> progression, List<Node<T>> members,
++            Map<CountKey, Long> memo) {
++        var flattened = new ArrayList<Node<T>>();
++        for (var member : distinct(flattenIntersection(members))) {
++            if (!coversAll(progression, member)) {
++                flattened.add(member);
++            }
++        }
++        if (flattened.isEmpty()) {
++            return progression.getCount();
++        }
++        for (var member : flattened) {
++            if (member instanceof Finite<T> finite) {
++                var others = new ArrayList<>(flattened);
++                others.remove(finite);
++                return countFinite(progression, finite, others);
++            }
++        }
++        var first = flattened.get(0);
++        var rest = flattened.subList(1, flattened.size());
++        return switch (first) {
++            case Leaf<T> leaf -> count(progression.restrict(leaf.progression()), new And<>(rest), memo);
++            case Or<T> or -> countUnion(progression, or.members().stream()
++                    .map(member -> (Node<T>) new And<>(prepend(member, rest)))
++                    .toList(), memo);
++            case Minus<T> minus -> count(progression,
++                    new Minus<>(new And<>(prepend(minus.included(), rest)), minus.excluded()), memo);
++            case Finite<T> finite -> throw new IllegalStateException("Impossible state: finite member not handled.");
++            case All<T> all -> throw new IllegalStateException("Impossible state: universal member not flattened.");
++            case And<T> and -> throw new IllegalStateException("Impossible state: nested intersection not flattened.");
++        };
++    }
++
++    private static <T> List<Node<T>> flattenIntersection(List<Node<T>> members) {
++        var flattened = new ArrayList<Node<T>>(members.size());
++        for (var member : members) {
++            if (member instanceof And<T> and) {
++                flattened.addAll(flattenIntersection(and.members()));
++            } else if (!(member instanceof All<T>)) {
++                flattened.add(member);
++            }
++        }
++        return flattened;
++    }
++
++    /**
++     * @return true if every value of the progression belongs to the node,
++     *         which makes the node redundant in an intersection and decisive in a union
++     */
++    private static <T> boolean coversAll(NumericProgression<T> progression, Node<T> node) {
++        return switch (node) {
++            case All<T> all -> true;
++            case Leaf<T> leaf -> progression.restrict(leaf.progression()).getCount() == progression.getCount();
++            case And<T> and -> and.members().stream().allMatch(member -> coversAll(progression, member));
++            case Or<T> or -> or.members().stream().anyMatch(member -> coversAll(progression, member));
++            default -> false;
++        };
++    }
++
++    private static <T> List<Node<T>> distinct(List<Node<T>> members) {
++        var seen = new HashSet<Node<T>>(members.size());
++        var distinctMembers = new ArrayList<Node<T>>(members.size());
++        for (var member : members) {
++            if (seen.add(member)) {
++                distinctMembers.add(member);
++            }
++        }
++        return distinctMembers;
++    }
++
++    private static <T> List<Node<T>> prepend(Node<T> first, List<Node<T>> rest) {
++        var list = new ArrayList<Node<T>>(rest.size() + 1);
++        list.add(first);
++        list.addAll(rest);
++        return list;
++    }
++
++    private static <T> long countFinite(NumericProgression<T> progression, Finite<T> finite, List<Node<T>> others) {
++        var countedIndexSet = new HashSet<Long>();
++        var count = 0L;
++        var iterator = finite.valueRange().createOriginalIterator();
++        while (iterator.hasNext()) {
++            var index = progression.indexOf(iterator.next());
++            if (index < 0L || !countedIndexSet.add(index)) {
++                continue;
++            }
++            var value = progression.valueAt(index);
++            var contained = finite.valueRange().contains(value);
++            for (var other : others) {
++                if (!contained) {
++                    break;
++                }
++                if (!contains(other, value)) {
++                    contained = false;
++                    break;
++                }
++            }
++            if (contained) {
++                count++;
++            }
++        }
++        return count;
++    }
++
++}

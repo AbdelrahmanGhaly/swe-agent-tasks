@@ -1,0 +1,1427 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..3d4ba347
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() { echo "usage: $0 [--output_path <path>] base|new" >&2; exit 2; }
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new) MODE="$1"; MODE_COUNT=$((MODE_COUNT + 1)); shift ;;
++    --output_path) shift; [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }; OUTPUT_PATH="$1"; shift ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    *) echo "unknown argument: $1" >&2; usage ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++[ -n "$OUTPUT_PATH" ] || OUTPUT_PATH="$(pwd)/test-results-$MODE.xml"
++case "$OUTPUT_PATH" in /*) ;; *) OUTPUT_PATH="$(pwd)/$OUTPUT_PATH" ;; esac
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++rm -f "$OUTPUT_PATH"
++
++cd "$(dirname "$0")" || exit 1
++
++NEW_TESTS=(
++  vivisect/tests/test_elfversions_c78c6d.py
++)
++
++PYTEST=(python3 -m pytest -p no:cacheprovider -o addopts= -o "python_files=test*.py" -v --junitxml="$OUTPUT_PATH")
++
++LOG="$(mktemp 2>/dev/null || echo "$OUTPUT_PATH.log")"
++
++if [ "$MODE" = "new" ]; then
++  timeout 1800 "${PYTEST[@]}" "${NEW_TESTS[@]}" 2>&1 | tee "$LOG"
++  STATUS=${PIPESTATUS[0]}
++else
++  IGNORES=()
++  for t in "${NEW_TESTS[@]}"; do
++    IGNORES+=("--ignore=$t")
++  done
++  # vtrace and vdb tests start child processes and attach to them with ptrace.
++  # cobra and testremote start localhost TCP servers on fixed ports from worker threads, so a socket
++  # that is still closing can make a later bind fail with "Address already in use" from run to run.
++  # testcconvs.py holds no tests and its TestCase subclass overrides __init__ without arguments, so it cannot be collected.
++  timeout 3000 "${PYTEST[@]}" "${IGNORES[@]}" \
++    --ignore=vtrace --ignore=vdb --ignore=cobra --ignore=vivisect/tests/testremote.py \
++    --ignore=vivisect/tests/testcconvs.py . 2>&1 | tee "$LOG"
++  STATUS=${PIPESTATUS[0]}
++fi
++
++if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  DETAIL="$(tail -n 200 "$LOG" 2>/dev/null | LC_ALL=C tr -cd '\11\12\15\40-\176' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++  cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="utf-8"?>
++<testsuites><testsuite name="pytest" tests="1" failures="1" errors="0" time="0">
++<testcase classname="test.sh" name="${MODE}_suite"><failure message="no test results">pytest exited with status ${STATUS} before reporting any test.
++${DETAIL}</failure></testcase>
++</testsuite></testsuites>
++XMLEOF
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++rm -f "$LOG"
++exit "$STATUS"
+diff --git a/vivisect/tests/test_elfversions_c78c6d.py b/vivisect/tests/test_elfversions_c78c6d.py
+new file mode 100644
+index 00000000..17db451b
+--- /dev/null
++++ b/vivisect/tests/test_elfversions_c78c6d.py
+@@ -0,0 +1,1351 @@
++import io
++import os
++import zlib
++import base64
++import shutil
++import tempfile
++import unittest
++
++import Elf
++import vivisect
++import vivisect.const as v_const
++import vivisect.analysis.generic.linker as v_linker
++
++FIXTURES = {
++    "libver2.so": (
++        "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"
++    ),
++    "libver2_i386.so": (
++        "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"
++        "ic/VEv79G21FaX0="
++    ),
++    "libver2_s390x.so": (
++        "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"
++    ),
++    "libver1.so": (
++        "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"
++        "cPvLffTrtjv88yL9/wehXCP/"
++    ),
++    "libver3.so": (
++        "eNrtm89rE0EUx9/uaps2trZaRalCFMWKdG2ih/g7tW1aUYtGKwrVbdJsTaTJSpJqK4giIhVBBT14EQT/AY+C3rx6FP8Dj2IV"
++        "/HFQ4+zum2R23G0VVBDeJ8x+d97M2/nRmUCzb64MHEqqigIcDfZCPQeQQI3HRFscmth1KbQ6dRdBMM81r0KbK7bfYiEv6zrw"
++        "qujntBdBu6SPwKuiX4Od3YrmfV6dA69yP/U3/UKoizDFVZw/STeAV/kcHnlTyc43viC/o8yvAX4dPt0pbO9Xx6cI7XY46wVg"
++        "cHgEEknt/ts7468vf+48fsr8YH1pWX0dsFwR5r9//wPHXVw3s+XZsJ2ejc2GX614eOZe+8MzQf2218wyaIQwDiAs2UGyK2hf"
++        "KdnXsNQO76vy85cH2CGTLsGEZcFkPnPBLOllC04MpI4ZUb3HvYmxG3u9XNXA/qi19t2PNfiyqQPbbRL6prLrk00zzbxsuVBm"
++        "P+XJereM9zkk1CEIgiAIgiAIgvgdRoZuvnlq/7Ny+oVzq9RvNeeWpoggCIIgCIIgCIIg/nuUTm2X/S7ZeT0/V60mmISZjjFd"
++        "yfQq1uPvIJVLKVCm25TOJY2hu4r7TtJOT99Vq8671d7WthtqX0tDklXAst0sPZ6nfJSl2wHlBEEQBEEQBEEQBPE3aEXlMbof"
++        "v1ctW8cwoHcx2rswnp3HXD/A8mbMb0Tl8carUL9W8Xno/w3zPDx+DvPD2r8Z72Bf385IV7+ZyaeLkWhMj+k93dHtW7JmJhqb"
++        "im5G0zy/H4Adx+0TLx1gt+dD9YnT7nCe1VyLO+esda6hehw80oPPkePAd4B/fHgS/OPDD4J/vPeeAPtx8I8nx7jwbfo4FM2L"
++        "Rr5wfhKM/lPDvYcP9IFhDA6PGANDRjLVe3jAGOpPgTWZdStNWFaiFkluZxK1cHI75Bz08kyhks4wrZRczfG7olUx9bPFKT0z"
++        "lZ/Mduez4ORy6XIO9OxMkXm6Wim5JayD5bxV9GQM5lUxpyugmzljopQumEYuW6rnnCekC/lx0MetQsEsVv7IuutkqRGgFicf"
++        "dD6ivpa86Cx9YnuF+/P9yTWOdr6N5N+S4rW16N2/XO8K7SqCP9/HCXy2Kn0fcN3os09EhliqCv3n+53rEqn/qqQj+N1RG7/m"
++        "1VGh/5rP+LNQP5PhEHD+Jqj/54CfX0AiXl3o7zct+XdFvDot1Zf7fw37XjtWxM+t4DmWOandkDTMW9j+T19taNgUMH5RVZ91"
++        "3YX+EazYgutcXj9NQt896yLq6skF5r89wP8R+t9fwP8H3BX2uQ=="
++    ),
++    "libver4.so": (
++        "eNrtm89rE0EUx99u0nbbaG2lFrEqUYtW1LWJPRQtmpL+iKBFIxUq2jVpVhNpkpqmmvZiEJGKICIevBQFL14Ej3pV9OBBPPgf"
++        "iODNetCTGmd33yS7426roIL4PmXynXkzb35ld6DZt5cGDw3JkgQcH+yHWgkggloO22290Mg+V0Gz2dYP3ih+p0KLJYZfna0s"
++        "6iZwqt3P7CqIdkHvgVPtfvVGcTeaDzh1EZzK/eRf9FNQ/Zh6Zassaic4lW/PkXfF1FLr8/I7yvzq4efh2x3H8X52fZJt3Dbz"
++        "egEYHhkFJfjqjtI99vzUxMO3V7SrOwo9L+8C1ku2/Y+0PFEUySr7sK/N9+cDW1h6s2Zh/PWL+cCt1oXxNesWxpeav+G/Ghqq"
++        "CwkI9oBg38BSK3ysiP3UYft2oX2bR/utHnY4P1OCucQUTGaSF/RCjzqdh+OD8WNaSO22MmGe2cMyxurLfrYDvrJs7qWEf6tO"
++        "PF1hjL2epUbbmmT2+WjbbBOva7PV+Vjto81WXSeuVRHa+I02m6w2fB0KtiUIgiAIgiAI4v9gNHbt3WPjn4JTz8zsxlq2y8zS"
++        "FhEEQRAEQRAEQRDEP4/U4dtnPDM0n8UuVioRJgGmp5m2My1ju+qzxLk4SKUWqWNFg3JTsp5FGunxh0rFfHba39xyVY6urB9i"
++        "DbCuj6X7S9SfZOmGRz1BEARBEARBEARB/AmaUXns7advlbyhpzFuuw7tMQxe5jHX97C+CcsYTl2NJ16L+qVi9TeP/l+xzOO4"
++        "F7Fc8v2d9Q5Ho3uDXQN6MpPIBUNhNax27wr17EjpyVB4JrQdTUv8fmDO3SUe2sMeMH2aqvHlYPt9QXaJw16PdjHOuxPtYpz3"
++        "TvNTqcXNI1Fwj9s2puEW/30I3OPLxzz6OethT4J7PHo1TnwCtIGxkf7DB6NG+LiWn0wZoeRVzekXQdOGR0a1wZg2FO8/PKjF"
++        "BuJG00g1qpy1izhDzENojdQCztXp2WwxkWRaLFia5rlcvqirZ3MzanImM5nalUmBWUonptOgpmZzzNPSYsGqYROfzuRzjoLG"
++        "vIp6qQiqntbOFBJZXUunCrWS2UMim5kAdSKfzeq54m+5fjtYagDrPQ0Dr/csatekE5Wlz+ye4/78Pufah3Z+O4q/SfXidyoL"
++        "5wDXB7ZxJZs/Pw8i2LcsnCtcd7vcb3ZiLFVs8+fnBtdmYf6yoKN4BvEyP5e4lm3z97usPwW1dztMPN7j8Zr/OeDvNyBBpy73"
++        "/ZUE/66gU0tCe3H+l3HufH+q77/gxi8K4yrCMq/j+D8ckWjY5rF+u8ou13UX+h/BhitxbPH6abTN3bEvIUunltn/Vg//9+h/"
++        "exn/74yoCfw="
++    ),
++    "libver5.so": (
++        "eNrtm89PE0EUx99uKbQUEJQYEkjswQSMYW0b1EaNgm1pTYRgTQ0edGlpsTW0m7TFFC8mHgzGSxP14MF/QC8cSbyQeNS7/4Ak"
++        "Xoz1oF7UdX+8obPrLmBi1Jj3IdPvvpl9O7857L65k7g4LQoCMDxwFtoWwCTqRpjPi4Jf+90Hfca9HeDOnMeq0G+K7uflbLse"
++        "BKvyfkZ9Qcy3aQOsyvt16uYxzD5n1RZYlfmJv+jnQ+3AFBVN266HwapsDOe26vmd+jcCVmV+lzS/Ttg7bLjTWN9e+ydw9Q4a"
++        "6wUgOZuBx0+W3r955R1qHiql335pnXy2fqIJWC5w4x8/b4xQh4BlOmu1tcCLhbXAw4Gn193aq9+/H7q2Gx7AfC/mB2z5B7Q0"
++        "AB/Vnx60pCiQy1ZhuZS7VahKNQWuJNKX5bAUMmZbABHrM/+U5Gv/II63n2uLfuf66Gr3IFcfQRAEQRAEQRDEv0wmdX9rI6Jd"
++        "XHtpXJ4xLmlcCIIgCIIgCIIgCOJ/Qhj2nNa/bRpfPVuqGtUkoOk8lrPvm8LtNAiNfmG4p8vXFMzvoXra/KCqxjfXqb7+e2Ks"
++        "t3NauwHL9HcJz13KCYIgCIIgCIIgCOJv0ofKYn0/fVcVXRcwbtuL+S20Wcx1E+1utFl8NotHHkL9qprPG8Lg529oi+y5aPd4"
++        "/kx/k7HYqeBYvJArZSvBcESKSKHx8MTRfCEXjqyEj2DWDu8PQI8Fd4izdskPGD7d2/HlYHnP4GvHuyOj4BzHrTfJKR58Apzj"
++        "wTHe+7i0CHL86uzUzIUYyHJyNiMnUvJ0emomIafi6XYsOAsTB6m2Wq5nc5rWq6YW2VVFqRekG5UVKbdSWs6Pl/JgWMVsrQhS"
++        "frWieZpar5olWgNqJaViMWTNq15o1EEqFOWlarZckIv5atsynpAtlxZBWlTK5UKl/lvmfVhLXdy6czuf0J5LK5KWPmtrlfmz"
++        "/cGULRm2jO3vfKI4N6Jt/zBd4OoVOH+2jybx2aJtPzIdcVinPCktqVz72X5j6rO1X7RpBvcus9l+Zhrl2i869D8P7TMRBi7n"
++        "X9zafxPYOQQkaNWRXeavYfMPBq06b7vf3v672PbtYz3s3AieI2nZ6vXZuvkA6w85bWzc907951V0WNdj6L+Jdi/+z7avHz/X"
++        "dp53Iev8uY3/gIt/EM9JPdrF/weixtGh"
++    ),
++    "libdecoy.so": (
++        "eNrtm8trE1EUh89M+kiTNrZSpdBSIgitSMemKEQttjVJG8GWGom0Qp3mMTWRJoEkLYkggqhE3BR0686VblxJwU3Bvf+Cq6K4"
++        "MeJjpR1nJuc2d6aZtoKoyPnKzW/OvXPmvgPNnHs7dHFSFARgOOAc1C2AcdR1H5/nhzbt8wB4jHubwJ5Zh1mhsya6XzNnW/Uw"
++        "mJX3M+rzYr5FS2BW3q9FN09g9phZq2BW5if+op8TtQmTX6zZVj0KZmVjOLtZTO7Wvz4wK/O7pPm1wP5hwx3B+vbbP4Grt9tY"
++        "LwBTM1EYdVVufXj6bHXrc2q+Gnr3Rr368i1gucCNf/C8MUJNApbpVAoV96vFivtR15Nrdu3V7z8IrdsNd2N+M+a7LfmHtNQF"
++        "n9QdD1rK5SAey8NyOp5UErmyVMjBlVDksuyTho35Fo05F/BvbOGLuxvHu41ri6h9vhgou7q5+giCIAiCIAiCIP5louEHm+t3"
++        "tf/EFl4bl/eMSxoXgiAIgiAIgiAIgvifEHodZ/V3m8Zr6aqq+jVxazqH5ez9pnAzAkKpU+htb3WuCbX3oXra+KiqxjvXCU/n"
++        "fTHQ0TKp3YBlo1p6blNOEARBEARBEARBEH8TDyqL9f26peZ0XcS47WbMr6LNYq7X0Hah3Y/K4pF7UL+rtef1YPDzD7RF9ly0"
++        "PY4/09+pQOCMdzCoxNOxrNc3Io1Iw0O+k8eTStw3suI7hlm7/H4Aeix4gzhrm/x2w8e1HV/OqMVPO+vx7sggNI7j1o8jNIoH"
++        "PwWN48Hr8d4JkIPzMxPTFwIgy1MzUTkUlicjE9MhORyM1EPBWZw4SIVyphiLa1rM1zTFrrK5oiJdz65I8ZX0cnIonQTDSsUK"
++        "KZCS5azmWdNivlayquQL6VzWZMiaV1EpFUFSUvJSPpZR5FQyX7eMJ8Qy6QRIiVwmo2SLv2Pee7XUyq07u/MJ9bk0I2npm7ZW"
++        "mT/bH0zZkmHL2Pqbjx/nRrTsH6aLXL0C58/20Tg+W7TsR6b9DdYpT1hLKtd+tt+YOi3tFy0axb3LbLafmfq59osN+p+E+pkI"
++        "A5vzL3btvwHsHALiNWvfHvNXsvh7vWads9xvbf8dbPv2sR52bgTPkVQt9Tot3XyI9e/4asGMAZv+8yo2WNeD6L+Bdgd+Z1vX"
++        "TxvXdp736H96j/HvsvE/guekHu/h/xPJ99V4"
++    ),
++    "libplain.so": (
++        "eNrtm89rE0EUx99ufyWmLdVWUaqQg2DEdm2Kh6CiremPCDZoIFKhst10NyaQ7EqyldSL4kHam3rx7EnBf0DwUvDisf+DFI/q"
++        "QS+i6+zmTTO77taKICjvA5Pvzpt5mZm3kxx239ybvTInSxJwuuACdGoAU6ittGjLQJx9DkC/17cbonkn+xWG2uL69Qj1oB4C"
++        "v4p+3nhJtAe0BX4V/XrduZ/GNVz06yb4lfvJv+kXQ+3GksF1B/U4+JXH8Oq2re+2vqPgV+53jfn1wt7h4S7geHtdnySMO+Lt"
++        "F4D5fBHePvt6P37k+dOx65Wlb8ceP0g8eW/y+ElC/Lsvtd0lbHu9vJ7YaK4noubp7pED7DOBE04I83DtELBD2bKgpDWgVi3d"
++        "MRpK0wKCIAiCIAiCIAiCUcxtbL/S2cXNN97lmOReUlwIgiAIgiAIgiAI4n9CGu06575L9l5Lf3ScDJME00VsH+H97hZAag1J"
++        "o/19sUdS+/2zWzY/OI737nV6cOihnB3onWMdsO08Ky8j2gmCIAiCIAiCIAjiX2IQNY76+bvjZRwvY553D9q3sM5ztNexvg/r"
++        "w6g8j/nwX5r/fDZ7NpmaMUpVzUymJ5VJZWI8feaUbpTSk6vpk2ja5fkBuLngn5ywtjB7v+cT28kv5xzk0Un67SkIz/Meg/C8"
++        "cDfv+3ZNq5rKCqgzN/LTC5ezoKrz+aI6m1PnCtMLs2puprCTJg5Kc61uayWmdqOtFX5lWrah3DJXldJqtaaPV3XwahWtWQFF"
++        "XzOZZ1vtBii20bJBMSpquaHVDbWiNzo1r5dWr66AsmLV64Zp//F9G2WlD/C5DUSfL+jcCz8KK18cx+L+fL9yTaG9CzX4zCaD"
++        "MZcD+5lrThhXEvz5vp7C75YDvw+uwyH7TCQHnTMFHhHnR6L882jj40eds4iK31LAP5n062KgfzB+ZZw7j+/OuQs8h7EZGDcW"
++        "WKaF4//000TDiYj1iyqH7KsU+r8Q/o96Qu5fXJi7yNaEbxqR8d8f4Q94zqj1C/8fx+Cm1A=="
++    ),
++    "libother.so": (
++        "eNrtm0FrE0EUx99u2jQxbUilFaEechAasV2bIhhUtDVtmoINGgi0oGw32a2JJFlJNpB68SbtTfwA3kRBr4IiSKEnPfXoF+hZ"
++        "PejRdXfzppldd2tFEJT3g8l/5828zMzbSQ67bx4sXs+JggCMEFyBfg1gDrWb5m0ZiFqfIzDs9B2AYPZFt0KiJ7bfIFf36glw"
++        "K+/njJdEu0e74FbeL2zP/Ryu4apbd8CtzE/8Tb8I6gCWDK7bq6fBrSyGN/YN9bD1nQK3Mr+bll8Yjg4LdxHHO+r6BG7cMWe/"
++        "ACwVSvByefTu41cXPu6m4x+evH/39M2k8YzFT+DiP3Ct5y5g29v1rdh2eysWNE97jxy3PmM44Rg3D9sOHjts6DqUlRbUa2Xd"
++        "qGotqa0DQRAEQRAEQRAEAaX89v5r1bq4vetcTgn2JcWFIAiCIAiCIAiCIP4nhInQJftdsvNa+rNpZiyJWbqK7WOs3/0iCN2E"
++        "MDE8FHkk9N4/22Xnk2k6717n44mHYnYknLM6YNtlq7wIaCcIgiAIgiAIgiCIf4k4ahT163fTyTdexzzvQbTvYZ3laG9h/RjW"
++        "x1FZHvPJvzT/pWz2YjK1oJVrSjOZnpVmpZnp9PmzqlZOz3bSZ9B0yPMDsHPBv5h+bX72YccncpBfDq71h/v57kgK/PO8p8A/"
++        "L9zO+75XV2pNqQLywlphfmU5C7K8VCjJi3k5V5xfWZTzC8WDNHGQ2psNQylbarR6WmVXTd3QpDvNjlTu1OrqdE0Fp1ZV2lWQ"
++        "1M2m5dlTowWSoXUNkLSqvNFSGppcVVv9mtNLadQqIFX0RkNrGn983yasMgT43AaCzxf074UbySrfTFNn/my/Mk2hPYTqfWaT"
++        "wZiLnv3MNM+NK3D+bF/P4XeLnt8H03GffcaTh/6ZAoeA8yNB/gW0sfGDzlkExe+Wxz+ZdOuqp783fhs4dxbfg3MXeA5jxzNu"
++        "xLNMHcf/6aeJhsmA9fMq+uyrFPo/5/6PBn3uX5SbO8/ejGsagfEfDfAHPGfU/YX/D1wuqF8="
++    ),
++    "libalias.so": (
++        "eNrtm01ME0EUx99u+SgUEASMBg6NkYAaVtp4aMQIyEcxEaI1ECTK0tLF1vTDtIUULxoPBOOFRE24cPHqQY4mGmPi1aPx6EkS"
++        "buJBT2rd2X3Tzi5dPhKjiXm/Zvc/82bfzkdnNmn3zb3hyyOyJAHHBReglAPoRw34RVsAavTzIWgwrq0AZ167rAqNpjC/SiFv"
++        "1yNgVdHPqM+LdpvmwaqiXxXLnkFzn1W3warcTz6gnxu1Ao+AjONn0xNgVT6GVzZz0d361w5W5X5Xdb8q2D98uENY3377Jwn1"
++        "thjzBSA4PgFzy8emZ+ZfRE9tPXW/2fr8cfpTQxCwXBLGf+jimuEuzpuV7IqHHa9mVzwfWtdnHjetzzi1m82Zw1Bd7IBnD7uE"
++        "do/NzsavCb4W7PdvdrBDJJyB+XQaEvHIopZRsmmYHA5dU31Kj5nw6wk2X+67gH3kYv3mJx18X9OC9dYIbZP180bnUi0vaxbK"
++        "2F02jptlvM1u4RqCIAiCIAiCIIiDMDH6cPOl/rMJbr4zki4jSeNCEARBEARBEARBEP8TUpurl71XNN5XbhcKAV08uk5hOX/3"
++        "KN0NgZRvlNrqqt2rkvkukh1vvxQKxjvVgYbGZXmwvmpEvwDLzuvHc4dygiAIgiAIgiAIgviXNKDyGN1vvwppprMY0FuJ9i6M"
++        "Z+cx12tYXov5DlQeb3wU9UcB74f+PzHPw+O3MT/u+jv9DQ4OnvN2DWmReDjl9fkVv9LT7Tt7OqpFfP4F30k07fL/AbA47jLx"
++        "0g72OsOnthhfzmk1zu5SvDsfZ+O/iZ1x3X4Hey+UjwMfdbCPQfl47z4H+ySUjydnceHhRDycVeZAHbo+PjB2aRBUNTg+oQ6P"
++        "qiOhgbFhdXQoxELIVeM6IxVP3kmwRH8xlpxl+osB5SzoHJTsUjIXjuiay5ga46lUOqcpt1ILSmQhnoh2x6Ng5GLhbAyU6FJK"
++        "9zQ1lzFLFrVMNp5OWTKq7pXT8jlQtJg6nwknNTUWzZRyxh3CyfgcKHPpZFJL5f7AvGvTj2qAYpy80/6I0lyyoujHd32tcH++"
++        "PrkG0M6Xkf0/pwB+d7Jt/XJdFeqVBH++jvvx3rLtecC1o8w6EWHzsSC0n693rnW29ss2ncBnR7H/LqveENrvKtP/KJT2ZBg4"
++        "7L9xav9t4PsXEK9V2/f4/vI2f6/XqlO26+3tf4BtL24r4vtWcB/Ltq1et62bj7D+HY82NHQ69F9Uucy87kJ/L15Yj/PcPn9q"
++        "hLZb5oXP1Ok9xr/Jwf8Z+j/Zw/831w/qGA=="
++    ),
++    "libabs.so": (
++        "eNrtm8trE1EUh89M+kjTh2kNUqjQKGIr0rEpRUMFTU3TRqihjUToQqdJMzWRJoFkWho3gguxFKGg4EoE/wKXXYpudCtuuyy4"
++        "M0V0pY7zODe5M02aCiIq5ws3v5w798x9B5I5915kdloUBGC44BLULIAQ6naAzwtCh/5+BHrMsi3QmDmXXcFrieHXytlO7QS7"
++        "8n5mfX7Md+gc2JX3azPMc5h92a4VsCvzE3/Rz43agikoWrZTT4Fd2RjO7arpg/rnA7syv3ndrw0ODxvuONZ32P4JXL0+c70A"
++        "zMQS8DT/aOHD7M7neOV1bEc8Udp8/+Id4HWBG//QFXfIWEECjq1xfaP0sPNx77Nbz3fm9xq11yjfB+371scxPfXCnuYs32r2"
++        "cU8b73NcWC4UIJkqrSVXYCWb0j9JpQLciMSvywFp1Jpx4yXgq3Ch7Db6eVxPXVxbjBIvh8oeH9cOgiAIgiAIgiCIv5lEdGN3"
++        "2/hBc/MNDQZBEARBEARBEARB/KcIA66LxjNM87luRdNGMZ891xTuxkFY9woDXe3uLcF6Dmqkt580zXwGO9njfSCGu9um9QI0"
++        "nARBEARBEARBEMQ/Qg8qi/X98kMrGLqIcdutmF9Bm8Vcb6HtQXsQlcUp96N+06z79WM8/He0RXZftL2uP9PfmXB4wj88paSy"
++        "ybw/MCaNSaMjgfGzaSUVGFsNnMGsA/4/ACMWfH/8NTTI95g+nmp8OeOo+e6uxbsjp6F+HPcI1I/7Pg/148RZsPcSyFMLsclr"
++        "V8MgyzOxhByJytPxyWsROToVZ4Hh1XBwI1gcpFI5pyZTuqpFSzPsU76gKtLt/KqUWs2upEeyaTCtTLKUASldzuuelqpF68qa"
++        "UixlC3mbIeteqrKugqRk5OViMqfImXSxZpl3SOaySyAtFXI5Ja/+hnkf0FM7t+4anU+ozaUdSU9f9bXK/Nn+YMqWDFvGzv+G"
++        "gjg3omP/MF3k6hU4f7aPQnhv0bEfmQ7WWac8UT1pXPvZfmPqdrRfdGgC9y6z2X5mGuTaL9bpfxpqZyKsiu3a2aT9dwCqZyhM"
++        "/Hb1NZm/dYd/v9+uQUd5Z/vvY9urx3rYuRE8R1Jx1Ot2dHMT69/31YIZQw36z6tYZ10Po/8rtLvxO9u5fjq4tvN8RP+JJuPf"
++        "28D/JJ6TetLE/ycbx8u6"
++    ),
++    "libnoso.so": (
++        "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"
++    ),
++    "app_old.so": (
++        "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"
++    ),
++    "app_new.so": (
++        "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"
++    ),
++    "app_plain.so": (
++        "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"
++    ),
++    "app2_plain.so": (
++        "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"
++    ),
++    "app_libc.so": (
++        "eNrtW2toHEUcn73L465Nk2tJbB61OUuLfdjrJTZt2hJzyeVxLUka00QsWrZ7d3u5s/cId3ttUsRGi31YChHbL36q4Iei4AME"
++        "ET/YGltCqRI/iAUVglBIQDSlKLEfss7s/udud3qbVBAUnF/Y/e38Z34zszOzO7O5/5zq7OmyCQKisKNnUD6EkA840GS0NSMn"
++        "PtehWi1tEbKGo9jMyKUT0RUbwizvEcxs1GnlucHO8LvIzEZdCT5mt+vh2RYze206N9vMOhvoFkC30GLmacHMDpAXwdHM5Et5"
++        "IzIzbcP+u0p4qfuz0j2LdSXo0UGbewDKs2qXapuZBUO5ldp4Qai7bwjt3mqf+vnzvTfe/vqyuOfDzzJn7tceoO1Xamh/hMZz"
++        "J2L/vv7sUsMHifhYY1F/dwH7sEV6wSL9Uxb2LnxsKGAf0vIvQzWr9XBVrqLicCKVFDOKlFZEEYn7B3vFsJyWh2MZRU4P9vrj"
++        "qaQ8KAXjsh5XOEYMjUpiJJaU4rGTMpJGRkQ5qaTH0EhWCUWlNIqkUigeCx6X056MdhXC7NmFnuscOCQ2eryou2d/ux9fNXqa"
++        "tNYXcA8J+M8GPUeujxna76MNYytIL57KtZOAsobxka2NOUk+55B5XNBx7oJ2mGfs05CBy8ekh/BUq84lMEYopg1248C4Y7AX"
++        "G+wzBrtp/EM5pYYxq9XDYLcjDg4ODg4ODg4Ojv8XAqd/cQQuFN/YgS9fv6bY1OnA6a8ck7l4tekWjlI33cbninofviLhKIma"
++        "m1ExNn1JwmSJPTethd/A4chELv+LLR+TvC8Wv0doz4JShYvrg+Kc6kxFvfYtOAmM07+qpW86SWjLYuD8fOD6r62B6wv2gHAz"
++        "8O2iUokzeBwycKgzkYr6jrz+fsX6B+MtLTvIp8u2ocDplgcekuv5u0pZ4ELLemyfPYxrORvGp5vFVTgsHMFak37uBI4cwpov"
++        "RskXj5Okr8SnI5PQXqYW4uDg4ODg4ODg4ODg4OD470Oos+8jvyWT38Lc86rqw9yPmXzh19xT1XFIV0nTnxxAwqhLqCsrdUwI"
++        "+u/Q6/Bx5zdV9ZIE5a6u8uoDFStPOMZRa+2+rU9v3ED1+DMdzeB0DkP5RPsiPt7EZWq/pbaVu87Y/KtK+nEBvHs4ODg4ODg4"
++        "ODg4ODj+Nqif5rTBH5rgGDKHs8BlOaFOqyDohXxqIEz9QesgTL/ZaoGpX+g6Jv73RTVF+Cg4f1KfzgA4ZVJfznMQvwLCl4BX"
++        "AlcDU1/OWfAHpT6lXub7tRR4LfCdIrPdW2Su51VgJ1PeoqrXfx4KViFMy52H8I8Q/yeE/y2fU+qvzmIX9G8X46/b7ffvdW/u"
++        "kIMxKeluIP7E3u0NO7eF5WBDY7ZhC5iW+L8CIv6791TWXqa1URk66jLby8E+wdifAPs0Y9+tlfEYqvaZx69fu16dG3cUL0E+"
++        "9DmgOK6ld+XGMcVli/pb3dcVLa4CXXE/3BaF0n+g1WdV7nmi+ETLpyrXDxTXNfuah/rxFm09ptyfIJ9qJp85zV6Ze04oVK0+"
++        "zrzjN6BYKOxPXyMU9ptvEgr7x7da5NNjkc8LFvasUNgvH4XSSkbJRiKeEMq73YtKQgwR9/oMEsVwShyOp4JSXAwrqXRGlLKj"
++        "KJRKjMRlRQ7jsVwwBXHGj4lSOi2NgSt+JC0lZDGcTSTGsMQQEnFKxZSU+O9rPvohnLJroK23U+zs6yC7A0iupMBMSoxKyTBx"
++        "/e843NfWu9+Prd19Q2JnAASBjgFsGuz1U2l3z8H2th7xYFfXoc5BcbCtvacTW0nZdJeAz7gJYKmNCPn9BZFUypfbQ1BoK8Mj"
++        "bFcwFYs8mbGEIgUxK2mdo/QqmVJkz3Ay6wlmY/Hw9lgYaaGolIkiT3gsiZU6K2k95riczsRSSVNAxHFpOS6RhHA1EleQR2sI"
++        "cukZTuELRR7FZ625PXIUuisaTudDukTvNz0lvcY5S4lYCJGc9MzDkiIhTzCTQR48chK47f6p93MdzEF0/rDaL5R/p5hBvJz+"
++        "wHMM1dN59SijtzPzMEUzzKk2Zt6lfM1QrmDQ0/nQB3nbmHmc8qUC71EjAjCHUj2dNym7mPrbGB6COTk3/9rN7DPU31bg/sOG"
++        "OOM6gPJVi/aj958EfTuzrqDsNegrC+hHkXGPFHpoP9zaZfo/w+jdLjOzUzW77e4VRt/vMjPbXg6GzzJ6Or9T/saifIqLjJ7O"
++        "i5Sdy9z/W6DP7SVym3m55+cdRr/ZbeaXLe6f4n1Yw9iZdTHdV7dc+32KjwqDnq5f5h9RPwltZ2fWe3TfIt2fWMToaD+8BvdP"
++        "9XR/1tQOc3NalX+b0dP1xSzoNy+j/47R0/WPy7v0/VP8ADaqp+ueags9+/6ZARv7nFD9kxZ6I9sKvNd9XvN7tMbi+XdafBtM"
++        "Neo8ISxd/9UW+ud35td9S+n/AjMWVpU="
++    ),
++    "app_noso.so": (
++        "eNrtW19sFEUYn73rnyuU9kqKtFTpSUALyNFW0CppuXK9djFtwf4xkoDDXnfbnrm7bfa20ILRaqPYEBKMMTHxBRMfEF+UB3kz"
++        "YAkBJaY8gE18sBpIWmMUYjTVh66zu99cd4fblkQTfZhfsvvb+eb7zczO7O7s3n3zWqy91ScIiMKPmtBiCqEIcO1Op60BFZF9"
++        "FVpn+eYhb0zluRkFbTJ1+Y40y82Cm506q6gQ2Bn+CLnZqSsg2/w2Oz3f6OaQz+Yan1vnA10gbKcDTW6+KLg5API82BqgPJY3"
++        "IjfT7tl/R5eXOj8v3fNEV4AeHLS7u6A+r34J+NwsOOott64XhNo6e9E3Zdduvf9D9POJjbcvnHtxy4Lccv572n+Fjv5HaCy7"
++        "M+3fVp9Y6vJBrY4ucAKTbXUO+xMe/kEPe59HOYKHf6/lX4wqy+z0I9kG4YGUmsYZXdJ0jBHe29OBZUVTBhIZXdF6OqJJNa30"
++        "SPGkYuflzsF9IxLuT6SlZOKYgqShIaykdW0U9asqiksaSibiaTWjhjMqeiHW1Y3rw7V2a31ko3vbIqABxzh/umF0hTkaGmLG"
++        "l/YPnA9qctunoIBghPGH9NXdNhc4rg1L57D7HfZph9058DMOu+s6hnoK4VqiCDjs+YiDg4ODg4ODg4OD40Egjv8cEE/m39xO"
++        "Dt+8qPuMKXH8cmAym2/s/IpkGZuuk31pdYQcmelBM2tuxiDY9KWZNl/956astEbS/aez5Z9q/Mws+1T+OZOemdfXkOpeguqK"
++        "jJnSautbcBKY+L9u+e88ZtLmBXHirnjpl93ipXm/KFwRbyzo5aSANVBAwJjpL61uWdT/Vrr+r7HGRpKNhrf2iuONP5of7uLE"
++        "Hb1YPNm4nthnD5BWzspkd8UqRjhEtC793FGS2Us03WbvzBaR1MTk7GpCwrR48tD8tUnoN1dPcXBwcHBwcHBwcHBwcHD8fyFU"
++        "+XeZ/yWb/9GF7hpGhPB+wuYXfuU9wxgDv3Lqf6wLCSNBoaq4MHBasP+Hfphs078ahvVXZEmwtaTiudKVRwNjaPe6XVue3LiB"
++        "6slnOpohfgFH/ab2INneIXVa/6U2lwTf8kVXFcTG/d2kDj5CHBwcHBwcHBwcHBwc/ww03nPKER9tYgC4OOto0ypINoCuEtI0"
++        "jrQK0vSDbR3VNy1+5znzf18wVJMPQ1AnjeEUIViUxoC+DfkrIH0ceCVwBTCNMZ2FOFIaK1rLfL8WAq8FPpPnts/73e08C1zE"
++        "1Ldg2O2fBn8D0rQf70L6MuT/CWn/fzTeNF6dxVMwvq1MnG9bNPpsqKZFiSekdKiuPlwfrt1Wt2OrrMTr6ofrNoNpid8VkBnf"
++        "e89g7cXW2BSjw0G3vQTspxn7o2CfYuxPW3U8hCoi7us3ah2XZa87ipehnGycM+CI5R/MXscU73m03+u8PrDyStGZ0P19kcv/"
++        "Y8t/9X3jct6yr8meF8UXYA8y9q+t8ypaDPQG3KC9yrTntuW/KnsfU/xklV+evX+cJ5wr3n2FkDs+vlLIHU//mId/xMN+0KOc"
++        "hIc/6tP0jD7c3x/uQ4th91hP4T4zvD6DMJZVPJBU41ISy7qqZbA0PIL61NRQUtEVmVzLOT3MYPwEljRNGqWh+JqUUrA8nEqN"
++        "EokjhYmn7nKVhoZIczBu7WruiOFYZ4u5MKDlQGdzx94oMfd0RKkRyxkVD0pp2VwEYJZDTG2dvTgmglhs6UJWWxBua9+3p7kd"
++        "72tt7Y714J7mPe0x7FgqwKwh6FfVSHapwBIrD5ZYrxCXNEcR7nUOKJwZTelSnLCu2TxIj9KqroQH0sPh+HAiKW9LyMhKDUqZ"
++        "QRSWR9NEabOu2TlHFC2TUNOuBCZ5mpKUTEc4GkrqKGx1knkYHlDJga6MkL3VQWFlEIZlUNYWU7bEHh/bkx6TkqVUog+ZJdmF"
++        "y5IuoXA8k0FhcoWkSMf+W8/hKuRey+C1Lmjx2eGGGc30B5lLqJ7On4cZvZ+ZbykaYO70MfMr5YuOegWHns57ESjbx8zXlI/n"
++        "eF46IcJcSfV0fqQcZNrvY7gX5l6apvMv5ZBH+ylkyPMx8z3lsx79R88/Dfo9zPsD5VqHvjyHfgQ510Kh+9a9rV1m/DOMPhR0"
++        "Mzsls8vrXmX0+4NuZvsrwPAJRk/nccq3POqnOMXo6TxEuWiZ838X9Nm1QCE3L3f/fMjoa0JufsXj/Ck+gXcVP/P+S9fPLdd/"
++        "F8hW6nwPbHLc2A+gn0TuNVXZ9Yigp+sQ8xgdHYc34Pypnq7furrd3Z1e9V9n9PR9YRb0NcvobzJ6+j4TrF36/Cm+AxvV0/ek"
++        "Cg89+/yZARt7n1D94x56J/tyvcfUup+jlR73f5HHN8DVeng+CEu3v8xDH9lh89wy5/8350xEKg=="
++    ),
++    "app_noso_old.so": (
++        "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"
++    ),
++    "libver2_cut.so": (
++        "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"
++    ),
++    "libver2_i386_cut.so": (
++        "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"
++        "xOdqCf/+DQfYaW0="
++    ),
++    "app_libc_cut.so": (
++        "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"
++        "UecJYen6r7bQP78zv+5bSv8XMS1WdQ=="
++    ),
++    "libver2_reserved.so": (
++        "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"
++        "1w=="
++    ),
++    "libver2_reorder.so": (
++        "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"
++    ),
++}
++
++DYNSYM_NAMES = {
++    "app2_plain.so": [
++        "",
++        "__cxa_finalize",
++        "qux",
++        "_ITM_registerTMCloneTable",
++        "_ITM_deregisterTMCloneTable",
++        "zap",
++        "__gmon_start__",
++        "call_qux",
++        "call_zap",
++    ],
++    "app_libc.so": [
++        "",
++        "putchar@GLIBC_2.2.5",
++        "_ITM_deregisterTMCloneTable",
++        "foo@VERS_2.0",
++        "__gmon_start__",
++        "_ITM_registerTMCloneTable",
++        "__cxa_finalize@GLIBC_2.2.5",
++        "app_entry",
++    ],
++    "app_new.so": [
++        "",
++        "__cxa_finalize",
++        "foo@VERS_2.0",
++        "_ITM_registerTMCloneTable",
++        "_ITM_deregisterTMCloneTable",
++        "bar@VERS_2.0",
++        "__gmon_start__",
++        "app_entry",
++    ],
++    "app_noso.so": [
++        "",
++        "__cxa_finalize",
++        "foo@VERS_2.0",
++        "_ITM_registerTMCloneTable",
++        "_ITM_deregisterTMCloneTable",
++        "bar@VERS_2.0",
++        "__gmon_start__",
++        "app_entry",
++    ],
++    "app_noso_old.so": [
++        "",
++        "__cxa_finalize",
++        "_ITM_registerTMCloneTable",
++        "foo@VERS_1.0",
++        "bar@VERS_1.0",
++        "_ITM_deregisterTMCloneTable",
++        "__gmon_start__",
++        "app_entry",
++    ],
++    "app_old.so": [
++        "",
++        "__cxa_finalize",
++        "_ITM_registerTMCloneTable",
++        "foo@VERS_1.0",
++        "bar@VERS_1.0",
++        "_ITM_deregisterTMCloneTable",
++        "__gmon_start__",
++        "app_entry",
++    ],
++    "app_plain.so": [
++        "",
++        "__cxa_finalize",
++        "_ITM_registerTMCloneTable",
++        "_ITM_deregisterTMCloneTable",
++        "foo",
++        "bar",
++        "__gmon_start__",
++        "app_entry",
++    ],
++    "libabs.so": ["", "foo@@VERS_1.0", "VERS_1.0", "absval@@VERS_1.0"],
++    "libalias.so": ["", "foo@VERS_1.0", "foo@@VERS_2.0", "bar@@VERS_2.0", "VERS_2.0", "VERS_1.0"],
++    "libdecoy.so": ["", "foo@@VERS_1.0", "bar@@VERS_1.0", "VERS_1.0"],
++    "libnoso.so": [
++        "",
++        "_ITM_deregisterTMCloneTable",
++        "printf@GLIBC_2.2.5",
++        "__gmon_start__",
++        "_ITM_registerTMCloneTable",
++        "__cxa_finalize@GLIBC_2.2.5",
++        "bar@@VERS_2.0",
++        "foo@@VERS_2.0",
++        "foo@VERS_1.0",
++        "foo_old_ptr@@VERS_2.0",
++        "VERS_2.0",
++        "greet@@VERS_2.0",
++        "foo_ptr@@VERS_2.0",
++        "VERS_1.0",
++        "counter@@VERS_2.0",
++    ],
++    "libother.so": ["", "bar", "foo"],
++    "libplain.so": ["", "bar", "foo"],
++    "libver1.so": [
++        "",
++        "__cxa_finalize",
++        "_ITM_registerTMCloneTable",
++        "_ITM_deregisterTMCloneTable",
++        "__gmon_start__",
++        "foo@@VERS_1.0",
++        "bar@@VERS_1.0",
++        "VERS_1.0",
++    ],
++    "libver2.so": [
++        "",
++        "_ITM_deregisterTMCloneTable",
++        "printf@GLIBC_2.2.5",
++        "__gmon_start__",
++        "_ITM_registerTMCloneTable",
++        "__cxa_finalize@GLIBC_2.2.5",
++        "bar@@VERS_2.0",
++        "foo@@VERS_2.0",
++        "foo@VERS_1.0",
++        "foo_old_ptr@@VERS_2.0",
++        "VERS_2.0",
++        "greet@@VERS_2.0",
++        "foo_ptr@@VERS_2.0",
++        "VERS_1.0",
++        "counter@@VERS_2.0",
++    ],
++    "libver2_i386.so": [
++        "",
++        "_ITM_deregisterTMCloneTable",
++        "printf@GLIBC_2.0",
++        "__cxa_finalize@GLIBC_2.1.3",
++        "__gmon_start__",
++        "_ITM_registerTMCloneTable",
++        "bar@@VERS_2.0",
++        "foo@@VERS_2.0",
++        "foo@VERS_1.0",
++        "foo_old_ptr@@VERS_2.0",
++        "VERS_2.0",
++        "greet@@VERS_2.0",
++        "foo_ptr@@VERS_2.0",
++        "VERS_1.0",
++        "counter@@VERS_2.0",
++    ],
++    "libver2_reorder.so": [
++        "",
++        "_ITM_deregisterTMCloneTable",
++        "printf@GLIBC_2.2.5",
++        "__gmon_start__",
++        "_ITM_registerTMCloneTable",
++        "__cxa_finalize@GLIBC_2.2.5",
++        "bar@@VERS_1.0",
++        "foo@@VERS_1.0",
++        "foo@VERS_2.0",
++        "foo_old_ptr@@VERS_1.0",
++        "VERS_2.0@@VERS_1.0",
++        "greet@@VERS_1.0",
++        "foo_ptr@@VERS_1.0",
++        "VERS_1.0@@VERS_2.0",
++        "counter@@VERS_1.0",
++    ],
++    "libver2_s390x.so": [
++        "",
++        "",
++        "foo@VERS_1.0",
++        "foo@@VERS_2.0",
++        "bar@@VERS_2.0",
++        "VERS_2.0",
++        "greet@@VERS_2.0",
++        "VERS_1.0",
++        "foo_ptr@@VERS_2.0",
++        "counter@@VERS_2.0",
++    ],
++    "libver3.so": ["", "foo@VERS_1.0", "foo@@VERS_2.0", "bar@@VERS_2.0", "VERS_2.0", "VERS_1.0"],
++    "libver4.so": ["", "qux@VERS_2.0", "qux@@VERS_3.0", "VERS_2.0", "zap@VERS_2.0", "VERS_1.0", "VERS_3.0"],
++    "libver5.so": ["", "foo@@VERS_1.0", "bar", "VERS_1.0"],
++}
++
++SYMVALUES = {
++    "app2_plain.so": {"call_qux": 4377, "call_zap": 4388},
++    "app_libc.so": {"app_entry": 4377},
++    "app_new.so": {"app_entry": 4377},
++    "app_noso.so": {"app_entry": 4377},
++    "app_noso_old.so": {"app_entry": 4377},
++    "app_old.so": {"app_entry": 4377},
++    "app_plain.so": {"app_entry": 4377},
++    "libabs.so": {"foo@@VERS_1.0": 4096},
++    "libalias.so": {"bar@@VERS_2.0": 4107, "foo@@VERS_2.0": 4096, "foo@VERS_1.0": 4096},
++    "libdecoy.so": {"bar@@VERS_1.0": 4107, "foo@@VERS_1.0": 4096},
++    "libnoso.so": {
++        "bar@@VERS_2.0": 4383,
++        "counter@@VERS_2.0": 16400,
++        "foo@@VERS_2.0": 4372,
++        "foo@VERS_1.0": 4361,
++        "foo_old_ptr@@VERS_2.0": 16416,
++        "foo_ptr@@VERS_2.0": 16408,
++        "greet@@VERS_2.0": 4394,
++    },
++    "libother.so": {"bar": 4107, "foo": 4096},
++    "libplain.so": {"bar": 4107, "foo": 4096},
++    "libver1.so": {"bar@@VERS_1.0": 4356, "foo@@VERS_1.0": 4345},
++    "libver2.so": {
++        "bar@@VERS_2.0": 4383,
++        "counter@@VERS_2.0": 16400,
++        "foo@@VERS_2.0": 4372,
++        "foo@VERS_1.0": 4361,
++        "foo_old_ptr@@VERS_2.0": 16416,
++        "foo_ptr@@VERS_2.0": 16408,
++        "greet@@VERS_2.0": 4394,
++    },
++    "libver2_i386.so": {
++        "bar@@VERS_2.0": 4469,
++        "counter@@VERS_2.0": 16392,
++        "foo@@VERS_2.0": 4449,
++        "foo@VERS_1.0": 4429,
++        "foo_old_ptr@@VERS_2.0": 16400,
++        "foo_ptr@@VERS_2.0": 16396,
++        "greet@@VERS_2.0": 4489,
++    },
++    "libver2_reorder.so": {
++        "bar@@VERS_1.0": 4383,
++        "counter@@VERS_1.0": 16400,
++        "foo@@VERS_1.0": 4372,
++        "foo@VERS_2.0": 4361,
++        "foo_old_ptr@@VERS_1.0": 16416,
++        "foo_ptr@@VERS_1.0": 16408,
++        "greet@@VERS_1.0": 4394,
++    },
++    "libver2_s390x.so": {
++        "bar@@VERS_2.0": 1184,
++        "counter@@VERS_2.0": 8200,
++        "foo@@VERS_2.0": 1152,
++        "foo@VERS_1.0": 1120,
++        "foo_ptr@@VERS_2.0": 8208,
++        "greet@@VERS_2.0": 1216,
++    },
++    "libver3.so": {"bar@@VERS_2.0": 4118, "foo@@VERS_2.0": 4096, "foo@VERS_1.0": 4107},
++    "libver4.so": {"qux@@VERS_3.0": 4107, "qux@VERS_2.0": 4096, "zap@VERS_2.0": 4118},
++    "libver5.so": {"bar": 4107, "foo@@VERS_1.0": 4096},
++}
++
++VERSYMS = {
++    "app2_plain.so": [],
++    "app_libc.so": [0, 2, 1, 3, 1, 1, 2, 1],
++    "app_new.so": [0, 1, 2, 1, 1, 2, 1, 1],
++    "app_noso.so": [0, 1, 2, 1, 1, 2, 1, 1],
++    "app_noso_old.so": [0, 1, 1, 2, 2, 1, 1, 1],
++    "app_old.so": [0, 1, 1, 2, 2, 1, 1, 1],
++    "app_plain.so": [],
++    "libabs.so": [0, 2, 2, 2],
++    "libalias.so": [0, 32770, 3, 3, 3, 2],
++    "libdecoy.so": [0, 2, 2, 2],
++    "libnoso.so": [0, 1, 4, 1, 1, 4, 3, 3, 32770, 3, 3, 3, 3, 2, 3],
++    "libother.so": [],
++    "libplain.so": [],
++    "libver1.so": [0, 1, 1, 1, 1, 2, 2, 2],
++    "libver2.so": [0, 1, 4, 1, 1, 4, 3, 3, 32770, 3, 3, 3, 3, 2, 3],
++    "libver2_i386.so": [0, 1, 4, 5, 1, 1, 3, 3, 32770, 3, 3, 3, 3, 2, 3],
++    "libver2_reorder.so": [0, 1, 4, 1, 1, 4, 3, 3, 32770, 3, 3, 3, 3, 2, 3],
++    "libver2_s390x.so": [0, 0, 32770, 3, 3, 3, 3, 2, 3, 3],
++    "libver3.so": [0, 32770, 3, 3, 3, 2],
++    "libver4.so": [0, 32771, 4, 3, 32771, 2, 4],
++    "libver5.so": [0, 2, 1, 2],
++}
++
++VERDEFS = {
++    "app2_plain.so": [],
++    "app_libc.so": [],
++    "app_new.so": [],
++    "app_noso.so": [],
++    "app_noso_old.so": [],
++    "app_old.so": [],
++    "app_plain.so": [],
++    "libabs.so": [(1, "libabs.so", [], True), (2, "VERS_1.0", [], False)],
++    "libalias.so": [(1, "libver.so", [], True), (2, "VERS_1.0", [], False), (3, "VERS_2.0", ["VERS_1.0"], False)],
++    "libdecoy.so": [(1, "libdecoy.so", [], True), (2, "VERS_1.0", [], False)],
++    "libnoso.so": [(1, "libnoso.so", [], True), (2, "VERS_1.0", [], False), (3, "VERS_2.0", ["VERS_1.0"], False)],
++    "libother.so": [],
++    "libplain.so": [],
++    "libver1.so": [(1, "libver.so", [], True), (2, "VERS_1.0", [], False)],
++    "libver2.so": [(1, "libver.so", [], True), (2, "VERS_1.0", [], False), (3, "VERS_2.0", ["VERS_1.0"], False)],
++    "libver2_i386.so": [(1, "libver.so", [], True), (2, "VERS_1.0", [], False), (3, "VERS_2.0", ["VERS_1.0"], False)],
++    "libver2_s390x.so": [(1, "libver.so", [], True), (2, "VERS_1.0", [], False), (3, "VERS_2.0", ["VERS_1.0"], False)],
++    "libver3.so": [(1, "libver.so", [], True), (2, "VERS_1.0", [], False), (3, "VERS_2.0", ["VERS_1.0"], False)],
++    "libver4.so": [
++        (1, "libver4.so", [], True),
++        (2, "VERS_1.0", [], False),
++        (3, "VERS_2.0", ["VERS_1.0"], False),
++        (4, "VERS_3.0", ["VERS_2.0"], False),
++    ],
++    "libver5.so": [(1, "libver.so", [], True), (2, "VERS_1.0", [], False)],
++}
++
++VERNEEDS = {
++    "app2_plain.so": [],
++    "app_libc.so": [("libver.so", [(3, "VERS_2.0")]), ("libc.so.6", [(2, "GLIBC_2.2.5")])],
++    "app_new.so": [("libver.so", [(2, "VERS_2.0")])],
++    "app_noso.so": [("libnoso.so", [(2, "VERS_2.0")])],
++    "app_noso_old.so": [("libnoso.so", [(2, "VERS_1.0")])],
++    "app_old.so": [("libver.so", [(2, "VERS_1.0")])],
++    "app_plain.so": [],
++    "libabs.so": [],
++    "libalias.so": [],
++    "libdecoy.so": [],
++    "libnoso.so": [("libc.so.6", [(4, "GLIBC_2.2.5")])],
++    "libother.so": [],
++    "libplain.so": [],
++    "libver1.so": [],
++    "libver2.so": [("libc.so.6", [(4, "GLIBC_2.2.5")])],
++    "libver2_i386.so": [("libc.so.6", [(5, "GLIBC_2.1.3"), (4, "GLIBC_2.0")])],
++    "libver2_s390x.so": [],
++    "libver3.so": [],
++    "libver4.so": [],
++    "libver5.so": [],
++}
++
++VERLAYOUT = {
++    "app_old.so": {"ElfVerdaux": [], "ElfVerdef": [], "ElfVernaux": [1000], "ElfVerneed": [984], "versym": (962, 8)},
++    "libver2.so": {
++        "ElfVerdaux": [1276, 1304, 1332, 1340],
++        "ElfVerdef": [1256, 1284, 1312],
++        "ElfVernaux": [1368],
++        "ElfVerneed": [1352],
++        "versym": (1224, 15),
++    },
++    "libver2_i386.so": {
++        "ElfVerdaux": [932, 960, 988, 996],
++        "ElfVerdef": [912, 940, 968],
++        "ElfVernaux": [1020, 1036],
++        "ElfVerneed": [1004],
++        "versym": (882, 15),
++    },
++}
++
++SONAMES = {
++    "libabs.so": "libabs.so",
++    "libalias.so": "libver.so",
++    "libdecoy.so": "libdecoy.so",
++    "libother.so": "libother.so",
++    "libplain.so": "libver.so",
++    "libver1.so": "libver.so",
++    "libver2.so": "libver.so",
++    "libver2_i386.so": "libver.so",
++    "libver2_s390x.so": "libver.so",
++    "libver3.so": "libver.so",
++    "libver4.so": "libver4.so",
++    "libver5.so": "libver.so",
++}
++
++CRAFTED = {
++    "app_libc_cut.so": {"needs": [("libver.so", [(3, "VERS_2.0")])]},
++    "libver2_cut.so": {"defs": [(1, "libver.so", [], True), (2, "VERS_1.0", [], False)]},
++    "libver2_i386_cut.so": {"needs": [("libc.so.6", [(5, "GLIBC_2.1.3")])]},
++    "libver2_reorder.so": {
++        "defs": [(1, "libver.so", [], True), (3, "VERS_1.0", [], False), (2, "VERS_2.0", ["VERS_1.0"], False)]
++    },
++    "libver2_reserved.so": {"labels": {10: "VERS_2.0", 13: "VERS_1.0"}, "shndx": {10: 65280, 13: 65522}},
++}
++
++
++def fixtureBytes(name):
++    return zlib.decompress(base64.b64decode(FIXTURES[name]))
++
++
++def loadElf(name):
++    return Elf.Elf(io.BytesIO(fixtureBytes(name)))
++
++
++def field(record, name):
++    if hasattr(record, name):
++        return getattr(record, name)
++    return record[name]
++
++
++def defsOf(elf):
++    return [
++        (field(d, "ndx"), field(d, "name"), list(field(d, "parents")), field(d, "isbase")) for d in elf.getVersionDefs()
++    ]
++
++
++def needsOf(elf):
++    return [
++        (field(n, "file"), [(field(a, "other"), field(a, "name")) for a in field(n, "auxs")])
++        for n in elf.getVersionNeeds()
++    ]
++
++
++def symIndex(fixture, name):
++    return DYNSYM_NAMES[fixture].index(name)
++
++
++class ElfVersionTablesTest(unittest.TestCase):
++
++    def test_definitions_list_the_base_entry_then_each_version_with_its_parents(self):
++        self.assertEqual(defsOf(loadElf("libver2.so")), VERDEFS["libver2.so"])
++
++    def test_definitions_keep_file_order_when_indexes_are_not_sorted(self):
++        expected = CRAFTED["libver2_reorder.so"]["defs"]
++        self.assertEqual([ndx for ndx, name, parents, isbase in expected], [1, 3, 2])
++        self.assertEqual(defsOf(loadElf("libver2_reorder.so")), expected)
++
++    def test_definitions_follow_a_multi_level_parent_chain(self):
++        self.assertEqual(defsOf(loadElf("libver4.so")), VERDEFS["libver4.so"])
++
++    def test_needs_list_the_file_and_its_version_indexes(self):
++        self.assertEqual(needsOf(loadElf("libver2.so")), VERNEEDS["libver2.so"])
++
++    def test_needs_walk_every_aux_record_of_a_file(self):
++        self.assertEqual(needsOf(loadElf("libver2_i386.so")), VERNEEDS["libver2_i386.so"])
++
++    def test_application_needs_name_the_providing_library(self):
++        self.assertEqual(needsOf(loadElf("app_old.so")), VERNEEDS["app_old.so"])
++        self.assertEqual(needsOf(loadElf("app_new.so")), VERNEEDS["app_new.so"])
++
++    def test_version_symbols_are_raw_entries_including_the_hidden_bit(self):
++        elf = loadElf("libver2.so")
++        self.assertEqual(list(elf.getVersionSymbols()), VERSYMS["libver2.so"])
++        self.assertIn(0x8002, elf.getVersionSymbols())
++
++    def test_thirty_two_bit_tables(self):
++        elf = loadElf("libver2_i386.so")
++        self.assertEqual(defsOf(elf), VERDEFS["libver2_i386.so"])
++        self.assertEqual(list(elf.getVersionSymbols()), VERSYMS["libver2_i386.so"])
++
++    def test_big_endian_tables(self):
++        elf = loadElf("libver2_s390x.so")
++        self.assertEqual(defsOf(elf), VERDEFS["libver2_s390x.so"])
++        self.assertEqual(list(elf.getVersionSymbols()), VERSYMS["libver2_s390x.so"])
++
++    def test_zero_next_offsets_end_each_chain(self):
++        self.assertEqual(needsOf(loadElf("app_libc.so")), VERNEEDS["app_libc.so"])
++        self.assertEqual(len(VERNEEDS["app_libc.so"]), 2)
++        self.assertEqual(defsOf(loadElf("libver2_cut.so")), CRAFTED["libver2_cut.so"]["defs"])
++        self.assertEqual(needsOf(loadElf("libver2_i386_cut.so")), CRAFTED["libver2_i386_cut.so"]["needs"])
++        self.assertEqual(needsOf(loadElf("app_libc_cut.so")), CRAFTED["app_libc_cut.so"]["needs"])
++
++    def test_files_without_versions_have_empty_tables(self):
++        for name in ("libplain.so", "app_plain.so"):
++            elf = loadElf(name)
++            self.assertEqual(list(elf.getVersionDefs()), [])
++            self.assertEqual(list(elf.getVersionNeeds()), [])
++            self.assertEqual(list(elf.getVersionSymbols()), [])
++
++
++class ElfVersionedNameTest(unittest.TestCase):
++
++    def assertVersionedNames(self, fixture):
++        elf = loadElf(fixture)
++        names = [elf.getVersionedName(i) for i in range(len(DYNSYM_NAMES[fixture]))]
++        self.assertEqual(names, DYNSYM_NAMES[fixture])
++
++    def test_versioned_names_x86_64_library(self):
++        self.assertVersionedNames("libver2.so")
++
++    def test_versioned_names_i386_library(self):
++        self.assertVersionedNames("libver2_i386.so")
++
++    def test_versioned_names_big_endian_library(self):
++        self.assertVersionedNames("libver2_s390x.so")
++
++    def test_versioned_names_single_version_library(self):
++        self.assertVersionedNames("libver1.so")
++
++    def test_versioned_names_reordered_library(self):
++        self.assertVersionedNames("libver3.so")
++
++    def test_versioned_names_follow_the_definition_index_not_its_position(self):
++        self.assertVersionedNames("libver2_reorder.so")
++        elf = loadElf("libver2_reorder.so")
++        hidden = symIndex("libver2_reorder.so", "foo@VERS_2.0")
++        default = symIndex("libver2_reorder.so", "foo@@VERS_1.0")
++        self.assertEqual([VERSYMS["libver2_reorder.so"][i] for i in (hidden, default)], [0x8002, 3])
++        self.assertEqual(tuple(elf.getSymbolVersion(hidden)), ("VERS_2.0", False))
++        self.assertEqual(tuple(elf.getSymbolVersion(default)), ("VERS_1.0", True))
++
++    def test_versioned_names_three_version_library(self):
++        self.assertVersionedNames("libver4.so")
++
++    def test_versioned_names_base_version_library(self):
++        self.assertVersionedNames("libver5.so")
++
++    def test_versioned_names_decoy_library(self):
++        self.assertVersionedNames("libdecoy.so")
++
++    def test_versioned_names_compat_application(self):
++        self.assertVersionedNames("app_old.so")
++
++    def test_versioned_names_current_application(self):
++        self.assertVersionedNames("app_new.so")
++
++    def test_versioned_names_alias_library(self):
++        self.assertVersionedNames("libalias.so")
++
++    def test_versioned_names_library_without_soname(self):
++        self.assertVersionedNames("libnoso.so")
++        self.assertVersionedNames("app_noso.so")
++        self.assertVersionedNames("app_noso_old.so")
++
++    def test_versioned_names_application_with_two_needs(self):
++        self.assertVersionedNames("app_libc.so")
++
++    def test_versioned_names_unversioned_files(self):
++        self.assertVersionedNames("libplain.so")
++        self.assertVersionedNames("app_plain.so")
++        self.assertVersionedNames("app2_plain.so")
++
++    def test_local_and_global_entries_have_no_version(self):
++        elf = loadElf("libver2.so")
++        self.assertEqual(tuple(elf.getSymbolVersion(0)), (None, True))
++        gidx = VERSYMS["libver2.so"].index(1)
++        self.assertEqual(tuple(elf.getSymbolVersion(gidx)), (None, True))
++        self.assertEqual(elf.getVersionedName(gidx), DYNSYM_NAMES["libver2.so"][gidx])
++
++    def test_undefined_symbol_takes_its_needed_version(self):
++        elf = loadElf("libver2.so")
++        idx = symIndex("libver2.so", "printf@GLIBC_2.2.5")
++        self.assertEqual(tuple(elf.getSymbolVersion(idx)), ("GLIBC_2.2.5", False))
++
++    def test_default_definition_uses_a_double_at(self):
++        elf = loadElf("libver2.so")
++        idx = symIndex("libver2.so", "foo@@VERS_2.0")
++        self.assertEqual(tuple(elf.getSymbolVersion(idx)), ("VERS_2.0", True))
++        self.assertEqual(elf.getVersionedName(idx), "foo@@VERS_2.0")
++
++    def test_hidden_definition_uses_a_single_at(self):
++        elf = loadElf("libver2.so")
++        idx = symIndex("libver2.so", "foo@VERS_1.0")
++        self.assertEqual(tuple(elf.getSymbolVersion(idx)), ("VERS_1.0", False))
++        self.assertEqual(elf.getVersionedName(idx), "foo@VERS_1.0")
++
++    def test_version_labels_in_a_reserved_section_have_no_version(self):
++        elf = loadElf("libver2.so")
++        idx = symIndex("libver2.so", "VERS_2.0")
++        self.assertNotIn(VERSYMS["libver2.so"][idx] & 0x7FFF, (0, 1))
++        self.assertEqual(tuple(elf.getSymbolVersion(idx)), (None, True))
++        self.assertEqual(elf.getVersionedName(idx), "VERS_2.0")
++
++    def test_out_of_range_index_has_no_version(self):
++        elf = loadElf("libver2.so")
++        count = len(elf.getDynSyms())
++        self.assertEqual(tuple(elf.getSymbolVersion(count)), (None, True))
++        self.assertEqual(tuple(elf.getSymbolVersion(-1)), (None, True))
++        self.assertEqual(elf.getVersionedName(count), "")
++        self.assertEqual(elf.getVersionedName(-1), "")
++
++    def test_version_labels_in_any_reserved_section_index_have_no_version(self):
++        elf = loadElf("libver2_reserved.so")
++        crafted = CRAFTED["libver2_reserved.so"]
++        for idx, label in crafted["labels"].items():
++            self.assertEqual(elf.getDynSyms()[idx].st_shndx, crafted["shndx"][idx])
++            self.assertEqual(tuple(elf.getSymbolVersion(idx)), (None, True))
++            self.assertEqual(elf.getVersionedName(idx), label)
++
++    def test_absolute_definition_that_is_not_a_label_keeps_its_version(self):
++        self.assertVersionedNames("libabs.so")
++        elf = loadElf("libabs.so")
++        idx = symIndex("libabs.so", "absval@@VERS_1.0")
++        self.assertEqual(tuple(elf.getSymbolVersion(idx)), ("VERS_1.0", True))
++        label = symIndex("libabs.so", "VERS_1.0")
++        self.assertEqual(tuple(elf.getSymbolVersion(label)), (None, True))
++
++
++class WorkspaceVersionTest(unittest.TestCase):
++
++    @classmethod
++    def setUpClass(cls):
++        cls.tmpdir = tempfile.mkdtemp()
++        for name in FIXTURES:
++            os.mkdir(os.path.join(cls.tmpdir, name))
++            with open(cls.fixturePath(name), "wb") as f:
++                f.write(fixtureBytes(name))
++
++    @classmethod
++    def fixturePath(cls, name):
++        return os.path.join(cls.tmpdir, name, SONAMES.get(name, name))
++
++    @classmethod
++    def tearDownClass(cls):
++        shutil.rmtree(cls.tmpdir)
++
++    def load(self, *names):
++        vw = vivisect.VivWorkspace()
++        fnames = [vw.loadFromFile(self.fixturePath(name)) for name in names]
++        return vw, fnames
++
++    def symva(self, vw, fname, fixture, symname):
++        return vw.getFileMeta(fname, "imagebase") + SYMVALUES[fixture][symname]
++
++    def link(self, app, *libs):
++        vw, fnames = self.load(app, *libs)
++        imports = {
++            isym.split(".", 1)[1].split("@")[0]: va
++            for va, size, itype, isym in vw.getImports()
++            if vw.getFileByVa(va) == fnames[0]
++        }
++        v_linker.analyze(vw)
++        resolved = vw.getVaSet("ResolvedImports")
++        bound = {sym: (resolved[va][2] if va in resolved else None) for sym, va in imports.items()}
++        return vw, fnames, bound
++
++    def test_hidden_definition_is_exported_with_its_version(self):
++        vw, (fname,) = self.load("libver2.so")
++        exports = {(name, va) for va, etype, name, efname in vw.getExports() if efname == fname}
++        self.assertIn(("foo@VERS_1.0", self.symva(vw, fname, "libver2.so", "foo@VERS_1.0")), exports)
++        self.assertIn(("foo", self.symva(vw, fname, "libver2.so", "foo@@VERS_2.0")), exports)
++        self.assertIn(("bar", self.symva(vw, fname, "libver2.so", "bar@@VERS_2.0")), exports)
++        self.assertIn(("counter", self.symva(vw, fname, "libver2.so", "counter@@VERS_2.0")), exports)
++
++    def test_imports_keep_plain_names(self):
++        vw, (fname,) = self.load("libver2.so")
++        imports = {isym for va, size, itype, isym in vw.getImports() if vw.getFileByVa(va) == fname}
++        self.assertIn("*.printf", imports)
++        self.assertIn("*.__cxa_finalize", imports)
++        self.assertEqual([isym for isym in imports if "@" in isym], [])
++        exports = {name for va, etype, name, efname in vw.getExports() if efname == fname}
++        self.assertIn("foo@VERS_1.0", exports)
++
++    def test_loader_names_exports_by_the_definition_index(self):
++        vw, (fname,) = self.load("libver2_reorder.so")
++        exports = {(name, va) for va, etype, name, efname in vw.getExports() if efname == fname}
++        self.assertIn(("foo@VERS_2.0", self.symva(vw, fname, "libver2_reorder.so", "foo@VERS_2.0")), exports)
++        self.assertIn(("foo", self.symva(vw, fname, "libver2_reorder.so", "foo@@VERS_1.0")), exports)
++        self.assertIn(("bar", self.symva(vw, fname, "libver2_reorder.so", "bar@@VERS_1.0")), exports)
++
++    def test_loader_lays_out_version_tables(self):
++        for fixture in ("libver2.so", "libver2_i386.so", "app_old.so"):
++            vw, (fname,) = self.load(fixture)
++            base = vw.getFileMeta(fname, "imagebase")
++            layout = VERLAYOUT[fixture]
++            for sname in ("ElfVerdef", "ElfVerdaux", "ElfVerneed", "ElfVernaux"):
++                for rva in layout[sname]:
++                    loc = vw.getLocation(base + rva)
++                    self.assertEqual((loc[0], loc[2], loc[3]), (base + rva, v_const.LOC_STRUCT, "elf." + sname))
++            start, count = layout["versym"]
++            for i in range(count):
++                self.assertEqual(
++                    vw.getLocation(base + start + 2 * i)[:3], (base + start + 2 * i, 2, v_const.LOC_NUMBER)
++                )
++
++    def test_relocation_against_the_default_definition_points_to_it(self):
++        vw, (fname,) = self.load("libver2.so")
++        ptrva = self.symva(vw, fname, "libver2.so", "foo_ptr@@VERS_2.0")
++        target = self.symva(vw, fname, "libver2.so", "foo@@VERS_2.0")
++        self.assertEqual(vw.readMemoryPtr(ptrva), target)
++        self.assertEqual([xto for xfr, xto, xtype, xflags in vw.getXrefsFrom(ptrva)], [target])
++
++    def test_relocation_against_a_hidden_definition_points_to_it(self):
++        vw, (fname,) = self.load("libver2.so")
++        ptrva = self.symva(vw, fname, "libver2.so", "foo_old_ptr@@VERS_2.0")
++        target = self.symva(vw, fname, "libver2.so", "foo@VERS_1.0")
++        self.assertEqual(vw.readMemoryPtr(ptrva), target)
++        self.assertEqual([xto for xfr, xto, xtype, xflags in vw.getXrefsFrom(ptrva)], [target])
++
++    def test_versioned_provider_without_a_soname_matches_its_file_name(self):
++        vw, fnames, bound = self.link("app_noso_old.so", "libnoso.so")
++        self.assertEqual(bound["foo"], self.symva(vw, fnames[1], "libnoso.so", "foo@VERS_1.0"))
++        self.assertIsNone(bound["bar"])
++        vw, fnames, bound = self.link("app_noso.so", "libnoso.so")
++        self.assertEqual(bound["foo"], self.symva(vw, fnames[1], "libnoso.so", "foo@@VERS_2.0"))
++        self.assertEqual(bound["bar"], self.symva(vw, fnames[1], "libnoso.so", "bar@@VERS_2.0"))
++
++    def test_versioned_aliases_at_one_address_bind_each_version(self):
++        vw, (fname,) = self.load("libalias.so")
++        addr = self.symva(vw, fname, "libalias.so", "foo@VERS_1.0")
++        self.assertEqual(addr, self.symva(vw, fname, "libalias.so", "foo@@VERS_2.0"))
++        exports = {(name, va) for va, etype, name, efname in vw.getExports() if efname == fname}
++        self.assertIn(("foo@VERS_1.0", addr), exports)
++        self.assertIn(("foo", addr), exports)
++        vw, fnames, bound = self.link("app_old.so", "libalias.so")
++        self.assertEqual(bound["foo"], self.symva(vw, fnames[1], "libalias.so", "foo@VERS_1.0"))
++        self.assertIsNone(bound["bar"])
++        vw, fnames, bound = self.link("app_new.so", "libalias.so")
++        self.assertEqual(bound["foo"], self.symva(vw, fnames[1], "libalias.so", "foo@@VERS_2.0"))
++        self.assertEqual(bound["bar"], self.symva(vw, fnames[1], "libalias.so", "bar@@VERS_2.0"))
++
++    def test_versioned_import_binds_the_compat_definition(self):
++        for lib in ("libver2.so", "libver3.so"):
++            vw, fnames, bound = self.link("app_old.so", lib)
++            self.assertEqual(bound["foo"], self.symva(vw, fnames[1], lib, "foo@VERS_1.0"))
++
++    def test_versioned_import_binds_the_default_definition(self):
++        for lib in ("libver2.so", "libver3.so"):
++            vw, fnames, bound = self.link("app_new.so", lib)
++            self.assertEqual(bound["foo"], self.symva(vw, fnames[1], lib, "foo@@VERS_2.0"))
++            self.assertEqual(bound["bar"], self.symva(vw, fnames[1], lib, "bar@@VERS_2.0"))
++
++    def test_versioned_import_without_a_matching_version_stays_unbound(self):
++        for lib in ("libver2.so", "libver3.so"):
++            vw, fnames, bound = self.link("app_old.so", lib)
++            self.assertIsNone(bound["bar"])
++
++    def test_versioned_import_ignores_the_same_version_from_another_library(self):
++        for libs in (("libver2.so", "libdecoy.so"), ("libdecoy.so", "libver2.so")):
++            vw, fnames, bound = self.link("app_old.so", *libs)
++            libfname = fnames[1 + libs.index("libver2.so")]
++            self.assertEqual(bound["foo"], self.symva(vw, libfname, "libver2.so", "foo@VERS_1.0"))
++            self.assertIsNone(bound["bar"])
++
++    def test_versioned_import_ignores_an_unrelated_library_without_versions(self):
++        vw, fnames, bound = self.link("app_old.so", "libver2.so", "libother.so")
++        self.assertEqual(bound["foo"], self.symva(vw, fnames[1], "libver2.so", "foo@VERS_1.0"))
++        self.assertIsNone(bound["bar"])
++        vw, fnames, bound = self.link("app_old.so", "libplain.so", "libother.so")
++        self.assertEqual(bound["foo"], self.symva(vw, fnames[1], "libplain.so", "foo"))
++        self.assertEqual(bound["bar"], self.symva(vw, fnames[1], "libplain.so", "bar"))
++
++    def test_unversioned_import_takes_a_version_index_1_or_2_definition(self):
++        for lib in ("libver2.so", "libver3.so"):
++            vw, fnames, bound = self.link("app_plain.so", lib)
++            self.assertEqual(bound["foo"], self.symva(vw, fnames[1], lib, "foo@VERS_1.0"))
++            self.assertEqual(bound["bar"], self.symva(vw, fnames[1], lib, "bar@@VERS_2.0"))
++        vw, fnames, bound = self.link("app_plain.so", "libver5.so")
++        self.assertEqual(bound["foo"], self.symva(vw, fnames[1], "libver5.so", "foo@@VERS_1.0"))
++        self.assertEqual(bound["bar"], self.symva(vw, fnames[1], "libver5.so", "bar"))
++
++    def test_unversioned_import_takes_the_default_without_a_first_version_definition(self):
++        vw, fnames, bound = self.link("app2_plain.so", "libver4.so")
++        self.assertEqual(bound["qux"], self.symva(vw, fnames[1], "libver4.so", "qux@@VERS_3.0"))
++        self.assertIsNone(bound["zap"])
++
++    def test_library_without_versions_links_by_name(self):
++        self.assertEqual(needsOf(loadElf("app_old.so")), VERNEEDS["app_old.so"])
++        vw, fnames, bound = self.link("app_old.so", "libplain.so")
++        self.assertEqual(bound["foo"], self.symva(vw, fnames[1], "libplain.so", "foo"))
++        self.assertEqual(bound["bar"], self.symva(vw, fnames[1], "libplain.so", "bar"))
++        vw, fnames, bound = self.link("app_plain.so", "libplain.so")
++        self.assertEqual(bound["foo"], self.symva(vw, fnames[1], "libplain.so", "foo"))

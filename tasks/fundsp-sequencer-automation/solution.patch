@@ -1,0 +1,1114 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 4a968b4..e9be38f 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -5,6 +5,10 @@
+ - `Sequencer` now supports looping. Some fixes were also made.
+ - New `AudioNode` tree introspection system in the module `graph`.
+ - In order to take effect, `Sequencer` changes must now be committed to the backend.
++- Settings can be scheduled for `Sequencer` events with sample accuracy using `Sequencer::set_at`
++  and `Sequencer::set_at_relative`. Events are addressed with `Setting::event`.
++- New method `Sequencer::remove` for removing events.
++- Fixed `Sequencer` block processing of fades, inputs and loops.
+ 
+ ### Version 0.23
+ 
+diff --git a/README.md b/README.md
+index 1d3bff7..760d61f 100644
+--- a/README.md
++++ b/README.md
+@@ -609,6 +609,19 @@ sequencer.edit_relative(id2, 0.1, 0.1);
+ sequencer.commit();
+ ```
+ 
++Settings can be scheduled for events with sample accuracy.
++The event is picked with the `event` address of the setting.
++Scheduled settings are retained with the event and applied again when the event is replayed.
++
++```rust
++// Set the value of the constant 0.5 seconds from now.
++let id3 = sequencer.push_relative(0.0, 1.0, Fade::Smooth, 0.0, 0.0, Box::new(dc(0.5)));
++sequencer.set_at_relative(0.5, Setting::value(0.25).event(id3));
++// Remove the event with a fade-out time of 0.1 seconds. Removed events are not replayed.
++sequencer.remove(id1, 0.1);
++sequencer.commit();
++```
++
+ ## Input Modalities And Ranges
+ 
+ Some signals found flowing in audio networks.
+@@ -929,6 +942,7 @@ Nodes inside structures can be accessed via addressing:
+ | `right()`      | Pick right side of binary operation. This is identical to `index(1)`. |
+ | `index(i)`     | Pick index `i` inside structure such as `busi`. |
+ | `node(id)`     | Pick node with `id` inside `Net`. |
++| `event(id)`    | Pick event with `id` inside `Sequencer`. |
+ 
+ Addresses are specified after the parameter constructor.
+ They can be nested up to six levels deep.
+diff --git a/src/buffer.rs b/src/buffer.rs
+index bc02c93..3d35f8c 100644
+--- a/src/buffer.rs
++++ b/src/buffer.rs
+@@ -130,8 +130,8 @@ impl<'a> BufferMut<'a> {
+     /// Create a sub-span of this buffer.
+     pub fn span(&self, start: usize, length: usize, target: &mut BufferVec) {
+         for channel in 0..self.channels() {
+-            for i in start..length {
+-                target.set_f32(channel, i - start, self.at_f32(channel, start));
++            for i in start..start + length {
++                target.set_f32(channel, i - start, self.at_f32(channel, i));
+             }
+         }
+     }
+@@ -215,8 +215,8 @@ impl<'a> BufferRef<'a> {
+     /// Create a sub-span of this buffer.
+     pub fn span(&self, start: usize, length: usize, target: &mut BufferVec) {
+         for channel in 0..self.channels() {
+-            for i in start..length {
+-                target.set_f32(channel, i - start, self.at_f32(channel, start));
++            for i in start..start + length {
++                target.set_f32(channel, i - start, self.at_f32(channel, i));
+             }
+         }
+     }
+diff --git a/src/realseq.rs b/src/realseq.rs
+index 6f5a842..6ccd4b5 100644
+--- a/src/realseq.rs
++++ b/src/realseq.rs
+@@ -4,6 +4,7 @@ use super::audiounit::*;
+ use super::buffer::*;
+ use super::math::*;
+ use super::sequencer::*;
++use super::setting::*;
+ use super::signal::*;
+ use super::*;
+ use tinyvec::TinyVec;
+@@ -21,6 +22,12 @@ pub(crate) enum Message {
+     Edit(EventId, Edit),
+     /// Edit event in relative time.
+     EditRelative(EventId, Edit),
++    /// Schedule setting in absolute time.
++    SetAt(f64, Setting),
++    /// Schedule setting in relative time.
++    SetAtRelative(f64, Setting),
++    /// Remove event with fade out time.
++    Remove(EventId, f64),
+ }
+ 
+ #[derive(Default)]
+@@ -95,6 +102,16 @@ impl SequencerBackend {
+                         self.sequencer
+                             .edit_relative(id, edit.end_time, edit.fade_out);
+                     }
++                    Message::SetAt(time, setting) => {
++                        self.sequencer.set_at(time, setting);
++                    }
++                    Message::SetAtRelative(time, setting) => {
++                        self.sequencer.set_at_relative(time, setting);
++                    }
++                    Message::Remove(id, fade_out_time) => {
++                        self.sequencer.remove_event(id, fade_out_time);
++                        self.send_back_removed();
++                    }
+                 }
+             }
+             self.fill_message.msg.push(Some(message));
+@@ -113,6 +130,13 @@ impl SequencerBackend {
+         }
+     }
+ 
++    #[inline]
++    fn send_back_removed(&mut self) {
++        while let Some(event) = self.sequencer.get_removed_event() {
++            self.return_event(event);
++        }
++    }
++
+     #[inline]
+     fn return_event(&mut self, event: Event) {
+         self.fill_message.vec.push(Some(event));
+@@ -152,17 +176,25 @@ impl AudioUnit for SequencerBackend {
+             _ => (),
+         }
+         self.sequencer.reset();
++        self.send_back_removed();
+     }
+ 
+     fn set_sample_rate(&mut self, sample_rate: f64) {
+         self.handle_messages();
+         self.sequencer.set_sample_rate(sample_rate);
++        self.send_back_removed();
++    }
++
++    fn set(&mut self, setting: Setting) {
++        self.handle_messages();
++        self.sequencer.set(setting);
+     }
+ 
+     #[inline]
+     fn tick(&mut self, input: &[f32], output: &mut [f32]) {
+         self.handle_messages();
+         self.sequencer.tick(input, output);
++        self.send_back_removed();
+         // Tick and process are the only places where events may be pushed to the past vector.
+         match self.sequencer.replay_mode() {
+             ReplayMode::None => {
+@@ -176,6 +208,7 @@ impl AudioUnit for SequencerBackend {
+     fn process(&mut self, size: usize, input: &BufferRef, output: &mut BufferMut) {
+         self.handle_messages();
+         self.sequencer.process(size, input, output);
++        self.send_back_removed();
+         // Tick and process are the only places where events may be pushed to the past vector.
+         match self.sequencer.replay_mode() {
+             ReplayMode::None => {
+diff --git a/src/sequencer.rs b/src/sequencer.rs
+index aa29f34..e4c3515 100644
+--- a/src/sequencer.rs
++++ b/src/sequencer.rs
+@@ -4,6 +4,7 @@ use super::audiounit::*;
+ use super::buffer::*;
+ use super::math::*;
+ use super::realseq::*;
++use super::setting::*;
+ use super::shared::IdGenerator;
+ use super::signal::*;
+ use super::*;
+@@ -67,6 +68,9 @@ pub(crate) struct Event {
+     pub fade_in: f64,
+     pub fade_out: f64,
+     pub id: EventId,
++    pub next_setting: usize,
++    pub template: Option<Box<dyn AudioUnit>>,
++    pub removed: bool,
+ }
+ 
+ impl Event {
+@@ -88,8 +92,69 @@ impl Event {
+             fade_in,
+             fade_out,
+             id: EventId::new(),
++            next_setting: 0,
++            template: None,
++            removed: false,
+         }
+     }
++
++    fn make_template(&mut self) {
++        if self.template.is_none() {
++            let mut template = self.unit.clone();
++            template.reset();
++            self.template = Some(template);
++        }
++    }
++
++    fn is_due(&self, settings: &[Scheduled], time: f64) -> bool {
++        self.next_setting < settings.len()
++            && self.start_time + settings[self.next_setting].offset < time
++    }
++
++    fn deliver(&mut self, settings: &[Scheduled], time: f64) {
++        while self.is_due(settings, time) {
++            self.unit.set(settings[self.next_setting].setting.clone());
++            self.next_setting += 1;
++        }
++    }
++
++    fn rewind(&mut self) {
++        match &self.template {
++            Some(template) if self.next_setting > 0 => self.unit = template.clone(),
++            _ => self.unit.reset(),
++        }
++        self.next_setting = 0;
++    }
++
++    fn set_sample_rate(&mut self, sample_rate: f64) {
++        self.unit.set_sample_rate(sample_rate);
++        if let Some(template) = &mut self.template {
++            template.set_sample_rate(sample_rate);
++        }
++    }
++
++    fn is_fading(&self, first_time: f64, last_time: f64) -> bool {
++        (self.fade_in > 0.0 && first_time < self.start_time + self.fade_in)
++            || (self.fade_out > 0.0 && last_time > self.end_time - self.fade_out)
++    }
++
++    fn fade(&self, time: f64) -> (f32, f32) {
++        let mut fade_in = 1.0;
++        if self.fade_in > 0.0 {
++            let x = delerp(self.start_time, self.start_time + self.fade_in, time) as f32;
++            if x < 1.0 {
++                fade_in = self.fade_ease.at(x);
++            }
++        }
++        let mut fade_out = 1.0;
++        if self.fade_out > 0.0 {
++            let x = delerp(self.end_time - self.fade_out, self.end_time, time) as f32;
++            if x > 0.0 {
++                fade_out = self.fade_ease.at(1.0 - x);
++            }
++        }
++        (fade_in, fade_out)
++    }
+ }
+ 
+ impl PartialEq for Event {
+@@ -118,100 +183,41 @@ pub(crate) struct Edit {
+     pub fade_out: f64,
+ }
+ 
++#[derive(Clone)]
++pub(crate) struct Scheduled {
++    pub id: EventId,
++    pub offset: f64,
++    pub sequence: u64,
++    pub setting: Setting,
++}
++
++/// Index of the sample on which a setting `offset` seconds from `start_time` is delivered.
+ #[inline]
+-fn fade_in(
+-    sample_duration: f64,
+-    time: f64,
+-    end_time: f64,
+-    start_index: usize,
+-    end_index: usize,
+-    ease: Fade,
+-    fade_duration: f64,
+-    fade_start_time: f64,
+-    output: &mut BufferMut,
+-) {
+-    let fade_end_time = fade_start_time + fade_duration;
+-    if fade_duration > 0.0 && fade_end_time > time {
+-        let fade_end_i = if fade_end_time >= end_time {
+-            end_index
+-        } else {
+-            round((fade_end_time - time) / sample_duration) as usize
+-        };
+-        let fade_phase = delerp(
+-            fade_start_time,
+-            fade_end_time,
+-            time + start_index as f64 * sample_duration,
+-        ) as f32;
+-        let fade_d = (sample_duration / fade_duration) as f32;
+-        match ease {
+-            Fade::Power => {
+-                for channel in 0..output.channels() {
+-                    let mut fade = fade_phase;
+-                    for x in output.channel_f32_mut(channel)[..fade_end_i].iter_mut() {
+-                        *x *= sine_ease(fade);
+-                        fade += fade_d;
+-                    }
+-                }
+-            }
+-            Fade::Smooth => {
+-                for channel in 0..output.channels() {
+-                    let mut fade = fade_phase;
+-                    for x in output.channel_f32_mut(channel)[..fade_end_i].iter_mut() {
+-                        *x *= smooth5(fade);
+-                        fade += fade_d;
+-                    }
+-                }
+-            }
+-        }
+-    }
++fn delivery_sample(start_time: f64, offset: f64, sample_rate: f64) -> f64 {
++    floor((start_time + offset) * sample_rate + 0.5)
+ }
+ 
++/// Index range of the settings scheduled for event `id`.
+ #[inline]
+-fn fade_out(
+-    sample_duration: f64,
+-    time: f64,
+-    end_time: f64,
+-    _start_index: usize,
+-    end_index: usize,
+-    ease: Fade,
+-    fade_duration: f64,
+-    fade_end_time: f64,
+-    output: &mut BufferMut,
+-) {
+-    let fade_start_time = fade_end_time - fade_duration;
+-    if fade_duration > 0.0 && fade_start_time < end_time {
+-        let fade_i = if fade_start_time <= time {
+-            0
+-        } else {
+-            round((fade_start_time - time) / sample_duration) as usize
+-        };
+-        let fade_phase = delerp(
+-            fade_start_time,
+-            fade_end_time,
+-            time + fade_i as f64 * sample_duration,
+-        ) as f32;
+-        let fade_d = (sample_duration / fade_duration) as f32;
+-        match ease {
+-            Fade::Power => {
+-                for channel in 0..output.channels() {
+-                    let mut fade = fade_phase;
+-                    for x in output.channel_f32_mut(channel)[fade_i..end_index].iter_mut() {
+-                        *x *= sine_ease(1.0 - fade);
+-                        fade += fade_d;
+-                    }
+-                }
+-            }
+-            Fade::Smooth => {
+-                for channel in 0..output.channels() {
+-                    let mut fade = fade_phase;
+-                    for x in output.channel_f32_mut(channel)[fade_i..end_index].iter_mut() {
+-                        *x *= smooth5(1.0 - fade);
+-                        fade += fade_d;
+-                    }
+-                }
+-            }
+-        }
+-    }
++fn setting_range(settings: &[Scheduled], id: EventId) -> (usize, usize) {
++    let first = settings.partition_point(|setting| setting.id.0 < id.0);
++    let last = first + settings[first..].partition_point(|setting| setting.id.0 == id.0);
++    (first, last)
++}
++
++/// Position of a new setting `offset` seconds from `start_time` among the settings of an event.
++/// Settings are ordered by delivery sample and then by scheduling order.
++#[inline]
++fn setting_position(
++    settings: &[Scheduled],
++    start_time: f64,
++    offset: f64,
++    sample_rate: f64,
++) -> usize {
++    let sample = delivery_sample(start_time, offset, sample_rate);
++    settings.partition_point(|setting| {
++        delivery_sample(start_time, setting.offset, sample_rate) <= sample
++    })
+ }
+ 
+ /// Controls whether a sequencer retains and replays events after a reset.
+@@ -241,8 +247,14 @@ pub struct Sequencer {
+     ready: BinaryHeap<Event>,
+     /// Past events, unsorted.
+     past: Vec<Event>,
++    /// Removed events waiting for deallocation.
++    removed: Vec<Event>,
+     /// Map of edits to be made to events in the ready queue.
+     edit_map: HashMap<EventId, Edit>,
++    /// Scheduled settings ordered by event, delivery sample and scheduling order.
++    settings: Vec<Scheduled>,
++    /// Sequence number of the next scheduled setting.
++    sequence: u64,
+     /// Number of input channels.
+     inputs: usize,
+     /// Number of output channels.
+@@ -267,10 +279,6 @@ pub struct Sequencer {
+     input_buffer: BufferVec,
+     /// Loop point rounded to the nearest sample, if we are looping, or otherwise `f64::INFINITY`.
+     loop_point: f64,
+-    /// Input buffer used when looping.
+-    loop_input_buffer: BufferVec,
+-    /// Output buffer used when looping.
+-    loop_output_buffer: BufferVec,
+ }
+ 
+ impl Clone for Sequencer {
+@@ -284,7 +292,10 @@ impl Clone for Sequencer {
+             active_threshold: self.active_threshold,
+             ready: self.ready.clone(),
+             past: self.past.clone(),
++            removed: Vec::new(),
+             edit_map: self.edit_map.clone(),
++            settings: self.settings.clone(),
++            sequence: self.sequence,
+             inputs: self.inputs,
+             outputs: self.outputs,
+             time: self.time,
+@@ -297,8 +308,6 @@ impl Clone for Sequencer {
+             mode: self.mode.clone(),
+             input_buffer: self.input_buffer.clone(),
+             loop_point: self.loop_point.clone(),
+-            loop_input_buffer: self.loop_input_buffer.clone(),
+-            loop_output_buffer: self.loop_output_buffer.clone(),
+         }
+     }
+ }
+@@ -318,7 +327,10 @@ impl Sequencer {
+             active_threshold: 0.0,
+             ready: BinaryHeap::with_capacity(DEFAULT_CAPACITY),
+             past: Vec::with_capacity(DEFAULT_CAPACITY),
++            removed: Vec::with_capacity(DEFAULT_CAPACITY),
+             edit_map: HashMap::with_capacity(DEFAULT_CAPACITY),
++            settings: Vec::with_capacity(DEFAULT_CAPACITY),
++            sequence: 0,
+             inputs,
+             outputs,
+             time: 0.0,
+@@ -331,8 +343,6 @@ impl Sequencer {
+             mode,
+             input_buffer: BufferVec::new(inputs),
+             loop_point: 0.0,
+-            loop_input_buffer: BufferVec::new(inputs),
+-            loop_output_buffer: BufferVec::new(outputs),
+         };
+         sequencer.reset();
+         sequencer
+@@ -368,7 +378,7 @@ impl Sequencer {
+         // Make sure the sample rate of the unit matches ours.
+         unit.set_sample_rate(self.sample_rate);
+         unit.allocate();
+-        let event = Event::new(
++        let mut event = Event::new(
+             unit,
+             start_time,
+             end_time,
+@@ -376,6 +386,9 @@ impl Sequencer {
+             fade_in_time,
+             fade_out_time,
+         );
++        if self.has_backend() && self.is_replay() {
++            event.make_template();
++        }
+         let id = event.id;
+         self.push_event(event);
+         id
+@@ -429,7 +442,7 @@ impl Sequencer {
+         // Make sure the sample rate of the unit matches ours.
+         unit.set_sample_rate(self.sample_rate);
+         unit.allocate();
+-        let event = Event::new(
++        let mut event = Event::new(
+             unit,
+             start_time,
+             end_time,
+@@ -437,6 +450,9 @@ impl Sequencer {
+             fade_in_time,
+             fade_out_time,
+         );
++        if self.has_backend() && self.is_replay() {
++            event.make_template();
++        }
+         let id = event.id;
+         self.push_relative_event(event);
+         id
+@@ -579,6 +595,155 @@ impl Sequencer {
+         }
+     }
+ 
++    /// Schedule a setting for an event. The event is picked with the `event` address of the setting.
++    /// The setting is applied to the unit of the event at `time` seconds, with sample accuracy.
++    /// Settings are retained with the event and applied again when the event is replayed.
++    pub fn set_at(&mut self, time: f64, setting: Setting) {
++        if let Some((_sender, receiver)) = &mut self.front {
++            // Deallocate all past events.
++            while receiver.dequeue().is_some() {}
++            // Send the new setting over.
++            self.commit_message
++                .edits
++                .push(Message::SetAt(time, setting));
++        } else if let Address::Event(id) = setting.direction() {
++            let setting = setting.peel();
++            let replay = self.is_replay();
++            let (first, last) = setting_range(&self.settings, id);
++            let event = match self.active_map.get(&id) {
++                Some(&i) => Some(&mut self.active[i]),
++                None if replay => self.past.iter_mut().find(|event| event.id == id),
++                None => None,
++            };
++            let (start_time, position) = if let Some(event) = event {
++                if replay {
++                    event.make_template();
++                }
++                let offset = time - event.start_time;
++                let position = setting_position(
++                    &self.settings[first..last],
++                    event.start_time,
++                    offset,
++                    self.sample_rate,
++                );
++                if position < event.next_setting {
++                    event.unit.set(setting.clone());
++                    event.next_setting += 1;
++                }
++                (event.start_time, position)
++            } else if let Some(event) = self.ready.iter().find(|event| event.id == id) {
++                let offset = time - event.start_time;
++                let position = setting_position(
++                    &self.settings[first..last],
++                    event.start_time,
++                    offset,
++                    self.sample_rate,
++                );
++                (event.start_time, position)
++            } else {
++                return;
++            };
++            self.settings.insert(
++                first + position,
++                Scheduled {
++                    id,
++                    offset: time - start_time,
++                    sequence: self.sequence,
++                    setting,
++                },
++            );
++            self.sequence += 1;
++        }
++    }
++
++    /// Schedule a setting for an event. The event is picked with the `event` address of the setting.
++    /// The time is relative to current time.
++    pub fn set_at_relative(&mut self, time: f64, setting: Setting) {
++        if let Some((_sender, receiver)) = &mut self.front {
++            // Deallocate all past events.
++            while receiver.dequeue().is_some() {}
++            // Send the new setting over.
++            self.commit_message
++                .edits
++                .push(Message::SetAtRelative(time, setting));
++        } else {
++            self.set_at(self.time + time, setting);
++        }
++    }
++
++    /// Remove an event. If the event is playing, it fades out over `fade_out_time` seconds
++    /// starting from current time. Removed events are not replayed.
++    pub fn remove(&mut self, id: EventId, fade_out_time: f64) {
++        if let Some((_sender, receiver)) = &mut self.front {
++            // Deallocate all past events.
++            while receiver.dequeue().is_some() {}
++            // Send the removal over.
++            self.commit_message
++                .edits
++                .push(Message::Remove(id, fade_out_time));
++        } else {
++            self.remove_event(id, fade_out_time);
++        }
++    }
++
++    /// Remove an event. This is an internal method.
++    pub(crate) fn remove_event(&mut self, id: EventId, fade_out_time: f64) {
++        self.edit_map.remove(&id);
++        if let Some(&i) = self.active_map.get(&id) {
++            if fade_out_time > 0.0
++                && self.active[i].end_time > self.time + 0.5 * self.sample_duration
++            {
++                let event = &mut self.active[i];
++                event.removed = true;
++                event.end_time = self.time + fade_out_time;
++                event.fade_out = fade_out_time;
++                return;
++            }
++            self.active_map.remove(&id);
++            if i + 1 < self.active.len() {
++                self.active_map
++                    .insert(self.active[self.active.len() - 1].id, i);
++            }
++            let event = self.active.swap_remove(i);
++            self.removed.push(event);
++        } else if let Some(i) = self.past.iter().position(|event| event.id == id) {
++            let event = self.past.swap_remove(i);
++            self.removed.push(event);
++        } else if self.ready.iter().any(|event| event.id == id) {
++            let mut ready = core::mem::take(&mut self.ready).into_vec();
++            if let Some(i) = ready.iter().position(|event| event.id == id) {
++                let event = ready.swap_remove(i);
++                self.removed.push(event);
++            }
++            self.ready = BinaryHeap::from(ready);
++        }
++        self.remove_settings(id);
++    }
++
++    /// Remove the scheduled settings of event `id`.
++    fn remove_settings(&mut self, id: EventId) {
++        let (first, last) = setting_range(&self.settings, id);
++        self.settings.drain(first..last);
++    }
++
++    /// Create replay templates for all events.
++    fn make_templates(&mut self) {
++        for event in self.active.iter_mut().chain(self.past.iter_mut()) {
++            event.make_template();
++        }
++        let mut ready = core::mem::take(&mut self.ready).into_vec();
++        for event in ready.iter_mut() {
++            event.make_template();
++        }
++        self.ready = BinaryHeap::from(ready);
++    }
++
++    /// Get removed events.
++    #[inline]
++    pub(crate) fn get_removed_event(&mut self) -> Option<Event> {
++        self.removed.pop()
++    }
++
+     /// Move units that start before the end time to the active set.
+     #[inline]
+     fn ready_to_active(&mut self, next_end_time: f64) {
+@@ -596,6 +761,12 @@ impl Sequencer {
+                         ready.end_time = edit.end_time;
+                         self.edit_map.remove(&ready.id);
+                     }
++                    if ready.template.is_none() && self.is_replay() {
++                        let (first, last) = setting_range(&self.settings, ready.id);
++                        if first < last {
++                            ready.template = Some(ready.unit.clone());
++                        }
++                    }
+                     self.active.push(ready);
+                 }
+             } else {
+@@ -620,6 +791,9 @@ impl Sequencer {
+         let mut sequencer = self.clone();
+         core::mem::swap(self, &mut sequencer);
+         sequencer.allocate();
++        if sequencer.is_replay() {
++            sequencer.make_templates();
++        }
+         self.front = Some((queue_a.clone(), queue_b.clone()));
+         SequencerBackend::new(queue_b, queue_a, sequencer)
+     }
+@@ -680,21 +854,120 @@ impl Sequencer {
+         None
+     }
+ 
+-    /// Called at end of event.
++    /// Render `length` samples starting from index `offset` of the block.
++    fn process_span(
++        &mut self,
++        offset: usize,
++        length: usize,
++        input: &BufferRef,
++        output: &mut BufferMut,
++    ) {
++        let end_time = self.time + self.sample_duration * length as f64;
++        self.ready_to_active(end_time);
++        let mut i = 0;
++        while i < self.active.len() {
++            let start_index = if self.active[i].start_time <= self.time {
++                0
++            } else {
++                round((self.active[i].start_time - self.time) * self.sample_rate) as usize
++            };
++            let end_index = if self.active[i].end_time >= end_time {
++                length
++            } else {
++                min(
++                    length,
++                    ceil((self.active[i].end_time - self.time) * self.sample_rate - 0.5) as usize,
++                )
++            };
++            let (first, last) = setting_range(&self.settings, self.active[i].id);
++            let mut j = start_index;
++            while j < end_index {
++                let time = self.time + j as f64 * self.sample_duration;
++                self.active[i].deliver(
++                    &self.settings[first..last],
++                    time + 0.5 * self.sample_duration,
++                );
++                let mut k = j + 1;
++                while k < end_index
++                    && !self.active[i].is_due(
++                        &self.settings[first..last],
++                        self.time + (k as f64 + 0.5) * self.sample_duration,
++                    )
++                {
++                    k += 1;
++                }
++                let mut buffer_output = self.buffer.buffer_mut();
++                if offset + j == 0 {
++                    self.active[i]
++                        .unit
++                        .process(k - j, input, &mut buffer_output);
++                } else {
++                    input.span(offset + j, k - j, &mut self.input_buffer);
++                    self.active[i].unit.process(
++                        k - j,
++                        &self.input_buffer.buffer_ref(),
++                        &mut buffer_output,
++                    );
++                }
++                let last_time = self.time + (k - 1) as f64 * self.sample_duration;
++                if !self.active[i].is_fading(time, last_time) && (offset + j) & SIMD_M == 0 {
++                    let full = (k - j) >> SIMD_S;
++                    for channel in 0..self.outputs {
++                        for n in 0..full {
++                            output.add(
++                                channel,
++                                ((offset + j) >> SIMD_S) + n,
++                                buffer_output.at(channel, n),
++                            );
++                        }
++                        for n in full << SIMD_S..k - j {
++                            output.channel_f32_mut(channel)[offset + j + n] +=
++                                buffer_output.channel_f32(channel)[n];
++                        }
++                    }
++                } else {
++                    for n in j..k {
++                        let (fade_in, fade_out) =
++                            self.active[i].fade(self.time + n as f64 * self.sample_duration);
++                        for channel in 0..self.outputs {
++                            output.channel_f32_mut(channel)[offset + n] +=
++                                buffer_output.channel_f32(channel)[n - j] * fade_in * fade_out;
++                        }
++                    }
++                }
++                j = k;
++            }
++            if end_index < length {
++                self.end_of_event(i, self.time + end_index as f64 * self.sample_duration);
++            } else {
++                i += 1;
++            }
++        }
++        self.time = end_time;
++    }
++
++    /// Called at end of event. `time` is the time when the event ended.
+     #[inline]
+-    pub(crate) fn end_of_event(&mut self, i: usize) {
++    pub(crate) fn end_of_event(&mut self, i: usize, time: f64) {
+         self.active_map.remove(&self.active[i].id);
+         if i + 1 < self.active.len() {
+             self.active_map
+                 .insert(self.active[self.active.len() - 1].id, i);
+         }
+         let mut event = self.active.swap_remove(i);
++        if event.removed {
++            self.remove_settings(event.id);
++            self.removed.push(event);
++            return;
++        }
+         event.start_time = event.original_start_time;
+         event.end_time = event.original_end_time;
+         if self.is_replay() {
+-            event.unit.reset();
++            event.rewind();
++        } else {
++            self.remove_settings(event.id);
+         }
+-        if self.is_loop() && event.start_time >= self.time {
++        if self.is_loop() && event.start_time >= time {
+             self.ready.push(event);
+         } else {
+             self.past.push(event);
+@@ -726,8 +999,13 @@ impl AudioUnit for Sequencer {
+                     }
+                 } else {
+                     while let Some(mut event) = self.active.pop() {
+-                        event.unit.reset();
+-                        self.ready.push(event);
++                        if event.removed {
++                            self.remove_settings(event.id);
++                            self.removed.push(event);
++                        } else {
++                            event.rewind();
++                            self.ready.push(event);
++                        }
+                     }
+                     self.active_map.clear();
+                 }
+@@ -740,6 +1018,7 @@ impl AudioUnit for Sequencer {
+                 self.past.clear();
+                 self.active.clear();
+                 self.edit_map.clear();
++                self.settings.clear();
+                 self.active_map.clear();
+             }
+         }
+@@ -751,15 +1030,29 @@ impl AudioUnit for Sequencer {
+         if self.sample_rate != sample_rate {
+             self.sample_rate = sample_rate;
+             self.sample_duration = 1.0 / sample_rate;
++            for event in self
++                .active
++                .iter()
++                .chain(self.past.iter())
++                .chain(self.ready.iter())
++            {
++                let (first, last) = setting_range(&self.settings, event.id);
++                let start_time = event.start_time;
++                self.settings[first..last].sort_unstable_by(|x, y| {
++                    delivery_sample(start_time, x.offset, sample_rate)
++                        .total_cmp(&delivery_sample(start_time, y.offset, sample_rate))
++                        .then(x.sequence.cmp(&y.sequence))
++                });
++            }
+             while let Some(mut event) = self.ready.pop() {
+-                event.unit.set_sample_rate(sample_rate);
++                event.set_sample_rate(sample_rate);
+                 self.active.push(event);
+             }
+             for event in self.past.iter_mut() {
+-                event.unit.set_sample_rate(sample_rate);
++                event.set_sample_rate(sample_rate);
+             }
+             for event in self.active.iter_mut() {
+-                event.unit.set_sample_rate(sample_rate);
++                event.set_sample_rate(sample_rate);
+             }
+             self.reset();
+         }
+@@ -770,6 +1063,7 @@ impl AudioUnit for Sequencer {
+         if !self.is_replay() {
+             while let Some(_) = self.past.pop() {}
+         }
++        self.removed.clear();
+         for channel in 0..self.outputs {
+             output[channel] = 0.0;
+         }
+@@ -778,53 +1072,17 @@ impl AudioUnit for Sequencer {
+         let mut i = 0;
+         while i < self.active.len() {
+             if self.active[i].end_time <= self.time + 0.5 * self.sample_duration {
+-                self.end_of_event(i);
++                self.end_of_event(i, self.time);
+             } else {
++                let (first, last) = setting_range(&self.settings, self.active[i].id);
++                self.active[i].deliver(
++                    &self.settings[first..last],
++                    self.time + 0.5 * self.sample_duration,
++                );
+                 self.active[i].unit.tick(input, &mut self.tick_buffer);
+-                if self.active[i].fade_in > 0.0 {
+-                    let fade_in = delerp(
+-                        self.active[i].start_time,
+-                        self.active[i].start_time + self.active[i].fade_in,
+-                        self.time,
+-                    ) as f32;
+-                    if fade_in < 1.0 {
+-                        match self.active[i].fade_ease {
+-                            Fade::Power => {
+-                                for channel in 0..self.outputs {
+-                                    self.tick_buffer[channel] *= sine_ease(fade_in);
+-                                }
+-                            }
+-                            Fade::Smooth => {
+-                                for channel in 0..self.outputs {
+-                                    self.tick_buffer[channel] *= smooth5(fade_in);
+-                                }
+-                            }
+-                        }
+-                    }
+-                }
+-                if self.active[i].fade_out > 0.0 {
+-                    let fade_out = delerp(
+-                        self.active[i].end_time - self.active[i].fade_out,
+-                        self.active[i].end_time,
+-                        self.time,
+-                    ) as f32;
+-                    if fade_out > 0.0 {
+-                        match self.active[i].fade_ease {
+-                            Fade::Power => {
+-                                for channel in 0..self.outputs {
+-                                    self.tick_buffer[channel] *= sine_ease(1.0 - fade_out);
+-                                }
+-                            }
+-                            Fade::Smooth => {
+-                                for channel in 0..self.outputs {
+-                                    self.tick_buffer[channel] *= smooth5(1.0 - fade_out);
+-                                }
+-                            }
+-                        }
+-                    }
+-                }
++                let (fade_in, fade_out) = self.active[i].fade(self.time);
+                 for channel in 0..self.outputs {
+-                    output[channel] += self.tick_buffer[channel];
++                    output[channel] += self.tick_buffer[channel] * fade_in * fade_out;
+                 }
+                 i += 1;
+             }
+@@ -839,120 +1097,37 @@ impl AudioUnit for Sequencer {
+         if !self.is_replay() {
+             while let Some(_) = self.past.pop() {}
+         }
++        self.removed.clear();
+         if size == 0 {
+             return;
+         }
+         output.clear();
+-        let end_time = min(
+-            self.time + self.sample_duration * size as f64,
+-            self.loop_point,
+-        );
+-        self.ready_to_active(end_time);
+-        let mut i = 0;
+-        let loop_size = if self.is_loop() {
+-            round(max(0.0, self.loop_point - self.time) * self.sample_rate) as usize
+-        } else {
+-            size
+-        };
+-        while i < self.active.len() {
+-            if self.active[i].end_time <= self.time + 0.5 * self.sample_duration {
+-                self.end_of_event(i);
+-            } else {
+-                let start_index = if self.active[i].start_time <= self.time {
+-                    0
+-                } else {
+-                    round((self.active[i].start_time - self.time) * self.sample_rate) as usize
+-                };
+-                let end_index = if self.active[i].end_time >= end_time {
+-                    min(size, loop_size)
+-                } else {
+-                    min(
+-                        loop_size,
+-                        round((self.active[i].end_time - self.time) * self.sample_rate) as usize,
+-                    )
+-                };
+-                if end_index > start_index {
+-                    let mut buffer_output = self.buffer.buffer_mut();
+-                    let node_input = if start_index == 0 {
+-                        input
+-                    } else {
+-                        input.span(start_index, end_index - start_index, &mut self.input_buffer);
+-                        &self.input_buffer.buffer_ref()
+-                    };
+-                    self.active[i].unit.process(
+-                        end_index - start_index,
+-                        node_input,
+-                        &mut buffer_output,
+-                    );
+-                    fade_in(
+-                        self.sample_duration,
+-                        self.time,
+-                        end_time,
+-                        start_index,
+-                        end_index,
+-                        self.active[i].fade_ease.clone(),
+-                        self.active[i].fade_in,
+-                        self.active[i].start_time,
+-                        &mut buffer_output,
+-                    );
+-                    fade_out(
+-                        self.sample_duration,
+-                        self.time,
+-                        end_time,
+-                        start_index,
+-                        end_index,
+-                        self.active[i].fade_ease.clone(),
+-                        self.active[i].fade_out,
+-                        self.active[i].end_time,
+-                        &mut buffer_output,
+-                    );
+-                    if start_index == 0 {
+-                        for channel in 0..self.outputs {
+-                            for j in 0..end_index >> SIMD_S {
+-                                output.add(channel, j, buffer_output.at(channel, j));
+-                            }
+-                            for j in end_index & !SIMD_M..end_index {
+-                                output.channel_f32_mut(channel)[j] +=
+-                                    buffer_output.channel_f32(channel)[j - start_index];
+-                            }
+-                        }
+-                    } else {
+-                        for channel in 0..self.outputs {
+-                            for j in start_index..end_index {
+-                                output.channel_f32_mut(channel)[j] +=
+-                                    buffer_output.channel_f32(channel)[j - start_index];
+-                            }
+-                        }
++        let mut offset = 0;
++        while offset < size {
++            let mut length = size - offset;
++            if self.is_loop() {
++                let remaining = round((self.loop_point - self.time) * self.sample_rate) as usize;
++                length = remaining.clamp(1, length);
++                // Like `tick`, an event that ends inside a span can only start again in a later span.
++                for event in self.active.iter() {
++                    let end_index = ceil((event.end_time - self.time) * self.sample_rate - 0.5);
++                    if end_index < length as f64 {
++                        length = max(0.0, end_index) as usize + 1;
+                     }
+                 }
+-                i += 1;
+             }
+-        }
+-        self.time = end_time;
+-        if loop_size < size {
+-            self.reset();
+-            let mut loop_input_tmp = BufferVec::new(0);
+-            core::mem::swap(&mut loop_input_tmp, &mut self.loop_input_buffer);
+-            let mut loop_output_tmp = BufferVec::new(0);
+-            core::mem::swap(&mut loop_output_tmp, &mut self.loop_output_buffer);
+-            for channel in 0..self.inputs() {
+-                for j in loop_size - size..size {
+-                    loop_input_tmp.set_f32(channel, j - loop_size, input.at_f32(channel, j));
+-                }
++            self.process_span(offset, length, input, output);
++            offset += length;
++            if self.time + 0.5 * self.sample_duration >= self.loop_point {
++                self.reset();
+             }
+-            let input_ref = &loop_input_tmp.buffer_ref();
+-            let output_ref = &mut loop_output_tmp.buffer_mut();
+-            self.process(size - loop_size, input_ref, output_ref);
+-            for channel in 0..self.outputs() {
+-                for j in loop_size - size..size {
+-                    output.set_f32(channel, j, output_ref.at_f32(channel, j - loop_size));
+-                }
+-            }
+-            core::mem::swap(&mut loop_input_tmp, &mut self.loop_input_buffer);
+-            core::mem::swap(&mut loop_output_tmp, &mut self.loop_output_buffer);
+         }
+     }
+ 
++    fn set(&mut self, setting: Setting) {
++        self.set_at_relative(0.0, setting);
++    }
++
+     #[inline]
+     fn get_id(&self) -> u64 {
+         const ID: u64 = 64;
+@@ -992,10 +1167,17 @@ impl AudioUnit for Sequencer {
+         if self.past.len() < DEFAULT_CAPACITY {
+             self.past.reserve(DEFAULT_CAPACITY - self.past.len());
+         }
++        if self.removed.len() < DEFAULT_CAPACITY {
++            self.removed.reserve(DEFAULT_CAPACITY - self.removed.len());
++        }
+         if self.edit_map.len() < DEFAULT_CAPACITY {
+             self.edit_map
+                 .reserve(DEFAULT_CAPACITY - self.edit_map.len());
+         }
++        if self.settings.len() < DEFAULT_CAPACITY {
++            self.settings
++                .reserve(DEFAULT_CAPACITY - self.settings.len());
++        }
+     }
+ }
+ 
+diff --git a/src/setting.rs b/src/setting.rs
+index e852338..03a6ac2 100644
+--- a/src/setting.rs
++++ b/src/setting.rs
+@@ -5,6 +5,7 @@ use super::buffer::*;
+ use super::combinator::*;
+ use super::math::*;
+ use super::net::NodeId;
++use super::sequencer::EventId;
+ use super::signal::*;
+ use super::*;
+ use tinyvec::ArrayVec;
+@@ -59,6 +60,8 @@ pub enum Address {
+     Index(usize),
+     /// Specify node ID in `Net`.
+     Node(NodeId),
++    /// Specify event ID in `Sequencer`.
++    Event(EventId),
+ }
+ 
+ /// Settings are node parameters with no dedicated inputs.
+@@ -179,6 +182,11 @@ impl Setting {
+         self.address.push(Address::Node(id));
+         self
+     }
++    /// Add Sequencer contained event address to setting.
++    pub fn event(mut self, id: EventId) -> Self {
++        self.address.push(Address::Event(id));
++        self
++    }
+     /// Add left choice address to setting.
+     pub fn left(mut self) -> Self {
+         self.address.push(Address::Index(0));

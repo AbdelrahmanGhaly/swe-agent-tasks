@@ -1,0 +1,3473 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..bb333f5
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,98 @@
++#!/bin/bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++    case "$1" in
++    --output_path=*)
++        OUTPUT_PATH="${1#--output_path=}"
++        shift
++        ;;
++    --output_path)
++        OUTPUT_PATH="$2"
++        shift 2
++        ;;
++    base | new)
++        MODE="$1"
++        shift
++        ;;
++    *)
++        shift
++        ;;
++    esac
++done
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-$(pwd)/test-results.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++ROOT="$(cd "$(dirname "$0")" && pwd)"
++BUILD_DIR="$ROOT/build"
++NEW_TEST_PATTERN='designated-init-*-c2cf13.ispc'
++
++xml_escape() {
++    tr -d '\000-\010\013\014\016-\037' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
++}
++
++write_failure() {
++    local details
++    details="$(printf '%s\n' "${3:-$2}" | xml_escape)"
++    cat >"$OUTPUT_PATH" <<EOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites>
++<testsuite name="ispc-$MODE" tests="1" failures="1" errors="0">
++<testcase classname="ispc.$MODE" name="$1">
++<failure message="$2">$details</failure>
++</testcase>
++</testsuite>
++</testsuites>
++EOF
++}
++
++JOBS="$(nproc)"
++if [ "$JOBS" -gt 8 ]; then
++    JOBS=8
++fi
++if ! cmake --build "$BUILD_DIR" --target ispc ispc-opt generic-target-bc stdlibs-bc stdlib-headers \
++    -j"$JOBS" >"$BUILD_DIR/test-build.log" 2>&1; then
++    tail -n 60 "$BUILD_DIR/test-build.log"
++    write_failure "build" "ispc failed to build" "$(tail -n 60 "$BUILD_DIR/test-build.log")"
++    exit 1
++fi
++
++LIT_ARGS=(
++    "--path=$BUILD_DIR/bin"
++    "--path=/usr/lib/llvm-21/bin"
++    "-Dispc_build_dir=$BUILD_DIR"
++    "-Dispc_test_exec_root=$BUILD_DIR/bin/tests"
++    "-Dispc_llvm_version_number=$(/usr/lib/llvm-21/bin/llvm-config --version)"
++    -Dx86_enabled=ON -Darm_enabled=OFF -Driscv_enabled=OFF -Dppc64_enabled=OFF -Dwasm_enabled=OFF -Dxe_enabled=OFF
++    -Dwindows_enabled=OFF -Dlinux_enabled=ON -Dps_enabled=OFF -Dmacos_arm_enabled=OFF -Dmacos_ios_enabled=OFF
++    "-Dfile_check_executable=/usr/lib/llvm-21/bin/FileCheck"
++    -Dispc_lib_enabled=OFF -Dispc_lib_jit_enabled=OFF
++    "--xunit-xml-output=$OUTPUT_PATH"
++)
++if [ "$MODE" = "new" ]; then
++    mapfile -t TESTS < <(find "$ROOT/tests/lit-tests" -maxdepth 1 -type f -name "$NEW_TEST_PATTERN" | sort)
++else
++    # 2334_unroll.ispc and 3081.ispc match exact loop-unroll and fptosi codegen that the LLVM 21.1.8
++    # packages in this image do not produce; both already fail on the unmodified base commit and
++    # neither involves initializers.
++    mapfile -t TESTS < <(find "$ROOT/tests/lit-tests" -maxdepth 1 -type f \( -name '*.ispc' -o -name '*.ll' -o -name '*.cpp' \) \
++        ! -name "$NEW_TEST_PATTERN" ! -name '2334_unroll.ispc' ! -name '3081.ispc' | sort)
++fi
++if [ "${#TESTS[@]}" -eq 0 ]; then
++    write_failure "discovery" "no lit tests found for mode $MODE"
++    exit 1
++fi
++
++rm -f "$OUTPUT_PATH"
++python3 "$ROOT/utils/lit/lit.py" "${LIT_ARGS[@]}" -v "${TESTS[@]}"
++STATUS=$?
++if [ ! -s "$OUTPUT_PATH" ] || ! grep -q "<testcase" "$OUTPUT_PATH"; then
++    write_failure "lit" "lit produced no test results"
++    if [ $STATUS -eq 0 ]; then
++        STATUS=1
++    fi
++fi
++exit $STATUS
+diff --git a/tests/lit-tests/designated-init-array-index-c2cf13.ispc b/tests/lit-tests/designated-init-array-index-c2cf13.ispc
+new file mode 100644
+index 0000000..1b66268
+--- /dev/null
++++ b/tests/lit-tests/designated-init-array-index-c2cf13.ispc
+@@ -0,0 +1,25 @@
++// Array index designators with continuation, using constant and runtime values.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: a1 0 10 11 30
++// CHECK-NEXT: a2 1 2 3 0 5
++// CHECK-NEXT: a3 0 10 11 0 40
++// CHECK-NEXT: a4 2 3 1
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++extern "C" uniform int main() {
++    uniform int32 a1[4] = { [3] = 30, [1] = 10, 11 };
++    print("a1 % % % %\n", a1[0], a1[1], a1[2], a1[3]);
++    uniform int32 a2[5] = { 1, 2, [4] = 5, [2] = 3 };
++    print("a2 % % % % %\n", a2[0], a2[1], a2[2], a2[3], a2[4]);
++    uniform int32 a3[5] = { [1] = id(10), id(11), [4] = id(40) };
++    print("a3 % % % % %\n", a3[0], a3[1], a3[2], a3[3], a3[4]);
++    uniform int32 a4[3] = { [2] = 1, [0] = id(2), 3 };
++    print("a4 % % %\n", a4[0], a4[1], a4[2]);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-array-of-structs-c2cf13.ispc b/tests/lit-tests/designated-init-array-of-structs-c2cf13.ispc
+new file mode 100644
+index 0000000..0b0239a
+--- /dev/null
++++ b/tests/lit-tests/designated-init-array-of-structs-c2cf13.ispc
+@@ -0,0 +1,26 @@
++// Designators that mix array elements and struct members.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: p1 4 5 0 0 0 9
++// CHECK-NEXT: p2 0 0 0 4 5 6
++// CHECK-NEXT: p3 0 1 0 0 7 8
++
++struct Point {
++    int32 x, y;
++};
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++extern "C" uniform int main() {
++    uniform Point p1[3] = { [2] = { .y = 9 }, [0].x = 4, 5 };
++    print("p1 % % % % % %\n", p1[0].x, p1[0].y, p1[1].x, p1[1].y, p1[2].x, p1[2].y);
++    uniform Point p2[3] = { [1].y = 4, { 5, 6 } };
++    print("p2 % % % % % %\n", p2[0].x, p2[0].y, p2[1].x, p2[1].y, p2[2].x, p2[2].y);
++    uniform Point p3[3] = { { .y = 1 }, [2].x = id(7), id(8) };
++    print("p3 % % % % % %\n", p3[0].x, p3[0].y, p3[1].x, p3[1].y, p3[2].x, p3[2].y);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-const-index-c2cf13.ispc b/tests/lit-tests/designated-init-const-index-c2cf13.ispc
+new file mode 100644
+index 0000000..da0fd31
+--- /dev/null
++++ b/tests/lit-tests/designated-init-const-index-c2cf13.ispc
+@@ -0,0 +1,36 @@
++// Array designator indices given by enum values, plain and brace-initialized const variables, and constant arithmetic.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: v 0 5 6 7
++// CHECK-NEXT: w 2 0 1 0
++// CHECK-NEXT: u 0 4 3 0
++// CHECK-NEXT: gv 2 0 0 1
++// CHECK-NEXT: gb 3 0 7 8
++// CHECK-NEXT: lb 0 0 9 4
++
++enum Axis { AX, AY, AZ, AW };
++
++static const uniform int32 LAST = 3;
++static const uniform int32 SLOT = { 1 };
++const uniform Axis BRACED = { AZ };
++
++uniform int32 gv[4] = { [LAST] = 1, [AX] = 2 };
++uniform int32 gb[] = { [SLOT] = 7, [BRACED] = 8 };
++
++extern "C" uniform int main() {
++    uniform int32 v[4] = { [LAST] = 7, [AY] = 5, [AX + 2] = 6 };
++    print("v % % % %\n", v[0], v[1], v[2], v[3]);
++    uniform int32 w[LAST + 1] = { [LAST - 1] = 1, [2 * 0] = 2 };
++    print("w % % % %\n", w[0], w[1], w[2], w[3]);
++    uniform int32 u[4] = { [AW - AY] = 3, [(LAST + AZ) / 5] = 4 };
++    print("u % % % %\n", u[0], u[1], u[2], u[3]);
++    print("gv % % % %\n", gv[0], gv[1], gv[2], gv[3]);
++    print("gb % % % %\n", (uniform int32)(sizeof(gb) / sizeof(gb[0])), gb[0], gb[1], gb[2]);
++    uniform int32 lb[4] = { [BRACED + SLOT] = 4, [BRACED] = 9 };
++    print("lb % % % %\n", lb[0], lb[1], lb[2], lb[3]);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-conversion-c2cf13.ispc b/tests/lit-tests/designated-init-conversion-c2cf13.ispc
+new file mode 100644
+index 0000000..b759346
+--- /dev/null
++++ b/tests/lit-tests/designated-init-conversion-c2cf13.ispc
+@@ -0,0 +1,41 @@
++// Designated values are converted to the type of the member they initialize.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: m1 false 5 3
++// CHECK-NEXT: m2 true 7 100
++// CHECK-NEXT: t1 2 42 false
++// CHECK-NEXT: t2 0 9 true
++// CHECK-NEXT: gm false 11 0
++
++enum Level { LOW, MID, HIGH };
++
++struct Mixed {
++    bool flag;
++    int32 count;
++    int8 small;
++};
++
++struct Tagged {
++    Level level;
++    int32 value;
++    bool on;
++};
++
++uniform Mixed gm = { .count = 11 };
++
++extern "C" uniform int main() {
++    uniform Mixed m1 = { .count = 5, .small = 3 };
++    print("m1 % % %\n", m1.flag, m1.count, m1.small);
++    uniform Mixed m2 = { .small = 100, .flag = true, 7 };
++    print("m2 % % %\n", m2.flag, m2.count, m2.small);
++    uniform Tagged t1 = { .value = 42, .level = HIGH };
++    print("t1 % % %\n", (uniform int32)t1.level, t1.value, t1.on);
++    uniform Tagged t2 = { .on = true, .value = 9 };
++    print("t2 % % %\n", (uniform int32)t2.level, t2.value, t2.on);
++    print("gm % % %\n", gm.flag, gm.count, gm.small);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-corpus-convert-global-c2cf13.ispc b/tests/lit-tests/designated-init-corpus-convert-global-c2cf13.ispc
+new file mode 100644
+index 0000000..c0b1abd
+--- /dev/null
++++ b/tests/lit-tests/designated-init-corpus-convert-global-c2cf13.ispc
+@@ -0,0 +1,385 @@
++// Global designated initializers over deeper struct and array chains with converting scalar values, whose expected values come from compiling the same initializers as C with clang.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: case40 0 1273 0 -42125 0 0
++// CHECK-NEXT: case183 0 0 -14000 1 11
++// CHECK-NEXT: case57 54 18368 0 -1125 0 0 0 0 0 0 0 0
++// CHECK-NEXT: case106 0 0 67 0 0 0 0 0
++// CHECK-NEXT: case393 -89500 0
++// CHECK-NEXT: case211 -53 0 157 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
++// CHECK-NEXT: case300 -93 0 0 0 0 0 0 0 0 0 0 0 47 0 22 0 0 0 0
++// CHECK-NEXT: case56 0 0 25 0 0 0 74 7000 0 0 0 0
++// CHECK-NEXT: case318 3 0 0 0 0 -10 0 0 0 0 0 0 38558 68 0 0
++// CHECK-NEXT: case102 0 0 0 0 0 0 0 0 0 0 0 4294967218 0 0 0 0 0 0 0 117 0 0 0
++// CHECK-NEXT: case335 0 0 0 0 0 0 1 0 0 0 0 0 70 27221
++// CHECK-NEXT: case349 -6 0 0 0 0 0 -90125
++
++struct C40_T2 {
++    int64 f0;
++};
++struct C40_T3 {
++    double f0[1];
++};
++struct C40_T1 {
++    int32 f0;
++    C40_T2 f1[2];
++    C40_T3 f2[3];
++};
++
++struct C183_T2 {
++    float f0[3];
++};
++struct C183_T1 {
++    C183_T2 f0[1];
++    bool f1;
++    uint8 f2;
++};
++
++struct C57_T2 {
++    double f0[3];
++};
++struct C57_T1 {
++    int64 f0[2];
++    int8 f1;
++    C57_T2 f2[3];
++};
++
++struct C106_T2 {
++    int32 f0;
++    int16 f1;
++    uint16 f2;
++};
++struct C106_T1 {
++    int32 f0[1];
++    uint16 f1;
++    C106_T2 f2[2];
++};
++
++struct C393_T2 {
++    double f0[1];
++    float f1;
++};
++struct C393_T1 {
++    C393_T2 f0[1];
++};
++
++struct C211_T2 {
++    uint8 f0[2];
++    uint8 f1[3];
++    int8 f2[3];
++};
++struct C211_T3 {
++    double f0[2];
++    uint32 f1;
++    int64 f2[3];
++};
++struct C211_T1 {
++    int64 f0;
++    C211_T2 f1[2];
++    C211_T3 f2[1];
++};
++
++struct C300_T2 {
++    int8 f0[3];
++    double f1[1];
++    int64 f2[3];
++};
++struct C300_T3 {
++    uint32 f0[1];
++    int32 f1[2];
++    uint32 f2[1];
++};
++struct C300_T1 {
++    C300_T2 f0[1];
++    C300_T3 f1[3];
++};
++
++struct C56_T2 {
++    int16 f0;
++    float f1;
++};
++struct C56_T3 {
++    uint8 f0;
++    int16 f1;
++};
++struct C56_T1 {
++    C56_T2 f0[2];
++    C56_T3 f1[1];
++};
++
++struct C318_T2 {
++    int64 f0;
++    int16 f1;
++};
++struct C318_T1 {
++    int32 f0;
++    C318_T2 f1[2];
++};
++
++struct C102_T2 {
++    int8 f0[2];
++    uint8 f1[3];
++    uint32 f2;
++};
++struct C102_T3 {
++    int8 f0[2];
++};
++struct C102_T1 {
++    C102_T2 f0[3];
++    C102_T3 f1[1];
++    bool f2[3];
++};
++
++struct C335_T2 {
++    bool f0[1];
++    int8 f1[3];
++    int64 f2[2];
++};
++struct C335_T3 {
++    uint16 f0[2];
++};
++struct C335_T1 {
++    C335_T2 f0[2];
++    C335_T3 f1[1];
++};
++
++struct C349_T2 {
++    bool f0[2];
++    double f1;
++};
++struct C349_T1 {
++    int8 f0;
++    C349_T2 f1[2];
++};
++
++uniform C40_T1 case40_value = { .f1[0] = { .f0 = -18.5f, .f0 = 42.25f, .f0 = 38293, .f0 = -26.125f, .f0 = 1273 }, .f2[0].f0[0] = -42.125d };
++uniform C183_T1 case183_value = { .f0[0].f0[1] = 19.5f, .f1 = 5, .f1 = 3.125f, 11, .f0 = { [0].f0[2] = 94.25d, [0].f0 = { [2] = -14 } } };
++uniform C57_T1 case57_value = { .f0[1] = 18368, .f0[0] = 54.25f, .f2[0].f0[0] = -1.125f };
++uniform C106_T1 case106_value[1] = { [0].f1 = -37, [0] = { .f2[0].f1 = -71 }, [0].f1 = 18, [0] = { .f2 = { [0].f2 = 70.125f, [0].f0 = 48299 }, .f2[0] = { 67 } } };
++uniform C393_T1 case393_value = { .f0 = { [0].f0[0] = -19.125f, [0].f1 = 12, [0] = { .f0[0] = 18, .f0 = { 67, [0] = 32, [0] = -89.5d }, .f1 = 0 } } };
++uniform C211_T1 case211_value = { .f0 = 20.125f, .f0 = 43832, .f0 = -53, .f1 = { [0].f0[1] = 69789 } };
++uniform C300_T1 case300_value = { .f0 = { [0].f0[0] = -93.125f }, .f1[2].f2[0] = 52, .f1 = { [1] = { .f1 = { 3 }, .f1[0] = 47, .f2 = { 22 } } } };
++uniform C56_T1 case56_value[2] = { [0].f0[1].f0 = 25, [1] = { .f0[0] = { .f1 = 36, .f1 = 22 }, .f0[1].f1 = 24.125d, .f0 = { [0].f1 = 16.5f, [0].f0 = 74, { 7 } } } };
++uniform C318_T1 case318_value[] = { [0].f1[1].f1 = -10, [2] = { .f1 = { [0] = { .f0 = 86, .f1 = 68, .f0 = 38558 } } } };
++uniform C102_T1 case102_value = { .f1[0].f0[1] = 9077, .f0[1].f2 = -78 };
++uniform C335_T1 case335_value = { .f0 = { [1].f2[0] = 84 }, .f1[0].f0 = { [0] = 70.125f, 83, [1] = 27221 }, .f0[1] = { { 17, [0] = 1 } } };
++uniform C349_T1 case349_value = { .f0 = 77, .f1[1].f1 = -90.125f, .f0 = -6.125f };
++
++noinline void case40() {
++    print("case40");
++    print(" %", (uniform int32)(case40_value.f0));
++    print(" %", (uniform int64)(case40_value.f1[0].f0));
++    print(" %", (uniform int64)(case40_value.f1[1].f0));
++    print(" %", (uniform int64)((uniform double)(case40_value.f2[0].f0[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case40_value.f2[1].f0[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case40_value.f2[2].f0[0]) * 1000.0d));
++    print("\n");
++}
++
++noinline void case183() {
++    print("case183");
++    print(" %", (uniform int64)((uniform double)(case183_value.f0[0].f0[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case183_value.f0[0].f0[1]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case183_value.f0[0].f0[2]) * 1000.0d));
++    print(" %", (uniform int32)(case183_value.f1));
++    print(" %", (uniform int32)(case183_value.f2));
++    print("\n");
++}
++
++noinline void case57() {
++    print("case57");
++    print(" %", (uniform int64)(case57_value.f0[0]));
++    print(" %", (uniform int64)(case57_value.f0[1]));
++    print(" %", (uniform int32)(case57_value.f1));
++    print(" %", (uniform int64)((uniform double)(case57_value.f2[0].f0[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case57_value.f2[0].f0[1]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case57_value.f2[0].f0[2]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case57_value.f2[1].f0[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case57_value.f2[1].f0[1]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case57_value.f2[1].f0[2]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case57_value.f2[2].f0[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case57_value.f2[2].f0[1]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case57_value.f2[2].f0[2]) * 1000.0d));
++    print("\n");
++}
++
++noinline void case106() {
++    print("case106");
++    print(" %", (uniform int32)(case106_value[0].f0[0]));
++    print(" %", (uniform int32)(case106_value[0].f1));
++    print(" %", (uniform int32)(case106_value[0].f2[0].f0));
++    print(" %", (uniform int32)(case106_value[0].f2[0].f1));
++    print(" %", (uniform int32)(case106_value[0].f2[0].f2));
++    print(" %", (uniform int32)(case106_value[0].f2[1].f0));
++    print(" %", (uniform int32)(case106_value[0].f2[1].f1));
++    print(" %", (uniform int32)(case106_value[0].f2[1].f2));
++    print("\n");
++}
++
++noinline void case393() {
++    print("case393");
++    print(" %", (uniform int64)((uniform double)(case393_value.f0[0].f0[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case393_value.f0[0].f1) * 1000.0d));
++    print("\n");
++}
++
++noinline void case211() {
++    print("case211");
++    print(" %", (uniform int64)(case211_value.f0));
++    print(" %", (uniform int32)(case211_value.f1[0].f0[0]));
++    print(" %", (uniform int32)(case211_value.f1[0].f0[1]));
++    print(" %", (uniform int32)(case211_value.f1[0].f1[0]));
++    print(" %", (uniform int32)(case211_value.f1[0].f1[1]));
++    print(" %", (uniform int32)(case211_value.f1[0].f1[2]));
++    print(" %", (uniform int32)(case211_value.f1[0].f2[0]));
++    print(" %", (uniform int32)(case211_value.f1[0].f2[1]));
++    print(" %", (uniform int32)(case211_value.f1[0].f2[2]));
++    print(" %", (uniform int32)(case211_value.f1[1].f0[0]));
++    print(" %", (uniform int32)(case211_value.f1[1].f0[1]));
++    print(" %", (uniform int32)(case211_value.f1[1].f1[0]));
++    print(" %", (uniform int32)(case211_value.f1[1].f1[1]));
++    print(" %", (uniform int32)(case211_value.f1[1].f1[2]));
++    print(" %", (uniform int32)(case211_value.f1[1].f2[0]));
++    print(" %", (uniform int32)(case211_value.f1[1].f2[1]));
++    print(" %", (uniform int32)(case211_value.f1[1].f2[2]));
++    print(" %", (uniform int64)((uniform double)(case211_value.f2[0].f0[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(case211_value.f2[0].f0[1]) * 1000.0d));
++    print(" %", (uniform int64)(case211_value.f2[0].f1));
++    print(" %", (uniform int64)(case211_value.f2[0].f2[0]));
++    print(" %", (uniform int64)(case211_value.f2[0].f2[1]));
++    print(" %", (uniform int64)(case211_value.f2[0].f2[2]));
++    print("\n");
++}
++
++noinline void case300() {
++    print("case300");
++    print(" %", (uniform int32)(case300_value.f0[0].f0[0]));
++    print(" %", (uniform int32)(case300_value.f0[0].f0[1]));
++    print(" %", (uniform int32)(case300_value.f0[0].f0[2]));
++    print(" %", (uniform int64)((uniform double)(case300_value.f0[0].f1[0]) * 1000.0d));
++    print(" %", (uniform int64)(case300_value.f0[0].f2[0]));
++    print(" %", (uniform int64)(case300_value.f0[0].f2[1]));
++    print(" %", (uniform int64)(case300_value.f0[0].f2[2]));
++    print(" %", (uniform int64)(case300_value.f1[0].f0[0]));
++    print(" %", (uniform int32)(case300_value.f1[0].f1[0]));
++    print(" %", (uniform int32)(case300_value.f1[0].f1[1]));
++    print(" %", (uniform int64)(case300_value.f1[0].f2[0]));
++    print(" %", (uniform int64)(case300_value.f1[1].f0[0]));
++    print(" %", (uniform int32)(case300_value.f1[1].f1[0]));
++    print(" %", (uniform int32)(case300_value.f1[1].f1[1]));
++    print(" %", (uniform int64)(case300_value.f1[1].f2[0]));
++    print(" %", (uniform int64)(case300_value.f1[2].f0[0]));
++    print(" %", (uniform int32)(case300_value.f1[2].f1[0]));
++    print(" %", (uniform int32)(case300_value.f1[2].f1[1]));
++    print(" %", (uniform int64)(case300_value.f1[2].f2[0]));
++    print("\n");
++}
++
++noinline void case56() {
++    print("case56");
++    print(" %", (uniform int32)(case56_value[0].f0[0].f0));
++    print(" %", (uniform int64)((uniform double)(case56_value[0].f0[0].f1) * 1000.0d));
++    print(" %", (uniform int32)(case56_value[0].f0[1].f0));
++    print(" %", (uniform int64)((uniform double)(case56_value[0].f0[1].f1) * 1000.0d));
++    print(" %", (uniform int32)(case56_value[0].f1[0].f0));
++    print(" %", (uniform int32)(case56_value[0].f1[0].f1));
++    print(" %", (uniform int32)(case56_value[1].f0[0].f0));
++    print(" %", (uniform int64)((uniform double)(case56_value[1].f0[0].f1) * 1000.0d));
++    print(" %", (uniform int32)(case56_value[1].f0[1].f0));
++    print(" %", (uniform int64)((uniform double)(case56_value[1].f0[1].f1) * 1000.0d));
++    print(" %", (uniform int32)(case56_value[1].f1[0].f0));
++    print(" %", (uniform int32)(case56_value[1].f1[0].f1));
++    print("\n");
++}
++
++noinline void case318() {
++    print("case318");
++    print(" %", (uniform int32)(sizeof(case318_value) / sizeof(case318_value[0])));
++    for (uniform int32 i = 0; i < (uniform int32)(sizeof(case318_value) / sizeof(case318_value[0])); ++i) {
++        print(" %", (uniform int32)(case318_value[i].f0));
++        print(" %", (uniform int64)(case318_value[i].f1[0].f0));
++        print(" %", (uniform int32)(case318_value[i].f1[0].f1));
++        print(" %", (uniform int64)(case318_value[i].f1[1].f0));
++        print(" %", (uniform int32)(case318_value[i].f1[1].f1));
++    }
++    print("\n");
++}
++
++noinline void case102() {
++    print("case102");
++    print(" %", (uniform int32)(case102_value.f0[0].f0[0]));
++    print(" %", (uniform int32)(case102_value.f0[0].f0[1]));
++    print(" %", (uniform int32)(case102_value.f0[0].f1[0]));
++    print(" %", (uniform int32)(case102_value.f0[0].f1[1]));
++    print(" %", (uniform int32)(case102_value.f0[0].f1[2]));
++    print(" %", (uniform int64)(case102_value.f0[0].f2));
++    print(" %", (uniform int32)(case102_value.f0[1].f0[0]));
++    print(" %", (uniform int32)(case102_value.f0[1].f0[1]));
++    print(" %", (uniform int32)(case102_value.f0[1].f1[0]));
++    print(" %", (uniform int32)(case102_value.f0[1].f1[1]));
++    print(" %", (uniform int32)(case102_value.f0[1].f1[2]));
++    print(" %", (uniform int64)(case102_value.f0[1].f2));
++    print(" %", (uniform int32)(case102_value.f0[2].f0[0]));
++    print(" %", (uniform int32)(case102_value.f0[2].f0[1]));
++    print(" %", (uniform int32)(case102_value.f0[2].f1[0]));
++    print(" %", (uniform int32)(case102_value.f0[2].f1[1]));
++    print(" %", (uniform int32)(case102_value.f0[2].f1[2]));
++    print(" %", (uniform int64)(case102_value.f0[2].f2));
++    print(" %", (uniform int32)(case102_value.f1[0].f0[0]));
++    print(" %", (uniform int32)(case102_value.f1[0].f0[1]));
++    print(" %", (uniform int32)(case102_value.f2[0]));
++    print(" %", (uniform int32)(case102_value.f2[1]));
++    print(" %", (uniform int32)(case102_value.f2[2]));
++    print("\n");
++}
++
++noinline void case335() {
++    print("case335");
++    print(" %", (uniform int32)(case335_value.f0[0].f0[0]));
++    print(" %", (uniform int32)(case335_value.f0[0].f1[0]));
++    print(" %", (uniform int32)(case335_value.f0[0].f1[1]));
++    print(" %", (uniform int32)(case335_value.f0[0].f1[2]));
++    print(" %", (uniform int64)(case335_value.f0[0].f2[0]));
++    print(" %", (uniform int64)(case335_value.f0[0].f2[1]));
++    print(" %", (uniform int32)(case335_value.f0[1].f0[0]));
++    print(" %", (uniform int32)(case335_value.f0[1].f1[0]));
++    print(" %", (uniform int32)(case335_value.f0[1].f1[1]));
++    print(" %", (uniform int32)(case335_value.f0[1].f1[2]));
++    print(" %", (uniform int64)(case335_value.f0[1].f2[0]));
++    print(" %", (uniform int64)(case335_value.f0[1].f2[1]));
++    print(" %", (uniform int32)(case335_value.f1[0].f0[0]));
++    print(" %", (uniform int32)(case335_value.f1[0].f0[1]));
++    print("\n");
++}
++
++noinline void case349() {
++    print("case349");
++    print(" %", (uniform int32)(case349_value.f0));
++    print(" %", (uniform int32)(case349_value.f1[0].f0[0]));
++    print(" %", (uniform int32)(case349_value.f1[0].f0[1]));
++    print(" %", (uniform int64)((uniform double)(case349_value.f1[0].f1) * 1000.0d));
++    print(" %", (uniform int32)(case349_value.f1[1].f0[0]));
++    print(" %", (uniform int32)(case349_value.f1[1].f0[1]));
++    print(" %", (uniform int64)((uniform double)(case349_value.f1[1].f1) * 1000.0d));
++    print("\n");
++}
++
++extern "C" uniform int main() {
++    case40();
++    case183();
++    case57();
++    case106();
++    case393();
++    case211();
++    case300();
++    case56();
++    case318();
++    case102();
++    case335();
++    case349();
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-corpus-convert-local-c2cf13.ispc b/tests/lit-tests/designated-init-corpus-convert-local-c2cf13.ispc
+new file mode 100644
+index 0000000..8d2ecf0
+--- /dev/null
++++ b/tests/lit-tests/designated-init-corpus-convert-local-c2cf13.ispc
+@@ -0,0 +1,362 @@
++// Local designated initializers over deeper struct and array chains with converting scalar values, whose expected values come from compiling the same initializers as C with clang.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: case178 0 0 55500 0 15560 -92 0 0 0 -46500 0 0
++// CHECK-NEXT: case372 0 0 0 30 0 0 -37000 0 0 0 -34250 0 0 7
++// CHECK-NEXT: case396 0 -47000 0 0 -71 18
++// CHECK-NEXT: case380 126 63454 0 0 0 0 0 0 0 0 58 0 0 0 0
++// CHECK-NEXT: case239 0 -10 -96500 0 0 0 0 0 -62
++// CHECK-NEXT: case263 69 59611 27 59 0 73 41 65448 0 0 0 0
++// CHECK-NEXT: case80 19 0 0 0 -95 11000
++// CHECK-NEXT: case210 -10 0 0 693 0 0
++// CHECK-NEXT: case36 0 0 1 0 0 0 0 0 0 -94 1 1 0 0 0
++// CHECK-NEXT: case255 0 0 0 0 0 0 0 0 51 0 3408 0 0 0 0 0 0 0 0 0 0 0 0
++// CHECK-NEXT: case328 -91 9 0 69 0 29951 0 0 0 0 0 0
++// CHECK-NEXT: case41 -19 0 0 238
++
++struct C178_T2 {
++    double f0;
++    float f1;
++};
++struct C178_T1 {
++    C178_T2 f0[2];
++    int16 f1[2];
++};
++
++struct C372_T2 {
++    int8 f0[1];
++    int32 f1[1];
++    double f2[3];
++};
++struct C372_T1 {
++    int16 f0[3];
++    C372_T2 f1[2];
++    int16 f2;
++};
++
++struct C396_T2 {
++    float f0[2];
++    int64 f1[2];
++};
++struct C396_T1 {
++    double f0;
++    float f1;
++    C396_T2 f2[1];
++};
++
++struct C380_T2 {
++    uint16 f0;
++    uint8 f1;
++};
++struct C380_T1 {
++    uint8 f0;
++    C380_T2 f1[2];
++};
++
++struct C239_T2 {
++    int32 f0;
++    double f1;
++};
++struct C239_T3 {
++    int16 f0;
++};
++struct C239_T1 {
++    float f0;
++    C239_T2 f1[3];
++    C239_T3 f2[2];
++};
++
++struct C263_T1 {
++    uint16 f0[3];
++    int32 f1[3];
++};
++
++struct C80_T2 {
++    uint32 f0[2];
++    uint32 f1[2];
++};
++struct C80_T3 {
++    double f0[1];
++};
++struct C80_T1 {
++    C80_T2 f0[1];
++    int16 f1[1];
++    C80_T3 f2[1];
++};
++
++struct C210_T2 {
++    int32 f0[1];
++};
++struct C210_T1 {
++    C210_T2 f0[1];
++    uint16 f1[3];
++    float f2[2];
++};
++
++struct C36_T2 {
++    bool f0[3];
++    int16 f1[2];
++};
++struct C36_T1 {
++    C36_T2 f0[3];
++};
++
++struct C255_T2 {
++    double f0[3];
++    uint32 f1[2];
++};
++struct C255_T3 {
++    uint16 f0[2];
++};
++struct C255_T4 {
++    int32 f0[1];
++    int64 f1[2];
++};
++struct C255_T1 {
++    C255_T2 f0[2];
++    C255_T3 f1[2];
++    C255_T4 f2[3];
++};
++
++struct C328_T2 {
++    int8 f0;
++    int16 f1;
++    uint32 f2;
++};
++struct C328_T1 {
++    C328_T2 f0[2];
++};
++
++struct C41_T2 {
++    int32 f0[3];
++    uint8 f1;
++};
++struct C41_T1 {
++    C41_T2 f0[1];
++};
++
++noinline void case178() {
++    uniform C178_T1 v[2] = { [0].f1[0] = 15560, [1].f0[1].f1 = -46.5d, [0].f1[1] = -92.25f, [0].f0[1].f0 = 55.5f };
++    print("case178");
++    print(" %", (uniform int64)((uniform double)(v[0].f0[0].f0) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v[0].f0[0].f1) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v[0].f0[1].f0) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v[0].f0[1].f1) * 1000.0d));
++    print(" %", (uniform int32)(v[0].f1[0]));
++    print(" %", (uniform int32)(v[0].f1[1]));
++    print(" %", (uniform int64)((uniform double)(v[1].f0[0].f0) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v[1].f0[0].f1) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v[1].f0[1].f0) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v[1].f0[1].f1) * 1000.0d));
++    print(" %", (uniform int32)(v[1].f1[0]));
++    print(" %", (uniform int32)(v[1].f1[1]));
++    print("\n");
++}
++
++noinline void case372() {
++    uniform C372_T1 v = { .f1[1].f2[0] = -34.25d, .f1[0].f2[1] = -37, .f2 = 7.75f, .f1[0].f0[0] = 30 };
++    print("case372");
++    print(" %", (uniform int32)(v.f0[0]));
++    print(" %", (uniform int32)(v.f0[1]));
++    print(" %", (uniform int32)(v.f0[2]));
++    print(" %", (uniform int32)(v.f1[0].f0[0]));
++    print(" %", (uniform int32)(v.f1[0].f1[0]));
++    print(" %", (uniform int64)((uniform double)(v.f1[0].f2[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f1[0].f2[1]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f1[0].f2[2]) * 1000.0d));
++    print(" %", (uniform int32)(v.f1[1].f0[0]));
++    print(" %", (uniform int32)(v.f1[1].f1[0]));
++    print(" %", (uniform int64)((uniform double)(v.f1[1].f2[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f1[1].f2[1]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f1[1].f2[2]) * 1000.0d));
++    print(" %", (uniform int32)(v.f2));
++    print("\n");
++}
++
++noinline void case396() {
++    uniform C396_T1 v = { .f1 = -47, .f2[0].f0[1] = 76.25d, .f2 = { [0].f0[0] = -15, [0] = { .f1 = { [1] = -19, [0] = 60, [0] = -71.25f, [1] = 18 } } } };
++    print("case396");
++    print(" %", (uniform int64)((uniform double)(v.f0) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f1) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f2[0].f0[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f2[0].f0[1]) * 1000.0d));
++    print(" %", (uniform int64)(v.f2[0].f1[0]));
++    print(" %", (uniform int64)(v.f2[0].f1[1]));
++    print("\n");
++}
++
++noinline void case380() {
++    uniform C380_T1 v[3] = { [2].f0 = 70.25f, [2].f0 = 58, [0] = { .f0 = -99, .f0 = 22910, .f1[0].f0 = 87.25f }, [0].f1[0].f0 = 63454 };
++    print("case380");
++    print(" %", (uniform int32)(v[0].f0));
++    print(" %", (uniform int32)(v[0].f1[0].f0));
++    print(" %", (uniform int32)(v[0].f1[0].f1));
++    print(" %", (uniform int32)(v[0].f1[1].f0));
++    print(" %", (uniform int32)(v[0].f1[1].f1));
++    print(" %", (uniform int32)(v[1].f0));
++    print(" %", (uniform int32)(v[1].f1[0].f0));
++    print(" %", (uniform int32)(v[1].f1[0].f1));
++    print(" %", (uniform int32)(v[1].f1[1].f0));
++    print(" %", (uniform int32)(v[1].f1[1].f1));
++    print(" %", (uniform int32)(v[2].f0));
++    print(" %", (uniform int32)(v[2].f1[0].f0));
++    print(" %", (uniform int32)(v[2].f1[0].f1));
++    print(" %", (uniform int32)(v[2].f1[1].f0));
++    print(" %", (uniform int32)(v[2].f1[1].f1));
++    print("\n");
++}
++
++noinline void case239() {
++    uniform C239_T1 v = { .f2[1].f0 = -62.5f, .f1[0].f0 = -10, .f1[0].f1 = -96.5d };
++    print("case239");
++    print(" %", (uniform int64)((uniform double)(v.f0) * 1000.0d));
++    print(" %", (uniform int32)(v.f1[0].f0));
++    print(" %", (uniform int64)((uniform double)(v.f1[0].f1) * 1000.0d));
++    print(" %", (uniform int32)(v.f1[1].f0));
++    print(" %", (uniform int64)((uniform double)(v.f1[1].f1) * 1000.0d));
++    print(" %", (uniform int32)(v.f1[2].f0));
++    print(" %", (uniform int64)((uniform double)(v.f1[2].f1) * 1000.0d));
++    print(" %", (uniform int32)(v.f2[0].f0));
++    print(" %", (uniform int32)(v.f2[1].f0));
++    print("\n");
++}
++
++noinline void case263() {
++    uniform C263_T1 v[2] = { [1].f1[2] = 16.5f, [0] = { { [1] = 59611, 27 }, { [0] = 59, [2] = 73 }, .f0[0] = 69.125f }, [1] = { { [1] = -88, [0] = 41.125f } } };
++    print("case263");
++    print(" %", (uniform int32)(v[0].f0[0]));
++    print(" %", (uniform int32)(v[0].f0[1]));
++    print(" %", (uniform int32)(v[0].f0[2]));
++    print(" %", (uniform int32)(v[0].f1[0]));
++    print(" %", (uniform int32)(v[0].f1[1]));
++    print(" %", (uniform int32)(v[0].f1[2]));
++    print(" %", (uniform int32)(v[1].f0[0]));
++    print(" %", (uniform int32)(v[1].f0[1]));
++    print(" %", (uniform int32)(v[1].f0[2]));
++    print(" %", (uniform int32)(v[1].f1[0]));
++    print(" %", (uniform int32)(v[1].f1[1]));
++    print(" %", (uniform int32)(v[1].f1[2]));
++    print("\n");
++}
++
++noinline void case80() {
++    uniform C80_T1 v = { .f0[0].f0[0] = 19.75f, .f1[0] = -95, .f2[0].f0[0] = 11 };
++    print("case80");
++    print(" %", (uniform int64)(v.f0[0].f0[0]));
++    print(" %", (uniform int64)(v.f0[0].f0[1]));
++    print(" %", (uniform int64)(v.f0[0].f1[0]));
++    print(" %", (uniform int64)(v.f0[0].f1[1]));
++    print(" %", (uniform int32)(v.f1[0]));
++    print(" %", (uniform int64)((uniform double)(v.f2[0].f0[0]) * 1000.0d));
++    print("\n");
++}
++
++noinline void case210() {
++    uniform C210_T1 v = { .f0[0].f0[0] = -10, .f1[2] = 66229 };
++    print("case210");
++    print(" %", (uniform int32)(v.f0[0].f0[0]));
++    print(" %", (uniform int32)(v.f1[0]));
++    print(" %", (uniform int32)(v.f1[1]));
++    print(" %", (uniform int32)(v.f1[2]));
++    print(" %", (uniform int64)((uniform double)(v.f2[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f2[1]) * 1000.0d));
++    print("\n");
++}
++
++noinline void case36() {
++    uniform C36_T1 v = { .f0[2].f1[1] = -50.25f, .f0[0].f0[2] = 9, .f0[1] = { .f1[1] = 93.75f, .f1[1] = -94 }, .f0[2] = { { 69, [1] = -22, [1] = 83 } } };
++    print("case36");
++    print(" %", (uniform int32)(v.f0[0].f0[0]));
++    print(" %", (uniform int32)(v.f0[0].f0[1]));
++    print(" %", (uniform int32)(v.f0[0].f0[2]));
++    print(" %", (uniform int32)(v.f0[0].f1[0]));
++    print(" %", (uniform int32)(v.f0[0].f1[1]));
++    print(" %", (uniform int32)(v.f0[1].f0[0]));
++    print(" %", (uniform int32)(v.f0[1].f0[1]));
++    print(" %", (uniform int32)(v.f0[1].f0[2]));
++    print(" %", (uniform int32)(v.f0[1].f1[0]));
++    print(" %", (uniform int32)(v.f0[1].f1[1]));
++    print(" %", (uniform int32)(v.f0[2].f0[0]));
++    print(" %", (uniform int32)(v.f0[2].f0[1]));
++    print(" %", (uniform int32)(v.f0[2].f0[2]));
++    print(" %", (uniform int32)(v.f0[2].f1[0]));
++    print(" %", (uniform int32)(v.f0[2].f1[1]));
++    print("\n");
++}
++
++noinline void case255() {
++    uniform C255_T1 v = { .f0[1].f1[0] = 51.5f, .f1[1].f0[1] = 76, .f1 = { [1].f0[0] = 36320, [0].f0[1] = 55.5f, [1].f0[1] = 63902 }, .f1 = { { .f0 = { [0] = 68944 } } } };
++    print("case255");
++    print(" %", (uniform int64)((uniform double)(v.f0[0].f0[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f0[0].f0[1]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f0[0].f0[2]) * 1000.0d));
++    print(" %", (uniform int64)(v.f0[0].f1[0]));
++    print(" %", (uniform int64)(v.f0[0].f1[1]));
++    print(" %", (uniform int64)((uniform double)(v.f0[1].f0[0]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f0[1].f0[1]) * 1000.0d));
++    print(" %", (uniform int64)((uniform double)(v.f0[1].f0[2]) * 1000.0d));
++    print(" %", (uniform int64)(v.f0[1].f1[0]));
++    print(" %", (uniform int64)(v.f0[1].f1[1]));
++    print(" %", (uniform int32)(v.f1[0].f0[0]));
++    print(" %", (uniform int32)(v.f1[0].f0[1]));
++    print(" %", (uniform int32)(v.f1[1].f0[0]));
++    print(" %", (uniform int32)(v.f1[1].f0[1]));
++    print(" %", (uniform int32)(v.f2[0].f0[0]));
++    print(" %", (uniform int64)(v.f2[0].f1[0]));
++    print(" %", (uniform int64)(v.f2[0].f1[1]));
++    print(" %", (uniform int32)(v.f2[1].f0[0]));
++    print(" %", (uniform int64)(v.f2[1].f1[0]));
++    print(" %", (uniform int64)(v.f2[1].f1[1]));
++    print(" %", (uniform int32)(v.f2[2].f0[0]));
++    print(" %", (uniform int64)(v.f2[2].f1[0]));
++    print(" %", (uniform int64)(v.f2[2].f1[1]));
++    print("\n");
++}
++
++noinline void case328() {
++    uniform C328_T1 v[2] = { { { [1] = { .f2 = 24223 }, [0].f0 = 2469 }, .f0[0].f1 = 9.5f, .f0[1] = { .f2 = 61, .f0 = 69, .f2 = 29951 } } };
++    print("case328");
++    print(" %", (uniform int32)(v[0].f0[0].f0));
++    print(" %", (uniform int32)(v[0].f0[0].f1));
++    print(" %", (uniform int64)(v[0].f0[0].f2));
++    print(" %", (uniform int32)(v[0].f0[1].f0));
++    print(" %", (uniform int32)(v[0].f0[1].f1));
++    print(" %", (uniform int64)(v[0].f0[1].f2));
++    print(" %", (uniform int32)(v[1].f0[0].f0));
++    print(" %", (uniform int32)(v[1].f0[0].f1));
++    print(" %", (uniform int64)(v[1].f0[0].f2));
++    print(" %", (uniform int32)(v[1].f0[1].f0));
++    print(" %", (uniform int32)(v[1].f0[1].f1));
++    print(" %", (uniform int64)(v[1].f0[1].f2));
++    print("\n");
++}
++
++noinline void case41() {
++    uniform C41_T1 v = { .f0[0].f1 = 83, .f0 = { [0].f0 = { 16, [0] = 18, [0] = 40 }, [0].f0[0] = -19, [0].f1 = 29.5f, [0].f1 = -96, [0].f1 = -18 } };
++    print("case41");
++    print(" %", (uniform int32)(v.f0[0].f0[0]));
++    print(" %", (uniform int32)(v.f0[0].f0[1]));
++    print(" %", (uniform int32)(v.f0[0].f0[2]));
++    print(" %", (uniform int32)(v.f0[0].f1));
++    print("\n");
++}
++
++extern "C" uniform int main() {
++    case178();
++    case372();
++    case396();
++    case380();
++    case239();
++    case263();
++    case80();
++    case210();
++    case36();
++    case255();
++    case328();
++    case41();
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-corpus-global-c2cf13.ispc b/tests/lit-tests/designated-init-corpus-global-c2cf13.ispc
+new file mode 100644
+index 0000000..844f155
+--- /dev/null
++++ b/tests/lit-tests/designated-init-corpus-global-c2cf13.ispc
+@@ -0,0 +1,171 @@
++// Global designated initializers whose expected values come from compiling the same initializers as C with clang.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: case26 8 0 98 0 96 0 65 89 29
++// CHECK-NEXT: case72 99 0 53 29 0
++// CHECK-NEXT: case100 31 0 0 0 0 0 0 0 0 0 0 49
++// CHECK-NEXT: case150 0 0 64 19 48 62
++// CHECK-NEXT: case170 2 64 60 1 97 0 0
++// CHECK-NEXT: case224 33 7 36 69
++// CHECK-NEXT: case227 57 0 0 0 0 0 58 0 0 0
++// CHECK-NEXT: case232 0 0 0 0 62
++// CHECK-NEXT: case263 2 1 0 14 71 0 0 23 37
++// CHECK-NEXT: case292 4 0 0 0 0 0 0 5 94 45 36 33 0
++
++struct C72_S3 {
++    int32 m0;
++    int32 m1;
++};
++struct C72_S2 {
++    int32 m0;
++    C72_S3 m1;
++    int32 m2;
++};
++struct C72_S1 {
++    int32 m0;
++    C72_S2 m1;
++};
++
++struct C100_S3 {
++    int32 m0;
++};
++struct C100_S4 {
++    int32 m0;
++};
++struct C100_S5 {
++    int32 m0;
++    int32 m1;
++};
++struct C100_S2 {
++    C100_S3 m0;
++    int32 m1;
++    C100_S4 m2;
++    C100_S5 m3;
++};
++struct C100_S1 {
++    int32 m0[4];
++    C100_S2 m1;
++    int32 m2[2];
++    int32 m3;
++};
++
++struct C224_S2 {
++    int32 m0;
++    int32 m1[2];
++};
++struct C224_S1 {
++    C224_S2 m0;
++    int32 m1;
++};
++
++struct C227_S2 {
++    int32 m0;
++    int32 m1;
++    int32 m2;
++    int32 m3;
++};
++struct C227_S3 {
++    int32 m0;
++};
++struct C227_S1 {
++    int32 m0;
++    C227_S2 m1[2];
++    C227_S3 m2;
++};
++
++struct C232_S1 {
++    int32 m0[3];
++    int32 m1[1][2];
++};
++
++uniform int32 case26_value[] = { [1] = 98, [5] = 65, [3] = 96, [6] = 89, { 29 } };
++uniform C72_S1 case72_value = { .m0 = 29, .m0 = 99, .m1.m1.m1 = 29, .m1.m1.m0 = 53 };
++uniform C100_S1 case100_value = { .m3 = 27, .m3 = 49, .m0 = { 25, [0] = 31 } };
++uniform int32 case150_value[2][3] = { [1] = { 18, 48, 62, [0] = { 19 } }, [0][2] = 64 };
++uniform int32 case170_value[][3] = { [0] = { 64, [1] = 1, [1] = 60, [2] = 1 }, { 15, [0] = 97 } };
++uniform C224_S1 case224_value = { .m0 = { 33, .m1[0] = 70, .m1[0] = { 7 }, 36 }, .m1 = 64, .m1 = 69 };
++uniform C227_S1 case227_value = { .m1[1].m1 = 58, .m0 = 14, .m0 = 57 };
++uniform C232_S1 case232_value = { .m1[0] = { 56, 9 }, .m1 = { [0][1] = 27, [0][0] = 81, [0] = { [1] = 62 } } };
++uniform int32 case263_value[][4] = { { 1, [2] = 85, 71, [2] = 14 }, { [2] = 23, 37 } };
++uniform int32 case292_value[][3] = { [2] = { { 5 }, [2] = 24, [1] = 94, 45 }, { [0] = 36, 33 } };
++
++noinline void case26() {
++    print("case26 %", (uniform int32)(sizeof(case26_value) / sizeof(case26_value[0])));
++    for (uniform int32 i = 0; i < (uniform int32)(sizeof(case26_value) / sizeof(case26_value[0])); ++i) {
++        print(" %", case26_value[i]);
++    }
++    print("\n");
++}
++
++noinline void case72() {
++    print("case72 % % % % %\n", case72_value.m0, case72_value.m1.m0, case72_value.m1.m1.m0, case72_value.m1.m1.m1, case72_value.m1.m2);
++}
++
++noinline void case100() {
++    print("case100 % % % % % % % % % % % %\n", case100_value.m0[0], case100_value.m0[1], case100_value.m0[2], case100_value.m0[3], case100_value.m1.m0.m0, case100_value.m1.m1, case100_value.m1.m2.m0, case100_value.m1.m3.m0, case100_value.m1.m3.m1, case100_value.m2[0], case100_value.m2[1], case100_value.m3);
++}
++
++noinline void case150() {
++    print("case150 % % % % % %\n", case150_value[0][0], case150_value[0][1], case150_value[0][2], case150_value[1][0], case150_value[1][1], case150_value[1][2]);
++}
++
++noinline void case170() {
++    print("case170 %", (uniform int32)(sizeof(case170_value) / sizeof(case170_value[0])));
++    for (uniform int32 i = 0; i < (uniform int32)(sizeof(case170_value) / sizeof(case170_value[0])); ++i) {
++        print(" %", case170_value[i][0]);
++        print(" %", case170_value[i][1]);
++        print(" %", case170_value[i][2]);
++    }
++    print("\n");
++}
++
++noinline void case224() {
++    print("case224 % % % %\n", case224_value.m0.m0, case224_value.m0.m1[0], case224_value.m0.m1[1], case224_value.m1);
++}
++
++noinline void case227() {
++    print("case227 % % % % % % % % % %\n", case227_value.m0, case227_value.m1[0].m0, case227_value.m1[0].m1, case227_value.m1[0].m2, case227_value.m1[0].m3, case227_value.m1[1].m0, case227_value.m1[1].m1, case227_value.m1[1].m2, case227_value.m1[1].m3, case227_value.m2.m0);
++}
++
++noinline void case232() {
++    print("case232 % % % % %\n", case232_value.m0[0], case232_value.m0[1], case232_value.m0[2], case232_value.m1[0][0], case232_value.m1[0][1]);
++}
++
++noinline void case263() {
++    print("case263 %", (uniform int32)(sizeof(case263_value) / sizeof(case263_value[0])));
++    for (uniform int32 i = 0; i < (uniform int32)(sizeof(case263_value) / sizeof(case263_value[0])); ++i) {
++        print(" %", case263_value[i][0]);
++        print(" %", case263_value[i][1]);
++        print(" %", case263_value[i][2]);
++        print(" %", case263_value[i][3]);
++    }
++    print("\n");
++}
++
++noinline void case292() {
++    print("case292 %", (uniform int32)(sizeof(case292_value) / sizeof(case292_value[0])));
++    for (uniform int32 i = 0; i < (uniform int32)(sizeof(case292_value) / sizeof(case292_value[0])); ++i) {
++        print(" %", case292_value[i][0]);
++        print(" %", case292_value[i][1]);
++        print(" %", case292_value[i][2]);
++    }
++    print("\n");
++}
++
++extern "C" uniform int main() {
++    case26();
++    case72();
++    case100();
++    case150();
++    case170();
++    case224();
++    case227();
++    case232();
++    case263();
++    case292();
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-corpus-local-c2cf13.ispc b/tests/lit-tests/designated-init-corpus-local-c2cf13.ispc
+new file mode 100644
+index 0000000..808cd95
+--- /dev/null
++++ b/tests/lit-tests/designated-init-corpus-local-c2cf13.ispc
+@@ -0,0 +1,182 @@
++// Local designated initializers whose expected values come from compiling the same initializers as C with clang.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: case19 0 0 0 0 0 0 54 0 15 39
++// CHECK-NEXT: case32 72 43 0
++// CHECK-NEXT: case41 12 0 0 3 0 0 0 0 0 0
++// CHECK-NEXT: case56 74 18 24 50
++// CHECK-NEXT: case69 9 0 0 19 0 0 0 57 71 51
++// CHECK-NEXT: case99 0 0 0 0 0 18 0 0 0
++// CHECK-NEXT: case102 57 66 0 81 96 22 0 0
++// CHECK-NEXT: case139 0 0 0 0 0 65 95 31 60 0
++// CHECK-NEXT: case144 0 33 0 0 19 31 57
++// CHECK-NEXT: case171 3 0 0 0 0 14 0 43 0 21 76 48 69
++
++struct C32_S3 {
++    int32 m0;
++};
++struct C32_S4 {
++    int32 m0;
++};
++struct C32_S2 {
++    C32_S3 m0;
++    C32_S4 m1;
++};
++struct C32_S1 {
++    int32 m0;
++    C32_S2 m1;
++};
++
++struct C41_S1 {
++    int32 m0[3][3];
++    int32 m1;
++};
++
++struct C56_S1 {
++    int32 m0;
++    int32 m1;
++    int32 m2;
++    int32 m3;
++};
++
++struct C99_S2 {
++    int32 m0;
++    int32 m1[4];
++};
++struct C99_S3 {
++    int32 m0[4];
++};
++struct C99_S1 {
++    C99_S2 m0;
++    C99_S3 m1;
++};
++
++struct C102_S3 {
++    int32 m0;
++};
++struct C102_S2 {
++    int32 m0;
++    C102_S3 m1;
++};
++struct C102_S5 {
++    int32 m0;
++    int32 m1;
++    int32 m2;
++    int32 m3;
++};
++struct C102_S4 {
++    C102_S5 m0;
++    int32 m1;
++};
++struct C102_S1 {
++    int32 m0;
++    C102_S2 m1;
++    C102_S4 m2;
++};
++
++struct C139_S3 {
++    int32 m0;
++    int32 m1;
++    int32 m2;
++};
++struct C139_S2 {
++    C139_S3 m0;
++};
++struct C139_S1 {
++    C139_S2 m0;
++    int32 m1;
++    int32 m2[3][2];
++};
++
++struct C144_S1 {
++    int32 m0;
++    int32 m1[4];
++    int32 m2;
++    int32 m3;
++};
++
++struct C171_S1 {
++    int32 m0;
++    int32 m1;
++    int32 m2;
++    int32 m3;
++};
++
++noinline void case19() {
++    uniform int32 v[5][2] = { [4] = { 99, [1] = { 80 }, [0] = 15 }, [3][0] = 54, [4][1] = 39 };
++    print("case19 % % % % % % % % % %\n", v[0][0], v[0][1], v[1][0], v[1][1], v[2][0], v[2][1], v[3][0], v[3][1], v[4][0], v[4][1]);
++}
++
++noinline void case32() {
++    uniform C32_S1 v = { .m0 = 17, .m1.m0.m0 = 43, .m0 = 57, .m0 = 72 };
++    print("case32 % % %\n", v.m0, v.m1.m0.m0, v.m1.m1.m0);
++}
++
++noinline void case41() {
++    uniform C41_S1 v = { .m0[0] = { 33, 8 }, .m0 = { [1][0] = 3, [0][0] = { 41 } }, .m0[0] = { [0] = 12 } };
++    print("case41 % % % % % % % % % %\n", v.m0[0][0], v.m0[0][1], v.m0[0][2], v.m0[1][0], v.m0[1][1], v.m0[1][2], v.m0[2][0], v.m0[2][1], v.m0[2][2], v.m1);
++}
++
++noinline void case56() {
++    uniform C56_S1 v[1] = { { { 74 }, .m1 = 4, 24 }, [0].m3 = 50, [0].m1 = 18 };
++    print("case56 % % % %\n", v[0].m0, v[0].m1, v[0].m2, v[0].m3);
++}
++
++noinline void case69() {
++    uniform int32 v[] = { [6] = 71, [6] = 57, 71, 51, [2] = 19 };
++    print("case69 %", (uniform int32)(sizeof(v) / sizeof(v[0])));
++    for (uniform int32 i = 0; i < (uniform int32)(sizeof(v) / sizeof(v[0])); ++i) {
++        print(" %", v[i]);
++    }
++    print("\n");
++}
++
++noinline void case99() {
++    uniform C99_S1 v = { .m1.m0 = { [0] = 52, [0] = 47, 60, [1] = 7, [1] = 92 }, .m1.m0[1] = { 3 }, .m1 = { { 18 } } };
++    print("case99 % % % % % % % % %\n", v.m0.m0, v.m0.m1[0], v.m0.m1[1], v.m0.m1[2], v.m0.m1[3], v.m1.m0[0], v.m1.m0[1], v.m1.m0[2], v.m1.m0[3]);
++}
++
++noinline void case102() {
++    uniform C102_S1 v = { .m2.m0 = { 43, .m1 = 96, 22, .m0 = 81 }, .m0 = 57, { 66 } };
++    print("case102 % % % % % % % %\n", v.m0, v.m1.m0, v.m1.m1.m0, v.m2.m0.m0, v.m2.m0.m1, v.m2.m0.m2, v.m2.m0.m3, v.m2.m1);
++}
++
++noinline void case139() {
++    uniform C139_S1 v = { .m2 = { [0][1] = 65, { [0] = 66, [0] = 95, [1] = 2, [1] = 31 }, { 60 } } };
++    print("case139 % % % % % % % % % %\n", v.m0.m0.m0, v.m0.m0.m1, v.m0.m0.m2, v.m1, v.m2[0][0], v.m2[0][1], v.m2[1][0], v.m2[1][1], v.m2[2][0], v.m2[2][1]);
++}
++
++noinline void case144() {
++    uniform C144_S1 v = { .m1 = { 33 }, .m2 = { 88 }, .m2 = 31, 57, .m1[3] = 19 };
++    print("case144 % % % % % % %\n", v.m0, v.m1[0], v.m1[1], v.m1[2], v.m1[3], v.m2, v.m3);
++}
++
++noinline void case171() {
++    uniform C171_S1 v[] = { [1] = { 14, .m2 = { 43 } }, { .m1 = 76, .m0 = 21, .m2 = 48, 69 } };
++    print("case171 %", (uniform int32)(sizeof(v) / sizeof(v[0])));
++    for (uniform int32 i = 0; i < (uniform int32)(sizeof(v) / sizeof(v[0])); ++i) {
++        print(" %", v[i].m0);
++        print(" %", v[i].m1);
++        print(" %", v[i].m2);
++        print(" %", v[i].m3);
++    }
++    print("\n");
++}
++
++extern "C" uniform int main() {
++    case19();
++    case32();
++    case41();
++    case56();
++    case69();
++    case99();
++    case102();
++    case139();
++    case144();
++    case171();
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-corpus-new-c2cf13.ispc b/tests/lit-tests/designated-init-corpus-new-c2cf13.ispc
+new file mode 100644
+index 0000000..135d186
+--- /dev/null
++++ b/tests/lit-tests/designated-init-corpus-new-c2cf13.ispc
+@@ -0,0 +1,205 @@
++// Designated initializer values in new expressions whose expected values come from compiling the same initializers as C with clang.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: case7 75 29
++// CHECK-NEXT: case65 45 0 0 0 0 0 30
++// CHECK-NEXT: case107 0 0 0 0 0 35 31 0 0
++// CHECK-NEXT: case113 0 23 51 0
++// CHECK-NEXT: case148 55 73 89
++// CHECK-NEXT: case169 22 68 27 0
++// CHECK-NEXT: case212 12
++// CHECK-NEXT: case251 25 0 0 0 0 78 60 0
++// CHECK-NEXT: case254 82 44 14
++// CHECK-NEXT: case281 67 64 0 0 0 0
++
++struct C7_S1 {
++    int32 m0;
++    int32 m1;
++};
++
++struct C65_S3 {
++    int32 m0;
++    int32 m1;
++    int32 m2;
++};
++struct C65_S2 {
++    int32 m0;
++    C65_S3 m1;
++};
++struct C65_S4 {
++    int32 m0;
++    int32 m1;
++};
++struct C65_S1 {
++    C65_S2 m0;
++    C65_S4 m1[1];
++    int32 m2;
++};
++
++struct C107_S3 {
++    int32 m0;
++    int32 m1;
++    int32 m2;
++};
++struct C107_S2 {
++    int32 m0[1];
++    int32 m1;
++    C107_S3 m2;
++};
++struct C107_S4 {
++    int32 m0;
++    int32 m1;
++};
++struct C107_S1 {
++    C107_S2 m0;
++    int32 m1;
++    int32 m2;
++    C107_S4 m3;
++};
++
++struct C113_S2 {
++    int32 m0;
++    int32 m1;
++};
++struct C113_S1 {
++    int32 m0;
++    C113_S2 m1;
++    int32 m2;
++};
++
++struct C148_S1 {
++    int32 m0[3];
++};
++
++struct C169_S3 {
++    int32 m0;
++    int32 m1;
++    int32 m2;
++};
++struct C169_S2 {
++    C169_S3 m0;
++};
++struct C169_S1 {
++    C169_S2 m0;
++    int32 m1;
++};
++
++struct C212_S2 {
++    int32 m0;
++};
++struct C212_S1 {
++    C212_S2 m0;
++};
++
++struct C251_S3 {
++    int32 m0;
++};
++struct C251_S2 {
++    int32 m0;
++    C251_S3 m1;
++    int32 m2[2];
++    int32 m3[1];
++};
++struct C251_S1 {
++    C251_S2 m0;
++    int32 m1;
++    int32 m2;
++    int32 m3;
++};
++
++struct C254_S1 {
++    int32 m0;
++    int32 m1;
++    int32 m2;
++};
++
++struct C281_S3 {
++    int32 m0;
++};
++struct C281_S2 {
++    int32 m0[3];
++    C281_S3 m1;
++};
++struct C281_S1 {
++    int32 m0;
++    int32 m1;
++    C281_S2 m2;
++};
++
++noinline void case7() {
++    uniform C7_S1 *uniform p = uniform new uniform C7_S1(.m0 = 28, .m1 = 31, .m1 = { 73 }, .m0 = 75, { 29 });
++    print("case7 % %\n", p[0].m0, p[0].m1);
++    delete p;
++}
++
++noinline void case65() {
++    uniform C65_S1 *uniform p = uniform new uniform C65_S1(.m0.m0 = 45, .m2 = 30);
++    print("case65 % % % % % % %\n", p[0].m0.m0, p[0].m0.m1.m0, p[0].m0.m1.m1, p[0].m0.m1.m2, p[0].m1[0].m0, p[0].m1[0].m1, p[0].m2);
++    delete p;
++}
++
++noinline void case107() {
++    uniform C107_S1 *uniform p = uniform new uniform C107_S1(.m1 = 35, .m2 = 31);
++    print("case107 % % % % % % % % %\n", p[0].m0.m0[0], p[0].m0.m1, p[0].m0.m2.m0, p[0].m0.m2.m1, p[0].m0.m2.m2, p[0].m1, p[0].m2, p[0].m3.m0, p[0].m3.m1);
++    delete p;
++}
++
++noinline void case113() {
++    uniform C113_S1 *uniform p = uniform new uniform C113_S1(.m1.m1 = 51, .m1.m0 = 23);
++    print("case113 % % % %\n", p[0].m0, p[0].m1.m0, p[0].m1.m1, p[0].m2);
++    delete p;
++}
++
++noinline void case148() {
++    uniform C148_S1 *uniform p = uniform new uniform C148_S1(.m0 = { 74, 53, 89 }, .m0[1] = 73, .m0[0] = 55);
++    print("case148 % % %\n", p[0].m0[0], p[0].m0[1], p[0].m0[2]);
++    delete p;
++}
++
++noinline void case169() {
++    uniform C169_S1 *uniform p = uniform new uniform C169_S1({ .m0 = { .m0 = 22, .m1 = { 68 }, .m2 = 27 } });
++    print("case169 % % % %\n", p[0].m0.m0.m0, p[0].m0.m0.m1, p[0].m0.m0.m2, p[0].m1);
++    delete p;
++}
++
++noinline void case212() {
++    uniform C212_S1 *uniform p = uniform new uniform C212_S1(.m0 = { .m0 = 55, .m0 = 6, .m0 = 36, .m0 = 59, .m0 = 6 }, .m0.m0 = 12);
++    print("case212 %\n", p[0].m0.m0);
++    delete p;
++}
++
++noinline void case251() {
++    uniform C251_S1 *uniform p = uniform new uniform C251_S1({ 25 }, .m1 = { 26 }, 60, .m1 = 78);
++    print("case251 % % % % % % % %\n", p[0].m0.m0, p[0].m0.m1.m0, p[0].m0.m2[0], p[0].m0.m2[1], p[0].m0.m3[0], p[0].m1, p[0].m2, p[0].m3);
++    delete p;
++}
++
++noinline void case254() {
++    uniform C254_S1 *uniform p = uniform new uniform C254_S1(87, .m0 = 9, .m0 = 82, 44, { 14 });
++    print("case254 % % %\n", p[0].m0, p[0].m1, p[0].m2);
++    delete p;
++}
++
++noinline void case281() {
++    uniform C281_S1 *uniform p = uniform new uniform C281_S1(13, .m0 = 55, 83, .m0 = 67, { 64 });
++    print("case281 % % % % % %\n", p[0].m0, p[0].m1, p[0].m2.m0[0], p[0].m2.m0[1], p[0].m2.m0[2], p[0].m2.m1.m0);
++    delete p;
++}
++
++extern "C" uniform int main() {
++    case7();
++    case65();
++    case107();
++    case113();
++    case148();
++    case169();
++    case212();
++    case251();
++    case254();
++    case281();
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-corpus-static-c2cf13.ispc b/tests/lit-tests/designated-init-corpus-static-c2cf13.ispc
+new file mode 100644
+index 0000000..5dadf4c
+--- /dev/null
++++ b/tests/lit-tests/designated-init-corpus-static-c2cf13.ispc
+@@ -0,0 +1,156 @@
++// Static local designated initializers whose expected values come from compiling the same initializers as C with clang.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: case6 2 71 69 0 43 53 13
++// CHECK-NEXT: case22 5 45 35 77 0 56
++// CHECK-NEXT: case34 74 31 0
++// CHECK-NEXT: case79 0 75 99 71 0 0 0 0 0 0 0
++// CHECK-NEXT: case196 2 15 46
++// CHECK-NEXT: case200 61 84
++// CHECK-NEXT: case234 0 0 0 95 40 46 0 0
++// CHECK-NEXT: case275 57 90 0 62 25 45 0 0 0
++// CHECK-NEXT: case276 0 40 77 0 0 0 0 0 0 18
++// CHECK-NEXT: case296 79 0 0 75 5 0 0 0 0
++
++struct C34_S1 {
++    int32 m0[1][3];
++};
++
++struct C79_S3 {
++    int32 m0;
++    int32 m1;
++};
++struct C79_S2 {
++    int32 m0;
++    C79_S3 m1;
++};
++struct C79_S5 {
++    int32 m0;
++    int32 m1;
++    int32 m2;
++};
++struct C79_S4 {
++    int32 m0;
++    C79_S5 m1;
++    int32 m2[3];
++};
++struct C79_S1 {
++    C79_S2 m0;
++    int32 m1;
++    C79_S4 m2;
++};
++
++struct C196_S1 {
++    int32 m0;
++};
++
++struct C200_S2 {
++    int32 m0;
++};
++struct C200_S1 {
++    C200_S2 m0;
++    int32 m1[1];
++};
++
++struct C234_S1 {
++    int32 m0[2][4];
++};
++
++struct C276_S1 {
++    int32 m0[3][3];
++    int32 m1;
++};
++
++struct C296_S2 {
++    int32 m0[1];
++    int32 m1;
++    int32 m2[2];
++    int32 m3[3];
++};
++struct C296_S1 {
++    int32 m0;
++    C296_S2 m1;
++    int32 m2;
++};
++
++noinline void case6() {
++    static uniform int32 v[][3] = { { [0] = 26, 69, [0] = 71 }, { 43, 53, 13 } };
++    print("case6 %", (uniform int32)(sizeof(v) / sizeof(v[0])));
++    for (uniform int32 i = 0; i < (uniform int32)(sizeof(v) / sizeof(v[0])); ++i) {
++        print(" %", v[i][0]);
++        print(" %", v[i][1]);
++        print(" %", v[i][2]);
++    }
++    print("\n");
++}
++
++noinline void case22() {
++    static uniform int32 v[] = { [0] = 45, { 35 }, 77, [4] = 56 };
++    print("case22 %", (uniform int32)(sizeof(v) / sizeof(v[0])));
++    for (uniform int32 i = 0; i < (uniform int32)(sizeof(v) / sizeof(v[0])); ++i) {
++        print(" %", v[i]);
++    }
++    print("\n");
++}
++
++noinline void case34() {
++    static uniform C34_S1 v = { { { 97, [0] = 95, [0] = 22 }, [0] = { [0] = 74, 31 } } };
++    print("case34 % % %\n", v.m0[0][0], v.m0[0][1], v.m0[0][2]);
++}
++
++noinline void case79() {
++    static uniform C79_S1 v = { { .m1 = { .m0 = { 75 }, 19, .m1 = 99 } }, { { 71 } } };
++    print("case79 % % % % % % % % % % %\n", v.m0.m0, v.m0.m1.m0, v.m0.m1.m1, v.m1, v.m2.m0, v.m2.m1.m0, v.m2.m1.m1, v.m2.m1.m2, v.m2.m2[0], v.m2.m2[1], v.m2.m2[2]);
++}
++
++noinline void case196() {
++    static uniform C196_S1 v[] = { { 77 }, [1].m0 = 46, [0].m0 = 94, [0].m0 = 15 };
++    print("case196 %", (uniform int32)(sizeof(v) / sizeof(v[0])));
++    for (uniform int32 i = 0; i < (uniform int32)(sizeof(v) / sizeof(v[0])); ++i) {
++        print(" %", v[i].m0);
++    }
++    print("\n");
++}
++
++noinline void case200() {
++    static uniform C200_S1 v = { { .m0 = 16, .m0 = 13, .m0 = 63, .m0 = 17 }, .m0.m0 = 15, .m1[0] = 84, .m0.m0 = 61 };
++    print("case200 % %\n", v.m0.m0, v.m1[0]);
++}
++
++noinline void case234() {
++    static uniform C234_S1 v = { .m0[0] = { [3] = 95 }, .m0[1] = { 39, [1] = 98, [0] = 30, [0] = 40, 46 } };
++    print("case234 % % % % % % % %\n", v.m0[0][0], v.m0[0][1], v.m0[0][2], v.m0[0][3], v.m0[1][0], v.m0[1][1], v.m0[1][2], v.m0[1][3]);
++}
++
++noinline void case275() {
++    static uniform int32 v[3][3] = { { 57, [1] = 90 }, { [1] = 29, 45, [0] = 62, 25 } };
++    print("case275 % % % % % % % % %\n", v[0][0], v[0][1], v[0][2], v[1][0], v[1][1], v[1][2], v[2][0], v[2][1], v[2][2]);
++}
++
++noinline void case276() {
++    static uniform C276_S1 v = { .m1 = 41, .m0 = { [0] = { [1] = 34, 45, [2] = 77, [1] = { 40 } } }, { { 18 } } };
++    print("case276 % % % % % % % % % %\n", v.m0[0][0], v.m0[0][1], v.m0[0][2], v.m0[1][0], v.m0[1][1], v.m0[1][2], v.m0[2][0], v.m0[2][1], v.m0[2][2], v.m1);
++}
++
++noinline void case296() {
++    static uniform C296_S1 v = { .m0 = 79, .m1 = { .m2 = { [1] = 43, [1] = 42, [0] = 7, [0] = 75, [1] = 5 } } };
++    print("case296 % % % % % % % % %\n", v.m0, v.m1.m0[0], v.m1.m1, v.m1.m2[0], v.m1.m2[1], v.m1.m3[0], v.m1.m3[1], v.m1.m3[2], v.m2);
++}
++
++extern "C" uniform int main() {
++    case6();
++    case22();
++    case34();
++    case79();
++    case196();
++    case200();
++    case234();
++    case275();
++    case276();
++    case296();
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-err-brace-elision-c2cf13.ispc b/tests/lit-tests/designated-init-err-brace-elision-c2cf13.ispc
+new file mode 100644
+index 0000000..e99d9d9
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-brace-elision-c2cf13.ispc
+@@ -0,0 +1,45 @@
++// An item that lands on a struct or array must be a brace list.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DLOCAL %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DGLOBAL %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DARRAY %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DDESIGNATED %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DARRAY_MEMBER %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DARRAY_MEMBER_CONTINUED %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// CHECK: Error:
++
++struct Point {
++    int32 x, y;
++};
++
++struct Rect {
++    Point lo, hi;
++    int32 tag;
++};
++
++struct Poly {
++    int32 n;
++    int32 pts[3];
++};
++
++#ifdef GLOBAL
++uniform Rect g = { .lo.y = 1, 2 };
++#endif
++
++void f() {
++#ifdef LOCAL
++    uniform Rect r = { .lo.y = 1, 2 };
++#endif
++#ifdef ARRAY
++    uniform Point pts[2] = { [0].y = 1, 2 };
++#endif
++#ifdef DESIGNATED
++    uniform Rect r = { .hi = 5 };
++#endif
++#ifdef ARRAY_MEMBER
++    uniform Poly p = { .pts = 5 };
++#endif
++#ifdef ARRAY_MEMBER_CONTINUED
++    uniform Poly p = { .n = 1, 2 };
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-err-global-nonconstant-c2cf13.ispc b/tests/lit-tests/designated-init-err-global-nonconstant-c2cf13.ispc
+new file mode 100644
+index 0000000..b1983e7
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-global-nonconstant-c2cf13.ispc
+@@ -0,0 +1,36 @@
++// Designated initializers for global and static variables must still be compile-time constants, just like positional ones.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DDESIGNATED_CALL %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DDESIGNATED_VARIABLE %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DDESIGNATED_SOA_GLOBAL %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DDESIGNATED_SOA_STATIC %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DPOSITIONAL %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// CHECK: Error:{{.*}}constant
++
++struct Point {
++    int32 x, y;
++};
++
++uniform int32 counter = 3;
++
++uniform int32 next() { return counter + 1; }
++
++#ifdef DESIGNATED_CALL
++uniform int32 g[2] = { [1] = next() };
++#endif
++
++#ifdef DESIGNATED_VARIABLE
++uniform Point gp = { .y = counter };
++#endif
++
++#ifdef DESIGNATED_SOA_GLOBAL
++const soa<4> Point gs[1] = { [0].y = { 1, 2, 3, 4 } };
++#endif
++
++#ifdef DESIGNATED_SOA_STATIC
++void staticSoa() { static soa<4> Point ls[2] = { [1] = { .x = { 1, 2, 3, 4 } } }; }
++#endif
++
++#ifdef POSITIONAL
++uniform int32 h[2] = { 0, next() };
++#endif
+diff --git a/tests/lit-tests/designated-init-err-inconsistent-2d-c2cf13.ispc b/tests/lit-tests/designated-init-err-inconsistent-2d-c2cf13.ispc
+new file mode 100644
+index 0000000..f8899b5
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-inconsistent-2d-c2cf13.ispc
+@@ -0,0 +1,15 @@
++// Sub-lists of an array with no sizes must still imply the same length when they use designators.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DLOCAL %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DGLOBAL %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// CHECK: Error:
++
++#ifdef GLOBAL
++uniform int32 g[][] = { { 4, 5, 6 }, { [3] = 1 } };
++#endif
++
++void f() {
++#ifdef LOCAL
++    uniform int32 g[][] = { { [3] = 1 }, { 4, 5, 6 } };
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-err-index-range-c2cf13.ispc b/tests/lit-tests/designated-init-err-index-range-c2cf13.ispc
+new file mode 100644
+index 0000000..ed5b5f1
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-index-range-c2cf13.ispc
+@@ -0,0 +1,35 @@
++// Array designator indices outside a sized array or vector are errors that include the index.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DARRAY %s -o %t.o 2>&1 | FileCheck %s --check-prefix=ARRAY --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DNEGATIVE %s -o %t.o 2>&1 | FileCheck %s --check-prefix=NEGATIVE --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DVECTOR %s -o %t.o 2>&1 | FileCheck %s --check-prefix=VECTOR --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DNESTED %s -o %t.o 2>&1 | FileCheck %s --check-prefix=NESTED --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DGLOBAL %s -o %t.o 2>&1 | FileCheck %s --check-prefix=GLOBAL --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// ARRAY: Error:{{.*}}9
++// NEGATIVE: Error:{{.*}}-1
++// VECTOR: Error:{{.*}}5
++// NESTED: Error:{{.*}}7
++// GLOBAL: Error:{{.*}}6
++
++struct Poly {
++    int32 pts[3];
++};
++
++#ifdef GLOBAL
++uniform int32 g[4] = { [6] = 1 };
++#endif
++
++void f() {
++#ifdef ARRAY
++    uniform int32 a[4] = { [9] = 1 };
++#endif
++#ifdef NEGATIVE
++    uniform int32 a[4] = { [-1] = 1 };
++#endif
++#ifdef VECTOR
++    uniform float<3> v = { [5] = 1 };
++#endif
++#ifdef NESTED
++    uniform Poly p = { .pts[7] = 1 };
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-err-index-type-c2cf13.ispc b/tests/lit-tests/designated-init-err-index-type-c2cf13.ispc
+new file mode 100644
+index 0000000..98429ff
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-index-type-c2cf13.ispc
+@@ -0,0 +1,30 @@
++// Array designator indices of boolean or floating-point type are errors, constant or not.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DBOOL_LITERAL %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DBOOL_CONST %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DFLOAT_LITERAL %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DDOUBLE_CONST %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DGLOBAL_FLOAT_CONST %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// CHECK: Error:
++
++#ifdef GLOBAL_FLOAT_CONST
++static const uniform float ONE = 1.0f;
++uniform int32 g[2] = { [ONE] = 1 };
++#endif
++
++void f() {
++#ifdef BOOL_LITERAL
++    uniform int32 a[2] = { [true] = 1 };
++#endif
++#ifdef BOOL_CONST
++    const uniform bool flag = true;
++    uniform int32 b[2] = { [flag] = 1 };
++#endif
++#ifdef FLOAT_LITERAL
++    uniform int32 c[2] = { [1.0f] = 1 };
++#endif
++#ifdef DOUBLE_CONST
++    const uniform double half = 0.5d;
++    uniform int32 d[2] = { [half] = 1 };
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-err-kind-mismatch-c2cf13.ispc b/tests/lit-tests/designated-init-err-kind-mismatch-c2cf13.ispc
+new file mode 100644
+index 0000000..d59a415
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-kind-mismatch-c2cf13.ispc
+@@ -0,0 +1,26 @@
++// A member designator needs a struct and an index designator needs an array or vector.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DMEMBER_ON_ARRAY %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DINDEX_ON_STRUCT %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DMEMBER_ON_SCALAR %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DINDEX_ON_SCALAR %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// CHECK: Error:
++
++struct Point {
++    int32 x, y;
++};
++
++void f() {
++#ifdef MEMBER_ON_ARRAY
++    uniform int32 a[3] = { .x = 1 };
++#endif
++#ifdef INDEX_ON_STRUCT
++    uniform Point p = { [0] = 1 };
++#endif
++#ifdef MEMBER_ON_SCALAR
++    uniform Point p = { .x.y = 1 };
++#endif
++#ifdef INDEX_ON_SCALAR
++    uniform Point p = { .x[0] = 1 };
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-err-non-aggregate-c2cf13.ispc b/tests/lit-tests/designated-init-err-non-aggregate-c2cf13.ispc
+new file mode 100644
+index 0000000..7eefc5a
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-non-aggregate-c2cf13.ispc
+@@ -0,0 +1,50 @@
++// Designators are rejected in initializers for types other than structs, arrays and vectors.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DVARYING %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DUNIFORM %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DMEMBER %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DGLOBAL_VARYING %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DPOINTER %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DPOINTER_TO_STRUCT %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DENUM %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DGLOBAL_ENUM %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DFLOAT %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// CHECK: Error:
++
++struct Point {
++    int32 x, y;
++};
++
++enum Axis { AX, AY };
++
++#ifdef GLOBAL_VARYING
++static const varying int32 gx = { [0] = 1 };
++#endif
++
++#ifdef GLOBAL_ENUM
++uniform Axis ge = { .x = 1 };
++#endif
++
++void f() {
++#ifdef VARYING
++    varying int32 x = { [0] = 1 };
++#endif
++#ifdef UNIFORM
++    uniform int32 y = { .a = 1 };
++#endif
++#ifdef MEMBER
++    uniform Point p = { .x = { [0] = 1 } };
++#endif
++#ifdef POINTER
++    uniform int32 *uniform ptr = { [0] = 1 };
++#endif
++#ifdef POINTER_TO_STRUCT
++    uniform Point *uniform pp = { .x = 1 };
++#endif
++#ifdef ENUM
++    uniform Axis e = { [0] = AX };
++#endif
++#ifdef FLOAT
++    uniform float fl = { [0] = 1 };
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-err-nonconstant-index-c2cf13.ispc b/tests/lit-tests/designated-init-err-nonconstant-index-c2cf13.ispc
+new file mode 100644
+index 0000000..1d505ab
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-nonconstant-index-c2cf13.ispc
+@@ -0,0 +1,21 @@
++// Array designator indices must be integer constant expressions.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DPARAM %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DLOCALVAR %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DGLOBALVAR %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// CHECK: Error:
++
++#ifdef GLOBALVAR
++uniform int32 slot = 1;
++uniform int32 g[4] = { [slot] = 1 };
++#endif
++
++void f(uniform int32 n) {
++#ifdef PARAM
++    uniform int32 a[4] = { [n] = 1 };
++#endif
++#ifdef LOCALVAR
++    uniform int32 k = 2;
++    uniform int32 b[4] = { [k] = 1 };
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-err-struct-value-c2cf13.ispc b/tests/lit-tests/designated-init-err-struct-value-c2cf13.ispc
+new file mode 100644
+index 0000000..e8dbf9c
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-struct-value-c2cf13.ispc
+@@ -0,0 +1,36 @@
++// Inside an initializer that uses designators, an item that lands on a struct must be a brace list, even a value of that struct type.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DDESIGNATED %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DCONTINUED %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DELEMENT %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DNESTED_PLAIN %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DNEW %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// CHECK: Error:
++
++struct Point {
++    int32 x, y;
++};
++
++struct Rect {
++    int32 tag;
++    Point pos;
++    int32 area;
++};
++
++void f(uniform Point p) {
++#ifdef DESIGNATED
++    uniform Rect r = { .pos = p, .tag = 2 };
++#endif
++#ifdef CONTINUED
++    uniform Rect r = { .tag = 4, p, 9 };
++#endif
++#ifdef ELEMENT
++    uniform Point pts[2] = { [1] = p };
++#endif
++#ifdef NESTED_PLAIN
++    uniform Rect rs[2] = { [1] = { 5, p, 6 } };
++#endif
++#ifdef NEW
++    uniform Rect *uniform q = uniform new uniform Rect(.pos = p, .tag = 7);
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-err-too-many-c2cf13.ispc b/tests/lit-tests/designated-init-err-too-many-c2cf13.ispc
+new file mode 100644
+index 0000000..b08fdf0
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-too-many-c2cf13.ispc
+@@ -0,0 +1,65 @@
++// Items that continue past the end of the object after a designator are an error; plain lists with too many items keep their existing diagnostics.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DARRAY %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DSTRUCT %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DGLOBAL %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DNESTED %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DCHAIN %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DVECTOR %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DPLAIN_ARRAY %s -o %t.o 2>&1 | FileCheck %s --check-prefix=PLAIN_ARRAY --implicit-check-not=Error:
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DPLAIN_STRUCT %s -o %t.o 2>&1 | FileCheck %s --check-prefix=PLAIN_STRUCT --implicit-check-not=Error:
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DPLAIN_VECTOR %s -o %t.o 2>&1 | FileCheck %s --check-prefix=PLAIN_VECTOR --implicit-check-not=Error:
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DPLAIN_GLOBAL %s -o %t.o 2>&1 | FileCheck %s --check-prefix=PLAIN_GLOBAL --implicit-check-not=Error:
++
++// CHECK: Error:
++
++struct Point {
++    int32 x, y;
++};
++
++struct Rect {
++    Point lo, hi;
++    int32 tag;
++};
++
++#ifdef GLOBAL
++uniform int32 g[2] = { [1] = 1, 2 };
++#endif
++
++#ifdef PLAIN_GLOBAL
++// PLAIN_GLOBAL: {{.*}}:[[@LINE+2]]:25: Error: Initializer list for array "uniform int32[2]" must have no more than 2 elements (has 3).
++// PLAIN_GLOBAL: {{.*}}:[[@LINE+1]]:25: Error: Initializer for global variable "ga" must be a constant.
++uniform int32 ga[2] = { 1, 2, 3 };
++#endif
++
++void f() {
++#ifdef ARRAY
++    uniform int32 a[3] = { [2] = 1, 2 };
++#endif
++#ifdef STRUCT
++    uniform Point p = { .y = 1, 2 };
++#endif
++#ifdef NESTED
++    uniform Rect r = { .hi = { .y = 1, 2 } };
++#endif
++#ifdef CHAIN
++    uniform Rect r = { .hi.y = 1, .tag = 2, 3 };
++#endif
++#ifdef VECTOR
++    uniform float<3> v = { [2] = 1, 2 };
++#endif
++#ifdef PLAIN_ARRAY
++    // PLAIN_ARRAY: {{.*}}:[[@LINE+2]]:28: Error: Initializer list for array "uniform int32[2]" must have no more than 2 elements (has 3).
++    // PLAIN_ARRAY: {{.*}}:[[@LINE+1]]:28: Error: Initializer for array type "uniform int32[2]" requires no more than 2 values; 3 provided.
++    uniform int32 a[2] = { 1, 2, 3 };
++#endif
++#ifdef PLAIN_STRUCT
++    // PLAIN_STRUCT: {{.*}}:[[@LINE+2]]:25: Error: Initializer list for struct "uniform struct Point" must have no more than 2 elements (has 3).
++    // PLAIN_STRUCT: {{.*}}:[[@LINE+1]]:25: Error: Initializer for struct type "uniform struct Point" requires no more than 2 values; 3 provided.
++    uniform Point p = { 1, 2, 3 };
++#endif
++#ifdef PLAIN_VECTOR
++    // PLAIN_VECTOR: {{.*}}:[[@LINE+2]]:28: Error: Initializer list for vector "uniform int32<2>" must have no more than 2 elements (has 3).
++    // PLAIN_VECTOR: {{.*}}:[[@LINE+1]]:28: Error: Initializer for vector type "uniform int32<2>" requires no more than 2 values; 3 provided.
++    uniform int32<2> v = { 1, 2, 3 };
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-err-unknown-member-c2cf13.ispc b/tests/lit-tests/designated-init-err-unknown-member-c2cf13.ispc
+new file mode 100644
+index 0000000..e662eb1
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-unknown-member-c2cf13.ispc
+@@ -0,0 +1,35 @@
++// A member designator naming a member the struct does not have is an error that names the member.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DLOCAL %s -o %t.o 2>&1 | FileCheck %s --check-prefix=LOCAL --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DGLOBAL %s -o %t.o 2>&1 | FileCheck %s --check-prefix=GLOBAL --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DNEW %s -o %t.o 2>&1 | FileCheck %s --check-prefix=NEW --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DNESTED %s -o %t.o 2>&1 | FileCheck %s --check-prefix=NESTED --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// LOCAL: Error:{{.*}}wdith
++// GLOBAL: Error:{{.*}}hieght
++// NEW: Error:{{.*}}colour
++// NESTED: Error:{{.*}}dpeth
++
++struct Size {
++    int32 width, height;
++};
++
++struct Frame {
++    Size size;
++    int32 depth;
++};
++
++#ifdef GLOBAL
++uniform Size g = { .height = 1, .hieght = 2 };
++#endif
++
++void f() {
++#ifdef LOCAL
++    uniform Size s = { .wdith = 2 };
++#endif
++#ifdef NEW
++    uniform Size *uniform p = uniform new uniform Size(.colour = 2);
++#endif
++#ifdef NESTED
++    uniform Frame fr = { .depth = 1, .size.dpeth = 3 };
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-err-vector-member-c2cf13.ispc b/tests/lit-tests/designated-init-err-vector-member-c2cf13.ispc
+new file mode 100644
+index 0000000..48a0100
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-vector-member-c2cf13.ispc
+@@ -0,0 +1,23 @@
++// A vector member designator must be a one-letter name of an element the vector has.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DOUT_OF_RANGE %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DSWIZZLE %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DUNKNOWN %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DGLOBAL %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// CHECK: Error:
++
++#ifdef GLOBAL
++uniform int32<2> g = { .z = 1 };
++#endif
++
++void f() {
++#ifdef OUT_OF_RANGE
++    uniform float<3> v = { .w = 1 };
++#endif
++#ifdef SWIZZLE
++    uniform float<4> v = { .xy = 1 };
++#endif
++#ifdef UNKNOWN
++    uniform float<4> v = { .q = 1 };
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-err-vector-value-c2cf13.ispc b/tests/lit-tests/designated-init-err-vector-value-c2cf13.ispc
+new file mode 100644
+index 0000000..86c5af2
+--- /dev/null
++++ b/tests/lit-tests/designated-init-err-vector-value-c2cf13.ispc
+@@ -0,0 +1,42 @@
++// Inside an initializer that uses designators, an item that lands on a short vector must be a brace list, even a vector value.
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DVALUE %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DVALUE_THEN_LANE %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DVALUE_THEN_INDEX %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DCONTINUED %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DELEMENT_THEN_LANE %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DSCALAR %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++// RUN: not %{ispc} --target=host --nowrap --nostdlib -DGLOBAL_CONST %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not="syntax error" --implicit-check-not="FATAL ERROR"
++
++// CHECK: Error:
++
++struct Tagged {
++    int32 tag;
++    uniform int32<2> v;
++};
++
++static const uniform int32<2> CP = { 4, 5 };
++
++#ifdef GLOBAL_CONST
++uniform Tagged g = { .v = CP };
++#endif
++
++void f(uniform int32<2> prior) {
++#ifdef VALUE
++    uniform Tagged t = { .v = prior };
++#endif
++#ifdef VALUE_THEN_LANE
++    uniform Tagged t = { .v = prior, .v.x = 1 };
++#endif
++#ifdef VALUE_THEN_INDEX
++    uniform Tagged t = { .v = prior, .v[1] = 6 };
++#endif
++#ifdef CONTINUED
++    uniform Tagged t = { .tag = 1, prior };
++#endif
++#ifdef ELEMENT_THEN_LANE
++    uniform int32<2> arr[2] = { [0] = prior, [0].x = 1 };
++#endif
++#ifdef SCALAR
++    uniform Tagged t = { .v = 3 };
++#endif
++}
+diff --git a/tests/lit-tests/designated-init-global-c2cf13.ispc b/tests/lit-tests/designated-init-global-c2cf13.ispc
+new file mode 100644
+index 0000000..6302dc6
+--- /dev/null
++++ b/tests/lit-tests/designated-init-global-c2cf13.ispc
+@@ -0,0 +1,39 @@
++// Designated initializers for global variables.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: grect 1 0 0 2 3
++// CHECK-NEXT: garr 0 10 11 40
++// CHECK-NEXT: gpts 6 0 0 5
++// CHECK-NEXT: ctable 5 0 0 0 0 50
++// CHECK-NEXT: gm 2 3 0 1
++// CHECK-NEXT: crect 1 3 0 0 7
++
++struct Point {
++    int32 x, y;
++};
++
++struct Rect {
++    Point lo, hi;
++    int32 tag;
++};
++
++uniform Rect grect = { .hi = { .y = 2 }, .tag = 3, .lo.x = 1 };
++uniform int32 garr[4] = { [3] = 40, [1] = 10, 11 };
++uniform Point gpts[2] = { [1].y = 5, [0] = { 6 } };
++static const uniform int32 ctable[6] = { [5] = 50, [0] = 5 };
++uniform int32 gm[2][2] = { [1][1] = 1, [0] = { 2, 3 } };
++const uniform Rect crect = { .tag = 7, .lo = { 1, 2 }, .lo.y = 3 };
++
++extern "C" uniform int main() {
++    print("grect % % % % %\n", grect.lo.x, grect.lo.y, grect.hi.x, grect.hi.y, grect.tag);
++    print("garr % % % %\n", garr[0], garr[1], garr[2], garr[3]);
++    print("gpts % % % %\n", gpts[0].x, gpts[0].y, gpts[1].x, gpts[1].y);
++    print("ctable % % % % % %\n", ctable[0], ctable[1], ctable[2], ctable[3], ctable[4], ctable[5]);
++    print("gm % % % %\n", gm[0][0], gm[0][1], gm[1][0], gm[1][1]);
++    print("crect % % % % %\n", crect.lo.x, crect.lo.y, crect.hi.x, crect.hi.y, crect.tag);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-local-const-c2cf13.ispc b/tests/lit-tests/designated-init-local-const-c2cf13.ispc
+new file mode 100644
+index 0000000..d8abd62
+--- /dev/null
++++ b/tests/lit-tests/designated-init-local-const-c2cf13.ispc
+@@ -0,0 +1,56 @@
++// Local const variables, plain or brace-initialized, as array designator indices, and designated initializers for local const aggregates.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: a 0 7 8
++// CHECK-NEXT: b 0 4 9
++// CHECK-NEXT: c 0 0 5
++// CHECK-NEXT: e 4 5 6
++// CHECK-NEXT: s 0 3 0
++// CHECK-NEXT: t 0 0 4
++// CHECK-NEXT: cp 0 2 6
++// CHECK-NEXT: d 1 0
++
++enum Axis { AX, AY, AZ };
++
++struct Point {
++    int32 x, y;
++};
++
++noinline void staticCase() {
++    const uniform int32 k = 1;
++    static uniform int32 s[3] = { [k] = 3 };
++    print("s % % %\n", s[0], s[1], s[2]);
++    const uniform int32 j = { 2 };
++    static uniform int32 t[3] = { [j] = 4 };
++    print("t % % %\n", t[0], t[1], t[2]);
++}
++
++extern "C" uniform int main() {
++    const uniform int32 k = 1;
++    uniform int32 a[3] = { [k] = 7, 8 };
++    print("a % % %\n", a[0], a[1], a[2]);
++    const uniform int32 k2 = k + 1;
++    uniform int32 b[3] = { [k2] = 9, [k2 - k] = 4 };
++    print("b % % %\n", b[0], b[1], b[2]);
++    const uniform Axis last = AZ;
++    uniform int32 c[3] = { [last] = 5 };
++    print("c % % %\n", c[0], c[1], c[2]);
++    const uniform int32 slot = { 1 };
++    const uniform Axis mid = { AZ };
++    const uniform int8 first = { 0 };
++    uniform int32 e[3] = { [mid] = 6, [slot] = 5, [first] = 4 };
++    print("e % % %\n", e[0], e[1], e[2]);
++    staticCase();
++    const uniform Point cp = { .y = 2 };
++    print("cp % % %\n", cp.x, cp.y, cp.y * 3);
++    {
++        const uniform int32 j = 0;
++        uniform int32 d[2] = { [j] = 1 };
++        print("d % %\n", d[0], d[1]);
++    }
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-multidim-c2cf13.ispc b/tests/lit-tests/designated-init-multidim-c2cf13.ispc
+new file mode 100644
+index 0000000..d6aaef0
+--- /dev/null
++++ b/tests/lit-tests/designated-init-multidim-c2cf13.ispc
+@@ -0,0 +1,26 @@
++// Designators in multi-dimensional arrays.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: m 1 0 0 4 0 9
++// CHECK-NEXT: n 6 7 0 5
++// CHECK-NEXT: k 1 0 0 2 0 3 0 0
++// CHECK-NEXT: r 0 3 2 4
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++extern "C" uniform int main() {
++    uniform int32 m[2][3] = { [1][2] = 9, [0] = { 1 }, [1][0] = 4 };
++    print("m % % % % % %\n", m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2]);
++    uniform int32 n[2][2] = { [1] = { [1] = 5 }, [0][0] = 6, 7 };
++    print("n % % % %\n", n[0][0], n[0][1], n[1][0], n[1][1]);
++    uniform int32 k[2][2][2] = { [1][0][1] = 3, [0] = { { 1 }, [1][1] = 2 } };
++    print("k % % % % % % % %\n", k[0][0][0], k[0][0][1], k[0][1][0], k[0][1][1], k[1][0][0], k[1][0][1], k[1][1][0],
++          k[1][1][1]);
++    uniform int32 r[2][2] = { [1][1] = id(4), [0][1] = id(3), [1][0] = id(2) };
++    print("r % % % %\n", r[0][0], r[0][1], r[1][0], r[1][1]);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-nested-plain-c2cf13.ispc b/tests/lit-tests/designated-init-nested-plain-c2cf13.ispc
+new file mode 100644
+index 0000000..7c188ed
+--- /dev/null
++++ b/tests/lit-tests/designated-init-nested-plain-c2cf13.ispc
+@@ -0,0 +1,32 @@
++// Plain brace lists inside designated lists and designated lists inside plain lists.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: a 1 2 3 4 5
++// CHECK-NEXT: b 0 1 2 3
++// CHECK-NEXT: c 7 0 9 0 6
++// CHECK-NEXT: d 0 5 6 8 9
++
++struct Point {
++    int32 x, y;
++};
++
++struct Poly {
++    int32 pts[3];
++    Point c;
++};
++
++extern "C" uniform int main() {
++    uniform Poly a = { .c = { 4, 5 }, .pts = { 1, 2, 3 } };
++    print("a % % % % %\n", a.pts[0], a.pts[1], a.pts[2], a.c.x, a.c.y);
++    uniform Point b[2] = { { .y = 1 }, { 2, 3 } };
++    print("b % % % %\n", b[0].x, b[0].y, b[1].x, b[1].y);
++    uniform Poly c = { { 7, [2] = 9 }, .c.y = 6 };
++    print("c % % % % %\n", c.pts[0], c.pts[1], c.pts[2], c.c.x, c.c.y);
++    uniform Poly d = { .pts[1] = 5, 6, { 8, 9 } };
++    print("d % % % % %\n", d.pts[0], d.pts[1], d.pts[2], d.c.x, d.c.y);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-new-c2cf13.ispc b/tests/lit-tests/designated-init-new-c2cf13.ispc
+new file mode 100644
+index 0000000..4a01f7b
+--- /dev/null
++++ b/tests/lit-tests/designated-init-new-c2cf13.ispc
+@@ -0,0 +1,34 @@
++// Designated initializer values in new expressions.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: p 8 7
++// CHECK-NEXT: r 0 0 0 3 4
++// CHECK-NEXT: r2 5 6 0 0 1
++
++struct Point {
++    int32 x, y;
++};
++
++struct Rect {
++    Point lo, hi;
++    int32 tag;
++};
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++extern "C" uniform int main() {
++    uniform Point *uniform p = uniform new uniform Point(.y = 7, .x = 8);
++    print("p % %\n", p->x, p->y);
++    uniform Rect *uniform r = uniform new uniform Rect(.hi.y = 3, .tag = id(4));
++    print("r % % % % %\n", r->lo.x, r->lo.y, r->hi.x, r->hi.y, r->tag);
++    uniform Rect *uniform r2 = uniform new uniform Rect(.lo.x = 5, 6, .tag = 1);
++    print("r2 % % % % %\n", r2->lo.x, r2->lo.y, r2->hi.x, r2->hi.y, r2->tag);
++    delete p;
++    delete r;
++    delete r2;
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-override-elements-c2cf13.ispc b/tests/lit-tests/designated-init-override-elements-c2cf13.ispc
+new file mode 100644
+index 0000000..c38fd25
+--- /dev/null
++++ b/tests/lit-tests/designated-init-override-elements-c2cf13.ispc
+@@ -0,0 +1,32 @@
++// Later items override earlier ones for the same array element or struct member.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: b1 1 2 3 0
++// CHECK-NEXT: b2 2 0
++// CHECK-NEXT: b3 5 9 7
++// CHECK-NEXT: b4 1 2 0
++// CHECK-NEXT: c 3 2
++
++struct Point {
++    int32 x, y;
++};
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++extern "C" uniform int main() {
++    uniform int32 b1[4] = { [2] = 7, [0] = 1, 2, 3 };
++    print("b1 % % % %\n", b1[0], b1[1], b1[2], b1[3]);
++    uniform int32 b2[2] = { [0] = 1, [0] = 2 };
++    print("b2 % %\n", b2[0], b2[1]);
++    uniform int32 b3[3] = { 5, 6, 7, [1] = 9 };
++    print("b3 % % %\n", b3[0], b3[1], b3[2]);
++    uniform int32 b4[3] = { [1] = id(4), [0] = id(1), id(2) };
++    print("b4 % % %\n", b4[0], b4[1], b4[2]);
++    uniform Point c = { .x = 1, .y = 2, .x = 3 };
++    print("c % %\n", c.x, c.y);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-override-partial-c2cf13.ispc b/tests/lit-tests/designated-init-override-partial-c2cf13.ispc
+new file mode 100644
+index 0000000..d9fd85a
+--- /dev/null
++++ b/tests/lit-tests/designated-init-override-partial-c2cf13.ispc
+@@ -0,0 +1,38 @@
++// A designator reaching inside an element set by an earlier brace list only changes that part.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: q1 1 5 0
++// CHECK-NEXT: q2 3 5 4
++// CHECK-NEXT: q3 8 2 0
++// CHECK-NEXT: m 0 0 7 2
++// CHECK-NEXT: g 1 6 0
++
++struct P {
++    int32 x, y;
++};
++
++struct Q {
++    P p;
++    int32 d;
++};
++
++uniform Q g = { .p = { 1, 2 }, .p.y = 6 };
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++extern "C" uniform int main() {
++    uniform Q q1 = { .p = { 1, 2 }, .p.y = 5 };
++    print("q1 % % %\n", q1.p.x, q1.p.y, q1.d);
++    uniform Q q2 = { .p.x = 3, .d = 4, .p.y = 5 };
++    print("q2 % % %\n", q2.p.x, q2.p.y, q2.d);
++    uniform Q q3 = { .p = { id(1), id(2) }, .p.x = id(8) };
++    print("q3 % % %\n", q3.p.x, q3.p.y, q3.d);
++    uniform int32 m[2][2] = { [1] = { 1, 2 }, [1][0] = 7 };
++    print("m % % % %\n", m[0][0], m[0][1], m[1][0], m[1][1]);
++    print("g % % %\n", g.p.x, g.p.y, g.d);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-override-warning-c2cf13.ispc b/tests/lit-tests/designated-init-override-warning-c2cf13.ispc
+new file mode 100644
+index 0000000..4f6c6ce
+--- /dev/null
++++ b/tests/lit-tests/designated-init-override-warning-c2cf13.ispc
+@@ -0,0 +1,71 @@
++// Overwriting something an earlier item explicitly initialized is accepted with a warning at the later item.
++// RUN: %{ispc} --target=host --nowrap --nostdlib %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not=Warning: --implicit-check-not=Error:
++
++struct P {
++    int32 x, y;
++};
++
++struct Q {
++    P p;
++    int32 d;
++};
++
++uniform Q gq = {
++    .d = 1,
++    // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++    .d = 2
++};
++
++void f() {
++    uniform int32 a[4] = {
++        [2] = 7,
++        [0] = 1,
++        2,
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        3
++    };
++    uniform Q q1 = {
++        .p = { 1, 2 },
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        .p.y = 5
++    };
++    uniform Q q2 = {
++        .p.y = 5,
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        .p = { 1 }
++    };
++    uniform Q q3 = {
++        .p = { 1 },
++        .p.y = 5
++    };
++    uniform Q q4 = {
++        .p = {
++            .x = 1,
++            // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++            .x = 2
++        }
++    };
++    uniform int32 m[2][2] = {
++        [1] = { 1, 2 },
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        [1][0] = 7
++    };
++    uniform int32 k[3] = { [0] = 1, 2, [2] = 3 };
++    uniform P plain = { 1, 2 };
++    uniform float<3> v = {
++        .x = 1,
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        .x = 2
++    };
++    uniform int32<4> w = {
++        [0] = 1,
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        [0] = 2
++    };
++    uniform P *uniform ptr = uniform new uniform P(
++        .x = 1,
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        .x = 2
++    );
++    delete ptr;
++}
+diff --git a/tests/lit-tests/designated-init-override-warning-replaced-c2cf13.ispc b/tests/lit-tests/designated-init-override-warning-replaced-c2cf13.ispc
+new file mode 100644
+index 0000000..d05f59b
+--- /dev/null
++++ b/tests/lit-tests/designated-init-override-warning-replaced-c2cf13.ispc
+@@ -0,0 +1,65 @@
++// Items in a brace list that replaces an element only override each other, and parts of the replaced element no longer count as initialized.
++// RUN: %{ispc} --target=host --nowrap --nostdlib %s -o %t.o 2>&1 | FileCheck %s --implicit-check-not=Warning: --implicit-check-not=Error:
++
++struct P {
++    int32 x, y;
++};
++
++struct Q {
++    P p;
++    int32 d;
++};
++
++uniform Q g1 = {
++    .p.x = 1,
++    // CHECK: {{.*}}:[[@LINE+2]]:{{[0-9]+}}: Warning:
++    // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++    .p = { .y = 2, .y = 3 }
++};
++
++uniform Q g2 = {
++    .p.x = 1,
++    // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++    .p = { .y = 2 },
++    .p.x = 3
++};
++
++void f() {
++    uniform Q q1 = {
++        .p.x = 1,
++        // CHECK: {{.*}}:[[@LINE+2]]:{{[0-9]+}}: Warning:
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        .p = { .y = 2, .y = 3 }
++    };
++    uniform Q q2 = {
++        .p.x = 1,
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        .p = { .y = 2 },
++        .p.x = 3
++    };
++    uniform Q q3 = {
++        .p = { 1, 2 },
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        .p = { .y = 3 },
++        .p.x = 4
++    };
++    uniform int32 m1[2][2] = {
++        [1][0] = 1,
++        // CHECK: {{.*}}:[[@LINE+2]]:{{[0-9]+}}: Warning:
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        [1] = { [1] = 2, [1] = 3 }
++    };
++    uniform int32 m2[2][2] = {
++        [1][0] = 1,
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        [1] = { [1] = 2 },
++        [1][0] = 3
++    };
++    uniform Q *uniform n1 = uniform new uniform Q(
++        .p.x = 1,
++        // CHECK: {{.*}}:[[@LINE+2]]:{{[0-9]+}}: Warning:
++        // CHECK: {{.*}}:[[@LINE+1]]:{{[0-9]+}}: Warning:
++        .p = { .y = 2, .y = 3 }
++    );
++    delete n1;
++}
+diff --git a/tests/lit-tests/designated-init-override-whole-c2cf13.ispc b/tests/lit-tests/designated-init-override-whole-c2cf13.ispc
+new file mode 100644
+index 0000000..1297011
+--- /dev/null
++++ b/tests/lit-tests/designated-init-override-whole-c2cf13.ispc
+@@ -0,0 +1,55 @@
++// A later brace list for an element replaces everything earlier items set inside it.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: q1 1 0 0
++// CHECK-NEXT: q2 0 9 0
++// CHECK-NEXT: q3 7 0 6
++// CHECK-NEXT: m 8 0 0 0
++// CHECK-NEXT: u 3 1.000000 3 7.000000 -2 4.250000 0.000000
++// CHECK-NEXT: s 4 0 0
++
++struct P {
++    int32 x, y;
++};
++
++struct Q {
++    P p;
++    int32 d;
++};
++
++struct In {
++    int32 a;
++    float b;
++};
++
++struct Out {
++    In inner[2];
++    double d;
++};
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++noinline void staticCase() {
++    static uniform Q s = { .p.y = 3, .d = 0, .p = { 4 } };
++    print("s % % %\n", s.p.x, s.p.y, s.d);
++}
++
++extern "C" uniform int main() {
++    uniform Q q1 = { .p.y = 5, .p = { 1 } };
++    print("q1 % % %\n", q1.p.x, q1.p.y, q1.d);
++    uniform Q q2 = { .p = { 1, 2 }, .p = { .y = 9 } };
++    print("q2 % % %\n", q2.p.x, q2.p.y, q2.d);
++    uniform Q q3 = { .p.x = id(4), .p.y = id(5), .d = 6, .p = { id(7) } };
++    print("q3 % % %\n", q3.p.x, q3.p.y, q3.d);
++    uniform int32 m[2][2] = { [0][1] = 3, [0] = { 8 } };
++    print("m % % % %\n", m[0][0], m[0][1], m[1][0], m[1][1]);
++    uniform Out u[] = { [1].inner[0].b = 2.75, [0].d = 1, [1].inner[0] = { 3.9, 7 }, [2].inner[1].a = -2.5, 4.25 };
++    print("u % % % % % % %\n", sizeof(u) / sizeof(u[0]), u[0].d, u[1].inner[0].a, u[1].inner[0].b, u[2].inner[1].a,
++          u[2].inner[1].b, u[1].d);
++    staticCase();
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-reference-member-c2cf13.ispc b/tests/lit-tests/designated-init-reference-member-c2cf13.ispc
+new file mode 100644
+index 0000000..dad7093
+--- /dev/null
++++ b/tests/lit-tests/designated-init-reference-member-c2cf13.ispc
+@@ -0,0 +1,49 @@
++// Designated initializers for structs with reference members: an omitted reference is zero, as in positional lists.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: local 1 2
++// CHECK-NEXT: new 3
++// CHECK-NEXT: nested 4 5
++// CHECK-NEXT: global 6
++// CHECK-NEXT: static 7
++// CHECK-NEXT: bound 8 9
++
++struct S {
++    uint &ref;
++    int32 value;
++};
++
++struct Outer {
++    S s;
++    int32 z;
++};
++
++uniform S gs = { .value = 6 };
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++noinline void bound(uniform uint32 &r) {
++    uniform S s = { .value = 9, .ref = r };
++    print("bound % %\n", s.ref, s.value);
++}
++
++extern "C" uniform int main() {
++    uniform S c = { .value = 1 };
++    uniform S d = { .value = id(2) };
++    print("local % %\n", c.value, d.value);
++    uniform S *uniform p = uniform new uniform S(.value = 3);
++    print("new %\n", p->value);
++    delete p;
++    uniform Outer o = { .s.value = id(4), .z = 5 };
++    print("nested % %\n", o.s.value, o.z);
++    print("global %\n", gs.value);
++    static uniform S st = { .value = 7 };
++    print("static %\n", st.value);
++    uniform uint32 x = 8;
++    bound(x);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-soa-c2cf13.ispc b/tests/lit-tests/designated-init-soa-c2cf13.ispc
+new file mode 100644
+index 0000000..285b497
+--- /dev/null
++++ b/tests/lit-tests/designated-init-soa-c2cf13.ispc
+@@ -0,0 +1,41 @@
++// Designated initializers for soa<N> structs and arrays of them, including const arrays.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: pts 3 18 0 0 20
++// CHECK-NEXT: direct 3 6 0 1
++// CHECK-NEXT: one 11 4 0 0
++// CHECK-NEXT: u 8 6 0 3
++// CHECK-NEXT: rt 7 0 12
++// CHECK-NEXT: cpts 6 3 0 0
++
++struct Point {
++    float x, y, z;
++};
++
++noinline uniform float idf(uniform float v) { return v; }
++
++extern "C" uniform int main() {
++    soa<4> Point pts[2] = { [1] = { .y = { 17, 18, 19, 20 } }, [0].x = { 1, 2, 3, 4 } };
++    print("pts % % % % %\n", (uniform int32)pts[2].x, (uniform int32)pts[5].y, (uniform int32)pts[1].z,
++          (uniform int32)pts[4].x, (uniform int32)pts[7].y);
++    soa<4> Point direct = { .y = { 5, 6, 7, 8 }, .x = { 1, 2, 3, 4 } };
++    soa<4> Point *uniform dp = &direct;
++    print("direct % % % %\n", (uniform int32)dp[2].x, (uniform int32)dp[1].y, (uniform int32)dp[3].z,
++          (uniform int32)dp[0].x);
++    soa<4> Point one[1] = { { .z = { 9, 10, 11, 12 }, .x = { 1, 2, 3, 4 } } };
++    print("one % % % %\n", (uniform int32)one[2].z, (uniform int32)one[3].x, (uniform int32)one[1].y,
++          (uniform int32)one[0].y);
++    soa<4> Point u[] = { [1].y = { 5, 6, 7, 8 }, [0].z = { 1, 2, 3, 4 } };
++    print("u % % % %\n", (uniform int32)(sizeof(u) / sizeof(u[0])), (uniform int32)u[5].y, (uniform int32)u[5].x,
++          (uniform int32)u[2].z);
++    soa<4> Point r[1] = { { .y = { idf(5), 6, idf(7), 8 }, .z = { 9, 10, 11, idf(12) } } };
++    print("rt % % %\n", (uniform int32)r[2].y, (uniform int32)r[0].x, (uniform int32)r[3].z);
++    const soa<4> Point cpts[2] = { [1].y = { 5, 6, 7, 8 }, [0] = { .z = { 1, 2, 3, 4 } } };
++    print("cpts % % % %\n", (uniform int32)cpts[5].y, (uniform int32)cpts[2].z, (uniform int32)cpts[6].x,
++          (uniform int32)cpts[0].y);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-soa-wide-c2cf13.ispc b/tests/lit-tests/designated-init-soa-wide-c2cf13.ispc
+new file mode 100644
+index 0000000..6b82fbc
+--- /dev/null
++++ b/tests/lit-tests/designated-init-soa-wide-c2cf13.ispc
+@@ -0,0 +1,28 @@
++// Designated initializers for soa<8> structs and arrays of them.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: wide 6 15 0 0
++// CHECK-NEXT: direct 7 7 0 1
++// CHECK-NEXT: grown 16 12 0 2
++
++struct Point {
++    float x, y, z;
++};
++
++extern "C" uniform int main() {
++    soa<8> Point wide[2] = { [1].y = { 1, 2, 3, 4, 5, 6, 7, 8 }, [0] = { .z = { 9, 10, 11, 12, 13, 14, 15, 16 } } };
++    print("wide % % % %\n", (uniform int32)wide[13].y, (uniform int32)wide[6].z, (uniform int32)wide[9].x,
++          (uniform int32)wide[7].y);
++    soa<8> Point direct = { .z = { 8, 7, 6, 5, 4, 3, 2, 1 }, .x = { 1, 2, 3, 4, 5, 6, 7, 8 } };
++    soa<8> Point *uniform dp = &direct;
++    print("direct % % % %\n", (uniform int32)dp[6].x, (uniform int32)dp[1].z, (uniform int32)dp[5].y,
++          (uniform int32)dp[7].z);
++    soa<8> Point grown[] = { [1].x = { 9, 10, 11, 12, 13, 14, 15, 16 }, [0].y = { 1, 2, 3, 4, 5, 6, 7, 8 } };
++    print("grown % % % %\n", (uniform int32)(sizeof(grown) / sizeof(grown[0])), (uniform int32)grown[11].x,
++          (uniform int32)grown[11].y, (uniform int32)grown[1].y);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-static-local-c2cf13.ispc b/tests/lit-tests/designated-init-static-local-c2cf13.ispc
+new file mode 100644
+index 0000000..434dcd9
+--- /dev/null
++++ b/tests/lit-tests/designated-init-static-local-c2cf13.ispc
+@@ -0,0 +1,40 @@
++// Designated initializers for static local variables keep their value across calls.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: r 1 0 2 3 0
++// CHECK-NEXT: r 1 0 2 3 1
++// CHECK-NEXT: s 2 0 1
++// CHECK-NEXT: s 2 5 1
++
++struct Point {
++    int32 x, y;
++};
++
++struct Rect {
++    Point lo, hi;
++    int32 tag;
++};
++
++noinline void showRect() {
++    static uniform Rect r = { .hi.y = 8, .lo = { 1 }, { 2, 3 } };
++    print("r % % % % %\n", r.lo.x, r.lo.y, r.hi.x, r.hi.y, r.tag);
++    r.tag = r.tag + 1;
++}
++
++noinline void showCounters() {
++    static uniform int32 s[3] = { [2] = 1, [0] = 2 };
++    print("s % % %\n", s[0], s[1], s[2]);
++    s[1] = s[1] + 5;
++}
++
++extern "C" uniform int main() {
++    showRect();
++    showRect();
++    showCounters();
++    showCounters();
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-struct-chain-c2cf13.ispc b/tests/lit-tests/designated-init-struct-chain-c2cf13.ispc
+new file mode 100644
+index 0000000..d0ac3f6
+--- /dev/null
++++ b/tests/lit-tests/designated-init-struct-chain-c2cf13.ispc
+@@ -0,0 +1,37 @@
++// Chained member designators and how the following items continue inside and after the nested struct.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: r1 0 0 5 6 7
++// CHECK-NEXT: r2 0 1 2 3 4
++// CHECK-NEXT: r3 0 2 0 4 1
++// CHECK-NEXT: r4 0 0 5 6 7
++// CHECK-NEXT: r5 1 2 0 9 3
++
++struct Point {
++    int32 x, y;
++};
++
++struct Rect {
++    Point lo, hi;
++    int32 tag;
++};
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++extern "C" uniform int main() {
++    uniform Rect r1 = { .hi.x = 5, 6, 7 };
++    print("r1 % % % % %\n", r1.lo.x, r1.lo.y, r1.hi.x, r1.hi.y, r1.tag);
++    uniform Rect r2 = { .lo.y = 1, { 2, 3 }, 4 };
++    print("r2 % % % % %\n", r2.lo.x, r2.lo.y, r2.hi.x, r2.hi.y, r2.tag);
++    uniform Rect r3 = { .hi = { .y = 4 }, .lo.y = 2, .tag = 1 };
++    print("r3 % % % % %\n", r3.lo.x, r3.lo.y, r3.hi.x, r3.hi.y, r3.tag);
++    uniform Rect r4 = { .hi.x = id(5), id(6), id(7) };
++    print("r4 % % % % %\n", r4.lo.x, r4.lo.y, r4.hi.x, r4.hi.y, r4.tag);
++    uniform Rect r5 = { .lo.x = 1, 2, .hi.y = 9, 3 };
++    print("r5 % % % % %\n", r5.lo.x, r5.lo.y, r5.hi.x, r5.hi.y, r5.tag);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-struct-members-c2cf13.ispc b/tests/lit-tests/designated-init-struct-members-c2cf13.ispc
+new file mode 100644
+index 0000000..673f067
+--- /dev/null
++++ b/tests/lit-tests/designated-init-struct-members-c2cf13.ispc
+@@ -0,0 +1,35 @@
++// Designated struct members with gaps and continuation, using constant and runtime values.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: c1 1 0 3 4
++// CHECK-NEXT: c2 1 0 3 4
++// CHECK-NEXT: c3 0 0 7 8
++// CHECK-NEXT: c4 0 5 0 0
++// CHECK-NEXT: c5 9 6 7 2
++// CHECK-NEXT: c6 9 6 7 2
++
++struct Color {
++    int32 r, g, b, a;
++};
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++extern "C" uniform int main() {
++    uniform Color c1 = { .b = 3, 4, .r = 1 };
++    print("c1 % % % %\n", c1.r, c1.g, c1.b, c1.a);
++    uniform Color c2 = { .b = id(3), id(4), .r = id(1) };
++    print("c2 % % % %\n", c2.r, c2.g, c2.b, c2.a);
++    uniform Color c3 = { .b = 7, 8 };
++    print("c3 % % % %\n", c3.r, c3.g, c3.b, c3.a);
++    uniform Color c4 = { .g = id(5) };
++    print("c4 % % % %\n", c4.r, c4.g, c4.b, c4.a);
++    uniform Color c5 = { 9, .a = 2, .g = 6, 7 };
++    print("c5 % % % %\n", c5.r, c5.g, c5.b, c5.a);
++    uniform Color c6 = { id(9), .a = id(2), .g = id(6), id(7) };
++    print("c6 % % % %\n", c6.r, c6.g, c6.b, c6.a);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-struct-value-c2cf13.ispc b/tests/lit-tests/designated-init-struct-value-c2cf13.ispc
+new file mode 100644
+index 0000000..f86fd84
+--- /dev/null
++++ b/tests/lit-tests/designated-init-struct-value-c2cf13.ispc
+@@ -0,0 +1,52 @@
++// Plain initializer lists still take struct and vector values for struct and vector members; with designators the same members take brace lists.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: plain 1 3 4 9
++// CHECK-NEXT: plain-array 3 4 3 4
++// CHECK-NEXT: designated 2 3 4 0
++// CHECK-NEXT: element 0 0 3 4
++// CHECK-NEXT: plain-vector 1 7 8 2 3 3
++// CHECK-NEXT: designated-vector 5 7 8
++
++struct Point {
++    int32 x, y;
++};
++
++struct Rect {
++    int32 tag;
++    Point pos;
++    int32 area;
++};
++
++struct Tagged {
++    int32 tag;
++    uniform int32<2> v;
++};
++
++noinline uniform Point make(uniform int32 x, uniform int32 y) {
++    uniform Point p = { x, y };
++    return p;
++}
++
++extern "C" uniform int main() {
++    uniform Point p = make(3, 4);
++    uniform Rect r1 = { 1, p, 9 };
++    print("plain % % % %\n", r1.tag, r1.pos.x, r1.pos.y, r1.area);
++    uniform Point pts[2] = { p, p };
++    print("plain-array % % % %\n", pts[0].x, pts[0].y, pts[1].x, pts[1].y);
++    uniform Rect r2 = { .pos = { p.x, p.y }, .tag = 2 };
++    print("designated % % % %\n", r2.tag, r2.pos.x, r2.pos.y, r2.area);
++    uniform Point qs[2] = { [1] = { p.x, p.y } };
++    print("element % % % %\n", qs[0].x, qs[0].y, qs[1].x, qs[1].y);
++    uniform int32<2> pv = { p.x + 4, p.y + 4 };
++    uniform Tagged t1 = { 1, pv };
++    uniform Tagged t2 = { 2, 3 };
++    print("plain-vector % % % % % %\n", t1.tag, t1.v.x, t1.v.y, t2.tag, t2.v.x, t2.v.y);
++    uniform Tagged t3 = { .v = { pv.x, pv.y }, .tag = 5 };
++    print("designated-vector % % %\n", t3.tag, t3.v.x, t3.v.y);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-templates-c2cf13.ispc b/tests/lit-tests/designated-init-templates-c2cf13.ispc
+new file mode 100644
+index 0000000..b5972b3
+--- /dev/null
++++ b/tests/lit-tests/designated-init-templates-c2cf13.ispc
+@@ -0,0 +1,44 @@
++// Designated initializers inside function templates.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: add 53
++// CHECK-NEXT: make 0 3
++// CHECK-NEXT: fill3 98
++// CHECK-NEXT: fill2 980
++
++struct Point {
++    int32 x, y;
++};
++
++struct Rect {
++    Point lo, hi;
++    int32 tag;
++};
++
++template <typename T> noinline T addTag(T v) {
++    uniform Rect r = { .tag = 5, .lo.y = 2 };
++    return v + r.tag * 10 + r.lo.y;
++}
++
++template <typename T> noinline T makeValue() {
++    T v = { .y = 3 };
++    return v;
++}
++
++template <int N> noinline uniform int32 fill() {
++    uniform int32 a[4] = { [N - 1] = 9, 8 };
++    return a[0] * 1000 + a[1] * 100 + a[2] * 10 + a[3];
++}
++
++extern "C" uniform int main() {
++    print("add %\n", addTag<uniform int32>(1));
++    uniform Point p = makeValue<uniform Point>();
++    print("make % %\n", p.x, p.y);
++    print("fill3 %\n", fill<3>());
++    print("fill2 %\n", fill<2>());
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-unsized-2d-c2cf13.ispc b/tests/lit-tests/designated-init-unsized-2d-c2cf13.ispc
+new file mode 100644
+index 0000000..aae8cae
+--- /dev/null
++++ b/tests/lit-tests/designated-init-unsized-2d-c2cf13.ispc
+@@ -0,0 +1,32 @@
++// Designated sub-lists in multi-dimensional arrays declared without any sizes; a replaced sub-list does not count for sizing.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: g1 2 3 0 0 1 4 5 6
++// CHECK-NEXT: g2 3 2 0 0 0 2 3 4
++// CHECK-NEXT: g3 2 2 3 4 5 6
++// CHECK-NEXT: g4 1 1 2
++// CHECK-NEXT: g5 1 4 0 0 0 1
++
++uniform int32 g1[][] = { { [2] = 1 }, { 4, 5, 6 } };
++uniform int32 g2[][] = { [1] = { [1] = 2 }, { 3, 4 } };
++uniform int32 g4[][] = { [0] = { [3] = 1 }, [0] = { 2 } };
++
++extern "C" uniform int main() {
++    print("g1 % % % % % % % %\n", (uniform int32)(sizeof(g1) / sizeof(g1[0])),
++          (uniform int32)(sizeof(g1[0]) / sizeof(g1[0][0])), g1[0][0], g1[0][1], g1[0][2], g1[1][0], g1[1][1], g1[1][2]);
++    print("g2 % % % % % % % %\n", (uniform int32)(sizeof(g2) / sizeof(g2[0])),
++          (uniform int32)(sizeof(g2[0]) / sizeof(g2[0][0])), g2[0][0], g2[0][1], g2[1][0], g2[1][1], g2[2][0], g2[2][1]);
++    uniform int32 g3[][] = { [0] = { 1, 2 }, [1] = { 5, 6 }, [0] = { 3, 4 } };
++    print("g3 % % % % % %\n", (uniform int32)(sizeof(g3) / sizeof(g3[0])),
++          (uniform int32)(sizeof(g3[0]) / sizeof(g3[0][0])), g3[0][0], g3[0][1], g3[1][0], g3[1][1]);
++    print("g4 % % %\n", (uniform int32)(sizeof(g4) / sizeof(g4[0])), (uniform int32)(sizeof(g4[0]) / sizeof(g4[0][0])),
++          g4[0][0]);
++    uniform int32 g5[][] = { [0] = { 2 }, [0] = { [3] = 1 } };
++    print("g5 % % % % % %\n", (uniform int32)(sizeof(g5) / sizeof(g5[0])),
++          (uniform int32)(sizeof(g5[0]) / sizeof(g5[0][0])), g5[0][0], g5[0][1], g5[0][2], g5[0][3]);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-unsized-global-c2cf13.ispc b/tests/lit-tests/designated-init-unsized-global-c2cf13.ispc
+new file mode 100644
+index 0000000..87dd063
+--- /dev/null
++++ b/tests/lit-tests/designated-init-unsized-global-c2cf13.ispc
+@@ -0,0 +1,33 @@
++// Unsized global arrays take their size from the highest initialized element.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: u1 6 0 0 3 4 0 1
++// CHECK-NEXT: u2 3 0 5 6
++// CHECK-NEXT: u3 2 9 2
++// CHECK-NEXT: u4 3 0 1
++// CHECK-NEXT: u5 3 0 7 0 0 5 6
++
++struct Point {
++    int32 x, y;
++};
++
++uniform int32 u1[] = { [5] = 1, [2] = 3, 4 };
++static const uniform int32 u2[] = { [1] = 5, 6 };
++uniform int32 u3[] = { 1, 2, [0] = 9 };
++uniform Point u4[] = { [2].y = 1 };
++uniform int32 u5[][2] = { [2] = { 5, 6 }, [0][1] = 7 };
++
++extern "C" uniform int main() {
++    print("u1 % % % % % % %\n", (uniform int32)(sizeof(u1) / sizeof(u1[0])), u1[0], u1[1], u1[2], u1[3], u1[4],
++          u1[5]);
++    print("u2 % % % %\n", (uniform int32)(sizeof(u2) / sizeof(u2[0])), u2[0], u2[1], u2[2]);
++    print("u3 % % %\n", (uniform int32)(sizeof(u3) / sizeof(u3[0])), u3[0], u3[1]);
++    print("u4 % % %\n", (uniform int32)(sizeof(u4) / sizeof(u4[0])), u4[2].x, u4[2].y);
++    print("u5 % % % % % % %\n", (uniform int32)(sizeof(u5) / sizeof(u5[0])), u5[0][0], u5[0][1], u5[1][0], u5[1][1],
++          u5[2][0], u5[2][1]);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-unsized-local-c2cf13.ispc b/tests/lit-tests/designated-init-unsized-local-c2cf13.ispc
+new file mode 100644
+index 0000000..de04669
+--- /dev/null
++++ b/tests/lit-tests/designated-init-unsized-local-c2cf13.ispc
+@@ -0,0 +1,29 @@
++// Unsized local and static local arrays take their size from the highest initialized element.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: l1 4 0 2 0 1
++// CHECK-NEXT: l2 3 0 5 6
++// CHECK-NEXT: l3 2 0 0 3 4
++// CHECK-NEXT: s1 5 0 0 0 0 9
++
++struct Point {
++    int32 x, y;
++};
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++extern "C" uniform int main() {
++    uniform int32 l1[] = { [3] = id(1), [1] = 2 };
++    print("l1 % % % % %\n", (uniform int32)(sizeof(l1) / sizeof(l1[0])), l1[0], l1[1], l1[2], l1[3]);
++    uniform int32 l2[] = { [1] = 5, 6 };
++    print("l2 % % % %\n", (uniform int32)(sizeof(l2) / sizeof(l2[0])), l2[0], l2[1], l2[2]);
++    uniform Point l3[] = { [1].x = 3, 4 };
++    print("l3 % % % % %\n", (uniform int32)(sizeof(l3) / sizeof(l3[0])), l3[0].x, l3[0].y, l3[1].x, l3[1].y);
++    static uniform int32 s1[] = { [4] = 9 };
++    print("s1 % % % % % %\n", (uniform int32)(sizeof(s1) / sizeof(s1[0])), s1[0], s1[1], s1[2], s1[3], s1[4]);
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-varying-c2cf13.ispc b/tests/lit-tests/designated-init-varying-c2cf13.ispc
+new file mode 100644
+index 0000000..6cc4675
+--- /dev/null
++++ b/tests/lit-tests/designated-init-varying-c2cf13.ispc
+@@ -0,0 +1,21 @@
++// Designated initializers for varying structs and arrays of varying elements.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: vp true true
++// CHECK-NEXT: va true true true
++
++struct Point {
++    int32 x, y;
++};
++
++extern "C" uniform int main() {
++    Point vp = { .y = programIndex };
++    print("vp % %\n", all(vp.x == 0), all(vp.y == programIndex));
++    int32 va[3] = { [2] = programIndex, [0] = 1 };
++    print("va % % %\n", all(va[0] == 1), all(va[1] == 0), all(va[2] == programIndex));
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-vector-c2cf13.ispc b/tests/lit-tests/designated-init-vector-c2cf13.ispc
+new file mode 100644
+index 0000000..edc89eb
+--- /dev/null
++++ b/tests/lit-tests/designated-init-vector-c2cf13.ispc
+@@ -0,0 +1,50 @@
++// Index designators for short vectors, with constant, runtime and mixed-type element values.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++// RUN: %t.bin | FileCheck %s --match-full-lines
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: v1 0 2 0 4
++// CHECK-NEXT: v2 0 0 15 25
++// CHECK-NEXT: v3 5 20 0
++// CHECK-NEXT: v4 0 30 0 15
++// CHECK-NEXT: v5 1 2 0 3
++// CHECK-NEXT: v6 0 7 0 0
++// CHECK-NEXT: v7 15 0 0 0
++// CHECK-NEXT: v8 0 0 9 0 0 0 0 0
++// CHECK-NEXT: gv 0 0 5
++// CHECK-NEXT: vv true true
++
++uniform int32<3> gv = { [2] = 5 };
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++noinline uniform float idf(uniform float v) { return v; }
++
++extern "C" uniform int main() {
++    uniform int32<4> v1 = { [3] = id(4), [1] = id(2) };
++    print("v1 % % % %\n", v1[0], v1[1], v1[2], v1[3]);
++    uniform float<4> v2 = { [2] = 1.5, 2.5 };
++    print("v2 % % % %\n", (uniform int32)(v2[0] * 10), (uniform int32)(v2[1] * 10), (uniform int32)(v2[2] * 10),
++          (uniform int32)(v2[3] * 10));
++    uniform double<3> v3 = { [1] = id(2), [0] = 0.5d };
++    print("v3 % % %\n", (uniform int32)(v3[0] * 10), (uniform int32)(v3[1] * 10), (uniform int32)(v3[2] * 10));
++    uniform float<4> v4 = { [1] = id(3), [3] = idf(1.5f) };
++    print("v4 % % % %\n", (uniform int32)(v4[0] * 10), (uniform int32)(v4[1] * 10), (uniform int32)(v4[2] * 10),
++          (uniform int32)(v4[3] * 10));
++    uniform int64<4> v5 = { [0] = id(1), 2, [3] = idf(3.0f) };
++    print("v5 % % % %\n", v5[0], v5[1], v5[2], v5[3]);
++    uniform int32<4> v6 = { [1] = id(7) };
++    print("v6 % % % %\n", v6[0], v6[1], v6[2], v6[3]);
++    uniform float<4> v7 = { [0] = idf(1.5f) };
++    print("v7 % % % %\n", (uniform int32)(v7[0] * 10), (uniform int32)(v7[1] * 10), (uniform int32)(v7[2] * 10),
++          (uniform int32)(v7[3] * 10));
++    uniform int16<8> v8 = { [2] = id(9) };
++    print("v8 % % % % % % % %\n", v8[0], v8[1], v8[2], v8[3], v8[4], v8[5], v8[6], v8[7]);
++    print("gv % % %\n", gv[0], gv[1], gv[2]);
++    float<3> vv = { [2] = programIndex };
++    print("vv % %\n", all(vv[2] == programIndex), all(vv[0] == 0));
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-vector-members-c2cf13.ispc b/tests/lit-tests/designated-init-vector-members-c2cf13.ispc
+new file mode 100644
+index 0000000..be1047f
+--- /dev/null
++++ b/tests/lit-tests/designated-init-vector-members-c2cf13.ispc
+@@ -0,0 +1,42 @@
++// Short vector elements designated with the one-letter vector member names.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: c 20 0 15 0
++// CHECK-NEXT: p 0 1 2
++// CHECK-NEXT: q 1 2 0 4
++// CHECK-NEXT: uv 6 0 0 5
++// CHECK-NEXT: vx 0 0 3 9
++// CHECK-NEXT: gcol 0 7 0
++// CHECK-NEXT: xa 30 0 0 5
++
++struct Vertex {
++    float<3> pos;
++    int32 id;
++};
++
++uniform int32<3> gcol = { .g = 7 };
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++extern "C" uniform int main() {
++    uniform float<4> c = { .b = 1.5, .r = 2 };
++    print("c % % % %\n", (uniform int32)(c[0] * 10), (uniform int32)(c[1] * 10), (uniform int32)(c[2] * 10),
++          (uniform int32)(c[3] * 10));
++    uniform int32<3> p = { .y = 1, 2 };
++    print("p % % %\n", p[0], p[1], p[2]);
++    uniform int32<4> q = { .w = id(4), .u = id(1), .v = 2 };
++    print("q % % % %\n", q[0], q[1], q[2], q[3]);
++    uniform int32<2> uv[2] = { [1].v = 5, [0].u = 6 };
++    print("uv % % % %\n", uv[0][0], uv[0][1], uv[1][0], uv[1][1]);
++    uniform Vertex vx = { .pos.z = 3, .id = 9 };
++    print("vx % % % %\n", (uniform int32)vx.pos[0], (uniform int32)vx.pos[1], (uniform int32)vx.pos[2], vx.id);
++    print("gcol % % %\n", gcol[0], gcol[1], gcol[2]);
++    uniform float<4> xa = { .a = 0.5, .x = id(3) };
++    print("xa % % % %\n", (uniform int32)(xa[0] * 10), (uniform int32)(xa[1] * 10), (uniform int32)(xa[2] * 10),
++          (uniform int32)(xa[3] * 10));
++    return 0;
++}
+diff --git a/tests/lit-tests/designated-init-zero-kinds-c2cf13.ispc b/tests/lit-tests/designated-init-zero-kinds-c2cf13.ispc
+new file mode 100644
+index 0000000..2bfeb54
+--- /dev/null
++++ b/tests/lit-tests/designated-init-zero-kinds-c2cf13.ispc
+@@ -0,0 +1,52 @@
++// Members and elements that no item initializes are zero, and pointers are null.
++// RUN: %{ispc} --pic -O2 --target=host --nowrap %s -o %t.o
++// RUN: %{cc} %t.o -o %t.bin
++// RUN: %t.bin | FileCheck %s --match-full-lines
++
++// REQUIRES: !MACOS_HOST
++
++// CHECK: g 0 true false 0 true true 0 0
++// CHECK-NEXT: l 3 true false 0 true true 0 7
++// CHECK-NEXT: h true true true 0 4 true
++// CHECK-NEXT: s true 0 5 true
++
++enum Axis { AX, AY, AZ };
++
++struct Node {
++    int32 value;
++    Node *uniform next;
++    bool flag;
++    Axis axis;
++    float w;
++    double d;
++    int8 small;
++    uint16 tiny;
++};
++
++struct Holder {
++    Node node;
++    int32 arr[2];
++    Node *uniform ptrs[2];
++};
++
++uniform Node g = { .d = 2.5 };
++
++noinline uniform int32 id(uniform int32 v) { return v; }
++
++noinline void staticCase() {
++    static uniform Holder s = { .arr[1] = 5 };
++    print("s % % % %\n", s.node.next == NULL, s.arr[0], s.arr[1], s.ptrs[0] == NULL && s.ptrs[1] == NULL);
++}
++
++extern "C" uniform int main() {
++    print("g % % % % % % % %\n", g.value, g.next == NULL, g.flag, (uniform int32)g.axis, g.w == 0, g.d == 2.5, g.small,
++          g.tiny);
++    uniform Node l = { .tiny = 7, .value = id(3) };
++    print("l % % % % % % % %\n", l.value, l.next == NULL, l.flag, (uniform int32)l.axis, l.w == 0, l.d == 0, l.small,
++          l.tiny);
++    uniform Holder h = { .arr[1] = id(4) };
++    print("h % % % % % %\n", h.node.next == NULL, h.ptrs[0] == NULL, h.ptrs[1] == NULL, h.arr[0], h.arr[1],
++          h.node.d == 0);
++    staticCase();
++    return 0;
++}

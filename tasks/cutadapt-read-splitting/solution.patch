@@ -1,0 +1,780 @@
+diff --git a/doc/reference.rst b/doc/reference.rst
+index 2f44112..5a7fc7a 100644
+--- a/doc/reference.rst
++++ b/doc/reference.rst
+@@ -193,7 +193,7 @@ Adapter-finding options
+ ``-N``, ``--no-match-adapter-wildcards``
+     Do not interpret :ref:`IUPAC wildcards in adapters <wildcards>`.
+ 
+-``--action {trim,retain,mask,lowercase,none}`` (default: ``trim``)
++``--action {trim,retain,mask,lowercase,split,none}`` (default: ``trim``)
+     Specify what to do if an adapter match was found.
+ 
+     ``trim``: Trim the adapter itself and up- or downstream sequence (depending on adapter type).
+@@ -205,9 +205,26 @@ Adapter-finding options
+ 
+     ``lowercase``: Convert the adapter and up- or downstream sequence to lowercase.
+ 
++    ``split``: Remove the adapter and cut the read where it was, so that a read with n
++    matches becomes n+1 pieces. The search continues within every piece, an empty piece is
++    kept (use ``-m`` to discard it), and each piece runs through the remaining read
++    modifications and filters on its own. On paired-end data both reads are cut with their
++    own adapters and the pieces are paired by position; a pair whose reads yield different
++    numbers of pieces is discarded. This action cannot be combined with ``--times`` greater
++    than one, ``--pair-adapters``, ``--info-file``, ``--info-file-paired``, ``--rest-file``,
++    ``--wildcard-file``, demultiplexing, ``--revcomp`` or a linked adapter, and it needs at
++    least one adapter for each read end.
++
+     ``none``: Do not change the read. Found matches are still tracked and can be used for
+     renaming the read or demultiplexing.
+ 
++``--split-suffix TEMPLATE`` (default: ``_{piece}``)
++    Only for ``--action=split``. Append ``TEMPLATE`` to the id of each piece of a read that
++    was cut into more than one; the rest of the header is left alone and a read that stays
++    in one piece keeps its name. The template must contain ``{piece}``, the number of the
++    piece counting from one, and may also use ``{pieces}``, how many pieces the read
++    produced.
++
+ ``--rc``, ``--revcomp``
+     :ref:`Check both the read and its reverse complement for adapter matches <reverse-complement>`.
+     If the reverse-complemented version yields a better match, output that one.
+@@ -447,7 +464,7 @@ This example was reformatted to use less vertical space::
+ 
+     {
+       "tag": "Cutadapt report",
+-      "schema_version": [0, 3],
++      "schema_version": [0, 4],
+       "cutadapt_version": "4.5",
+       "python_version": "3.8.10",
+       "command_line_arguments": [
+@@ -462,6 +479,9 @@ This example was reformatted to use less vertical space::
+       },
+       "read_counts": {
+         "input": 100000,
++        "split": 0,
++        "pieces": 100000,
++        "unequal_pairs": 0,
+         "filtered": {
+           "too_short": 251,
+           "too_long": null,
+@@ -627,9 +647,22 @@ read_counts.filtered.discard_trimmed : int | null
+ read_counts.filtered.discard_untrimmed : int | null
+    Number of reads or read pairs that were filtered because no adapter match was found for them
+ 
++read_counts.split : int
++   Number of reads or read pairs that ``--action=split`` cut into more than one piece,
++   zero if that action was not used.
++
++read_counts.pieces : int
++   Number of pieces produced altogether, which is the number of input reads or read pairs
++   unless ``--action=split`` was used.
++
++read_counts.unequal_pairs : int
++   Number of read pairs that ``--action=split`` discarded because the two reads did not
++   yield the same number of pieces, zero otherwise.
++
+ read_counts.output : int
+    Number of reads written to the final output.
+-   This plus the sum of all filtered reads/read will equal the number of input reads.
++   This plus the sum of all filtered reads/read will equal ``read_counts.pieces``, which is
++   the number of input reads unless ``--action=split`` was used.
+ 
+ read_counts.reverse_complemented : int | null
+    If ``--revcomp`` was used, the number of reads or read pairs that were output
+diff --git a/src/cutadapt/cli.py b/src/cutadapt/cli.py
+index fb0b29d..f53b0a9 100644
+--- a/src/cutadapt/cli.py
++++ b/src/cutadapt/cli.py
+@@ -69,7 +69,12 @@ import dnaio
+ import xopen as xopen
+ 
+ from cutadapt import __version__
+-from cutadapt.adapters import warn_duplicate_adapters, Adapter, InvalidCharacter
++from cutadapt.adapters import (
++    warn_duplicate_adapters,
++    Adapter,
++    InvalidCharacter,
++    LinkedAdapter,
++)
+ from cutadapt.json import OneLine, dumps as json_dumps
+ from cutadapt.parser import make_adapters_from_specifications
+ from cutadapt.modifiers import (
+@@ -92,6 +97,8 @@ from cutadapt.modifiers import (
+     InvalidTemplate,
+     PolyATrimmer,
+     PairedReverseComplementer,
++    ReadSplitter,
++    PairedReadSplitter,
+ )
+ from cutadapt.predicates import (
+     TooShort,
+@@ -237,7 +244,7 @@ def get_argument_parser() -> ArgumentParser:
+     group.add_argument("-N", "--no-match-adapter-wildcards", action="store_false",
+         default=True, dest="match_adapter_wildcards",
+         help="Do not interpret IUPAC wildcards in adapters.")
+-    group.add_argument("--action", choices=("trim", "retain", "mask", "lowercase", "crop", "none"),
++    group.add_argument("--action", choices=("trim", "retain", "mask", "lowercase", "crop", "none", "split"),
+         default="trim",
+         help="What to do if a match was found. "
+             "trim: trim adapter and up- or downstream sequence; "
+@@ -245,7 +252,12 @@ def get_argument_parser() -> ArgumentParser:
+             "mask: replace with 'N' characters; "
+             "lowercase: convert to lowercase; "
+             "crop: trim up and downstream sequence; "
++            "split: remove the adapter and cut the read where it was; "
+             "none: leave unchanged. Default: %(default)s")
++    group.add_argument("--split-suffix", metavar="TEMPLATE", default=None,
++        help="With --action=split, append TEMPLATE to the id of each piece of a read "
++            "that was cut into more than one. The template may use {piece}, the number "
++            "of the piece, and {pieces}, how many there are. Default: _{piece}")
+     group.add_argument("--rc", "--revcomp", dest="reverse_complement", default=False,
+         action="store_true",
+         help="Check both the read and its reverse complement for adapter matches. If "
+@@ -631,6 +643,50 @@ def check_arguments(args, paired: bool) -> None:
+         raise CommandLineError("--pair-adapters cannot be used with --times")
+ 
+ 
++SPLIT_SUFFIX_DEFAULT = "_{piece}"
++
++
++def check_split_arguments(
++    args, paired: bool, adapters: Sequence[Adapter], adapters2: Sequence[Adapter]
++) -> None:
++    """
++    Raise a CommandLineError if --action=split was combined with something it does not support
++
++    Also reject --split-suffix when reads are not being split at all.
++    """
++    if args.action != "split":
++        if args.split_suffix is not None:
++            raise CommandLineError(
++                "Option --split-suffix can only be used with --action=split"
++            )
++        return
++    if not adapters or (paired and not adapters2):
++        raise CommandLineError(
++            "--action=split requires at least one adapter for every read"
++        )
++    if args.pair_adapters:
++        raise CommandLineError("--action=split cannot be used with --pair-adapters")
++    if args.times != 1:
++        raise CommandLineError("--action=split cannot be used with --times")
++    if args.reverse_complement:
++        raise CommandLineError("--action=split cannot be used with --revcomp")
++    for path, option in [
++        (args.info_file, "--info-file"),
++        (args.info_file2, "--info-file-paired"),
++        (args.rest_file, "--rest-file"),
++        (args.wildcard_file, "--wildcard-file"),
++    ]:
++        if path is not None:
++            raise CommandLineError(f"--action=split cannot be used with {option}")
++    if determine_demultiplex_mode(args.output, args.paired_output):
++        raise CommandLineError("--action=split cannot be used with demultiplexing")
++    for adapter in list(adapters) + list(adapters2):
++        if isinstance(adapter, LinkedAdapter):
++            raise CommandLineError(
++                "--action=split cannot be used with a linked adapter"
++            )
++
++
+ def make_pipeline_from_args(
+     args, input_file_format, outfiles, paired, adapters, adapters2
+ ):
+@@ -641,6 +697,7 @@ def make_pipeline_from_args(
+ 
+     Return an instance of Pipeline (SingleEndPipeline or PairedEndPipeline)
+     """
++    check_split_arguments(args, paired, adapters, adapters2)
+     action = None if args.action == "none" else args.action
+     pair_filter_mode = None
+     if paired:
+@@ -951,19 +1008,31 @@ def make_pipeline_from_args(
+             paired,
+         )
+     )
+-    modifiers.extend(
+-        make_adapter_cutter(
+-            adapters,
+-            adapters2,
+-            paired,
+-            args.pair_adapters,
+-            action,
+-            args.times,
+-            args.reverse_complement,
+-            not args.rename,  # no "rc" suffix if --rename is used
+-            args.index,
++    if args.action == "split":
++        suffix = (
++            SPLIT_SUFFIX_DEFAULT if args.split_suffix is None else args.split_suffix
++        )
++        try:
++            if paired:
++                modifiers.append(PairedReadSplitter(adapters, adapters2, suffix))
++            else:
++                modifiers.append(ReadSplitter(adapters, suffix))
++        except InvalidTemplate as e:
++            raise CommandLineError(e)
++    else:
++        modifiers.extend(
++            make_adapter_cutter(
++                adapters,
++                adapters2,
++                paired,
++                args.pair_adapters,
++                action,
++                args.times,
++                args.reverse_complement,
++                not args.rename,  # no "rc" suffix if --rename is used
++                args.index,
++            )
+         )
+-    )
+ 
+     if args.poly_a:
+         if paired:
+@@ -1389,7 +1458,7 @@ def json_report(
+ ) -> dict:
+     d = {
+         "tag": "Cutadapt report",
+-        "schema_version": OneLine([0, 3]),
++        "schema_version": OneLine([0, 4]),
+         "cutadapt_version": __version__,
+         "python_version": platform.python_version(),
+         "command_line_arguments": cmdlineargs,
+diff --git a/src/cutadapt/modifiers.py b/src/cutadapt/modifiers.py
+index de1bae7..e16f5a9 100644
+--- a/src/cutadapt/modifiers.py
++++ b/src/cutadapt/modifiers.py
+@@ -17,7 +17,9 @@ from dnaio import record_names_match, SequenceRecord
+ from .qualtrim import quality_trim_index, nextseq_trim_index, poly_a_trim_index
+ from .adapters import (
+     MultipleAdapters,
++    RemoveAfterMatch,
+     SingleAdapter,
++    SingleMatch,
+     IndexedPrefixAdapters,
+     IndexedSuffixAdapters,
+     Match,
+@@ -31,6 +33,16 @@ from .info import ModificationInfo
+ logger = logging.getLogger()
+ 
+ 
++class PieceInfo(ModificationInfo):
++    """
++    The ModificationInfo of one piece of a read that a splitter cut apart
++
++    Carrying the type lets later modifications tell a piece from an ordinary read. The
++    paired renamer needs that, because the suffix a piece carries moves the character that
++    tells R1 and R2 apart.
++    """
++
++
+ class SingleEndModifier(ABC):
+     @abstractmethod
+     def __call__(self, read: SequenceRecord, info: ModificationInfo):
+@@ -710,6 +722,12 @@ class PairedEndRenamer(PairedEndModifier):
+     Additionally, all template variables except `id` can be used in the read-specific
+     forms `{r1.variablename}` and `{r2.variablename}`. For example, `{r1.comment}`
+     always gets replaced with the R1 comment, even in R2.
++
++    When splitting has moved the character that tells R1 and R2 apart, which the suffix on
++    every piece of a cut read does, the pair is checked on the reads the pieces came from
++    instead, and the check on the renamed names is skipped because those names no longer
++    carry the pair marker where it is looked for. Records that a splitter did not produce
++    keep both checks.
+     """
+ 
+     def __init__(self, template: str):
+@@ -735,14 +753,21 @@ class PairedEndRenamer(PairedEndModifier):
+         info1: ModificationInfo,
+         info2: ModificationInfo,
+     ) -> tuple[SequenceRecord, SequenceRecord]:
+-        if not record_names_match(read1.name, read2.name):
++        names_are_paired = record_names_match(read1.name, read2.name)
++        suffixed_pieces = (
++            not names_are_paired
++            and isinstance(info1, PieceInfo)
++            and isinstance(info2, PieceInfo)
++            and record_names_match(info1.original_read.name, info2.original_read.name)
++        )
++        if not names_are_paired and not suffixed_pieces:
+             id1 = Renamer.parse_name(read1.name)[0]
+             id2 = Renamer.parse_name(read1.name)[1]
+             raise ValueError(f"Input read IDs not identical: '{id1}' != '{id2}'")
+ 
+         name1, name2 = self._rename(read1, read2, info1, info2)
+ 
+-        if not record_names_match(name1, name2):
++        if not suffixed_pieces and not record_names_match(name1, name2):
+             new_id1 = Renamer.parse_name(name1)[0]
+             new_id2 = Renamer.parse_name(name2)[0]
+             id1 = Renamer.parse_name(read1.name)[0]
+@@ -917,3 +942,235 @@ class NEndTrimmer(SingleEndModifier):
+         start_cut = start_cut.end() if start_cut else 0
+         end_cut = end_cut.start() if end_cut else len(read)
+         return read[start_cut:end_cut]
++
++
++class SplittingModifier(ABC):
++    """
++    A modification that turns one read into any number of reads
++
++    Unlike a SingleEndModifier, which maps a record to a record, this maps a record to a
++    list of (record, ModificationInfo) pairs. The pipeline passes each of them on to the
++    modifications and steps that follow.
++    """
++
++    @abstractmethod
++    def split(
++        self, read: SequenceRecord, info: ModificationInfo
++    ) -> list[tuple[SequenceRecord, ModificationInfo]]:
++        """Return the pieces the read is made of, in the order they occur in it"""
++
++
++class ReadSplitter(SplittingModifier):
++    """
++    Cut reads apart at every occurrence of one of multiple adapters
++
++    Each occurrence is removed and the read is cut where it stood, so a read with n
++    occurrences becomes n+1 pieces. The search covers the sequence on both sides of every
++    occurrence, so that no piece that is handed on still contains one.
++    """
++
++    variables = {"piece", "pieces"}
++
++    def __init__(self, adapters: Sequence[Adapter], suffix: str = "_{piece}"):
++        self.suffix = suffix
++        self.with_adapters = 0
++        self.split_reads = 0
++        self.pieces = 0
++        self.adapter_statistics = {a: a.create_statistics() for a in adapters}
++        self.adapters = MultipleAdapters(list(adapters))
++        self._check_suffix(suffix)
++
++    def __repr__(self):
++        return f"ReadSplitter(adapters={self.adapters!r}, suffix='{self.suffix}')"
++
++    @classmethod
++    def _check_suffix(cls, suffix: str) -> None:
++        try:
++            tokens = list(tokenize_braces(suffix))
++        except TokenizeError as e:
++            raise InvalidTemplate(f"Error in template '{suffix}': {e}")
++        Renamer.raise_if_invalid_variable(tokens, cls.variables)
++        placeholders = {
++            token.value for token in tokens if isinstance(token, BraceToken)
++        }
++        if "piece" not in placeholders:
++            raise InvalidTemplate(
++                "Error in template: The '{piece}' variable is required"
++            )
++
++    def cut_intervals(self, sequence: str) -> list[tuple[int, int, SingleMatch]]:
++        """
++        Return the intervals covered by adapter occurrences, sorted by start position
++
++        After the best-matching occurrence has been located, the stretches of sequence to
++        its left and to its right are searched in the same way.
++        """
++        intervals: list[tuple[int, int, SingleMatch]] = []
++        pending = [(sequence, 0)]
++        while pending:
++            subsequence, offset = pending.pop()
++            match = self.adapters.match_to(subsequence)
++            if match is None or match.rstop <= match.rstart:
++                continue
++            intervals.append((offset + match.rstart, offset + match.rstop, match))
++            if match.rstart > 0:
++                pending.append((subsequence[: match.rstart], offset))
++            if match.rstop < len(subsequence):
++                pending.append((subsequence[match.rstop :], offset + match.rstop))
++        intervals.sort(key=lambda interval: interval[0])
++        return intervals
++
++    @staticmethod
++    def occurrence_match(match: SingleMatch) -> SingleMatch:
++        """
++        Return a copy of a match that reports the matched interval as the removed sequence
++
++        The per-adapter statistics record how much sequence an adapter took out. Trimming
++        takes the sequence up- or downstream of the match with it, while splitting takes
++        out the match alone, so the copy is narrowed to it. A 3' match keeps the base in
++        front of it because the statistics count those bases separately.
++        """
++        length = match.rstop - match.rstart
++        if isinstance(match, RemoveAfterMatch):
++            start = min(match.rstart, 1)
++        else:
++            start = 0
++        return type(match)(
++            match.astart,
++            match.astop,
++            start,
++            start + length,
++            match.score,
++            match.errors,
++            match.adapter,
++            match.sequence[match.rstart - start : match.rstop],
++        )
++
++    @staticmethod
++    def parse_header(name: str) -> tuple[str, str]:
++        """Return the id of a read and the remainder of its header, separator included"""
++        index = 0
++        while index < len(name) and not name[index].isspace():
++            index += 1
++        return name[:index], name[index:]
++
++    def piece_name(self, name: str, index: int, count: int) -> str:
++        read_id, rest = self.parse_header(name)
++        return read_id + self.suffix.format(piece=index, pieces=count) + rest
++
++    def cut(
++        self, read: SequenceRecord, info: ModificationInfo
++    ) -> list[tuple[SequenceRecord, ModificationInfo]]:
++        """
++        Return the pieces of a read, each with its own ModificationInfo
++
++        The occurrences that were removed are added to the adapter statistics, but the
++        piece counters are left alone so that a caller can still drop the whole read.
++        """
++        intervals = self.cut_intervals(read.sequence)
++        if intervals:
++            self.with_adapters += 1
++            for _, _, match in intervals:
++                self.adapter_statistics[match.adapter].add_match(
++                    self.occurrence_match(match)
++                )
++        pieces = []
++        neighbors: list[tuple[Optional[SingleMatch], Optional[SingleMatch]]] = []
++        start = 0
++        previous: Optional[SingleMatch] = None
++        for cut_start, cut_stop, match in intervals:
++            pieces.append(read[start:cut_start])
++            neighbors.append((previous, match))
++            previous = match
++            start = cut_stop
++        pieces.append(read[start:])
++        neighbors.append((previous, None))
++
++        count = len(pieces)
++        result: list[tuple[SequenceRecord, ModificationInfo]] = []
++        for index, (piece, (left, right)) in enumerate(zip(pieces, neighbors), 1):
++            if count > 1:
++                piece.name = self.piece_name(piece.name, index, count)
++            piece_info = PieceInfo(info.original_read)
++            piece_info.cut_prefix = info.cut_prefix
++            piece_info.cut_suffix = info.cut_suffix
++            piece_info.is_rc = info.is_rc
++            piece_info.matches = [match for match in (left, right) if match is not None]
++            result.append((piece, piece_info))
++        return result
++
++    def split(
++        self, read: SequenceRecord, info: ModificationInfo
++    ) -> list[tuple[SequenceRecord, ModificationInfo]]:
++        pieces = self.cut(read, info)
++        self.pieces += len(pieces)
++        if len(pieces) > 1:
++            self.split_reads += 1
++        return pieces
++
++
++class PairedSplittingModifier(ABC):
++    """
++    A modification that turns one read pair into any number of read pairs
++    """
++
++    @abstractmethod
++    def split(
++        self,
++        read1: SequenceRecord,
++        read2: SequenceRecord,
++        info1: ModificationInfo,
++        info2: ModificationInfo,
++    ) -> list[
++        tuple[SequenceRecord, SequenceRecord, ModificationInfo, ModificationInfo]
++    ]:
++        """Return the piece pairs the read pair is made of"""
++
++
++class PairedReadSplitter(PairedSplittingModifier):
++    """
++    Cut both reads of a pair apart and pair up the pieces by their position
++
++    A pair whose reads do not fall into the same number of pieces is dropped, since its
++    pieces cannot be paired up.
++    """
++
++    def __init__(
++        self,
++        adapters1: Sequence[Adapter],
++        adapters2: Sequence[Adapter],
++        suffix: str = "_{piece}",
++    ):
++        self.splitter1 = ReadSplitter(adapters1, suffix)
++        self.splitter2 = ReadSplitter(adapters2, suffix)
++        self.split_reads = 0
++        self.pieces = 0
++        self.unequal_pairs = 0
++
++    def __repr__(self):
++        return (
++            f"PairedReadSplitter(splitter1={self.splitter1!r}, "
++            f"splitter2={self.splitter2!r})"
++        )
++
++    def split(
++        self,
++        read1: SequenceRecord,
++        read2: SequenceRecord,
++        info1: ModificationInfo,
++        info2: ModificationInfo,
++    ) -> list[
++        tuple[SequenceRecord, SequenceRecord, ModificationInfo, ModificationInfo]
++    ]:
++        first = self.splitter1.cut(read1, info1)
++        second = self.splitter2.cut(read2, info2)
++        if len(first) != len(second):
++            self.unequal_pairs += 1
++            return []
++        self.pieces += len(first)
++        if len(first) > 1:
++            self.split_reads += 1
++        return [
++            (piece1, piece2, piece_info1, piece_info2)
++            for (piece1, piece_info1), (piece2, piece_info2) in zip(first, second)
++        ]
+diff --git a/src/cutadapt/pipeline.py b/src/cutadapt/pipeline.py
+index c4db4a1..5338af0 100644
+--- a/src/cutadapt/pipeline.py
++++ b/src/cutadapt/pipeline.py
+@@ -9,6 +9,8 @@ from .modifiers import (
+     PairedEndModifier,
+     PairedEndModifierWrapper,
+     ModificationInfo,
++    SplittingModifier,
++    PairedSplittingModifier,
+ )
+ from .steps import SingleEndStep
+ 
+@@ -44,6 +46,25 @@ class SingleEndPipeline(Pipeline):
+         self._modifiers: list[SingleEndModifier] = modifiers
+         self._steps = steps
+ 
++    @staticmethod
++    def _apply(step, records):
++        """
++        Run one modification or pipeline step on every record
++
++        Return the records that are left. A SplittingModifier may replace a record with
++        any number of records, every other step maps a record to at most one record.
++        """
++        result = []
++        if isinstance(step, SplittingModifier):
++            for record, info in records:
++                result.extend(step.split(record, info))
++        else:
++            for record, info in records:
++                modified = step(record, info)
++                if modified is not None:
++                    result.append((modified, info))
++        return result
++
+     def process_reads(
+         self,
+         infiles: InputFiles,
+@@ -62,10 +83,10 @@ class SingleEndPipeline(Pipeline):
+             if n % 10000 == 0 and progress is not None:
+                 progress.update(10000)
+             total_bp += len(read)
+-            info = ModificationInfo(read)
++            records = [(read, ModificationInfo(read))]
+             for step in modifiers_and_steps:  # type: ignore[assignment]
+-                read = step(read, info)
+-                if read is None:
++                records = self._apply(step, records)
++                if not records:
+                     break
+         if progress is not None:
+             progress.update(n % 10000)
+@@ -122,6 +143,25 @@ class PairedEndPipeline(Pipeline):
+         """Add a Modifier (without wrapping it in a PairedEndModifierWrapper)"""
+         self._modifiers.append(modifier)
+ 
++    @staticmethod
++    def _apply(step, records):
++        """
++        Run one modification or pipeline step on every record pair
++
++        Return the record pairs that are left. A PairedSplittingModifier may replace a
++        pair with any number of pairs, every other step maps a pair to at most one pair.
++        """
++        result = []
++        if isinstance(step, PairedSplittingModifier):
++            for read1, read2, info1, info2 in records:
++                result.extend(step.split(read1, read2, info1, info2))
++        else:
++            for read1, read2, info1, info2 in records:
++                modified = step(read1, read2, info1, info2)
++                if modified is not None:
++                    result.append((modified[0], modified[1], info1, info2))
++        return result
++
+     def process_reads(
+         self,
+         infiles: InputFiles,
+@@ -141,11 +181,10 @@ class PairedEndPipeline(Pipeline):
+             read1, read2 = reads
+             total1_bp += len(read1)
+             total2_bp += len(read2)
+-            info1 = ModificationInfo(read1)
+-            info2 = ModificationInfo(read2)
++            records = [(read1, read2, ModificationInfo(read1), ModificationInfo(read2))]
+             for step in modifiers_and_steps:
+-                reads = step(*reads, info1, info2)  # type: ignore
+-                if reads is None:
++                records = self._apply(step, records)
++                if not records:
+                     break
+         if progress is not None:
+             progress.update(n % 10000)
+diff --git a/src/cutadapt/report.py b/src/cutadapt/report.py
+index d878b69..eb5ddc8 100644
+--- a/src/cutadapt/report.py
++++ b/src/cutadapt/report.py
+@@ -24,6 +24,8 @@ from .adapters import (
+ from .json import OneLine
+ from .modifiers import (
+     QualityTrimmer,
++    ReadSplitter,
++    PairedReadSplitter,
+     NextseqQualityTrimmer,
+     AdapterCutter,
+     PairedAdapterCutter,
+@@ -69,6 +71,9 @@ class Statistics:
+         self.filtered: dict[str, int] = defaultdict(int)
+         self.reverse_complemented: Optional[int] = None
+         self.n = 0
++        self.split_reads = 0
++        self.unequal_pairs = 0
++        self.pieces: Optional[int] = None
+         self.total_bp = [0, 0]
+         self.read_length_statistics = ReadLengthStatistics()
+         self.with_adapters: list[Optional[int]] = [None, None]
+@@ -84,6 +89,9 @@ class Statistics:
+         if not isinstance(other, Statistics):
+             raise TypeError(f"Cannot add {other.__type__.__name__}")
+         self.n += other.n
++        self.split_reads += other.split_reads
++        self.unequal_pairs += other.unequal_pairs
++        self.pieces = add_if_not_none(self.pieces, other.pieces)
+         self.read_length_statistics += other.read_length_statistics
+ 
+         if self.paired is None:
+@@ -162,6 +170,14 @@ class Statistics:
+             self.filtered[name] = step.filtered()
+ 
+     def _collect_modifier(self, m) -> None:
++        if isinstance(m, PairedReadSplitter):
++            for i, splitter in ((0, m.splitter1), (1, m.splitter2)):
++                self.with_adapters[i] = splitter.with_adapters
++                self.adapter_stats[i] = list(splitter.adapter_statistics.values())
++            self.split_reads = m.split_reads
++            self.pieces = m.pieces
++            self.unequal_pairs = m.unequal_pairs
++            return
+         if isinstance(m, PairedAdapterCutter):
+             for i in 0, 1:
+                 self.with_adapters[i] = m.with_adapters
+@@ -181,6 +197,11 @@ class Statistics:
+                 )
+             if isinstance(modifier, PolyATrimmer):
+                 self.poly_a_trimmed_lengths[i] = modifier.trimmed_bases
++            elif isinstance(modifier, ReadSplitter):
++                self.with_adapters[i] = modifier.with_adapters
++                self.adapter_stats[i] = list(modifier.adapter_statistics.values())
++                self.split_reads = modifier.split_reads
++                self.pieces = modifier.pieces
+             elif isinstance(modifier, AdapterCutter):
+                 if self.with_adapters[i] is None:
+                     self.with_adapters[i] = modifier.with_adapters
+@@ -217,10 +238,13 @@ class Statistics:
+         filtered_total = sum(self.filtered.values())
+         written_reads = self.read_length_statistics.written_reads()
+         written_bp = self.read_length_statistics.written_bp()
+-        assert written_reads + filtered_total == self.n
++        assert written_reads + filtered_total == self.total_pieces
+         return {
+             "read_counts": {  # pairs or reads
+                 "input": self.n,
++                "split": self.split_reads,
++                "pieces": self.total_pieces,
++                "unequal_pairs": self.unequal_pairs,
+                 "filtered": filtered,
+                 "output": self.read_length_statistics.written_reads(),
+                 "reverse_complemented": self.reverse_complemented,
+@@ -359,6 +383,15 @@ class Statistics:
+     def poly_a_trimmed(self) -> Optional[int]:
+         return add_if_not_none(*self.poly_a_trimmed_bp)
+ 
++    @property
++    def total_pieces(self) -> int:
++        """Number of records that reached the filters"""
++        return self.n if self.pieces is None else self.pieces
++
++    @property
++    def split_fraction(self) -> float:
++        return safe_divide(self.split_reads, self.n)
++
+     @property
+     def total_written_bp(self) -> int:
+         return sum(self.read_length_statistics.written_bp())
+@@ -369,7 +402,9 @@ class Statistics:
+ 
+     @property
+     def written_fraction(self) -> float:
+-        return safe_divide(self.read_length_statistics.written_reads(), self.n)
++        return safe_divide(
++            self.read_length_statistics.written_reads(), self.total_pieces
++        )
+ 
+     @property
+     def with_adapters_fraction(self) -> list[float]:
+@@ -392,7 +427,7 @@ class Statistics:
+         return safe_divide(self.reverse_complemented, self.n)
+ 
+     def filtered_fraction(self, filter_name: str) -> float:
+-        return safe_divide(self.filtered.get(filter_name), self.n)
++        return safe_divide(self.filtered.get(filter_name), self.total_pieces)
+ 
+     @property
+     def poly_a_trimmed_fraction(self) -> float:
+@@ -627,6 +662,13 @@ def full_report(stats: Statistics, time: float, gc_content: float) -> str:
+                     f"  Read {i+1} with adapter:           "
+                     f"{stats.with_adapters[i]:13,d} ({stats.with_adapters_fraction[i]:.1%})\n"
+                 )
++        if stats.pieces is not None:
++            report += (
++                f"Pairs split:                     "
++                f"{stats.split_reads:13,d} ({stats.split_fraction:.1%})\n"
++            )
++            report += f"Piece pairs produced:            {stats.pieces:13,d}\n"
++            report += f"Pairs with unequal pieces:       {stats.unequal_pairs:13,d}\n"
+     else:
+         report += f"Total reads processed:           {stats.n:13,d}\n"
+         if stats.with_adapters[0] is not None:
+@@ -634,6 +676,12 @@ def full_report(stats: Statistics, time: float, gc_content: float) -> str:
+                 f"Reads with adapters:             "
+                 f"{stats.with_adapters[0]:13,d} ({stats.with_adapters_fraction[0]:.1%})\n"
+             )
++        if stats.pieces is not None:
++            report += (
++                f"Reads split:                     "
++                f"{stats.split_reads:13,d} ({stats.split_fraction:.1%})\n"
++            )
++            report += f"Pieces produced:                 {stats.pieces:13,d}\n"
+ 
+     if stats.reverse_complemented is not None:
+         report += (

@@ -1,0 +1,640 @@
+diff --git a/bumble/a2dp.py b/bumble/a2dp.py
+index 9bb2438..c45eb8a 100644
+--- a/bumble/a2dp.py
++++ b/bumble/a2dp.py
+@@ -20,6 +20,7 @@ from __future__ import annotations
+ import dataclasses
+ import enum
+ import logging
++import math
+ import struct
+ from collections.abc import AsyncGenerator, Awaitable, Callable
+ from typing import ClassVar
+@@ -35,6 +36,8 @@ from bumble.core import (
+     BT_AUDIO_SOURCE_SERVICE,
+     BT_AVDTP_PROTOCOL_ID,
+     BT_L2CAP_PROTOCOL_ID,
++    InvalidArgumentError,
++    InvalidPacketError,
+     name_or_number,
+ )
+ from bumble.rtp import MediaPacket
+@@ -537,6 +540,42 @@ class OpusMediaCodecInformation(VendorSpecificMediaCodecInformation):
+         return repr(self)
+ 
+ 
++# -----------------------------------------------------------------------------
++def sbc_frame_length(
++    subbands: int, channels: int, blocks: int, bitpool: int, channel_mode: int
++) -> int:
++    """Length in bytes of an SBC frame with the given parameters."""
++    length = 4 + (4 * subbands * channels) // 8
++
++    if channel_mode in (SBC_MONO_CHANNEL_MODE, SBC_DUAL_CHANNEL_MODE):
++        return length + math.ceil(blocks * channels * bitpool / 8)
++
++    join = 1 if channel_mode == SBC_JOINT_STEREO_CHANNEL_MODE else 0
++    return length + math.ceil((join * subbands + blocks * bitpool) / 8)
++
++
++# -----------------------------------------------------------------------------
++def sbc_media_payload_header(
++    frame_count: int,
++    fragmented: bool = False,
++    start: bool = False,
++    last: bool = False,
++) -> bytes:
++    """Single-octet media payload header that precedes SBC frames in an RTP payload."""
++    if not 0 <= frame_count <= SBC_MAX_FRAMES_IN_RTP_PAYLOAD:
++        raise InvalidArgumentError(
++            f'{frame_count} does not fit the four bit frame counter'
++        )
++    return bytes(
++        [
++            (0x80 if fragmented else 0)
++            | (0x40 if fragmented and start else 0)
++            | (0x20 if fragmented and last else 0)
++            | frame_count
++        ]
++    )
++
++
+ # -----------------------------------------------------------------------------
+ @dataclasses.dataclass
+ class SbcFrame:
+@@ -572,6 +611,143 @@ class SbcFrame:
+         )
+ 
+ 
++# -----------------------------------------------------------------------------
++def sbc_frame_parameters(header: bytes) -> tuple[int, int, int, int, int, int, int]:
++    """Decode an SBC frame header into its parameters and the frame length."""
++    if len(header) < 4 or header[0] != SBC_SYNC_WORD:
++        raise InvalidPacketError('invalid SBC frame header')
++
++    sampling_frequency = SBC_SAMPLING_FREQUENCIES[(header[1] >> 6) & 3]
++    blocks = 4 * (1 + ((header[1] >> 4) & 3))
++    channel_mode = (header[1] >> 2) & 3
++    channels = 1 if channel_mode == SBC_MONO_CHANNEL_MODE else 2
++    allocation_method = (header[1] >> 1) & 1
++    subbands = 8 if (header[1] & 1) else 4
++    bitpool = header[2]
++    length = sbc_frame_length(subbands, channels, blocks, bitpool, channel_mode)
++
++    return (
++        sampling_frequency,
++        blocks,
++        channel_mode,
++        allocation_method,
++        subbands,
++        bitpool,
++        length,
++    )
++
++
++# -----------------------------------------------------------------------------
++def sbc_frames_from_payload(data: bytes) -> list[SbcFrame]:
++    """Split a buffer of concatenated SBC frames into individual frames."""
++    frames = []
++    offset = 0
++    while offset < len(data):
++        (
++            sampling_frequency,
++            blocks,
++            channel_mode,
++            allocation_method,
++            subbands,
++            bitpool,
++            length,
++        ) = sbc_frame_parameters(data[offset : offset + 4])
++        payload = data[offset : offset + length]
++        if len(payload) != length:
++            raise InvalidPacketError('truncated SBC frame')
++        frames.append(
++            SbcFrame(
++                sampling_frequency,
++                blocks,
++                channel_mode,
++                allocation_method,
++                subbands,
++                bitpool,
++                payload,
++            )
++        )
++        offset += length
++
++    return frames
++
++
++# -----------------------------------------------------------------------------
++class SbcPayloadAssembler:
++    """Reassembles SBC frames from the media payloads of RTP packets."""
++
++    def __init__(self, on_frames: Callable[[list[SbcFrame]], None]) -> None:
++        self.on_frames = on_frames
++        self.fragments: list[bytes] = []
++        self.expected_fragments = 0
++
++    def reset(self) -> None:
++        self.fragments = []
++        self.expected_fragments = 0
++
++    def on_payload(self, payload: bytes) -> None:
++        if not payload:
++            raise InvalidPacketError('empty media payload')
++
++        header = payload[0]
++        fragmented = bool(header & 0x80)
++        start = bool(header & 0x40)
++        last = bool(header & 0x20)
++        count = header & 0x0F
++        data = payload[1:]
++
++        if not fragmented:
++            if start or last:
++                raise InvalidPacketError('start or last set on an unfragmented payload')
++            self.reset()
++            frames = sbc_frames_from_payload(data)
++            if len(frames) != count:
++                raise InvalidPacketError(
++                    f'payload declares {count} frames but carries {len(frames)}'
++                )
++            self.on_frames(frames)
++            return
++
++        if start:
++            self.reset()
++            if last:
++                if count != 1:
++                    raise InvalidPacketError(
++                        'a fragment that both starts and ends must declare one'
++                    )
++                self.on_frames(sbc_frames_from_payload(data))
++                return
++
++            if count < 2:
++                raise InvalidPacketError(
++                    'a fragment with more to come must declare at least two'
++                )
++
++            self.fragments = [data]
++            self.expected_fragments = count
++            return
++
++        if not self.fragments:
++            logger.debug('ignoring a continuation without a start')
++            return
++
++        self.fragments.append(data)
++        if count != self.expected_fragments - len(self.fragments) + 1:
++            self.reset()
++            raise InvalidPacketError('fragment count is not decreasing as declared')
++
++        if count == 1 and not last:
++            self.reset()
++            raise InvalidPacketError('the fragment that declares one must be the last')
++
++        if last:
++            if len(self.fragments) != self.expected_fragments:
++                self.reset()
++                raise InvalidPacketError('fragmented frame ended early')
++            data = b''.join(self.fragments)
++            self.reset()
++            self.on_frames(sbc_frames_from_payload(data))
++
++
+ # -----------------------------------------------------------------------------
+ class SbcParser:
+     def __init__(self, read: Callable[[int], Awaitable[bytes]]) -> None:
+@@ -591,28 +767,22 @@ class SbcParser:
+                     logger.debug('invalid sync word')
+                     return
+ 
+-                # Extract some of the header fields
+-                sampling_frequency = SBC_SAMPLING_FREQUENCIES[(header[1] >> 6) & 3]
+-                blocks = 4 * (1 + ((header[1] >> 4) & 3))
+-                channel_mode = (header[1] >> 2) & 3
+-                channels = 1 if channel_mode == SBC_MONO_CHANNEL_MODE else 2
+-                allocation_method = (header[1] >> 1) & 1
+-                subbands = 8 if ((header[1]) & 1) else 4
+-                bitpool = header[2]
+-
+-                # Compute the frame length
+-                frame_length = 4 + (4 * subbands * channels) // 8
+-                if channel_mode in (SBC_MONO_CHANNEL_MODE, SBC_DUAL_CHANNEL_MODE):
+-                    frame_length += (blocks * channels * bitpool) // 8
+-                else:
+-                    frame_length += (
+-                        (1 if channel_mode == SBC_JOINT_STEREO_CHANNEL_MODE else 0)
+-                        * subbands
+-                        + blocks * bitpool
+-                    ) // 8
++                # Extract the header fields and the frame length
++                (
++                    sampling_frequency,
++                    blocks,
++                    channel_mode,
++                    allocation_method,
++                    subbands,
++                    bitpool,
++                    frame_length,
++                ) = sbc_frame_parameters(header)
+ 
+                 # Read the rest of the frame
+                 payload = header + await self.read(frame_length - 4)
++                if len(payload) != frame_length:
++                    logger.debug('truncated frame')
++                    return
+ 
+                 # Emit the next frame
+                 yield SbcFrame(
+@@ -639,42 +809,89 @@ class SbcPacketSource:
+         async def generate_packets():
+             sequence_number = 0
+             sample_count = 0
+-            frames = []
++            frames: list[SbcFrame] = []
+             frames_size = 0
+             max_rtp_payload = self.mtu - 12 - 1
++            if max_rtp_payload < 1:
++                raise InvalidArgumentError(
++                    f'MTU {self.mtu} leaves no room for frame bytes'
++                )
++
++            def make_packet(payload: bytes, timestamp: int, timestamp_seconds: float):
++                nonlocal sequence_number
++                packet = MediaPacket(
++                    2, 0, 0, 0, sequence_number, timestamp, 0, [], 96, payload
++                )
++                packet.timestamp_seconds = timestamp_seconds
++                sequence_number = (sequence_number + 1) & 0xFFFF
++                return packet
++
++            def flush():
++                nonlocal frames, frames_size, sample_count
++                if not frames:
++                    return
++
++                logger.debug(f"yielding {len(frames)} frames")
++                payload = sbc_media_payload_header(len(frames)) + b''.join(
++                    frame.payload for frame in frames
++                )
++                timestamp = sample_count & 0xFFFFFFFF
++                timestamp_seconds = sample_count / frames[0].sampling_frequency
++                sample_count += sum(frame.sample_count for frame in frames)
++                frames = []
++                frames_size = 0
++                return make_packet(payload, timestamp, timestamp_seconds)
++
++            def fragment(frame: SbcFrame):
++                nonlocal sample_count
++                fragments = [
++                    frame.payload[offset : offset + max_rtp_payload]
++                    for offset in range(0, len(frame.payload), max_rtp_payload)
++                ]
++                if len(fragments) > SBC_MAX_FRAMES_IN_RTP_PAYLOAD:
++                    raise InvalidArgumentError(
++                        f'frame needs {len(fragments)} fragments, more than the '
++                        'media payload header can count'
++                    )
++                timestamp = sample_count & 0xFFFFFFFF
++                timestamp_seconds = sample_count / frame.sampling_frequency
++                packets = []
++                for index, data in enumerate(fragments):
++                    header = sbc_media_payload_header(
++                        len(fragments) - index,
++                        fragmented=True,
++                        start=index == 0,
++                        last=index == len(fragments) - 1,
++                    )
++                    packets.append(
++                        make_packet(header + data, timestamp, timestamp_seconds)
++                    )
++                sample_count += frame.sample_count
++                return packets
+ 
+-            # NOTE: this doesn't support frame fragments
+             sbc_parser = SbcParser(self.read)
+             async for frame in sbc_parser.frames:
++                if len(frame.payload) > max_rtp_payload:
++                    # The frame does not fit in a payload of its own, so anything
++                    # accumulated before it has to go out first, in order
++                    if packet := flush():
++                        yield packet
++                    for packet in fragment(frame):
++                        yield packet
++                    continue
++
+                 if (
+                     frames_size + len(frame.payload) > max_rtp_payload
+                     or len(frames) == SBC_MAX_FRAMES_IN_RTP_PAYLOAD
+                 ):
+-                    # Need to flush what has been accumulated so far
+-                    logger.debug(f"yielding {len(frames)} frames")
++                    if packet := flush():
++                        yield packet
+ 
+-                    # Emit a packet
+-                    sbc_payload = bytes([len(frames) & 0x0F]) + b''.join(
+-                        [frame.payload for frame in frames]
+-                    )
+-                    timestamp_seconds = sample_count / frame.sampling_frequency
+-                    timestamp = int(1000 * timestamp_seconds)
+-                    packet = MediaPacket(
+-                        2, 0, 0, 0, sequence_number, timestamp, 0, [], 96, sbc_payload
+-                    )
+-                    packet.timestamp_seconds = timestamp_seconds
+-                    yield packet
+-
+-                    # Prepare for next packets
+-                    sequence_number += 1
+-                    sequence_number &= 0xFFFF
+-                    sample_count += sum(frame.sample_count for frame in frames)
+-                    frames = [frame]
+-                    frames_size = len(frame.payload)
+-                else:
+-                    # Accumulate
+-                    frames.append(frame)
+-                    frames_size += len(frame.payload)
++                frames.append(frame)
++                frames_size += len(frame.payload)
++
++            if packet := flush():
++                yield packet
+ 
+         return generate_packets()
+ 
+@@ -795,7 +1012,7 @@ class AacPacketSource:
+                     )
+                 )
+                 timestamp_seconds = sample_count / frame.sampling_frequency
+-                timestamp = int(1000 * timestamp_seconds)
++                timestamp = sample_count & 0xFFFFFFFF
+                 packet = MediaPacket(
+                     2, 0, 0, 0, sequence_number, timestamp, 0, [], 96, aac_payload
+                 )
+diff --git a/bumble/avdtp.py b/bumble/avdtp.py
+index a4498e7..e5148ec 100644
+--- a/bumble/avdtp.py
++++ b/bumble/avdtp.py
+@@ -21,6 +21,7 @@ import abc
+ import asyncio
+ import enum
+ import logging
++import math
+ import time
+ import warnings
+ from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+@@ -39,6 +40,7 @@ from bumble import a2dp, device, hci, l2cap, sdp, utils
+ from bumble.colors import color
+ from bumble.core import (
+     BT_ADVANCED_AUDIO_DISTRIBUTION_SERVICE,
++    InvalidArgumentError,
+     InvalidStateError,
+     ProtocolError,
+ )
+@@ -1530,47 +1532,67 @@ class Protocol(utils.EventEmitter):
+             f'{color(">>> Sending AVDTP message", "magenta")}: '
+             f'[{transaction_label}] {message}'
+         )
+-        max_fragment_size = (
+-            self.l2cap_channel.peer_mtu - 3
+-        )  # Enough space for a 3-byte start packet header
++        mtu = self.l2cap_channel.peer_mtu
+         payload = message.payload
+-        if len(payload) + 2 <= self.l2cap_channel.peer_mtu:
+-            # Fits in a single packet
+-            packet_type = self.PacketType.SINGLE_PACKET
+-        else:
+-            packet_type = self.PacketType.START_PACKET
+ 
+-        done = False
+-        while not done:
+-            first_header_byte = (
+-                transaction_label << 4 | packet_type << 2 | message.message_type
++        # Each packet type carries a header of a different size, so the space left
++        # for payload differs from one packet to the next
++        single_capacity = mtu - 2
++        start_capacity = mtu - 3
++        continuation_capacity = mtu - 1
++
++        if len(payload) <= single_capacity:
++            header = bytes(
++                [
++                    transaction_label << 4
++                    | self.PacketType.SINGLE_PACKET << 2
++                    | message.message_type,
++                    message.signal_identifier,
++                ]
+             )
++            self.l2cap_channel.write(header + payload)
++            return
+ 
+-            if packet_type == self.PacketType.SINGLE_PACKET:
+-                header = bytes([first_header_byte, message.signal_identifier])
+-            elif packet_type == self.PacketType.START_PACKET:
+-                packet_count = (
+-                    max_fragment_size - 1 + len(payload)
+-                ) // max_fragment_size
+-                header = bytes(
+-                    [first_header_byte, message.signal_identifier, packet_count]
+-                )
+-            else:
+-                header = bytes([first_header_byte])
+-
+-            # Send one packet
+-            self.l2cap_channel.write(header + payload[:max_fragment_size])
+-
+-            # Prepare for the next packet
+-            payload = payload[max_fragment_size:]
+-            if payload:
+-                packet_type = (
+-                    self.PacketType.CONTINUE_PACKET
+-                    if len(payload) > max_fragment_size
+-                    else self.PacketType.END_PACKET
+-                )
+-            else:
+-                done = True
++        if start_capacity < 1:
++            raise InvalidArgumentError(
++                f'peer MTU {mtu} is too small to carry a fragmented AVDTP message'
++            )
++
++        packet_count = 1 + math.ceil(
++            (len(payload) - start_capacity) / continuation_capacity
++        )
++        if packet_count > 0xFF:
++            raise InvalidArgumentError(
++                f'message needs {packet_count} fragments, more than a signalling '
++                'header can express'
++            )
++
++        fragment, payload = payload[:start_capacity], payload[start_capacity:]
++        header = bytes(
++            [
++                transaction_label << 4
++                | self.PacketType.START_PACKET << 2
++                | message.message_type,
++                message.signal_identifier,
++                packet_count,
++            ]
++        )
++        self.l2cap_channel.write(header + fragment)
++
++        while payload:
++            fragment, payload = (
++                payload[:continuation_capacity],
++                payload[continuation_capacity:],
++            )
++            packet_type = (
++                self.PacketType.CONTINUE_PACKET
++                if payload
++                else self.PacketType.END_PACKET
++            )
++            header = bytes(
++                [transaction_label << 4 | packet_type << 2 | message.message_type]
++            )
++            self.l2cap_channel.write(header + fragment)
+ 
+     async def send_command(self, command: Message):
+         # TODO: support timeouts
+diff --git a/bumble/rtp.py b/bumble/rtp.py
+index d07e1c9..f55a861 100644
+--- a/bumble/rtp.py
++++ b/bumble/rtp.py
+@@ -19,11 +19,16 @@ from __future__ import annotations
+ 
+ import struct
+ 
++from bumble.core import InvalidArgumentError, InvalidPacketError
++
+ 
+ # -----------------------------------------------------------------------------
+ class MediaPacket:
+     @staticmethod
+     def from_bytes(data: bytes) -> MediaPacket:
++        if len(data) < 12:
++            raise InvalidPacketError('RTP packet shorter than its fixed header')
++
+         version = (data[0] >> 6) & 0x03
+         padding = (data[0] >> 5) & 0x01
+         extension = (data[0] >> 4) & 0x01
+@@ -33,12 +38,41 @@ class MediaPacket:
+         sequence_number = struct.unpack_from('>H', data, 2)[0]
+         timestamp = struct.unpack_from('>I', data, 4)[0]
+         ssrc = struct.unpack_from('>I', data, 8)[0]
++        offset = 12
++        if len(data) < offset + csrc_count * 4:
++            raise InvalidPacketError('RTP packet shorter than its CSRC list')
++
+         csrc_list = [
+-            struct.unpack_from('>I', data, 12 + i)[0] for i in range(csrc_count)
++            struct.unpack_from('>I', data, offset + i * 4)[0]
++            for i in range(csrc_count)
+         ]
+-        payload = data[12 + csrc_count * 4 :]
++        offset += csrc_count * 4
++
++        extension_profile = 0
++        extension_data = b''
++        if extension:
++            if len(data) < offset + 4:
++                raise InvalidPacketError('truncated RTP header extension')
++            extension_profile, extension_words = struct.unpack_from(
++                '>HH', data, offset
++            )
++            offset += 4
++            extension_data = data[offset : offset + extension_words * 4]
++            if len(extension_data) != extension_words * 4:
++                raise InvalidPacketError('truncated RTP header extension')
++            offset += extension_words * 4
++
++        end = len(data)
++        padding_size = 0
++        if padding:
++            padding_size = data[-1]
++            if padding_size < 1 or end - padding_size < offset:
++                raise InvalidPacketError('invalid RTP padding')
++            end -= padding_size
+ 
+-        return MediaPacket(
++        payload = data[offset:end]
++
++        packet = MediaPacket(
+             version,
+             padding,
+             extension,
+@@ -49,7 +83,13 @@ class MediaPacket:
+             csrc_list,
+             payload_type,
+             payload,
++            extension_profile,
++            extension_data,
++            padding_size,
+         )
++        packet.padding_data = data[end:]
++
++        return packet
+ 
+     def __init__(
+         self,
+@@ -63,6 +103,9 @@ class MediaPacket:
+         csrc_list: list[int],
+         payload_type: int,
+         payload: bytes,
++        extension_profile: int = 0,
++        extension_data: bytes = b'',
++        padding_size: int = 0,
+     ) -> None:
+         self.version = version
+         self.padding = padding
+@@ -75,6 +118,10 @@ class MediaPacket:
+         self.csrc_list = csrc_list
+         self.payload_type = payload_type
+         self.payload = payload
++        self.extension_profile = extension_profile
++        self.extension_data = extension_data
++        self.padding_size = padding_size
++        self.padding_data = b''
+ 
+     def __bytes__(self) -> bytes:
+         header = bytes(
+@@ -93,7 +140,37 @@ class MediaPacket:
+         )
+         for csrc in self.csrc_list:
+             header += struct.pack('>I', csrc)
+-        return header + self.payload
++
++        if self.extension:
++            if len(self.extension_data) % 4:
++                raise InvalidArgumentError(
++                    'RTP header extension must be a whole number of 32-bit words'
++                )
++            extension_words = len(self.extension_data) // 4
++            if not 0 <= self.extension_profile <= 0xFFFF:
++                raise InvalidArgumentError(
++                    'an RTP extension profile must fit in 16 bits'
++                )
++            if extension_words > 0xFFFF:
++                raise InvalidArgumentError(
++                    'RTP header extension is too long for a 16-bit word count'
++                )
++            header += struct.pack('>HH', self.extension_profile, extension_words)
++            header += self.extension_data
++
++        trailer = b''
++        if self.padding:
++            if not 1 <= self.padding_size <= 0xFF:
++                raise InvalidArgumentError(
++                    'a padded RTP packet needs a padding size that one octet can '
++                    'express'
++                )
++            if len(self.padding_data) == self.padding_size:
++                trailer = self.padding_data
++            else:
++                trailer = bytes(self.padding_size - 1) + bytes([self.padding_size])
++
++        return header + self.payload + trailer
+ 
+     def __str__(self) -> str:
+         return (

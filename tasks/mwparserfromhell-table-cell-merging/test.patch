@@ -1,0 +1,999 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..20a01e3
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,46 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++cd "$(dirname "$0")"
++
++NEW_TESTS="tests/test_table_grid_210616.py"
++TMP_BASE="$(mktemp -d)"
++
++ARGS=(-p no:cacheprovider --basetemp="$TMP_BASE")
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  ARGS+=("--junitxml=$OUTPUT_PATH")
++fi
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "$NEW_TESTS" "${ARGS[@]}"
++else
++  python -m pytest tests --ignore="$NEW_TESTS" "${ARGS[@]}"
++fi
++EXIT_CODE=$?
++
++if [ -n "$OUTPUT_PATH" ] && ! grep -q "<testcase" "$OUTPUT_PATH" 2>/dev/null; then
++  cat > "$OUTPUT_PATH" <<'XMLEOF'
++<?xml version="1.0" encoding="utf-8"?>
++<testsuites><testsuite name="pytest" errors="1" failures="0" tests="1" time="0">
++<testcase classname="tests" name="collection" time="0">
++<error message="pytest produced no test results">pytest did not report any test case.</error>
++</testcase>
++</testsuite></testsuites>
++XMLEOF
++  [ "$EXIT_CODE" -eq 0 ] && EXIT_CODE=1
++fi
++
++exit $EXIT_CODE
+diff --git a/tests/test_table_grid_210616.py b/tests/test_table_grid_210616.py
+new file mode 100644
+index 0000000..33ed45b
+--- /dev/null
++++ b/tests/test_table_grid_210616.py
+@@ -0,0 +1,941 @@
++# Copyright (C) 2012-2025 Ben Kurtovic <ben.kurtovic@gmail.com>
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in
++# all copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++"""
++Tests for the Table class, which lays table cells out on a grid.
++"""
++
++from __future__ import annotations
++
++from itertools import permutations
++
++import pytest
++
++from mwparserfromhell import parse
++from mwparserfromhell.nodes import Tag, Text
++
++
++def load(text, index=0):
++    code = parse(text)
++    return code, code.get_tables()[index]
++
++
++def labels(table):
++    return [
++        [None if cell is None else str(cell.contents).strip() for cell in row]
++        for row in table.grid
++    ]
++
++
++def origins(table):
++    return [
++        [None if cell is None else table.position(cell) for cell in row]
++        for row in table.grid
++    ]
++
++
++def reparsed(code, index=0):
++    return parse(str(code)).get_tables()[index]
++
++
++def assert_round_trip(code, table, index=0):
++    again = reparsed(code, index)
++    assert labels(again) == labels(table)
++    assert origins(again) == origins(table)
++    assert [again.span(cell) for cell in again.cells] == [
++        table.span(cell) for cell in table.cells
++    ]
++
++
++def with_new_spans(text, *attrs):
++    return {text.replace("SPANS", " ".join(order)) for order in permutations(attrs)}
++
++
++def assert_unchanged(code, text, action):
++    with pytest.raises(ValueError):
++        action()
++    assert text == str(code)
++
++
++def test_get_tables_without_tables():
++    """test Wikicode.get_tables() on code holding no tables"""
++    assert [] == parse("no {{tables}} <div>here</div>").get_tables()
++
++
++def test_get_tables_order_and_nesting():
++    """test that get_tables() finds nested tables in the order they start"""
++    text = (
++        "{|\n| outer\n|\n{|\n| inner\n|}\n|}\n"
++        "<table><tr><td>{{t|<table><tr><td>deep</td></tr></table>}}</td></tr></table>"
++    )
++    code = parse(text)
++    tables = code.get_tables()
++    assert 4 == len(tables)
++    assert [["outer", "{|\n| inner\n|}"]] == labels(tables[0])
++    assert [["inner"]] == labels(tables[1])
++    assert [["deep"]] == labels(tables[3])
++    tags = code.filter_tags(matches=lambda node: node.tag == "table")
++    assert all(table.node is tag for table, tag in zip(tables, tags))
++
++
++def test_table_node():
++    """test that a Table exposes the tag it was built from"""
++    from mwparserfromhell.table import Table
++
++    code = parse("{|\n| a\n|}")
++    tag = code.get(0)
++    assert Table(tag).node is tag
++    assert [["a"]] == labels(Table(tag))
++
++
++def test_table_rejects_other_nodes():
++    """test that a Table can only be built from a table tag"""
++    from mwparserfromhell.table import Table
++
++    code = parse("{|\n| a\n|}<div>b</div>")
++    cell = code.filter_tags(matches=lambda node: node.tag == "td")[0]
++    with pytest.raises(ValueError):
++        Table(cell)
++    with pytest.raises(ValueError):
++        Table(code.get(1))
++    with pytest.raises(ValueError):
++        Table(Text("{|\n| a\n|}"))
++
++
++def test_table_from_html_tag():
++    """test building a Table directly from an HTML table tag"""
++    from mwparserfromhell.table import Table
++
++    code = parse("<Table><TR><td>a</td><TH>b</TH></TR></Table>")
++    table = Table(code.get(0))
++    assert table.node is code.get(0)
++    assert [["a", "b"]] == labels(table)
++    assert [(0, 0), (0, 1)] == [table.position(cell) for cell in table.cells]
++
++
++def test_uppercase_html_table():
++    """test that tag names are compared without regard to case"""
++    code, table = load("<TABLE><TR><TD>a</TD><Th>b</Th></TR></TABLE>")
++    assert [["a", "b"]] == labels(table)
++
++
++def test_cells_before_first_row():
++    """test that cells ahead of the first row marker form a row"""
++    code, table = load("{|\n| a || b\n|-\n| c\n|}")
++    assert [["a", "b"], ["c", None]] == labels(table)
++
++
++def test_leading_row_marker_adds_no_row():
++    """test that a row marker right after the table start opens the first row"""
++    code, table = load("{|\n|-\n| a\n|}")
++    assert [["a"]] == labels(table)
++
++
++def test_empty_rows_count():
++    """test that rows without cells still take a row of the grid"""
++    code, table = load("{|\n| a\n|-\n|-\n| b\n|-\n|}")
++    assert [["a"], [None], ["b"], [None]] == labels(table)
++
++
++def test_loose_html_cells_form_rows():
++    """test that runs of cells outside any row are rows of their own"""
++    code, table = load(
++        "<table><td>a</td><td>b</td><tr><td>c</td></tr><td>d</td></table>"
++    )
++    assert [["a", "b"], ["c", None], ["d", None]] == labels(table)
++
++
++def test_wiki_captions_are_not_cells():
++    """test that |+ caption lines, with or without attributes, are skipped"""
++    code, table = load("{|\n|+ Title\n|-\n| a\n|}")
++    assert [["a"]] == labels(table)
++    code, table = load('{|\n|+ style="x" | Title\n| a\n|}')
++    assert [["a"]] == labels(table)
++    assert 1 == len(table.cells)
++
++
++def test_caption_inside_row_is_not_a_cell():
++    """test that a caption line within a row does not take a slot"""
++    code, table = load("{|\n|-\n| a\n|+ Late\n| b\n|}")
++    assert [["a", "b"]] == labels(table)
++
++
++def test_plus_content_is_still_a_cell():
++    """test that cells whose text starts with a plus are not captions"""
++    code, table = load("{|\n| +1\n|-\n| a ||+ b\n|}")
++    assert [["+1", None], ["a", "+ b"]] == labels(table)
++
++
++def test_html_caption_is_not_a_cell():
++    """test that a caption tag takes no slot"""
++    code, table = load("<table><caption>c</caption><tr><td>a</td></tr></table>")
++    assert [["a"]] == labels(table)
++
++
++def test_nested_table_cells_belong_to_nested_table():
++    """test that cells of a table inside a cell are not the outer table's"""
++    code, table = load("{|\n| a\n| b\n{|\n| x || y\n|}\n|}")
++    assert 2 == len(table.cells)
++    inner = code.get_tables()[1]
++    assert [["x", "y"]] == labels(inner)
++    with pytest.raises(ValueError):
++        table.position(inner.cells[0])
++    with pytest.raises(ValueError):
++        table.span(inner.cells[1])
++
++
++def test_row_groups():
++    """test that rows inside thead, tbody and tfoot belong to the table"""
++    code, table = load(
++        "<table><thead><tr><th>h</th></tr></thead>"
++        "<tbody><tr><td>a</td></tr><tr><td>b</td></tr></tbody>"
++        "<tfoot><tr><td>f</td></tr></tfoot></table>"
++    )
++    assert [["h"], ["a"], ["b"], ["f"]] == labels(table)
++
++
++def test_mixed_case_group_and_caption_tags():
++    """test that row group and caption tag names ignore case"""
++    code, table = load(
++        "<table><CAPTION>c</CAPTION>"
++        "<THEAD><tr><th rowspan=0>h</th><th>x</th></tr><tr><th>y</th></tr></THEAD>"
++        "<TBody><tr><td>a</td></tr></TBody>"
++        "<TFoot><tr><td>f</td></tr></TFoot></table>"
++    )
++    assert [["h", "x"], ["h", "y"], ["a", None], ["f", None]] == labels(table)
++    assert (2, 1) == table.span(table.cells[0])
++
++
++def test_loose_cells_inside_row_group():
++    """test that cells directly inside a row group form a row"""
++    code, table = load("<table><tbody><td>a</td><td>b</td></tbody></table>")
++    assert [["a", "b"]] == labels(table)
++
++
++def test_loose_runs_split_by_other_nodes():
++    """test that anything but whitespace between loose cells ends the run"""
++    for between in ["<caption>c</caption>", "<!-- c -->", "x", "<div></div>"]:
++        code, table = load(f"<table><td>a</td>{between}<td>b</td></table>")
++        assert [["a"], ["b"]] == labels(table)
++
++
++def test_loose_run_continues_over_whitespace():
++    """test that whitespace text between loose cells keeps one run"""
++    code, table = load("<table>\n  <td>a</td>\n  <td>b</td>\n</table>")
++    assert [["a", "b"]] == labels(table)
++
++
++def test_wiki_caption_splits_loose_run():
++    """test that a caption line between loose wiki cells ends the run"""
++    code, table = load("{|\n| a\n|+ Title\n| b\n|}")
++    assert [["a"], ["b"]] == labels(table)
++    assert [(0, 0), (1, 0)] == [table.position(cell) for cell in table.cells]
++
++
++def test_split_extends_its_own_loose_run():
++    """test that a new cell joins the run it belongs to, not a later one"""
++    code, table = load(
++        "<table><td colspan=2>a</td><caption>c</caption><td>b</td></table>"
++    )
++    created = table.split(0, 1)
++    assert "<table><td>a</td><td></td><caption>c</caption><td>b</td></table>" == str(
++        code
++    )
++    assert [(0, 1)] == [table.position(cell) for cell in created]
++    assert [["a", ""], ["b", None]] == labels(table)
++    assert_round_trip(code, table)
++
++
++def test_wrapped_rows_and_cells_are_not_direct():
++    """test that rows and cells inside other wrapper tags are left out"""
++    code, table = load(
++        "<table><div><tr><td>x</td></tr></div>"
++        "<tr><td>a</td><span><td>b</td></span></tr></table>"
++    )
++    assert [["a"]] == labels(table)
++    assert 1 == len(table.cells)
++
++
++def test_rowspan_pushes_later_cells_right():
++    """test that slots covered from rows above are skipped"""
++    code, table = load("{|\n| rowspan=2 | a || b\n|-\n| c\n|}")
++    assert [["a", "b"], ["a", "c"]] == labels(table)
++    assert (1, 1) == table.position(table.cells[2])
++
++
++def test_colspan_covers_columns():
++    """test that colspan makes a cell cover several columns"""
++    code, table = load("{|\n| colspan=2 | a || b\n|-\n| c || d || e\n|}")
++    assert [["a", "a", "b"], ["c", "d", "e"]] == labels(table)
++    assert (1, 2) == table.span(table.cells[0])
++
++
++def test_block_span_and_width():
++    """test a cell spanning rows and columns and the width of the grid"""
++    code, table = load("{|\n| rowspan=3 colspan=2 | a || b\n|-\n| c\n|-\n| d || e\n|}")
++    assert [
++        ["a", "a", "b", None],
++        ["a", "a", "c", None],
++        ["a", "a", "d", "e"],
++    ] == labels(table)
++    assert [(0, 0), (0, 2), (1, 2), (2, 2), (2, 3)] == [
++        table.position(cell) for cell in table.cells
++    ]
++
++
++def test_span_attribute_name_case_and_spacing():
++    """test that span attribute names ignore case and surrounding space"""
++    code, table = load('{|\n| ROWSPAN = "2" | a\n| b\n|-\n| c\n|}')
++    assert [["a", "b"], ["a", "c"]] == labels(table)
++
++
++def test_last_span_attribute_counts():
++    """test that the last attribute of a name decides the span"""
++    code, table = load("{|\n| rowspan=3 rowspan=2 | a\n|-\n|-\n| b\n|}")
++    assert (2, 1) == table.span(table.cells[0])
++    assert [["a"], ["a"], ["b"]] == labels(table)
++    code, table = load("{|\n| rowspan=2 rowspan | a\n|-\n| b\n|}")
++    assert (1, 1) == table.span(table.cells[0])
++    assert [["a"], ["b"]] == labels(table)
++
++
++@pytest.mark.parametrize(
++    "value,expected",
++    [
++        ('"2px"', 2),
++        ('"  2"', 2),
++        ("x2", 1),
++        ('"-2"', 1),
++        ("+2", 1),
++        ('""', 1),
++        ("02", 2),
++    ],
++)
++def test_colspan_values(value, expected):
++    """test how colspan values are read"""
++    code, table = load(f"{{|\n| colspan={value} | a || b\n|}}")
++    assert (1, expected) == table.span(table.cells[0])
++    assert (0, expected) == table.position(table.cells[1])
++
++
++@pytest.mark.parametrize(
++    "value,expected",
++    [
++        ('" 2px"', 2),
++        ('"  2"', 2),
++        ("x2", 1),
++        ('"-2"', 1),
++        ("+2", 1),
++        ('""', 1),
++        ("02", 2),
++    ],
++)
++def test_rowspan_values(value, expected):
++    """test how rowspan values are read"""
++    code, table = load(f"{{|\n| rowspan={value} | a || b\n|-\n| c\n|-\n| d\n|}}")
++    assert (expected, 1) == table.span(table.cells[0])
++    assert (1, expected - 1) == table.position(table.cells[2])
++
++
++def test_colspan_zero_is_one():
++    """test that a colspan of zero covers one column"""
++    code, table = load("{|\n| colspan=0 | a || b\n|}")
++    assert [["a", "b"]] == labels(table)
++
++
++def test_rowspan_zero_reaches_last_row():
++    """test that a rowspan of zero covers every following row"""
++    code, table = load("{|\n| rowspan=0 | a || b\n|-\n| c\n|-\n| d\n|}")
++    assert [["a", "b"], ["a", "c"], ["a", "d"]] == labels(table)
++    assert (3, 1) == table.span(table.cells[0])
++
++
++def test_rowspan_stops_at_last_row():
++    """test that rowspans never add rows to the table"""
++    code, table = load("{|\n| rowspan=5 | a\n|-\n| b\n|}")
++    assert (2, 1) == table.span(table.cells[0])
++    assert [["a", None], ["a", "b"]] == labels(table)
++
++
++def test_rowspan_stops_at_row_group_end():
++    """test that rowspans do not reach into the next row group"""
++    code, table = load(
++        "<table><tbody><tr><td rowspan=5>a</td><td>b</td></tr>"
++        "<tr><td>c</td></tr></tbody>"
++        "<tfoot><tr><td>d</td></tr></tfoot></table>"
++    )
++    assert [["a", "b"], ["a", "c"], ["d", None]] == labels(table)
++    assert (2, 1) == table.span(table.cells[0])
++
++
++def test_rowspan_zero_inside_row_group():
++    """test that a rowspan of zero ends with its row group"""
++    code, table = load(
++        "<table><thead><tr><th rowspan=0>h</th><th>x</th></tr>"
++        "<tr><th>y</th></tr></thead>"
++        "<tbody><tr><td>a</td></tr></tbody></table>"
++    )
++    assert [["h", "x"], ["h", "y"], ["a", None]] == labels(table)
++
++
++def test_rows_between_groups_form_their_own_group():
++    """test that rows outside group tags are split into groups by them"""
++    code, table = load(
++        "<table><tr><td rowspan=0>a</td></tr><tr><td>b</td></tr>"
++        "<tbody><tr><td>c</td></tr></tbody><tr><td>d</td></tr></table>"
++    )
++    assert [["a", None], ["a", "b"], ["c", None], ["d", None]] == labels(table)
++    assert (2, 1) == table.span(table.cells[0])
++
++
++def test_overlapping_slot_keeps_first_cell():
++    """test that an overlapped slot stays with the cell placed first"""
++    code, table = load("{|\n| a || rowspan=2 | b\n|-\n| colspan=3 | c\n|}")
++    assert [["a", "b", None], ["c", "b", "c"]] == labels(table)
++    c = table.cells[2]
++    assert (1, 0) == table.position(c)
++    assert (1, 3) == table.span(c)
++
++
++def test_identical_cells_are_told_apart():
++    """test that equal-looking cells keep their own positions"""
++    code, table = load("{|\n| || \n|-\n| || \n|}")
++    cells = table.cells
++    assert 4 == len(cells)
++    assert [(0, 0), (0, 1), (1, 0), (1, 1)] == [table.position(c) for c in cells]
++    grid = table.grid
++    assert grid[1][1] is cells[3]
++    assert grid[0][0] is cells[0]
++
++
++def test_equal_cell_from_other_code_is_not_a_member():
++    """test that a cell from another parse of the same text is rejected"""
++    text = "{|\n| a || b\n|}"
++    code, table = load(text)
++    other_code, other = load(text)
++    with pytest.raises(ValueError):
++        table.position(other.cells[0])
++    with pytest.raises(ValueError):
++        table.span(other.cells[1])
++
++
++def test_caption_is_not_a_member():
++    """test that position() rejects a caption line"""
++    code, table = load("{|\n|+ Title\n| a\n|}")
++    caption = code.filter_tags(matches=lambda node: node.tag == "td")[0]
++    with pytest.raises(ValueError):
++        table.position(caption)
++
++
++def test_non_cell_nodes_are_not_members():
++    """test that position() and span() reject nodes that are not tags"""
++    code, table = load("{|\n| {{t}} x\n|}")
++    template = code.filter_templates()[0]
++    text = code.filter_text()[-1]
++    for node in [template, text, Text("x"), table.node]:
++        with pytest.raises(ValueError):
++            table.position(node)
++        with pytest.raises(ValueError):
++            table.span(node)
++
++
++def test_cells_in_grid_order():
++    """test the order of the cells property"""
++    code, table = load("{|\n| b || rowspan=2 | a\n|-\n| c\n|}")
++    assert ["b", "a", "c"] == [str(c.contents).strip() for c in table.cells]
++
++
++def test_table_follows_later_edits():
++    """test that the grid reflects changes made through other means"""
++    code, table = load("{|\n| rowspan=2 | a || b\n|-\n| c\n|}")
++    a, b, c = table.cells
++    a.get("rowspan").value = "1"
++    assert [["a", "b"], ["c", None]] == labels(table)
++    code.remove(b)
++    assert [["a"], ["c"]] == labels(table)
++
++
++def test_merge_row_cells():
++    """test merging cells written on one line"""
++    code, table = load("{|\n| a || || c\n|-\n| d || e || f\n|}")
++    anchor = table.cells[0]
++    assert anchor is table.merge(0, 0, 0, 1)
++    assert '{|\n| colspan="2" | a || c\n|-\n| d || e || f\n|}' == str(code)
++    assert [["a", "a", "c"], ["d", "e", "f"]] == labels(table)
++    assert_round_trip(code, table)
++
++
++def test_merge_removes_cell_not_its_twin():
++    """test that an equal-looking blank cell earlier on the line stays"""
++    code, table = load("{|\n| p || || q || || r\n|}")
++    twin = table.cells[1]
++    table.merge(0, 2, 0, 3)
++    assert '{|\n| p || || colspan="2" | q || r\n|}' == str(code)
++    assert table.cells[1] is twin
++    assert_round_trip(code, table)
++
++
++def test_merge_removes_last_cell_of_line():
++    """test that the line break of a removed cell is left behind"""
++    code, table = load("{|\n| a || b ||\n|-\n| d || e || f\n|}")
++    table.merge(0, 1, 0, 2)
++    assert '{|\n| a || colspan="2" | b \n|-\n| d || e || f\n|}' == str(code)
++    assert_round_trip(code, table)
++
++
++def test_merge_removes_line_start_before_shared_line():
++    """test removing a cell that starts a line shared with another cell"""
++    code, table = load("{|\n| a\n|\n| c\n|-\n| || e\n|}")
++    table.merge(0, 0, 1, 0)
++    assert '{|\n| rowspan="2" | a\n|\n| c\n|-\n| e\n|}' == str(code)
++    assert [["a", "", "c"], ["a", "e", None]] == labels(table)
++    assert_round_trip(code, table)
++
++
++def test_merge_keeps_header_kind_of_moved_cell():
++    """test that a header cell starting a line is written with !"""
++    code, table = load("{|\n! H\n|-\n! || x\n|}")
++    table.merge(0, 0, 1, 0)
++    assert '{|\n! rowspan="2" | H\n|-\n! x\n|}' == str(code)
++    assert "th" == table.grid[1][1].tag
++    assert_round_trip(code, table)
++
++
++def test_merge_header_line_with_pipe_separator():
++    """test a header cell that shared a line through || separators"""
++    code, table = load("{|\n! H\n|-\n! || x || y\n|}")
++    table.merge(0, 0, 1, 0)
++    assert '{|\n! rowspan="2" | H\n|-\n! x || y\n|}' == str(code)
++    assert ["th", "th"] == [str(c.tag) for c in table.cells[1:]]
++    assert_round_trip(code, table)
++
++
++def test_merge_block_of_cells():
++    """test merging a two by two block"""
++    code, table = load("{|\n| a ||\n|-\n| ||\n|}")
++    table.merge(0, 0, 1, 1)
++    assert str(code) in with_new_spans(
++        "{|\n| SPANS | a \n|-\n|}", 'rowspan="2"', 'colspan="2"'
++    )
++    assert (2, 2) == table.span(table.cells[0])
++    assert_round_trip(code, table)
++
++
++def test_merge_adds_separator_to_bare_cell():
++    """test that a cell without attributes gains a separator"""
++    code, table = load("{|\n|a\n|\n|}")
++    table.merge(0, 0, 0, 1)
++    assert '{|\n| colspan="2" |a\n|}' == str(code)
++    assert_round_trip(code, table)
++
++
++def test_merge_changes_existing_attribute_value():
++    """test that the span attribute already there is updated in place"""
++    code, table = load("{|\n| rowspan=2 | a\n|-\n|-\n|\n|}")
++    table.merge(0, 0, 2, 0)
++    assert "{|\n| rowspan=3 | a\n|-\n|-\n|}" == str(code)
++    assert_round_trip(code, table)
++
++
++def test_merge_updates_attribute_named_in_other_case():
++    """test updating an uppercase span attribute and adding another"""
++    code, table = load('{|\n| ROWSPAN = "2" | a ||\n|-\n|\n|}')
++    table.merge(0, 0, 1, 1)
++    assert '{|\n| ROWSPAN = "2" colspan="2" | a \n|-\n|}' == str(code)
++    assert_round_trip(code, table)
++
++
++def test_merge_updates_last_duplicate_attribute():
++    """test that the attribute that was read is the one updated"""
++    code, table = load("{|\n| colspan=5 colspan=1 | a ||\n|}")
++    table.merge(0, 0, 0, 1)
++    assert "{|\n| colspan=5 colspan=2 | a \n|}" == str(code)
++    assert (1, 2) == table.span(table.cells[0])
++
++
++def test_merge_span_of_one_removes_attributes():
++    """test that a span of one removes every attribute of that name"""
++    code, table = load('{|\n| colspan=3 COLSPAN="1" | a\n|-\n|\n|}')
++    table.merge(0, 0, 1, 0)
++    assert '{|\n| rowspan="2" | a\n|-\n|}' == str(code)
++    assert_round_trip(code, table)
++
++
++def test_merge_html_cells():
++    """test merging cells of an HTML table"""
++    code, table = load(
++        "<table><tr><td>a</td><td></td></tr><tr><td> </td><td>d</td></tr></table>"
++    )
++    table.merge(0, 0, 1, 0)
++    assert (
++        '<table><tr><td rowspan="2">a</td><td></td></tr><tr><td>d</td></tr></table>'
++        == str(code)
++    )
++    assert [["a", ""], ["a", "d"]] == labels(table)
++    assert_round_trip(code, table)
++
++
++def test_merge_over_empty_slots():
++    """test merging a region holding slots no cell covers"""
++    code, table = load("{|\n| a || b\n|-\n| c\n|}")
++    table.merge(0, 1, 1, 1)
++    assert '{|\n| a || rowspan="2" | b\n|-\n| c\n|}' == str(code)
++    assert [["a", "b"], ["c", "b"]] == labels(table)
++    assert_round_trip(code, table)
++
++
++def test_merge_absorbs_spanning_blank_cells():
++    """test merging a region holding blank cells that span slots"""
++    code, table = load("{|\n| a || ||\n|-\n| || colspan=2 |\n|}")
++    table.merge(0, 0, 1, 2)
++    assert str(code) in with_new_spans(
++        "{|\n| SPANS | a \n|-\n|}", 'rowspan="2"', 'colspan="3"'
++    )
++    assert [["a", "a", "a"], ["a", "a", "a"]] == labels(table)
++    assert_round_trip(code, table)
++
++
++def test_merge_duplicate_blank_cells_outside_region_stay():
++    """test that only the blank cells inside the region are removed"""
++    code, table = load("{|\n| || \n|-\n| a || \n|-\n| || \n|}")
++    first, second = table.cells[2], table.cells[3]
++    table.merge(1, 0, 2, 0)
++    assert '{|\n| || \n|-\n| rowspan="2" | a || \n|-\n| \n|}' == str(code)
++    assert table.cells[2] is first
++    assert table.cells[3] is second
++    assert [(0, 0), (0, 1), (1, 0), (1, 1), (2, 1)] == [
++        table.position(cell) for cell in table.cells
++    ]
++    assert_round_trip(code, table)
++
++
++def test_merge_writes_value_over_rowspan_zero():
++    """test that a rowspan of zero is replaced by the region height"""
++    code, table = load("{|\n| rowspan=0 | a ||\n|-\n| \n|}")
++    table.merge(0, 0, 1, 1)
++    assert '{|\n| rowspan=2 colspan="2" | a \n|-\n|}' == str(code)
++    assert_round_trip(code, table)
++
++
++def test_merge_single_slot_changes_nothing():
++    """test merging a region that is exactly one plain cell"""
++    text = "{|\n| a || b\n|}"
++    code, table = load(text)
++    assert table.cells[1] is table.merge(0, 1, 0, 1)
++    assert text == str(code)
++
++
++def test_merge_off_grid():
++    """test that merge() rejects corners outside the grid"""
++    text = "{|\n| a || b\n|-\n| c || d\n|}"
++    code, table = load(text)
++    for region in [(0, 0, 2, 0), (0, 0, 0, 2), (-1, 0, 0, 0), (0, -1, 1, 1)]:
++        with pytest.raises(IndexError):
++            table.merge(*region)
++    assert text == str(code)
++
++
++def test_merge_inverted_region():
++    """test that merge() rejects a region with its corners swapped"""
++    text = "{|\n| a || \n|-\n| || \n|}"
++    code, table = load(text)
++    assert_unchanged(code, text, lambda: table.merge(1, 0, 0, 0))
++    assert_unchanged(code, text, lambda: table.merge(0, 1, 1, 0))
++
++
++def test_merge_without_top_left_cell():
++    """test that merge() needs a cell at the top-left slot"""
++    text = "{|\n| a || b\n|-\n| c\n|}"
++    code, table = load(text)
++    assert_unchanged(code, text, lambda: table.merge(1, 1, 1, 1))
++
++
++def test_merge_region_starting_inside_a_span():
++    """test that a top-left cell starting above the region is rejected"""
++    text = "{|\n| rowspan=2 | a || b\n|-\n| c\n|}"
++    code, table = load(text)
++    assert_unchanged(code, text, lambda: table.merge(1, 0, 1, 1))
++
++
++def test_merge_region_cutting_a_blank_span():
++    """test that a cell reaching outside the region is rejected even if blank"""
++    text = "{|\n| a || colspan=2 | \n|-\n| || || \n|}"
++    code, table = load(text)
++    assert_unchanged(code, text, lambda: table.merge(0, 0, 1, 1))
++
++
++def test_merge_region_cutting_a_span_hidden_by_overlap():
++    """test that a cell whose slot in the region went to an earlier cell still counts"""
++    text = "{|\n| a || rowspan=2 | b\n|-\n| colspan=3 |\n|-\n|}"
++    code, table = load(text)
++    assert_unchanged(code, text, lambda: table.merge(0, 1, 2, 1))
++
++
++def test_merge_region_cutting_the_anchor():
++    """test that the top-left cell may not reach outside the region"""
++    text = "{|\n| colspan=2 | a\n|}"
++    code, table = load(text)
++    assert_unchanged(code, text, lambda: table.merge(0, 0, 0, 0))
++
++
++def test_merge_refuses_non_blank_cells():
++    """test that no cell is removed when one of them is not blank"""
++    text = "{|\n| a || || x\n|-\n| || || \n|}"
++    code, table = load(text)
++    assert_unchanged(code, text, lambda: table.merge(0, 0, 1, 2))
++
++
++@pytest.mark.parametrize("content", ["&nbsp;", "<!-- note -->", "{{x}}", "0"])
++def test_merge_refuses_cells_with_markup(content):
++    """test that anything other than whitespace makes a cell not blank"""
++    text = f"{{|\n| a || {content}\n|}}"
++    code, table = load(text)
++    assert_unchanged(code, text, lambda: table.merge(0, 0, 0, 1))
++
++
++def test_merge_accepts_whitespace_only_cells():
++    """test that cells holding only whitespace are blank"""
++    code, table = load("{|\n| a\n|   \t \n|-\n|\n\n|}")
++    table.merge(0, 0, 1, 1)
++    assert str(code) in with_new_spans(
++        "{|\n| SPANS | a\n|-\n|}", 'rowspan="2"', 'colspan="2"'
++    )
++
++
++def test_merge_across_row_groups():
++    """test that merge() refuses a region spanning two row groups"""
++    text = (
++        "<table><thead><tr><td>a</td></tr></thead>"
++        "<tbody><tr><td></td></tr></tbody></table>"
++    )
++    code, table = load(text)
++    assert_unchanged(code, text, lambda: table.merge(0, 0, 1, 0))
++
++
++def test_split_row_and_column_span():
++    """test splitting a cell spanning two rows and two columns"""
++    code, table = load('{|\n| rowspan="2" colspan="2" | a || b\n|-\n| c\n|}')
++    created = table.split(1, 1)
++    assert "{|\n| a \n|\n| b\n|-\n|\n|\n| c\n|}" == str(code)
++    assert 3 == len(created)
++    assert [(0, 1), (1, 0), (1, 1)] == [table.position(cell) for cell in created]
++    assert all((1, 1) == table.span(cell) for cell in created)
++    assert all("td" == cell.tag for cell in created)
++    assert [["a", "", "b"], ["", "", "c"]] == labels(table)
++    assert_round_trip(code, table)
++
++
++def test_split_header_cell():
++    """test that new cells are header cells when the split cell is one"""
++    code, table = load("{|\n! colspan=3 | H\n|-\n| a || b || c\n|}")
++    created = table.split(0, 2)
++    assert "{|\n! H\n!\n!\n|-\n| a || b || c\n|}" == str(code)
++    assert ["th", "th"] == [str(cell.tag) for cell in created]
++    assert_round_trip(code, table)
++
++
++def test_split_inserts_before_shared_line():
++    """test inserting a new cell in front of a cell sharing a line"""
++    code, table = load("{|\n| x || rowspan=2 | a || b\n|-\n| c || d\n|}")
++    created = table.split(0, 1)
++    assert "{|\n| x || a || b\n|-\n| c \n|\n| d\n|}" == str(code)
++    assert [(1, 1)] == [table.position(cell) for cell in created]
++    assert_round_trip(code, table)
++
++
++def test_split_between_other_spans():
++    """test placing new cells in rows partly covered by other cells"""
++    code, table = load(
++        "{|\n| rowspan=3 | a || rowspan=2 colspan=2 | b || c\n|-\n| d\n"
++        "|-\n| e || f || g\n|}"
++    )
++    assert [
++        ["a", "b", "b", "c"],
++        ["a", "b", "b", "d"],
++        ["a", "e", "f", "g"],
++    ] == labels(table)
++    created = table.split(1, 2)
++    assert (
++        "{|\n| rowspan=3 | a || b \n|\n| c\n|-\n|\n|\n| d\n|-\n| e || f || g\n|}"
++        == str(code)
++    )
++    assert [(0, 2), (1, 1), (1, 2)] == [table.position(cell) for cell in created]
++    assert [
++        ["a", "b", "", "c"],
++        ["a", "", "", "d"],
++        ["a", "e", "f", "g"],
++    ] == labels(table)
++    assert_round_trip(code, table)
++
++
++def test_split_rowspan_zero_into_empty_row():
++    """test splitting a rowspan of zero that reaches a row without cells"""
++    code, table = load("{|\n| rowspan=0 | a || b\n|-\n| c\n|-\n|}")
++    created = table.split(2, 0)
++    assert "{|\n| a || b\n|-\n|\n| c\n|-\n|\n|}" == str(code)
++    assert [(1, 0), (2, 0)] == [table.position(cell) for cell in created]
++    assert_round_trip(code, table)
++
++
++def test_split_keeps_other_attributes():
++    """test that other attributes and the separator stay"""
++    code, table = load('{|\n| style="s" colspan=2 | a\n|}')
++    table.split(0, 1)
++    assert '{|\n| style="s" | a\n|\n|}' == str(code)
++    assert_round_trip(code, table)
++
++
++def test_split_single_slot_cell():
++    """test splitting a cell that covers one slot"""
++    code, table = load('{|\n| rowspan="1" | a\n|}')
++    assert [] == table.split(0, 0)
++    assert "{|\n| a\n|}" == str(code)
++    code, table = load("{|\n| a\n|}")
++    assert [] == table.split(0, 0)
++    assert "{|\n| a\n|}" == str(code)
++
++
++def test_split_clipped_rowspan():
++    """test that a split creates cells only for the rows actually covered"""
++    code, table = load("{|\n| rowspan=9 | a || b\n|-\n| c\n|}")
++    created = table.split(0, 0)
++    assert 1 == len(created)
++    assert "{|\n| a || b\n|-\n|\n| c\n|}" == str(code)
++
++
++def test_split_empty_slot():
++    """test that split() needs a cell at the slot"""
++    text = "{|\n| a || b\n|-\n| c\n|}"
++    code, table = load(text)
++    assert_unchanged(code, text, lambda: table.split(1, 1))
++
++
++def test_split_off_grid():
++    """test that split() rejects slots outside the grid"""
++    text = "{|\n| a || b\n|}"
++    code, table = load(text)
++    for slot in [(1, 0), (0, 2), (-1, 0), (0, -1)]:
++        with pytest.raises(IndexError):
++            table.split(*slot)
++    assert text == str(code)
++
++
++def test_split_html_rowspan():
++    """test splitting a rowspan in an HTML table"""
++    code, table = load(
++        "<table><tr><td rowspan=2>a</td><td>b</td></tr><tr><td>c</td></tr></table>"
++    )
++    created = table.split(1, 0)
++    assert (
++        "<table><tr><td>a</td><td>b</td></tr><tr><td></td><td>c</td></tr></table>"
++        == str(code)
++    )
++    assert isinstance(created[0], Tag)
++    assert_round_trip(code, table)
++
++
++def test_split_html_header_colspan():
++    """test splitting a header colspan in an HTML table"""
++    code, table = load('<table><tr><th colspan="3">h</th></tr></table>')
++    table.split(0, 0)
++    assert "<table><tr><th>h</th><th></th><th></th></tr></table>" == str(code)
++
++
++def test_split_html_loose_row():
++    """test that new cells join a row of loose cells"""
++    code, table = load("<table><td colspan=2>a</td><tr><td>b</td></tr></table>")
++    table.split(0, 1)
++    assert "<table><td>a</td><td></td><tr><td>b</td></tr></table>" == str(code)
++    assert [["a", ""], ["b", None]] == labels(table)
++
++
++def test_split_skips_slots_owned_by_other_cells():
++    """test that overlapped slots do not receive new cells"""
++    code, table = load("{|\n| a || rowspan=2 | b\n|-\n| colspan=3 | c\n|}")
++    created = table.split(1, 0)
++    assert 1 == len(created)
++    assert "{|\n| a || rowspan=2 | b\n|-\n| c\n|\n|}" == str(code)
++    assert [["a", "b", None], ["c", "b", ""]] == labels(table)
++    assert_round_trip(code, table)
++
++
++def test_split_header_line_with_header_separator():
++    """test splitting in front of a header written after !!"""
++    code, table = load("{|\n! colspan=2 | H !! I\n|}")
++    table.split(0, 1)
++    assert "{|\n! H \n!\n! I\n|}" == str(code)
++    assert ["th", "th", "th"] == [str(c.tag) for c in table.cells]
++    assert_round_trip(code, table)
++
++
++def test_split_header_line_with_pipe_separator():
++    """test splitting in front of a header written after ||"""
++    code, table = load("{|\n! colspan=2 | H || I\n|}")
++    table.split(0, 1)
++    assert "{|\n! H \n!\n! I\n|}" == str(code)
++    assert_round_trip(code, table)
++
++
++def test_merge_then_split():
++    """test that a split undoes the grid of a merge"""
++    code, table = load("{|\n| a || || c\n|-\n| d || || f\n|}")
++    table.merge(0, 1, 1, 1)
++    assert [["a", "", "c"], ["d", "", "f"]] == labels(table)
++    created = table.split(1, 1)
++    assert [(1, 1)] == [table.position(cell) for cell in created]
++    assert [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)] == [
++        table.position(cell) for cell in table.cells
++    ]
++    assert_round_trip(code, table)
++
++
++def test_split_then_merge():
++    """test merging back the cells a split created"""
++    code, table = load("{|\n| rowspan=2 colspan=2 | a || b\n|-\n| c\n|}")
++    table.split(0, 0)
++    table.merge(0, 0, 1, 1)
++    assert str(code) in with_new_spans(
++        "{|\n| SPANS | a \n| b\n|-\n| c\n|}", 'rowspan="2"', 'colspan="2"'
++    )
++    assert [["a", "a", "b"], ["a", "a", "c"]] == labels(table)
++    assert_round_trip(code, table)
++
++
++def test_operations_on_nested_tables():
++    """test that outer and nested tables are edited independently"""
++    code = parse("{|\n| a ||\n|-\n|\n{|\n| x ||\n|}\n|}")
++    outer, inner = code.get_tables()
++    outer.merge(0, 0, 0, 1)
++    assert [["x", ""]] == labels(inner)
++    inner.merge(0, 0, 0, 1)
++    assert '{|\n| colspan="2" | a \n|-\n|\n{|\n| colspan="2" | x \n|}\n|}' == str(code)
++    assert [["a", "a"], ['{|\n| colspan="2" | x \n|}', None]] == labels(outer)
++    assert_round_trip(code, inner, 1)
++
++
++def test_two_views_of_one_table():
++    """test that tables from separate get_tables() calls stay in step"""
++    code = parse("{|\n| a || \n|-\n| b || \n|}")
++    first = code.get_tables()[0]
++    second = code.get_tables()[0]
++    first.merge(0, 1, 1, 1)
++    assert (2, 1) == second.span(second.cells[1])
++    second.split(0, 1)
++    assert [["a", ""], ["b", ""]] == labels(first)

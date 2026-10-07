@@ -1,0 +1,1389 @@
+diff --git a/build.go b/build.go
+index 5bbba54..41ea861 100644
+--- a/build.go
++++ b/build.go
+@@ -41,6 +41,22 @@ var builderProps = struct {
+ type builder struct {
+ 	parseDepth int
+ 	firstInput query
++	variables  []variableDecl
++}
++
++// variableDecl is a range variable visible to the expression being built.
++type variableDecl struct {
++	name string
++	typ  resultType
++}
++
++func (b *builder) lookupVariable(name string) (variableDecl, bool) {
++	for i := len(b.variables) - 1; i >= 0; i-- {
++		if b.variables[i].name == name {
++			return b.variables[i], true
++		}
++	}
++	return variableDecl{}, false
+ }
+ 
+ // axisPredicate creates a predicate to predicating for this axis node.
+@@ -153,7 +169,8 @@ func (b *builder) processAxis(root *axisNode, flags flag, props *builderProp) (q
+ 	case "preceding-sibling":
+ 		qyOutput = &precedingQuery{Input: qyInput, Predicate: predicate, Sibling: true}
+ 	case "self":
+-		qyOutput = &selfQuery{Input: qyInput, Predicate: predicate}
++		contextItem := root.Input == nil && root.Prop == "" && root.LocalName == "" && root.typeTest == allNode
++		qyOutput = &selfQuery{Input: qyInput, Predicate: predicate, ContextItem: contextItem}
+ 	case "namespace":
+ 		// haha,what will you do someting??
+ 	default:
+@@ -170,6 +187,22 @@ func canBeNumber(q query) bool {
+ 	return true
+ }
+ 
++// numericCondition reports whether a predicate may be positional, counting range variables as numbers.
++func (b *builder) numericCondition(n node) bool {
++	switch v := n.(type) {
++	case *variableNode:
++		_, ok := b.lookupVariable(v.Name)
++		return ok && v.Prefix == ""
++	case *groupNode:
++		return b.numericCondition(v.Input)
++	case *filterNode:
++		return b.numericCondition(v.Input)
++	case *forNode:
++		return true
++	}
++	return positionalCondition(n)
++}
++
+ // positionalCondition reports whether a condition AST node produces a numeric
+ // or positional result.
+ func positionalCondition(n node) bool {
+@@ -191,7 +224,7 @@ func positionalCondition(n node) bool {
+ 		return false
+ 	case *operatorNode:
+ 		switch v.Op {
+-		case "+", "-", "*", "div", "mod":
++		case "+", "-", "*", "div", "mod", "to":
+ 			return true
+ 		}
+ 		return positionalCondition(v.Left) || positionalCondition(v.Right)
+@@ -207,7 +240,7 @@ func (b *builder) processFilter(root *filterNode, flags flag, props *builderProp
+ 	// Inspect the condition AST to decide whether to set flagsEnum.Filter.
+ 	// Positional predicates cannot be compiled into a descendantQuery.
+ 	inputFlags := flags
+-	if positionalCondition(root.Condition) {
++	if b.numericCondition(root.Condition) {
+ 		inputFlags |= flagsEnum.Filter
+ 	}
+ 
+@@ -696,10 +729,65 @@ func (b *builder) processOperator(root *operatorNode, props *builderProp) (query
+ 	case "|":
+ 		*props |= builderProps.NonFlat
+ 		qyOutput = &unionQuery{Left: left, Right: right}
++	case "to":
++		qyOutput = &rangeQuery{Left: left, Right: right}
+ 	}
+ 	return qyOutput, nil
+ }
+ 
++// processBindings builds binding sequences, declaring each variable after its own sequence.
++func (b *builder) processBindings(vars []string, seqs []node) ([]query, error) {
++	var qs []query
++	for i, name := range vars {
++		var props builderProp
++		q, err := b.processNode(seqs[i], flagsEnum.None, &props)
++		if err != nil {
++			return nil, err
++		}
++		qs = append(qs, q)
++		b.variables = append(b.variables, variableDecl{name: name, typ: q.ValueType()})
++	}
++	return qs, nil
++}
++
++func (b *builder) processFor(root *forNode, props *builderProp) (query, error) {
++	outer := b.firstInput
++	depth := len(b.variables)
++	defer func() { b.variables = b.variables[:depth] }()
++
++	seqs, err := b.processBindings(root.Vars, root.Seqs)
++	if err != nil {
++		return nil, err
++	}
++	b.firstInput = outer
++	ret, err := b.processNode(root.Return, flagsEnum.None, props)
++	if err != nil {
++		return nil, err
++	}
++	*props = builderProps.None
++	b.firstInput = outer
++	return &forQuery{Vars: root.Vars, Seqs: seqs, Return: ret}, nil
++}
++
++func (b *builder) processQuantified(root *quantifiedNode, props *builderProp) (query, error) {
++	outer := b.firstInput
++	depth := len(b.variables)
++	defer func() { b.variables = b.variables[:depth] }()
++
++	seqs, err := b.processBindings(root.Vars, root.Seqs)
++	if err != nil {
++		return nil, err
++	}
++	b.firstInput = outer
++	test, err := b.processNode(root.Test, flagsEnum.None, props)
++	if err != nil {
++		return nil, err
++	}
++	*props = builderProps.None
++	b.firstInput = outer
++	return &quantifiedQuery{Every: root.Every, Vars: root.Vars, Seqs: seqs, Test: test}, nil
++}
++
+ func (b *builder) processNode(root node, flags flag, props *builderProp) (q query, err error) {
+ 	if b.parseDepth = b.parseDepth + 1; b.parseDepth > 1024 {
+ 		err = errors.New("the xpath expressions is too complex")
+@@ -729,14 +817,19 @@ func (b *builder) processNode(root node, flags flag, props *builderProp) (q quer
+ 		}
+ 		q = &groupQuery{Input: q}
+ 		b.firstInput = q
++	case nodeFor:
++		q, err = b.processFor(root.(*forNode), props)
++	case nodeQuantified:
++		q, err = b.processQuantified(root.(*quantifiedNode), props)
+ 	case nodeVariable:
+-		// Variables have no binding in a compiled expression, so they cannot
+-		// resolve to a query. A bare "$x" already surfaces as an undeclared
+-		// variable error because the nil result reaches the caller, but a
+-		// variable nested in a larger expression (e.g. "$x/@attr") would be
+-		// swallowed here and left as a nil sub-query that panics at select
+-		// time. Report it as undeclared instead.
++		// Only range variables of an enclosing for, some or every expression
++		// resolve; anything else is reported as undeclared.
+ 		n := root.(*variableNode)
++		if decl, ok := b.lookupVariable(n.Name); ok && n.Prefix == "" {
++			q = &variableQuery{Name: n.Name, typ: decl.typ}
++			b.firstInput = q
++			break
++		}
+ 		name := n.Name
+ 		if n.Prefix != "" {
+ 			name = n.Prefix + ":" + name
+diff --git a/func.go b/func.go
+index 0e26144..0022daf 100644
+--- a/func.go
++++ b/func.go
+@@ -40,6 +40,9 @@ func predicate(q query) func(NodeNavigator) bool {
+ // positionFunc is a XPath Node Set functions position().
+ func positionFunc() func(query, iterator) interface{} {
+ 	return func(q query, t iterator) interface{} {
++		if focus, ok := focusItem(t); ok {
++			return float64(focus.pos)
++		}
+ 		var (
+ 			count = 1
+ 			node  = t.Current().Copy()
+@@ -57,6 +60,9 @@ func positionFunc() func(query, iterator) interface{} {
+ // lastFunc is a XPath Node Set functions last().
+ func lastFunc() func(query, iterator) interface{} {
+ 	return func(q query, t iterator) interface{} {
++		if focus, ok := focusItem(t); ok {
++			return float64(focus.size)
++		}
+ 		var (
+ 			count = 0
+ 			node  = t.Current().Copy()
+@@ -88,6 +94,8 @@ func countFunc(arg query) func(query, iterator) interface{} {
+ 					count++
+ 				}
+ 			}
++		case []interface{}:
++			count = len(typ)
+ 		}
+ 		return float64(count)
+ 	}
+@@ -112,6 +120,12 @@ func sumFunc(arg query) func(query, iterator) interface{} {
+ 				panic(errors.New("sum() function argument type must be a node-set or number"))
+ 			}
+ 			sum = v
++		case []interface{}:
++			for _, item := range typ {
++				if v := asNumber(t, item); !math.IsNaN(v) {
++					sum += v
++				}
++			}
+ 		}
+ 		return sum
+ 	}
+@@ -119,12 +133,10 @@ func sumFunc(arg query) func(query, iterator) interface{} {
+ 
+ func asNumber(t iterator, o interface{}) float64 {
+ 	switch typ := o.(type) {
+-	case query:
+-		node := typ.Select(t)
+-		if node == nil {
+-			return math.NaN()
+-		}
+-		return stringToNumber(node.Value())
++	case query, []interface{}:
++		return asNumber(t, firstItem(t, typ))
++	case NodeNavigator:
++		return stringToNumber(typ.Value())
+ 	case float64:
+ 		return typ
+ 	case string:
+@@ -246,6 +258,10 @@ func asBool(t iterator, v interface{}) bool {
+ 	switch v := v.(type) {
+ 	case nil:
+ 		return false
++	case query, []interface{}:
++		return asBool(t, firstItem(t, v))
++	case NodeNavigator:
++		return true
+ 	case *NodeIterator:
+ 		return v.MoveNext()
+ 	case bool:
+@@ -254,8 +270,6 @@ func asBool(t iterator, v interface{}) bool {
+ 		return v != 0
+ 	case string:
+ 		return v != ""
+-	case query:
+-		return v.Select(t) != nil
+ 	default:
+ 		panic(fmt.Errorf("unexpected type: %T", v))
+ 	}
+@@ -300,12 +314,10 @@ func asString(t iterator, v interface{}) string {
+ 		return formatNumber(v)
+ 	case string:
+ 		return v
+-	case query:
+-		node := v.Select(t)
+-		if node == nil {
+-			return ""
+-		}
+-		return node.Value()
++	case query, []interface{}:
++		return asString(t, firstItem(t, v))
++	case NodeNavigator:
++		return v.Value()
+ 	default:
+ 		panic(fmt.Errorf("unexpected type: %T", v))
+ 	}
+@@ -331,6 +343,9 @@ func numberFunc(arg1 query) func(query, iterator) interface{} {
+ func stringFunc(arg1 query) func(query, iterator) interface{} {
+ 	return func(q query, t iterator) interface{} {
+ 		if arg1 == nil {
++			if focus, ok := focusItem(t); ok {
++				return asString(t, focus.item)
++			}
+ 			return t.Current().Value()
+ 		}
+ 		v := functionArgs(arg1).Evaluate(t)
+@@ -341,23 +356,11 @@ func stringFunc(arg1 query) func(query, iterator) interface{} {
+ // startwithFunc is a XPath functions starts-with(string, string).
+ func startwithFunc(arg1, arg2 query) func(query, iterator) interface{} {
+ 	return func(_ query, t iterator) interface{} {
+-		var (
+-			m, n string
+-			ok   bool
+-		)
+-		switch typ := functionArgs(arg1).Evaluate(t).(type) {
+-		case string:
+-			m = typ
+-		case query:
+-			node := typ.Select(t)
+-			if node == nil {
+-				return false
+-			}
+-			m = node.Value()
+-		default:
++		m, ok := stringArg(t, functionArgs(arg1).Evaluate(t))
++		if !ok {
+ 			panic(errors.New("starts-with() function argument type must be string"))
+ 		}
+-		n, ok = functionArgs(arg2).Evaluate(t).(string)
++		n, ok := stringArg(t, functionArgs(arg2).Evaluate(t))
+ 		if !ok {
+ 			panic(errors.New("starts-with() function argument type must be string"))
+ 		}
+@@ -368,23 +371,11 @@ func startwithFunc(arg1, arg2 query) func(query, iterator) interface{} {
+ // endwithFunc is a XPath functions ends-with(string, string).
+ func endwithFunc(arg1, arg2 query) func(query, iterator) interface{} {
+ 	return func(_ query, t iterator) interface{} {
+-		var (
+-			m, n string
+-			ok   bool
+-		)
+-		switch typ := functionArgs(arg1).Evaluate(t).(type) {
+-		case string:
+-			m = typ
+-		case query:
+-			node := typ.Select(t)
+-			if node == nil {
+-				return false
+-			}
+-			m = node.Value()
+-		default:
++		m, ok := stringArg(t, functionArgs(arg1).Evaluate(t))
++		if !ok {
+ 			panic(errors.New("ends-with() function argument type must be string"))
+ 		}
+-		n, ok = functionArgs(arg2).Evaluate(t).(string)
++		n, ok := stringArg(t, functionArgs(arg2).Evaluate(t))
+ 		if !ok {
+ 			panic(errors.New("ends-with() function argument type must be string"))
+ 		}
+@@ -395,24 +386,12 @@ func endwithFunc(arg1, arg2 query) func(query, iterator) interface{} {
+ // containsFunc is a XPath functions contains(string or @attr, string).
+ func containsFunc(arg1, arg2 query) func(query, iterator) interface{} {
+ 	return func(_ query, t iterator) interface{} {
+-		var (
+-			m, n string
+-			ok   bool
+-		)
+-		switch typ := functionArgs(arg1).Evaluate(t).(type) {
+-		case string:
+-			m = typ
+-		case query:
+-			node := typ.Select(t)
+-			if node == nil {
+-				return false
+-			}
+-			m = node.Value()
+-		default:
++		m, ok := stringArg(t, functionArgs(arg1).Evaluate(t))
++		if !ok {
+ 			panic(errors.New("contains() function argument type must be string"))
+ 		}
+ 
+-		n, ok = functionArgs(arg2).Evaluate(t).(string)
++		n, ok := stringArg(t, functionArgs(arg2).Evaluate(t))
+ 		if !ok {
+ 			panic(errors.New("contains() function argument type must be string"))
+ 		}
+@@ -426,22 +405,9 @@ func containsFunc(arg1, arg2 query) func(query, iterator) interface{} {
+ // needed, directly put flags in the regexp pattern, such as `(?i)^pattern$` for `i` flag.
+ func matchesFunc(arg1, arg2 query) func(query, iterator) interface{} {
+ 	return func(_ query, t iterator) interface{} {
+-		var s string
+-		switch typ := functionArgs(arg1).Evaluate(t).(type) {
+-		case string:
+-			s = typ
+-		case query:
+-			node := typ.Select(t)
+-			if node == nil {
+-				return false
+-			}
+-			s = node.Value()
+-		default:
+-			s = asString(t, typ)
+-		}
+-		var pattern string
+-		var ok bool
+-		if pattern, ok = functionArgs(arg2).Evaluate(t).(string); !ok {
++		s := asString(t, functionArgs(arg1).Evaluate(t))
++		pattern, ok := stringArg(t, functionArgs(arg2).Evaluate(t))
++		if !ok {
+ 			panic(errors.New("matches() function second argument type must be string"))
+ 		}
+ 		re, err := getRegexp(pattern)
+@@ -510,14 +476,14 @@ func substringFunc(arg1, arg2, arg3 query) func(query, iterator) interface{} {
+ 
+ 		var start, length float64
+ 		var ok bool
+-		if start, ok = functionArgs(arg2).Evaluate(t).(float64); !ok {
++		if start, ok = numberArg(t, functionArgs(arg2).Evaluate(t)); !ok {
+ 			panic(errors.New("substring() function first argument type must be number"))
+ 		}
+ 		// positions are in characters, not bytes (REC 4.2)
+ 		rs := []rune(m)
+ 		// fix https://github.com/antchfx/xpath/issues/109
+ 		start = math.Round(start)
+-		if start > float64(len(rs)) {
++		if math.IsNaN(start) || start > float64(len(rs)) {
+ 			return ""
+ 		}
+ 		if arg3 == nil {
+@@ -527,7 +493,7 @@ func substringFunc(arg1, arg2, arg3 query) func(query, iterator) interface{} {
+ 			return string(rs[int(start)-1:])
+ 		}
+ 
+-		if length, ok = functionArgs(arg3).Evaluate(t).(float64); !ok {
++		if length, ok = numberArg(t, functionArgs(arg3).Evaluate(t)); !ok {
+ 			panic(errors.New("substring() function second argument type must be number"))
+ 		}
+ 		length = math.Round(length)
+@@ -544,28 +510,8 @@ func substringFunc(arg1, arg2, arg3 query) func(query, iterator) interface{} {
+ // substringIndFunc is XPath functions substring-before/substring-after function returns a part of a given string.
+ func substringIndFunc(arg1, arg2 query, after bool) func(query, iterator) interface{} {
+ 	return func(_ query, t iterator) interface{} {
+-		var str string
+-		switch v := functionArgs(arg1).Evaluate(t).(type) {
+-		case string:
+-			str = v
+-		case query:
+-			node := v.Select(t)
+-			if node == nil {
+-				return ""
+-			}
+-			str = node.Value()
+-		}
+-		var word string
+-		switch v := functionArgs(arg2).Evaluate(t).(type) {
+-		case string:
+-			word = v
+-		case query:
+-			node := v.Select(t)
+-			if node == nil {
+-				return ""
+-			}
+-			word = node.Value()
+-		}
++		str, _ := stringArg(t, functionArgs(arg1).Evaluate(t))
++		word, _ := stringArg(t, functionArgs(arg2).Evaluate(t))
+ 		if word == "" {
+ 			return ""
+ 		}
+@@ -648,9 +594,8 @@ func notFunc(arg1 query) func(query, iterator) interface{} {
+ 		switch v := functionArgs(arg1).Evaluate(t).(type) {
+ 		case bool:
+ 			return !v
+-		case query:
+-			node := v.Select(t)
+-			return node == nil
++		case query, []interface{}:
++			return !asBool(t, v)
+ 		default:
+ 			return false
+ 		}
+@@ -706,16 +651,7 @@ func reverseFunc(q query, t iterator) func() NodeNavigator {
+ // string-join is a XPath Node Set functions string-join(node-set, separator).
+ func stringJoinFunc(q, arg1 query) func(query, iterator) interface{} {
+ 	return func(_ query, t iterator) interface{} {
+-		var separator string
+-		switch v := functionArgs(arg1).Evaluate(t).(type) {
+-		case string:
+-			separator = v
+-		case query:
+-			node := v.Select(t)
+-			if node != nil {
+-				separator = node.Value()
+-			}
+-		}
++		separator, _ := stringArg(t, functionArgs(arg1).Evaluate(t))
+ 
+ 		q = functionArgs(q)
+ 		test := predicate(q)
+@@ -729,6 +665,10 @@ func stringJoinFunc(q, arg1 query) func(query, iterator) interface{} {
+ 					parts = append(parts, node.Value())
+ 				}
+ 			}
++		case []interface{}:
++			for _, item := range v {
++				parts = append(parts, asString(t, item))
++			}
+ 		}
+ 		return strings.Join(parts, separator)
+ 	}
+@@ -741,3 +681,31 @@ func lowerCaseFunc(arg1 query) func(query, iterator) interface{} {
+ 		return strings.ToLower(asString(t, v))
+ 	}
+ }
++
++// stringArg returns a string argument, or the string value of the first item of a sequence
++// and the empty string for an empty one. It reports false for other values.
++func stringArg(t iterator, v interface{}) (string, bool) {
++	switch item := firstItem(t, v).(type) {
++	case nil:
++		return "", true
++	case string:
++		return item, true
++	case NodeNavigator:
++		return item.Value(), true
++	}
++	return "", false
++}
++
++// numberArg returns a number argument, or the number value of the first item of a sequence
++// and NaN for an empty one. It reports false for other values.
++func numberArg(t iterator, v interface{}) (float64, bool) {
++	switch item := firstItem(t, v).(type) {
++	case nil:
++		return math.NaN(), true
++	case float64:
++		return item, true
++	case NodeNavigator:
++		return stringToNumber(item.Value()), true
++	}
++	return 0, false
++}
+diff --git a/operator.go b/operator.go
+index 91e5a61..f2ae270 100644
+--- a/operator.go
++++ b/operator.go
+@@ -175,6 +175,9 @@ func cmpBooleanBoolean(t iterator, op string, m, n interface{}) bool {
+ 
+ // eqFunc is an `=` operator.
+ func eqFunc(t iterator, m, n interface{}) interface{} {
++	if isSequence(m) || isSequence(n) {
++		return cmpSequence(t, "=", m, n)
++	}
+ 	t1 := getXPathType(m)
+ 	t2 := getXPathType(n)
+ 	return logicalFuncs[t1][t2](t, "=", m, n)
+@@ -182,6 +185,9 @@ func eqFunc(t iterator, m, n interface{}) interface{} {
+ 
+ // gtFunc is an `>` operator.
+ func gtFunc(t iterator, m, n interface{}) interface{} {
++	if isSequence(m) || isSequence(n) {
++		return cmpSequence(t, ">", m, n)
++	}
+ 	t1 := getXPathType(m)
+ 	t2 := getXPathType(n)
+ 	return logicalFuncs[t1][t2](t, ">", m, n)
+@@ -189,6 +195,9 @@ func gtFunc(t iterator, m, n interface{}) interface{} {
+ 
+ // geFunc is an `>=` operator.
+ func geFunc(t iterator, m, n interface{}) interface{} {
++	if isSequence(m) || isSequence(n) {
++		return cmpSequence(t, ">=", m, n)
++	}
+ 	t1 := getXPathType(m)
+ 	t2 := getXPathType(n)
+ 	return logicalFuncs[t1][t2](t, ">=", m, n)
+@@ -196,6 +205,9 @@ func geFunc(t iterator, m, n interface{}) interface{} {
+ 
+ // ltFunc is an `<` operator.
+ func ltFunc(t iterator, m, n interface{}) interface{} {
++	if isSequence(m) || isSequence(n) {
++		return cmpSequence(t, "<", m, n)
++	}
+ 	t1 := getXPathType(m)
+ 	t2 := getXPathType(n)
+ 	return logicalFuncs[t1][t2](t, "<", m, n)
+@@ -203,6 +215,9 @@ func ltFunc(t iterator, m, n interface{}) interface{} {
+ 
+ // leFunc is an `<=` operator.
+ func leFunc(t iterator, m, n interface{}) interface{} {
++	if isSequence(m) || isSequence(n) {
++		return cmpSequence(t, "<=", m, n)
++	}
+ 	t1 := getXPathType(m)
+ 	t2 := getXPathType(n)
+ 	return logicalFuncs[t1][t2](t, "<=", m, n)
+@@ -210,6 +225,9 @@ func leFunc(t iterator, m, n interface{}) interface{} {
+ 
+ // neFunc is an `!=` operator.
+ func neFunc(t iterator, m, n interface{}) interface{} {
++	if isSequence(m) || isSequence(n) {
++		return cmpSequence(t, "!=", m, n)
++	}
+ 	t1 := getXPathType(m)
+ 	t2 := getXPathType(n)
+ 	return logicalFuncs[t1][t2](t, "!=", m, n)
+@@ -263,3 +281,44 @@ var modFunc = func(t iterator, m, n interface{}) interface{} {
+ 		return math.Mod(a, b)
+ 	})
+ }
++
++// isSequence reports whether a comparison operand is a value or node sequence rather than a
++// single value or an axis step's node-set.
++func isSequence(v interface{}) bool {
++	switch v := v.(type) {
++	case []interface{}:
++		return true
++	case query:
++		return sequenceInput(v)
++	}
++	return false
++}
++
++// cmpSequence holds when the comparison holds for some pair of items.
++func cmpSequence(t iterator, op string, m, n interface{}) bool {
++	left := sequenceItems(t, m)
++	right := sequenceItems(t, n)
++	for _, a := range left {
++		for _, b := range right {
++			if cmpItems(op, a, b) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++func cmpItems(op string, a, b interface{}) bool {
++	if node, ok := a.(NodeNavigator); ok {
++		a = node.Value()
++	}
++	if node, ok := b.(NodeNavigator); ok {
++		b = node.Value()
++	}
++	_, aNum := a.(float64)
++	_, bNum := b.(float64)
++	if aNum || bNum {
++		return cmpNumberNumberF(op, asNumber(nil, a), asNumber(nil, b))
++	}
++	return cmpStringStringF(op, asString(nil, a), asString(nil, b))
++}
+diff --git a/parse.go b/parse.go
+index 080fe98..4b91b76 100644
+--- a/parse.go
++++ b/parse.go
+@@ -67,6 +67,8 @@ const (
+ 	nodeVariable
+ 	nodeConstantOperand
+ 	nodeGroup
++	nodeFor
++	nodeQuantified
+ )
+ 
+ type parser struct {
+@@ -116,6 +118,14 @@ func newGroupNode(n node) node {
+ 	return &groupNode{nodeType: nodeGroup, Input: n}
+ }
+ 
++func newForNode(vars []string, seqs []node, ret node) node {
++	return &forNode{nodeType: nodeFor, Vars: vars, Seqs: seqs, Return: ret}
++}
++
++func newQuantifiedNode(every bool, vars []string, seqs []node, test node) node {
++	return &quantifiedNode{nodeType: nodeQuantified, Every: every, Vars: vars, Seqs: seqs, Test: test}
++}
++
+ // newRootNode returns a root node.
+ func newRootNode(s string) node {
+ 	return &rootNode{nodeType: nodeRoot, slash: s}
+@@ -168,11 +178,73 @@ func (p *parser) parseExpression(n node) node {
+ 	if p.d = p.d + 1; p.d > 200 {
+ 		panic("the xpath query is too complex(depth > 200)")
+ 	}
+-	n = p.parseOrExpr(n)
++	n = p.parseExprSingle(n)
+ 	p.d--
+ 	return n
+ }
+ 
++// ExprSingle ::= ForExpr | QuantifiedExpr | OrExpr
++func (p *parser) parseExprSingle(n node) node {
++	if p.r.typ == itemName && p.r.prefix == "" && p.r.canBeVar {
++		switch p.r.name {
++		case "for":
++			return p.parseForExpr(n)
++		case "some", "every":
++			return p.parseQuantifiedExpr(n)
++		}
++	}
++	return p.parseOrExpr(n)
++}
++
++// ForExpr ::= 'for' '$' VarName 'in' ExprSingle (',' '$' VarName 'in' ExprSingle)* 'return' ExprSingle
++func (p *parser) parseForExpr(n node) node {
++	p.next()
++	vars, seqs := p.parseBindings(n)
++	if !testOp(p.r, "return") {
++		panic(fmt.Sprintf("%s: expected 'return' in for expression", p.r.text))
++	}
++	p.next()
++	return newForNode(vars, seqs, p.parseExpression(n))
++}
++
++// QuantifiedExpr ::= ('some' | 'every') '$' VarName 'in' ExprSingle (',' '$' VarName 'in' ExprSingle)* 'satisfies' ExprSingle
++func (p *parser) parseQuantifiedExpr(n node) node {
++	every := p.r.name == "every"
++	p.next()
++	vars, seqs := p.parseBindings(n)
++	if !testOp(p.r, "satisfies") {
++		panic(fmt.Sprintf("%s: expected 'satisfies' in quantified expression", p.r.text))
++	}
++	p.next()
++	return newQuantifiedNode(every, vars, seqs, p.parseExpression(n))
++}
++
++func (p *parser) parseBindings(n node) ([]string, []node) {
++	var (
++		vars []string
++		seqs []node
++	)
++	for {
++		p.skipItem(itemDollar)
++		checkItem(p.r, itemName)
++		if p.r.prefix != "" {
++			panic(fmt.Sprintf("%s: a range variable name cannot have a prefix", p.r.text))
++		}
++		vars = append(vars, p.r.name)
++		p.next()
++		if !testOp(p.r, "in") {
++			panic(fmt.Sprintf("%s: expected 'in' after $%s", p.r.text, vars[len(vars)-1]))
++		}
++		p.next()
++		seqs = append(seqs, p.parseExpression(n))
++		if p.r.typ != itemComma {
++			break
++		}
++		p.next()
++	}
++	return vars, seqs
++}
++
+ // next scanning next item on forward.
+ func (p *parser) next() bool {
+ 	return p.r.nextItem()
+@@ -234,7 +306,7 @@ Loop:
+ //	| RelationalExpr '<=' AdditiveExpr
+ //	| RelationalExpr '>=' AdditiveExpr
+ func (p *parser) parseRelationalExpr(n node) node {
+-	opnd := p.parseAdditiveExpr(n)
++	opnd := p.parseRangeExpr(n)
+ Loop:
+ 	for {
+ 		var op string
+@@ -251,7 +323,17 @@ Loop:
+ 			break Loop
+ 		}
+ 		p.next()
+-		opnd = newOperatorNode(op, opnd, p.parseAdditiveExpr(n))
++		opnd = newOperatorNode(op, opnd, p.parseRangeExpr(n))
++	}
++	return opnd
++}
++
++// RangeExpr ::= AdditiveExpr ('to' AdditiveExpr)?
++func (p *parser) parseRangeExpr(n node) node {
++	opnd := p.parseAdditiveExpr(n)
++	if testOp(p.r, "to") {
++		p.next()
++		opnd = newOperatorNode("to", opnd, p.parseAdditiveExpr(n))
+ 	}
+ 	return opnd
+ }
+@@ -664,6 +746,23 @@ func (v *variableNode) String() string {
+ 	return fmt.Sprintf("%s:%s", v.Prefix, v.Name)
+ }
+ 
++// forNode holds a for expression.
++type forNode struct {
++	nodeType
++	Vars   []string
++	Seqs   []node
++	Return node
++}
++
++// quantifiedNode holds a some or every expression.
++type quantifiedNode struct {
++	nodeType
++	Every bool
++	Vars  []string
++	Seqs  []node
++	Test  node
++}
++
+ // functionNode holds a function call.
+ type functionNode struct {
+ 	nodeType
+@@ -697,6 +796,7 @@ type scanner struct {
+ 	strval    string  // text value at current pos
+ 	numval    float64 // number value at current pos
+ 	canBeFunc bool
++	canBeVar  bool
+ }
+ 
+ func (s *scanner) nextChar() bool {
+@@ -810,6 +910,7 @@ func (s *scanner) nextItem() bool {
+ 			}
+ 			s.skipSpace()
+ 			s.canBeFunc = s.curr == '('
++			s.canBeVar = s.curr == '$'
+ 		} else {
+ 			panic(fmt.Sprintf("%s has an invalid token.", s.text))
+ 		}
+diff --git a/query.go b/query.go
+index b12353f..5d8ac90 100644
+--- a/query.go
++++ b/query.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"fmt"
+ 	"hash/fnv"
++	"math"
+ 	"reflect"
+ 	"strconv"
+ )
+@@ -735,11 +736,17 @@ func (p *parentQuery) Test(n NodeNavigator) bool {
+ 
+ // selfQuery is an Self node query.(self::*)
+ type selfQuery struct {
+-	Input     query
+-	Predicate func(NodeNavigator) bool
++	Input       query
++	Predicate   func(NodeNavigator) bool
++	ContextItem bool
+ }
+ 
+ func (s *selfQuery) Select(t iterator) NodeNavigator {
++	if s.ContextItem {
++		if _, ok := valueFocus(t); ok {
++			return nil
++		}
++	}
+ 	for {
+ 		node := s.Input.Select(t)
+ 		if node == nil {
+@@ -753,6 +760,11 @@ func (s *selfQuery) Select(t iterator) NodeNavigator {
+ }
+ 
+ func (s *selfQuery) Evaluate(t iterator) interface{} {
++	if s.ContextItem {
++		if focus, ok := valueFocus(t); ok {
++			return focus.item
++		}
++	}
+ 	s.Input.Evaluate(t)
+ 	return s
+ }
+@@ -762,7 +774,7 @@ func (s *selfQuery) Test(n NodeNavigator) bool {
+ }
+ 
+ func (s *selfQuery) Clone() query {
+-	return &selfQuery{Input: s.Input.Clone(), Predicate: s.Predicate}
++	return &selfQuery{Input: s.Input.Clone(), Predicate: s.Predicate, ContextItem: s.ContextItem}
+ }
+ 
+ func (s *selfQuery) ValueType() resultType {
+@@ -781,18 +793,39 @@ type filterQuery struct {
+ 
+ 	posit    int
+ 	positmap map[int]int
++	items    []interface{}
++	loaded   bool
++	next     int
+ }
+ 
+ func (f *filterQuery) do(t iterator) bool {
+-	val := reflect.ValueOf(f.Predicate.Evaluate(t))
++	if _, ok := focusItem(t); ok {
++		t = &nodeFocusIterator{iterator: t}
++	}
++	return f.test(t, getNodePosition(f.Input), true)
++}
++
++// test reports whether the predicate holds for the item at position pos. A number selects the
++// item at exactly that position, except that a step predicate truncates it as before.
++func (f *filterQuery) test(t iterator, pos int, step bool) bool {
++	v := f.Predicate.Evaluate(t)
++	if items, ok := v.([]interface{}); ok {
++		if n, ok := singleNumber(items); ok {
++			return n == float64(pos)
++		}
++		return asBool(t, items)
++	}
++	val := reflect.ValueOf(v)
+ 	switch val.Kind() {
+ 	case reflect.Bool:
+ 		return val.Bool()
+ 	case reflect.String:
+ 		return len(val.String()) > 0
+ 	case reflect.Float64:
+-		pt := getNodePosition(f.Input)
+-		return int(val.Float()) == pt
++		if step {
++			return int(val.Float()) == pos
++		}
++		return val.Float() == float64(pos)
+ 	default:
+ 		if f.Predicate != nil {
+ 			return f.Predicate.Select(t) != nil
+@@ -806,6 +839,9 @@ func (f *filterQuery) position() int {
+ }
+ 
+ func (f *filterQuery) Select(t iterator) NodeNavigator {
++	if sequenceInput(f.Input) {
++		return f.selectSequence(t)
++	}
+ 	if f.positmap == nil {
+ 		f.positmap = make(map[int]int)
+ 	}
+@@ -830,18 +866,75 @@ func (f *filterQuery) Select(t iterator) NodeNavigator {
+ }
+ 
+ func (f *filterQuery) Evaluate(t iterator) interface{} {
+-	f.Input.Evaluate(t)
++	v := f.Input.Evaluate(t)
++	if items, ok := v.([]interface{}); ok {
++		return f.filterValues(t, items)
++	}
++	if sequenceInput(f.Input) {
++		switch v.(type) {
++		case float64, string, bool:
++			return f.filterValues(t, []interface{}{v})
++		}
++	}
+ 	// Reset the position map when re-evaluating to ensure clean state
+ 	f.positmap = nil
++	f.items, f.loaded, f.next = nil, false, 0
+ 	return f
+ }
+ 
++// selectSequence filters a node sequence, giving the predicate each node with its position
++// in the sequence and the sequence size.
++func (f *filterQuery) selectSequence(t iterator) NodeNavigator {
++	if !f.loaded {
++		f.items = sequenceItems(t, f.Input)
++		f.loaded, f.next, f.posit = true, 0, 0
++	}
++	root := t.Current().Copy()
++	defer t.Current().MoveTo(root)
++	for f.next < len(f.items) {
++		node := f.items[f.next].(NodeNavigator)
++		f.next++
++		t.Current().MoveTo(node)
++		focus := &itemIterator{iterator: t, item: node, pos: f.next, size: len(f.items)}
++		if f.test(focus, f.next, false) {
++			f.posit++
++			return node.Copy()
++		}
++	}
++	return nil
++}
++
++// filterValues applies the predicate with each value of a sequence as the focus.
++func (f *filterQuery) filterValues(t iterator, items []interface{}) []interface{} {
++	root := t.Current().Copy()
++	kept := []interface{}{}
++	for i, item := range items {
++		t.Current().MoveTo(root)
++		focus := &itemIterator{iterator: t, item: item, pos: i + 1, size: len(items)}
++		v := f.Predicate.Clone().Evaluate(focus)
++		if seq, ok := v.([]interface{}); ok {
++			if n, ok := singleNumber(seq); ok {
++				v = n
++			}
++		}
++		if n, ok := v.(float64); ok {
++			if n == float64(i+1) {
++				kept = append(kept, item)
++			}
++		} else if asBool(focus, v) {
++			kept = append(kept, item)
++		}
++	}
++	t.Current().MoveTo(root)
++	return kept
++}
++
+ func (f *filterQuery) Clone() query {
+ 	return &filterQuery{Input: f.Input.Clone(), Predicate: f.Predicate.Clone()}
+ }
+ 
+ func (f *filterQuery) ValueType() resultType {
+-	return xpathResultType.NodeSet
++	return f.Input.ValueType()
+ }
+ 
+ func (f *filterQuery) Properties() queryProp {
+@@ -910,7 +1003,7 @@ func (f *transformFunctionQuery) Clone() query {
+ }
+ 
+ func (f *transformFunctionQuery) ValueType() resultType {
+-	return xpathResultType.Any
++	return xpathResultType.NodeSet
+ }
+ 
+ func (f *transformFunctionQuery) Properties() queryProp {
+@@ -1219,6 +1312,9 @@ func (q *lastFuncQuery) Select(t iterator) NodeNavigator {
+ }
+ 
+ func (q *lastFuncQuery) Evaluate(t iterator) interface{} {
++	if focus, ok := focusItem(t); ok {
++		return float64(focus.size)
++	}
+ 	if !q.counted {
+ 		for {
+ 			node := q.Input.Select(t)
+@@ -1459,3 +1555,373 @@ func getXPathType(i interface{}) resultType {
+ 	}
+ 	panic(fmt.Errorf("xpath unknown value type: %v", v.Kind()))
+ }
++
++// scopeIterator binds one range variable without changing the focus.
++type scopeIterator struct {
++	iterator
++	name  string
++	value interface{}
++}
++
++func lookupVariable(t iterator, name string) interface{} {
++	for {
++		switch it := t.(type) {
++		case *scopeIterator:
++			if it.name == name {
++				return it.value
++			}
++			t = it.iterator
++		case *itemIterator:
++			t = it.iterator
++		case *nodeFocusIterator:
++			t = it.iterator
++		default:
++			panic(fmt.Errorf("xpath: variable $%s is not bound", name))
++		}
++	}
++}
++
++// itemIterator gives a predicate on a sequence its focus: the current item, its position and
++// the size of the sequence. When the item is a node, the navigator is on that node too.
++type itemIterator struct {
++	iterator
++	item      interface{}
++	pos, size int
++}
++
++// nodeFocusIterator hides the focus of an enclosing sequence predicate from a step predicate.
++type nodeFocusIterator struct {
++	iterator
++}
++
++// focusItem returns the focus of the innermost sequence predicate, if any.
++func focusItem(t iterator) (*itemIterator, bool) {
++	for {
++		switch it := t.(type) {
++		case *itemIterator:
++			return it, true
++		case *scopeIterator:
++			t = it.iterator
++		default:
++			return nil, false
++		}
++	}
++}
++
++// valueFocus returns the focus of the innermost sequence predicate when its item is a value.
++func valueFocus(t iterator) (*itemIterator, bool) {
++	focus, ok := focusItem(t)
++	if !ok {
++		return nil, false
++	}
++	if _, isNode := focus.item.(NodeNavigator); isNode {
++		return nil, false
++	}
++	return focus, true
++}
++
++// sequenceInput reports whether q gives a sequence rather than an axis step's node-set: a for
++// result, a range variable or reverse(), also in parentheses. Positions in it count in sequence
++// order, its items compare pairwise and a single value from it is a one-value sequence.
++func sequenceInput(q query) bool {
++	switch q := q.(type) {
++	case *forQuery, *variableQuery, *transformFunctionQuery:
++		return true
++	case *groupQuery:
++		return sequenceInput(q.Input)
++	case *filterQuery:
++		return sequenceInput(q.Input)
++	}
++	return false
++}
++
++// singleNumber reports whether a sequence holds exactly one number.
++func singleNumber(items []interface{}) (float64, bool) {
++	if len(items) != 1 {
++		return 0, false
++	}
++	n, ok := items[0].(float64)
++	return n, ok
++}
++
++// sequenceItems materializes an evaluated value, a node or a value sequence, into a list of items.
++func sequenceItems(t iterator, v interface{}) []interface{} {
++	switch v := v.(type) {
++	case nil:
++		return nil
++	case []interface{}:
++		return v
++	case query:
++		root := t.Current().Copy()
++		var items []interface{}
++		for node := v.Select(t); node != nil; node = v.Select(t) {
++			items = append(items, node.Copy())
++		}
++		t.Current().MoveTo(root)
++		return items
++	}
++	return []interface{}{v}
++}
++
++// firstItem returns the first item of a node or value sequence, or nil when the sequence
++// is empty. Any other value is returned as it is.
++func firstItem(t iterator, v interface{}) interface{} {
++	switch v := v.(type) {
++	case []interface{}:
++		if len(v) > 0 {
++			return v[0]
++		}
++		return nil
++	case query:
++		root := t.Current().Copy()
++		node := v.Select(t)
++		t.Current().MoveTo(root)
++		if node == nil {
++			return nil
++		}
++		return node
++	}
++	return v
++}
++
++// bindSequences calls fn for every combination of bound values until fn returns false.
++func bindSequences(t iterator, root NodeNavigator, vars []string, seqs []query, fn func(iterator) bool) bool {
++	var bind func(i int, scope iterator) bool
++	bind = func(i int, scope iterator) bool {
++		if i == len(vars) {
++			return fn(scope)
++		}
++		t.Current().MoveTo(root)
++		items := sequenceItems(scope, seqs[i].Clone().Evaluate(scope))
++		for _, item := range items {
++			if !bind(i+1, &scopeIterator{iterator: scope, name: vars[i], value: item}) {
++				return false
++			}
++		}
++		return true
++	}
++	ok := bind(0, t)
++	t.Current().MoveTo(root)
++	return ok
++}
++
++// forQuery is an XPath for expression.
++type forQuery struct {
++	Vars   []string
++	Seqs   []query
++	Return query
++
++	items     []interface{}
++	nodes     bool
++	evaluated bool
++	next      int
++	posit     int
++}
++
++// run collects the return values for every combination of bound values. They form a node
++// sequence when the return expression gives nodes, judged by its static type when there is
++// no combination.
++func (f *forQuery) run(t iterator) {
++	root := t.Current().Copy()
++	f.items = nil
++	f.nodes = f.Return.ValueType() == xpathResultType.NodeSet
++	bindSequences(t, root, f.Vars, f.Seqs, func(scope iterator) bool {
++		t.Current().MoveTo(root)
++		v := f.Return.Clone().Evaluate(scope)
++		_, f.nodes = v.(query)
++		f.items = append(f.items, sequenceItems(scope, v)...)
++		return true
++	})
++	f.evaluated = true
++	f.next = 0
++	f.posit = 0
++}
++
++func (f *forQuery) Select(t iterator) NodeNavigator {
++	if !f.evaluated {
++		f.run(t)
++	}
++	for f.next < len(f.items) {
++		item := f.items[f.next]
++		f.next++
++		if node, ok := item.(NodeNavigator); ok {
++			f.posit++
++			return node.Copy()
++		}
++	}
++	return nil
++}
++
++func (f *forQuery) Evaluate(t iterator) interface{} {
++	f.run(t)
++	if f.nodes {
++		return f
++	}
++	values := make([]interface{}, len(f.items))
++	copy(values, f.items)
++	return values
++}
++
++func (f *forQuery) Clone() query {
++	seqs := make([]query, len(f.Seqs))
++	for i, q := range f.Seqs {
++		seqs[i] = q.Clone()
++	}
++	return &forQuery{Vars: f.Vars, Seqs: seqs, Return: f.Return.Clone()}
++}
++
++func (f *forQuery) ValueType() resultType {
++	return f.Return.ValueType()
++}
++
++func (f *forQuery) Properties() queryProp {
++	return queryProps.Merge
++}
++
++func (f *forQuery) position() int {
++	return f.posit
++}
++
++// quantifiedQuery is an XPath some or every expression.
++type quantifiedQuery struct {
++	Every bool
++	Vars  []string
++	Seqs  []query
++	Test  query
++}
++
++func (q *quantifiedQuery) Select(t iterator) NodeNavigator {
++	return nil
++}
++
++func (q *quantifiedQuery) Evaluate(t iterator) interface{} {
++	root := t.Current().Copy()
++	found := false
++	all := bindSequences(t, root, q.Vars, q.Seqs, func(scope iterator) bool {
++		t.Current().MoveTo(root)
++		ok := asBool(scope, q.Test.Clone().Evaluate(scope))
++		if ok && !q.Every {
++			found = true
++			return false
++		}
++		return ok || !q.Every
++	})
++	if q.Every {
++		return all
++	}
++	return found
++}
++
++func (q *quantifiedQuery) Clone() query {
++	seqs := make([]query, len(q.Seqs))
++	for i, s := range q.Seqs {
++		seqs[i] = s.Clone()
++	}
++	return &quantifiedQuery{Every: q.Every, Vars: q.Vars, Seqs: seqs, Test: q.Test.Clone()}
++}
++
++func (q *quantifiedQuery) ValueType() resultType {
++	return xpathResultType.Boolean
++}
++
++func (q *quantifiedQuery) Properties() queryProp {
++	return queryProps.Merge
++}
++
++// maxInt is the largest int, the most items a sequence can hold.
++const maxInt = int(^uint(0) >> 1)
++
++// maxRangeBound bounds the operands of a range: below it every whole number is a float64.
++const maxRangeBound = 1 << 53
++
++// rangeQuery is an XPath range expression (A to B).
++type rangeQuery struct {
++	Left, Right query
++}
++
++func (r *rangeQuery) Select(t iterator) NodeNavigator {
++	return nil
++}
++
++func (r *rangeQuery) Evaluate(t iterator) interface{} {
++	root := t.Current().Copy()
++	from := asNumber(t, r.Left.Evaluate(t))
++	t.Current().MoveTo(root)
++	to := asNumber(t, r.Right.Evaluate(t))
++	t.Current().MoveTo(root)
++	if math.IsNaN(from) || math.IsNaN(to) {
++		return []interface{}{}
++	}
++	if math.Abs(from) >= maxRangeBound || math.Abs(to) >= maxRangeBound {
++		panic(fmt.Errorf("xpath: range bounds must be strictly between -2^53 and 2^53, got %v to %v", from, to))
++	}
++	first, last := math.Ceil(from), math.Floor(to)
++	if first > last {
++		return []interface{}{}
++	}
++	count := last - first + 1
++	if count >= float64(maxInt) {
++		panic(fmt.Errorf("xpath: range %v to %v has more items than a sequence can hold", from, to))
++	}
++	values := make([]interface{}, int(count))
++	for i := range values {
++		values[i] = first + float64(i)
++	}
++	return values
++}
++
++func (r *rangeQuery) Clone() query {
++	return &rangeQuery{Left: r.Left.Clone(), Right: r.Right.Clone()}
++}
++
++func (r *rangeQuery) ValueType() resultType {
++	return xpathResultType.Number
++}
++
++func (r *rangeQuery) Properties() queryProp {
++	return queryProps.Merge
++}
++
++// variableQuery is a reference to a range variable.
++type variableQuery struct {
++	Name string
++	typ  resultType
++
++	count int
++}
++
++func (v *variableQuery) Select(t iterator) NodeNavigator {
++	if v.count > 0 {
++		return nil
++	}
++	v.count++
++	if node, ok := lookupVariable(t, v.Name).(NodeNavigator); ok {
++		return node.Copy()
++	}
++	return nil
++}
++
++func (v *variableQuery) Evaluate(t iterator) interface{} {
++	v.count = 0
++	value := lookupVariable(t, v.Name)
++	if _, ok := value.(NodeNavigator); ok {
++		return v
++	}
++	return value
++}
++
++func (v *variableQuery) Clone() query {
++	return &variableQuery{Name: v.Name, typ: v.typ}
++}
++
++func (v *variableQuery) ValueType() resultType {
++	return v.typ
++}
++
++func (v *variableQuery) Properties() queryProp {
++	return queryProps.Position | queryProps.Count | queryProps.Cached
++}
++
++func (v *variableQuery) position() int {
++	return v.count
++}
+diff --git a/xpath.go b/xpath.go
+index 9d85ed2..8f9f755 100644
+--- a/xpath.go
++++ b/xpath.go
+@@ -120,7 +120,8 @@ func (f iteratorFunc) Current() NodeNavigator {
+ }
+ 
+ // Evaluate returns the result of the expression.
+-// The result type of the expression is one of the follow: bool,float64,string,NodeIterator).
++// The result type of the expression is one of the follow: bool,float64,string,NodeIterator),
++// or []interface{} for a sequence of values.
+ func (expr *Expr) Evaluate(root NodeNavigator) interface{} {
+ 	val := expr.q.Evaluate(iteratorFunc(func() NodeNavigator { return root }))
+ 	switch val.(type) {

@@ -1,0 +1,1448 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..eee4388f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,92 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++OUTPUT_PATH="${OUTPUT_PATH:-/tmp/results.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++cd /app
++
++export HOME="${HOME:-/tmp}"
++export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib}"
++export MPLBACKEND=Agg
++export QT_QPA_PLATFORM=offscreen
++mkdir -p "$MPLCONFIGDIR"
++
++NEW_TESTS="tests/test_constraint_resolution_93d6d4.py"
++PYTEST_LOG="$(mktemp)"
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "$NEW_TESTS" \
++    -p no:randomly -p no:cacheprovider --junitxml="$OUTPUT_PATH" -q 2>&1 | tee "$PYTEST_LOG"
++  EXIT_CODE=${PIPESTATUS[0]}
++else
++  # Base mode covers the modules this change touches and the callers that
++  # depend on them: pickups, solves, the optic updater, multi-configuration,
++  # paraxial rays, materials, coordinate systems, position reconstruction
++  # after a thickness write, serialization round trips and prescription
++  # output. That is 2371 of the repository's tests.
++  #
++  # tests/gui is left out: it drives PySide6 through worker processes, and its
++  # assertions about which event-loop turn a job lands on depend on how busy
++  # the machine is, so it is not a deterministic baseline.
++  BASE_TESTS="tests/test_pickup.py
++              tests/test_solves.py
++              tests/test_optic.py
++              tests/test_optic_deprecated.py
++              tests/test_multiconfig.py
++              tests/test_paraxial.py
++              tests/test_materials.py
++              tests/test_coordinate_system.py
++              tests/test_folded_paraxial.py
++              tests/test_folded_paraxial_finalization.py
++              tests/test_folded_paraxial_hardening.py
++              tests/test_optimization_recovery.py
++              tests/test_fileio
++              tests/prescription"
++
++  # Pre-existing failure on the base commit, unrelated to this change: a
++  # wall-clock performance ratio assertion (limit 40) that this container
++  # cannot satisfy, measuring 82-110 over five runs of an unpatched checkout.
++  PERF_RATIO_TEST="tests/test_materials.py::TestBaseMaterial::test_large_array_cache_key_avoids_python_scalar_overhead"
++
++  python -m pytest $BASE_TESTS \
++    --ignore="$NEW_TESTS" \
++    --deselect "$PERF_RATIO_TEST" \
++    -p no:randomly -p no:cacheprovider --junitxml="$OUTPUT_PATH" -q 2>&1 | tee "$PYTEST_LOG"
++  EXIT_CODE=${PIPESTATUS[0]}
++fi
++
++if [ ! -f "$OUTPUT_PATH" ] || ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  DETAIL="$(tail -n 80 "$PYTEST_LOG" 2>/dev/null \
++    | tr -d '\000-\010\013\014\016-\037' \
++    | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++  if [ -z "$DETAIL" ]; then
++    DETAIL="pytest produced no test cases and no output."
++  fi
++  {
++    echo '<?xml version="1.0" encoding="UTF-8"?>'
++    echo '<testsuites>'
++    echo '  <testsuite name="pytest" tests="1" failures="1" errors="0" time="0">'
++    echo '    <testcase name="collection" classname="pytest">'
++    echo "      <failure message=\"pytest produced no test cases (exit $EXIT_CODE)\">"
++    echo "$DETAIL"
++    echo '      </failure>'
++    echo '    </testcase>'
++    echo '  </testsuite>'
++    echo '</testsuites>'
++  } > "$OUTPUT_PATH"
++fi
++
++rm -f "$PYTEST_LOG"
++exit $EXIT_CODE
+diff --git a/tests/test_constraint_resolution_93d6d4.py b/tests/test_constraint_resolution_93d6d4.py
+new file mode 100644
+index 00000000..18e71bfb
+--- /dev/null
++++ b/tests/test_constraint_resolution_93d6d4.py
+@@ -0,0 +1,1344 @@
++"""Dependency-ordered resolution of pickups and solves."""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++
++import optiland.backend as be
++from optiland.multiconfig import MultiConfiguration
++from optiland.optic import Optic
++
++RADIUS_PATH = "surfaces.surfaces[i].geometry.radius"
++SHORT_RADIUS_PATH = "surfaces[i].geometry.radius"
++CONIC_PATH = "surfaces.surfaces[i].geometry.k"
++SHORT_CONIC_PATH = "surfaces[i].geometry.k"
++SHORT_MATERIAL_PATH = "surfaces[i].material_post"
++MATERIAL_PATH = "surfaces.surfaces[i].material_post"
++COMMENT_PATH = "surfaces.surfaces[i].comment"
++OFFSET_PATH = "surfaces.surfaces[i].geometry.cs.x"
++THICKNESS_PATH = "surfaces.surfaces[i].thickness"
++SHORT_THICKNESS_PATH = "surfaces[i].thickness"
++
++
++def scalar(value):
++    return float(be.to_numpy(value).reshape(-1)[0])
++
++
++def doublet():
++    lens = Optic()
++    lens.surfaces.add(index=0, radius=be.inf, thickness=be.inf)
++    lens.surfaces.add(
++        index=1, radius=50.0, thickness=6.0, material="N-BK7", is_stop=True
++    )
++    lens.surfaces.add(index=2, radius=-80.0, thickness=35.0)
++    lens.surfaces.add(index=3, radius=120.0, thickness=6.0, material="N-BK7")
++    lens.surfaces.add(index=4, radius=-140.0, thickness=45.0)
++    lens.surfaces.add(index=5)
++    lens.set_aperture(aperture_type="EPD", value=10.0)
++    lens.fields.set_type(field_type="angle")
++    lens.fields.add(y=0)
++    lens.wavelengths.add(value=0.5876, is_primary=True)
++    return lens
++
++
++def singlet():
++    lens = Optic()
++    lens.surfaces.add(index=0, radius=be.inf, thickness=be.inf)
++    lens.surfaces.add(
++        index=1, radius=60.0, thickness=8.0, material="N-BK7", is_stop=True
++    )
++    lens.surfaces.add(index=2, radius=-60.0, thickness=90.0)
++    lens.surfaces.add(index=3)
++    lens.set_aperture(aperture_type="EPD", value=12.0)
++    lens.fields.set_type(field_type="angle")
++    lens.fields.add(y=0)
++    lens.wavelengths.add(value=0.5876, is_primary=True)
++    return lens
++
++
++def two_glass_doublet():
++    lens = Optic()
++    lens.surfaces.add(index=0, radius=be.inf, thickness=be.inf)
++    lens.surfaces.add(
++        index=1, radius=50.0, thickness=6.0, material="N-BK7", is_stop=True
++    )
++    lens.surfaces.add(index=2, radius=-80.0, thickness=35.0)
++    lens.surfaces.add(index=3, radius=120.0, thickness=6.0, material="N-SF11")
++    lens.surfaces.add(index=4, radius=-140.0, thickness=45.0)
++    lens.surfaces.add(index=5)
++    lens.set_aperture(aperture_type="EPD", value=10.0)
++    lens.fields.set_type(field_type="angle")
++    lens.fields.add(y=0)
++    lens.wavelengths.add(value=0.5876, is_primary=True)
++    return lens
++
++
++def chief_height(lens, index):
++    y, _ = lens.paraxial.chief_ray()
++    return scalar(y[index])
++
++
++def finite_object_doublet():
++    lens = Optic()
++    lens.surfaces.add(index=0, radius=be.inf, thickness=200.0)
++    lens.surfaces.add(
++        index=1, radius=50.0, thickness=6.0, material="N-BK7", is_stop=True
++    )
++    lens.surfaces.add(index=2, radius=-80.0, thickness=35.0)
++    lens.surfaces.add(index=3, radius=120.0, thickness=6.0, material="N-BK7")
++    lens.surfaces.add(index=4, radius=-140.0, thickness=45.0)
++    lens.surfaces.add(index=5)
++    lens.set_aperture(aperture_type="EPD", value=10.0)
++    lens.fields.set_type(field_type="angle")
++    lens.fields.add(y=0)
++    lens.wavelengths.add(value=0.5876, is_primary=True)
++    return lens
++
++
++def stopped_doublet(stop_index):
++    lens = doublet()
++    lens.fields.add(y=4.0)
++    for index in range(1, 5):
++        lens.surfaces[index].is_stop = index == stop_index
++    return lens
++
++
++def glass(lens, index):
++    return lens.surfaces[index].material_post
++
++
++def glass_index(lens, index):
++    wavelength = lens.wavelengths.primary_wavelength.value
++    return scalar(glass(lens, index).n(wavelength))
++
++
++def conic_doublet():
++    lens = doublet()
++    for index in (1, 2, 3, 4):
++        lens.updater.set_conic(-0.5, index)
++    return lens
++
++
++def radius(lens, index):
++    return scalar(lens.surfaces.radii[index])
++
++
++def conic(lens, index):
++    return scalar(lens.surfaces.conic[index])
++
++
++def gap(lens, index):
++    return scalar(lens.surfaces.get_thickness(index))
++
++
++def recorded_gap(lens, index):
++    return scalar(lens.surfaces[index].thickness)
++
++
++def marginal_height(lens, index):
++    y, _ = lens.paraxial.marginal_ray()
++    return scalar(y[index])
++
++
++def marginal_slope(lens, index):
++    _, u = lens.paraxial.marginal_ray()
++    return scalar(u[index])
++
++
++def linked(lens, source, target, scale=1.0, offset=0.0, attr="radius"):
++    lens.pickups.add(source, attr, target, scale=scale, offset=offset)
++
++
++def counted(constraints):
++    tallies = []
++    for constraint in constraints:
++        tally = [0]
++
++        def wrapper(tally=tally, inner=constraint.apply):
++            tally[0] += 1
++            return inner()
++
++        constraint.apply = wrapper
++        tallies.append(tally)
++    return tallies
++
++
++def applications(tallies):
++    return [tally[0] for tally in tallies]
++
++
++class TestPickupChains:
++    def test_reverse_order_chain_resolves(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=-1.0)
++        linked(lens, 1, 3, scale=2.0)
++        lens.updater.set_radius(37.0, 1)
++        lens.updater.update()
++        assert radius(lens, 3) == pytest.approx(74.0)
++        assert radius(lens, 4) == pytest.approx(-74.0)
++
++    def test_reverse_order_chain_with_offsets_composes(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=-2.0, offset=5.0)
++        linked(lens, 1, 3, scale=3.0, offset=-4.0)
++        lens.updater.set_radius(20.0, 1)
++        lens.updater.update()
++        assert radius(lens, 3) == pytest.approx(56.0)
++        assert radius(lens, 4) == pytest.approx(-107.0)
++
++    def test_three_deep_chain_resolves_in_one_update(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=1.0, offset=1.0)
++        linked(lens, 2, 3, scale=1.0, offset=1.0)
++        linked(lens, 1, 2, scale=1.0, offset=1.0)
++        lens.updater.set_radius(10.0, 1)
++        lens.updater.update()
++        assert radius(lens, 2) == pytest.approx(11.0)
++        assert radius(lens, 3) == pytest.approx(12.0)
++        assert radius(lens, 4) == pytest.approx(13.0)
++
++    def test_chain_is_stable_across_repeated_updates(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=-1.0)
++        linked(lens, 1, 3, scale=2.0)
++        lens.updater.set_radius(31.0, 1)
++        lens.updater.update()
++        first = (radius(lens, 3), radius(lens, 4))
++        lens.updater.update()
++        assert (radius(lens, 3), radius(lens, 4)) == first
++
++    def test_conic_chain_resolves(self, set_test_backend):
++        lens = conic_doublet()
++        linked(lens, 3, 4, scale=-1.0, attr="conic")
++        linked(lens, 1, 3, scale=2.0, attr="conic")
++        lens.updater.set_conic(-0.25, 1)
++        lens.updater.update()
++        assert conic(lens, 3) == pytest.approx(-0.5)
++        assert conic(lens, 4) == pytest.approx(0.5)
++
++    def test_reader_runs_after_every_writer_of_its_source(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=1.0)
++        linked(lens, 1, 2, scale=-1.0)
++        linked(lens, 2, 3, scale=-0.5)
++        lens.updater.set_radius(9.0, 1)
++        lens.updater.update()
++        assert radius(lens, 2) == pytest.approx(-9.0)
++        assert radius(lens, 3) == pytest.approx(4.5)
++        assert radius(lens, 4) == pytest.approx(4.5)
++
++    def test_last_added_writer_of_a_value_wins(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=1.0)
++        linked(lens, 1, 3, scale=2.0)
++        linked(lens, 1, 3, scale=3.0)
++        lens.updater.set_radius(9.0, 1)
++        lens.updater.update()
++        assert radius(lens, 3) == pytest.approx(27.0)
++        assert radius(lens, 4) == pytest.approx(27.0)
++
++    def test_registration_order_decides_between_independent_pickups(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        linked(lens, 1, 3, scale=0.0, offset=3.0)
++        linked(lens, 1, 4, scale=0.0, offset=4.0)
++        order = lens.updater.resolution_order()
++        assert [item.target_surface_idx for item in order] == [3, 4]
++
++
++class TestWriterPrecedence:
++    def test_three_writers_of_one_value_run_in_the_order_they_were_added(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        linked(lens, 1, 3, scale=0.5)
++        lens.solves.add("marginal_ray_angle", 3, -0.08)
++        order = lens.updater.resolution_order()
++        assert order == [
++            lens.solves.solves[0],
++            lens.pickups.pickups[0],
++            lens.solves.solves[1],
++        ]
++        lens.updater.update()
++        assert marginal_slope(lens, 3) == pytest.approx(-0.08, abs=1e-9)
++        assert lens.updater.driven_values()["radius[3]"] is lens.solves.solves[1]
++
++    def test_a_pickup_added_after_a_solve_wins_the_radius(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        linked(lens, 1, 3, scale=0.5)
++        lens.updater.update()
++        assert radius(lens, 3) == pytest.approx(0.5 * radius(lens, 1))
++
++    def test_a_pickup_added_after_a_solve_is_credited_with_the_radius(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        linked(lens, 1, 3, scale=0.5)
++        driven = lens.updater.driven_values()
++        assert driven["radius[3]"] is lens.pickups.pickups[0]
++
++    def test_a_solve_added_after_a_pickup_wins_the_radius(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 1, 3, scale=0.5)
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        lens.updater.update()
++        assert marginal_slope(lens, 3) == pytest.approx(-0.05, abs=1e-9)
++        assert lens.updater.driven_values()["radius[3]"] is lens.solves.solves[0]
++
++    def test_a_later_solve_runs_after_the_pickup_it_overrides(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 1, 3, scale=0.5)
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        order = lens.updater.resolution_order()
++        assert order == [lens.pickups.pickups[0], lens.solves.solves[0]]
++
++    def test_an_earlier_solve_runs_before_the_pickup_that_overrides_it(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        linked(lens, 1, 3, scale=0.5)
++        order = lens.updater.resolution_order()
++        assert order == [lens.solves.solves[0], lens.pickups.pickups[0]]
++
++    def test_a_later_pickup_waits_only_on_the_solve_it_overrides(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        linked(lens, 1, 3, scale=0.5)
++        report = dict(
++            (id(item), waits) for item, waits in lens.updater.dependency_report()
++        )
++        pickup = lens.pickups.pickups[0]
++        assert report[id(pickup)] == [lens.solves.solves[0]]
++
++
++class TestRoundTrips:
++    def test_writer_precedence_survives_a_round_trip(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        lens.pickups.add(1, "radius", 3, scale=2.0, offset=1.0)
++        lens.updater.update()
++        settled = radius(lens, 3)
++        back = Optic.from_dict(lens.to_dict())
++        back.updater.update()
++        assert radius(back, 3) == pytest.approx(settled, abs=1e-9)
++        assert radius(back, 3) == pytest.approx(2.0 * radius(back, 1) + 1.0, abs=1e-9)
++
++    def test_writer_precedence_survives_a_json_round_trip(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        lens.pickups.add(1, "radius", 3, scale=2.0, offset=1.0)
++        lens.updater.update()
++        settled = radius(lens, 3)
++        back = Optic.from_dict(json.loads(json.dumps(lens.to_dict())))
++        back.updater.update()
++        assert radius(back, 3) == pytest.approx(settled, abs=1e-9)
++        assert radius(back, 3) == pytest.approx(2.0 * radius(back, 1) + 1.0, abs=1e-9)
++
++    def test_a_solve_driven_space_survives_a_round_trip(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        lens.pickups.add(2, "thickness", 1, scale=0.2)
++        lens.updater.update()
++        settled = gap(lens, 1)
++        back = Optic.from_dict(lens.to_dict())
++        back.updater.update()
++        assert gap(back, 1) == pytest.approx(settled, abs=1e-9)
++        assert gap(back, 1) == pytest.approx(0.2 * gap(back, 2), abs=1e-9)
++
++    def test_a_loaded_prescription_keeps_what_its_last_writer_settled(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.pickups.add(1, "radius", 3, scale=0.5)
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        lens.updater.update()
++        settled = radius(lens, 3)
++        back = Optic.from_dict(lens.to_dict())
++        assert radius(back, 3) == pytest.approx(settled, abs=1e-9)
++
++    def test_the_earlier_writer_still_loses_after_a_round_trip(self, set_test_backend):
++        lens = doublet()
++        lens.pickups.add(1, "radius", 3, scale=2.0, offset=1.0)
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        lens.updater.update()
++        back = Optic.from_dict(lens.to_dict())
++        back.updater.update()
++        assert marginal_slope(back, 3) == pytest.approx(-0.05, abs=1e-9)
++        assert back.updater.driven_values()["radius[3]"] is back.solves.solves[0]
++
++
++class TestExactlyOnce:
++    def test_update_applies_every_constraint_exactly_once(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=-1.0)
++        linked(lens, 1, 3, scale=2.0)
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        lens.solves.add("quick_focus")
++        tallies = counted(lens.updater.resolution_order())
++        lens.updater.update()
++        assert applications(tallies) == [1, 1, 1, 1]
++
++    def test_a_source_read_by_two_pickups_is_applied_once(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 1, 2, scale=0.5)
++        linked(lens, 2, 3, scale=2.0)
++        linked(lens, 2, 4, scale=-1.0)
++        tallies = counted(lens.updater.resolution_order())
++        lens.updater.update()
++        assert applications(tallies) == [1, 1, 1]
++
++    def test_a_solve_feeding_two_readers_is_applied_once(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        linked(lens, 1, 3, attr="thickness", scale=2.0)
++        linked(lens, 1, 4, attr="thickness", scale=3.0)
++        tallies = counted(lens.updater.resolution_order())
++        lens.updater.update()
++        assert applications(tallies) == [1, 1, 1]
++
++    def test_managers_apply_their_own_list_exactly_once(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=-1.0)
++        linked(lens, 1, 3, scale=2.0)
++        tallies = counted(lens.updater.resolution_order())
++        lens.pickups.apply()
++        assert applications(tallies) == [1, 1]
++
++    def test_solve_manager_applies_its_own_list_exactly_once(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        lens.updater.set_radius(37.0, 1)
++        tallies = counted(list(lens.solves.solves))
++        lens.solves.apply()
++        assert applications(tallies) == [1, 1]
++        assert marginal_height(lens, 2) == pytest.approx(3.0, abs=1e-9)
++        assert marginal_height(lens, 4) == pytest.approx(1.0, abs=1e-9)
++
++
++class TestValueIdentity:
++    def test_short_name_and_attribute_path_name_one_radius(self, set_test_backend):
++        lens = doublet()
++        lens.pickups.add(3, RADIUS_PATH, 4, scale=-1.0)
++        linked(lens, 1, 3, scale=2.0)
++        lens.updater.set_radius(37.0, 1)
++        lens.updater.update()
++        assert radius(lens, 4) == pytest.approx(-74.0)
++
++    def test_attribute_path_source_sees_short_name_writer(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=-1.0)
++        lens.pickups.add(1, RADIUS_PATH, 3, scale=2.0)
++        lens.updater.set_radius(37.0, 1)
++        lens.updater.update()
++        assert radius(lens, 4) == pytest.approx(-74.0)
++
++    def test_short_and_long_surface_spellings_name_one_path(self, set_test_backend):
++        lens = doublet()
++        lens.pickups.add(3, SHORT_RADIUS_PATH, 4, scale=-1.0)
++        lens.pickups.add(1, RADIUS_PATH, 3, scale=2.0)
++        lens.updater.set_radius(37.0, 1)
++        lens.updater.update()
++        assert radius(lens, 4) == pytest.approx(-74.0)
++
++    def test_short_name_and_attribute_path_name_one_conic(self, set_test_backend):
++        lens = conic_doublet()
++        lens.pickups.add(3, CONIC_PATH, 4, scale=-1.0)
++        linked(lens, 1, 3, scale=2.0, attr="conic")
++        lens.updater.set_conic(-0.25, 1)
++        lens.updater.update()
++        assert conic(lens, 4) == pytest.approx(0.5)
++
++    def test_short_material_path_and_the_short_name_name_one_value(
++        self, set_test_backend
++    ):
++        lens = two_glass_doublet()
++        lens.pickups.add(1, SHORT_MATERIAL_PATH, 4)
++        linked(lens, 3, 1, attr="material")
++        lens.updater.set_material("N-BK7", 1)
++        lens.updater.update()
++        assert glass_index(lens, 4) == pytest.approx(glass_index(lens, 3))
++
++    def test_short_conic_path_and_the_short_name_name_one_value(
++        self, set_test_backend
++    ):
++        lens = conic_doublet()
++        lens.pickups.add(3, SHORT_CONIC_PATH, 4, scale=-1.0)
++        linked(lens, 1, 3, scale=2.0, attr="conic")
++        lens.updater.set_conic(-0.25, 1)
++        lens.updater.update()
++        assert conic(lens, 4) == pytest.approx(0.5)
++
++    def test_unrelated_attribute_paths_stay_independent(self, set_test_backend):
++        lens = doublet()
++        lens.pickups.add(3, COMMENT_PATH, 4)
++        lens.pickups.add(1, RADIUS_PATH, 3, scale=2.0)
++        order = lens.updater.resolution_order()
++        assert order == [lens.pickups.pickups[0], lens.pickups.pickups[1]]
++
++    def test_a_pickup_between_two_optics_reads_the_other_optic(self, set_test_backend):
++        source = doublet()
++        target = doublet()
++        target.pickups.add(1, "radius", 3, scale=2.0)
++        target.pickups.add(1, "radius", 1, scale=1.0, source_optic=source)
++        source.updater.set_radius(44.0, 1)
++        target.updater.update()
++        assert radius(target, 1) == pytest.approx(44.0)
++        assert radius(target, 3) == pytest.approx(88.0)
++
++    def test_two_optics_do_not_share_a_value(self, set_test_backend):
++        source = doublet()
++        target = doublet()
++        target.pickups.add(1, "radius", 1, scale=1.0, source_optic=source)
++        target.pickups.add(1, "radius", 3, scale=2.0)
++        source.updater.set_radius(44.0, 1)
++        target.updater.update()
++        assert radius(target, 3) == pytest.approx(88.0)
++        assert list(target.updater.driven_values()) == ["radius[1]", "radius[3]"]
++
++
++class TestSpaces:
++    def test_ray_height_solve_feeds_a_thickness_pickup(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 0.0)
++        linked(lens, 3, 4, attr="thickness")
++        lens.updater.update()
++        assert gap(lens, 4) == pytest.approx(gap(lens, 3))
++
++    def test_a_thickness_pickup_reads_the_space_a_solve_resized(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        linked(lens, 1, 3, scale=2.0, attr="thickness")
++        lens.updater.set_radius(37.0, 1)
++        lens.updater.update()
++        assert marginal_height(lens, 2) == pytest.approx(3.0, abs=1e-9)
++        assert gap(lens, 3) == pytest.approx(2.0 * gap(lens, 1))
++
++    def test_ray_height_solve_resizes_only_its_own_space(self, set_test_backend):
++        lens = doublet()
++        before = [gap(lens, i) for i in range(5)]
++        lens.solves.add("marginal_ray_height", 4, 2.0)
++        lens.updater.update()
++        after = [gap(lens, i) for i in range(5)]
++        assert after[3] != pytest.approx(before[3])
++        assert [after[i] for i in (0, 1, 2, 4)] == pytest.approx(
++            [before[i] for i in (0, 1, 2, 4)]
++        )
++        assert [recorded_gap(lens, i) for i in range(1, 5)] == pytest.approx(
++            after[1:5]
++        )
++
++    def test_recorded_size_follows_a_ray_height_solve(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 2.0)
++        lens.updater.update()
++        assert recorded_gap(lens, 3) == pytest.approx(gap(lens, 3))
++
++    def test_recorded_size_follows_quick_focus(self, set_test_backend):
++        lens = singlet()
++        lens.solves.add("quick_focus")
++        lens.updater.update()
++        assert recorded_gap(lens, 2) == pytest.approx(gap(lens, 2))
++
++    def test_writing_another_space_does_not_undo_a_solve(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 2.0)
++        lens.updater.update()
++        solved = gap(lens, 3)
++        lens.updater.set_thickness(8.0, 1)
++        assert gap(lens, 3) == pytest.approx(solved)
++
++    def test_the_first_space_survives_a_later_thickness_write(self, set_test_backend):
++        lens = finite_object_doublet()
++        lens.solves.add("marginal_ray_height", 1, 4.0)
++        lens.updater.update()
++        solved = gap(lens, 0)
++        assert recorded_gap(lens, 0) == pytest.approx(solved)
++        lens.updater.set_thickness(9.0, 3)
++        assert gap(lens, 0) == pytest.approx(solved)
++
++    def test_quick_focus_survives_a_later_thickness_write(self, set_test_backend):
++        lens = singlet()
++        lens.solves.add("quick_focus")
++        lens.updater.update()
++        focus = gap(lens, 2)
++        lens.updater.set_thickness(8.5, 1)
++        assert gap(lens, 2) == pytest.approx(focus)
++
++    def test_a_thickness_path_pickup_moves_the_space_itself(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        lens.pickups.add(1, THICKNESS_PATH, 4)
++        lens.updater.set_radius(37.0, 1)
++        lens.updater.update()
++        assert marginal_height(lens, 2) == pytest.approx(3.0, abs=1e-9)
++        assert gap(lens, 4) == pytest.approx(gap(lens, 1))
++        assert recorded_gap(lens, 4) == pytest.approx(gap(lens, 4))
++        assert list(lens.updater.driven_values()) == ["thickness[1]", "thickness[4]"]
++
++    def test_the_short_thickness_path_names_the_same_space(self, set_test_backend):
++        lens = doublet()
++        lens.pickups.add(1, SHORT_THICKNESS_PATH, 4)
++        assert list(lens.updater.driven_values()) == ["thickness[4]"]
++        assert gap(lens, 4) == pytest.approx(gap(lens, 1))
++
++    def test_thickness_pickup_chain_across_a_solve(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, attr="thickness")
++        lens.solves.add("marginal_ray_height", 4, 0.5)
++        lens.updater.update()
++        assert gap(lens, 4) == pytest.approx(gap(lens, 3))
++        assert marginal_height(lens, 4) == pytest.approx(0.5, abs=1e-9)
++        assert recorded_gap(lens, 3) == pytest.approx(gap(lens, 3))
++        assert recorded_gap(lens, 4) == pytest.approx(gap(lens, 4))
++
++
++class TestSolveScope:
++    def test_two_ray_height_solves_both_reach_their_targets(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        lens.updater.set_radius(37.0, 1)
++        lens.updater.update()
++        assert marginal_height(lens, 2) == pytest.approx(3.0, abs=1e-9)
++        assert marginal_height(lens, 4) == pytest.approx(1.0, abs=1e-9)
++
++    def test_upstream_ray_height_solve_runs_first(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        order = lens.updater.resolution_order()
++        assert [item.surface_idx for item in order] == [2, 4]
++
++    def test_two_ray_height_solves_are_not_circular(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        assert len(lens.updater.resolution_order()) == 2
++
++    def test_a_pickup_on_a_later_surface_does_not_delay_a_solve(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        linked(lens, 3, 4, scale=-1.0)
++        order = lens.updater.resolution_order()
++        assert order == [lens.pickups.pickups[0], lens.solves.solves[0]]
++
++    def test_a_pickup_on_an_earlier_surface_runs_before_a_solve(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        linked(lens, 1, 2, scale=-1.0)
++        report = lens.updater.dependency_report()
++        solves = [item for item, _ in report if hasattr(item, "height")]
++        prerequisites = [needed for item, needed in report if hasattr(item, "height")]
++        assert len(solves) == 1
++        assert len(prerequisites[0]) == 1
++
++    def test_a_pickup_reads_the_radius_a_ray_angle_solve_drives(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        linked(lens, 3, 4, scale=-1.0)
++        lens.solves.add("marginal_ray_angle", 3, -0.06)
++        lens.updater.set_radius(45.0, 1)
++        lens.updater.update()
++        assert marginal_slope(lens, 3) == pytest.approx(-0.06, abs=1e-9)
++        assert radius(lens, 4) == pytest.approx(-radius(lens, 3))
++
++    def test_a_ray_angle_solve_does_not_wait_on_the_radius_it_drives(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.solves.add("marginal_ray_angle", 3, -0.06)
++        linked(lens, 2, 4, scale=-1.0)
++        linked(lens, 1, 2, scale=-1.0)
++        lens.updater.set_radius(45.0, 1)
++        lens.updater.update()
++        assert radius(lens, 2) == pytest.approx(-45.0)
++        assert radius(lens, 4) == pytest.approx(45.0)
++        assert marginal_slope(lens, 3) == pytest.approx(-0.06, abs=1e-9)
++
++    def test_quick_focus_waits_on_an_upstream_angle_solve(self, set_test_backend):
++        lens = singlet()
++        lens.solves.add("quick_focus")
++        lens.solves.add("marginal_ray_angle", 1, -0.05)
++        order = lens.updater.resolution_order()
++        assert order == [lens.solves.solves[1], lens.solves.solves[0]]
++
++    def test_quick_focus_runs_after_every_pickup_it_reads(self, set_test_backend):
++        lens = singlet()
++        lens.solves.add("quick_focus")
++        linked(lens, 1, 2, scale=-1.0)
++        lens.updater.set_radius(55.0, 1)
++        lens.updater.update()
++        assert radius(lens, 2) == pytest.approx(-55.0)
++        order = lens.updater.resolution_order()
++        assert order == [lens.pickups.pickups[0], lens.solves.solves[0]]
++
++
++class TestOwnSurfaceScope:
++    def test_a_height_and_an_angle_solve_share_one_surface(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_angle", 2, -0.05)
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        order = lens.updater.resolution_order()
++        assert order[0] is lens.solves.solves[1]
++        assert order[1] is lens.solves.solves[0]
++        lens.updater.update()
++        assert marginal_height(lens, 2) == pytest.approx(3.0, abs=1e-9)
++        assert marginal_slope(lens, 2) == pytest.approx(-0.05, abs=1e-9)
++
++    def test_a_chief_height_and_an_angle_solve_share_one_surface(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(1)
++        lens.solves.add("marginal_ray_angle", 2, -0.05)
++        lens.solves.add("chief_ray_height", 2, 1.0)
++        order = lens.updater.resolution_order()
++        assert order[0] is lens.solves.solves[1]
++        assert order[1] is lens.solves.solves[0]
++        lens.updater.update()
++        assert chief_height(lens, 2) == pytest.approx(1.0, abs=1e-9)
++        assert marginal_slope(lens, 2) == pytest.approx(-0.05, abs=1e-9)
++
++    def test_a_chief_height_and_an_angle_solve_share_a_surface_before_the_stop(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(4)
++        lens.solves.add("marginal_ray_angle", 2, -0.05)
++        lens.solves.add("chief_ray_height", 2, 1.0)
++        order = lens.updater.resolution_order()
++        assert order[0] is lens.solves.solves[1]
++        assert order[1] is lens.solves.solves[0]
++        lens.updater.update()
++        assert marginal_slope(lens, 2) == pytest.approx(-0.05, abs=1e-9)
++
++    def test_a_chief_height_and_a_chief_angle_share_a_surface_before_the_stop(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(4)
++        lens.solves.add("chief_ray_angle", 2, -0.05)
++        lens.solves.add("chief_ray_height", 2, 1.0)
++        order = lens.updater.resolution_order()
++        assert order[0] is lens.solves.solves[1]
++        assert order[1] is lens.solves.solves[0]
++        assert list(lens.updater.driven_values()) == ["thickness[1]", "radius[2]"]
++
++    def test_an_angle_and_a_height_solve_on_adjacent_surfaces(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        order = lens.updater.resolution_order()
++        assert order[0] is lens.solves.solves[1]
++        assert order[1] is lens.solves.solves[0]
++        lens.solves.apply()
++        assert marginal_slope(lens, 3) == pytest.approx(-0.05, abs=1e-9)
++        assert marginal_height(lens, 4) == pytest.approx(1.0, abs=1e-9)
++
++    def test_a_chief_angle_and_a_height_solve_on_adjacent_surfaces(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(4)
++        lens.solves.add("marginal_ray_height", 3, 2.0)
++        lens.solves.add("chief_ray_angle", 2, -0.05)
++        order = lens.updater.resolution_order()
++        assert order[0] is lens.solves.solves[1]
++        assert order[1] is lens.solves.solves[0]
++        assert list(lens.updater.driven_values()) == ["radius[2]", "thickness[2]"]
++        lens.solves.apply()
++        assert marginal_height(lens, 3) == pytest.approx(2.0, abs=1e-2)
++
++    def test_a_height_solve_ignores_the_glass_it_opens(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        lens.pickups.add(3, "material", 2)
++        report = lens.updater.dependency_report()
++        waited = [needed for item, needed in report if hasattr(item, "height")]
++        assert len(waited) == 1
++        assert waited[0] == []
++
++    def test_two_chief_height_solves_before_the_stop_are_not_circular(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(4)
++        lens.solves.add("chief_ray_height", 3, 1.5)
++        lens.solves.add("chief_ray_height", 2, 1.0)
++        order = lens.updater.resolution_order()
++        assert order[0] is lens.solves.solves[1]
++        assert order[1] is lens.solves.solves[0]
++        assert list(lens.updater.driven_values()) == ["thickness[1]", "thickness[2]"]
++
++    def test_a_chief_height_solve_ignores_the_glass_after_the_stop(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(4)
++        lens.solves.add("chief_ray_height", 2, 1.0)
++        lens.pickups.add(3, "material", 4)
++        report = lens.updater.dependency_report()
++        waited = [needed for item, needed in report if hasattr(item, "height")]
++        assert len(waited) == 1
++        assert waited[0] == []
++
++    def test_a_chief_height_solve_ignores_the_glass_it_opens(self, set_test_backend):
++        lens = stopped_doublet(1)
++        lens.solves.add("chief_ray_height", 2, 1.0)
++        lens.pickups.add(3, "material", 2)
++        report = lens.updater.dependency_report()
++        waited = [needed for item, needed in report if hasattr(item, "height")]
++        assert len(waited) == 1
++        assert waited[0] == []
++
++
++class TestCircularPrescriptions:
++    def test_two_pickups_reading_each_other_are_rejected(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 2, 1, offset=10.0)
++        linked(lens, 1, 2, offset=10.0)
++        with pytest.raises(ValueError):
++            lens.updater.update()
++
++    def test_a_pickup_reading_its_own_target_is_rejected(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 1, 1, scale=2.0)
++        with pytest.raises(ValueError):
++            lens.updater.update()
++
++    def test_a_loop_of_three_pickups_is_rejected(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 1, 2)
++        linked(lens, 2, 3)
++        linked(lens, 3, 1)
++        with pytest.raises(ValueError):
++            lens.updater.update()
++
++    def test_an_attribute_path_chain_resolves_in_dependency_order(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.surfaces[1].comment = "source"
++        lens.pickups.add(3, COMMENT_PATH, 4)
++        lens.pickups.add(1, COMMENT_PATH, 3)
++        lens.surfaces[3].comment = "stale"
++        lens.updater.update()
++        assert lens.surfaces[3].comment == "source"
++        assert lens.surfaces[4].comment == "source"
++
++    def test_a_loop_between_two_attribute_paths_is_rejected(self, set_test_backend):
++        lens = doublet()
++        lens.pickups.add(2, COMMENT_PATH, 1)
++        lens.pickups.add(1, COMMENT_PATH, 2)
++        with pytest.raises(ValueError):
++            lens.updater.update()
++
++    def test_a_loop_through_an_attribute_path_is_rejected(self, set_test_backend):
++        lens = doublet()
++        lens.pickups.add(2, RADIUS_PATH, 1, offset=10.0)
++        linked(lens, 1, 2, offset=10.0)
++        with pytest.raises(ValueError):
++            lens.updater.update()
++
++    def test_quick_focus_and_the_space_it_sets_form_a_loop(self, set_test_backend):
++        lens = singlet()
++        lens.solves.add("quick_focus")
++        linked(lens, 2, 1, attr="thickness")
++        before = [gap(lens, i) for i in range(3)]
++        recorded = [recorded_gap(lens, i) for i in range(1, 3)]
++        with pytest.raises(ValueError):
++            lens.updater.update()
++        assert [gap(lens, i) for i in range(3)] == pytest.approx(before)
++        assert [recorded_gap(lens, i) for i in range(1, 3)] == pytest.approx(recorded)
++
++    def test_a_loop_between_a_pickup_and_a_solve_is_rejected(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        linked(lens, 3, 1, attr="thickness")
++        with pytest.raises(ValueError):
++            lens.updater.update()
++
++    def test_a_rejected_prescription_leaves_every_value_alone(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 2, 1, offset=10.0)
++        linked(lens, 1, 2, offset=10.0)
++        before = [radius(lens, i) for i in range(1, 5)]
++        with pytest.raises(ValueError):
++            lens.updater.update()
++        assert [radius(lens, i) for i in range(1, 5)] == pytest.approx(before)
++
++    def test_a_rejected_mixed_prescription_leaves_every_space_alone(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        linked(lens, 3, 1, attr="thickness")
++        before = [gap(lens, i) for i in range(1, 5)]
++        recorded = [recorded_gap(lens, i) for i in range(1, 5)]
++        with pytest.raises(ValueError):
++            lens.updater.update()
++        assert [gap(lens, i) for i in range(1, 5)] == pytest.approx(before)
++        assert [recorded_gap(lens, i) for i in range(1, 5)] == pytest.approx(recorded)
++
++    def test_a_rejected_mixed_prescription_applies_no_constraint(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        linked(lens, 3, 1, attr="thickness")
++        tallies = counted(list(lens.pickups.pickups) + list(lens.solves.solves))
++        with pytest.raises(ValueError):
++            lens.updater.update()
++        assert applications(tallies) == [0, 0]
++
++    def test_resolution_order_reports_a_loop(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 2, 1, offset=10.0)
++        linked(lens, 1, 2, offset=10.0)
++        with pytest.raises(ValueError):
++            lens.updater.resolution_order()
++
++    def test_dependency_report_reports_a_loop(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 2, 1, offset=10.0)
++        linked(lens, 1, 2, offset=10.0)
++        with pytest.raises(ValueError):
++            lens.updater.dependency_report()
++
++    def test_a_loop_across_two_optics_is_rejected(self, set_test_backend):
++        first = doublet()
++        second = doublet()
++        first.pickups.add(1, "radius", 1, source_optic=second)
++        second.pickups.add(1, "radius", 1, source_optic=first)
++        configuration = MultiConfiguration(first)
++        configuration.configurations.append(second)
++        with pytest.raises(ValueError):
++            configuration.configuration_order()
++
++
++class TestReporting:
++    def test_resolution_order_lists_every_constraint(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 1, 2)
++        linked(lens, 3, 4)
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        assert len(lens.updater.resolution_order()) == 3
++
++    def test_resolution_order_places_a_source_before_its_reader(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        linked(lens, 3, 4, scale=-1.0)
++        linked(lens, 1, 3, scale=2.0)
++        order = lens.updater.resolution_order()
++        assert [item.target_surface_idx for item in order] == [3, 4]
++
++    def test_resolution_order_keeps_pickups_ahead_of_solves(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        linked(lens, 3, 4, scale=-1.0)
++        order = lens.updater.resolution_order()
++        assert order[0] is lens.pickups.pickups[0]
++
++    def test_dependency_report_names_the_constraint_waited_on(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=-1.0)
++        linked(lens, 1, 3, scale=2.0)
++        report = lens.updater.dependency_report()
++        assert [item.target_surface_idx for item, _ in report] == [3, 4]
++        assert report[0][1] == []
++        assert report[1][1] == [report[0][0]]
++
++    def test_dependency_report_leaves_independents_without_prerequisites(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        linked(lens, 1, 2)
++        linked(lens, 3, 4)
++        report = lens.updater.dependency_report()
++        assert [needed for _, needed in report] == [[], []]
++
++    def test_dependency_report_lists_every_writer_of_a_source(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 1, 3, scale=2.0)
++        linked(lens, 2, 3, scale=0.0, offset=5.0)
++        linked(lens, 3, 4, scale=1.0)
++        report = lens.updater.dependency_report()
++        assert len(report[2][1]) == 2
++
++
++class TestManagers:
++    def test_pickup_manager_orders_its_own_list(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=-1.0)
++        linked(lens, 1, 3, scale=2.0)
++        lens.updater.set_radius(37.0, 1)
++        lens.pickups.apply()
++        assert radius(lens, 4) == pytest.approx(-74.0)
++
++    def test_pickup_manager_rejects_a_loop(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 2, 1, offset=10.0)
++        linked(lens, 1, 2, offset=10.0)
++        with pytest.raises(ValueError):
++            lens.pickups.apply()
++
++    def test_solve_manager_orders_its_own_list(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        lens.solves.add("marginal_ray_height", 2, 3.0)
++        lens.updater.set_radius(37.0, 1)
++        lens.solves.apply()
++        assert marginal_height(lens, 2) == pytest.approx(3.0, abs=1e-9)
++        assert marginal_height(lens, 4) == pytest.approx(1.0, abs=1e-9)
++
++
++class TestConfigurations:
++    def test_configuration_order_puts_a_source_first(self, set_test_backend):
++        configuration = MultiConfiguration(doublet())
++        derived = configuration.add_configuration(0)
++        order = configuration.configuration_order()
++        assert order[0] is configuration.configurations[0]
++        assert order[1] is derived
++
++    def test_configuration_order_follows_a_chain(self, set_test_backend):
++        configuration = MultiConfiguration(doublet())
++        first = configuration.add_configuration(0)
++        second = configuration.add_configuration(1)
++        order = configuration.configuration_order()
++        assert order == [configuration.configurations[0], first, second]
++
++    def test_update_all_settles_a_derived_configuration(self, set_test_backend):
++        configuration = MultiConfiguration(doublet())
++        derived = configuration.add_configuration(0)
++        configuration.configurations[0].updater.set_radius(28.0, 1)
++        configuration.update_all()
++        assert radius(derived, 1) == pytest.approx(28.0)
++
++    def test_update_all_settles_a_chain_of_configurations(self, set_test_backend):
++        configuration = MultiConfiguration(doublet())
++        configuration.add_configuration(0)
++        last = configuration.add_configuration(1)
++        configuration.configurations[0].updater.set_radius(26.0, 1)
++        configuration.update_all()
++        assert radius(last, 1) == pytest.approx(26.0)
++
++    def test_update_all_resolves_inside_each_configuration(self, set_test_backend):
++        configuration = MultiConfiguration(doublet())
++        derived = configuration.add_configuration(0)
++        derived.pickups.add(3, "radius", 4, scale=-1.0)
++        configuration.configurations[0].updater.set_radius(-90.0, 3)
++        configuration.update_all()
++        assert radius(derived, 4) == pytest.approx(90.0)
++
++    def test_configuration_order_keeps_independent_configurations_in_order(
++        self, set_test_backend
++    ):
++        first = doublet()
++        second = doublet()
++        configuration = MultiConfiguration(first)
++        configuration.configurations.append(second)
++        assert configuration.configuration_order() == [first, second]
++
++    def test_configuration_order_puts_a_later_listed_source_first(
++        self, set_test_backend
++    ):
++        first = doublet()
++        second = doublet()
++        first.pickups.add(1, "radius", 1, source_optic=second, offset=3.0)
++        configuration = MultiConfiguration(first)
++        configuration.configurations.append(second)
++        assert configuration.configuration_order() == [second, first]
++
++    def test_update_all_settles_a_reader_listed_before_its_source(
++        self, set_test_backend
++    ):
++        first = doublet()
++        second = doublet()
++        second.pickups.add(1, "radius", 2, scale=2.0)
++        first.pickups.add(2, "radius", 2, source_optic=second)
++        configuration = MultiConfiguration(first)
++        configuration.configurations.append(second)
++        second.updater.set_radius(31.0, 1)
++        configuration.update_all()
++        assert radius(second, 2) == pytest.approx(62.0)
++        assert radius(first, 2) == pytest.approx(62.0)
++
++    def test_update_all_rejects_a_configuration_cycle_and_changes_nothing(
++        self, set_test_backend
++    ):
++        first = doublet()
++        second = doublet()
++        first.pickups.add(1, "radius", 1, source_optic=second, offset=3.0)
++        second.pickups.add(1, "radius", 1, source_optic=first, offset=5.0)
++        configuration = MultiConfiguration(first)
++        configuration.configurations.append(second)
++        before = [radius(first, 1), radius(second, 1)]
++        with pytest.raises(ValueError):
++            configuration.update_all()
++        assert [radius(first, 1), radius(second, 1)] == pytest.approx(before)
++
++
++class TestLaterConfigurations:
++    def test_update_all_changes_nothing_when_a_later_configuration_is_circular(
++        self, set_test_backend
++    ):
++        first = doublet()
++        second = doublet()
++        first.pickups.add(1, "radius", 2)
++        first.updater.set_radius(33.0, 1)
++        second.pickups.add(1, "radius", 2)
++        second.pickups.add(2, "radius", 1)
++        configuration = MultiConfiguration(first)
++        configuration.configurations.append(second)
++        before = [radius(first, 1), radius(first, 2), radius(second, 1)]
++        with pytest.raises(ValueError):
++            configuration.update_all()
++        assert [
++            radius(first, 1),
++            radius(first, 2),
++            radius(second, 1),
++        ] == pytest.approx(before)
++
++
++class TestMaterials:
++    def test_a_material_pickup_copies_the_glass(self, set_test_backend):
++        lens = two_glass_doublet()
++        linked(lens, 3, 1, attr="material")
++        lens.updater.update()
++        assert glass_index(lens, 1) == pytest.approx(glass_index(lens, 3))
++
++    def test_a_material_pickup_reaches_the_paraxial_model(self, set_test_backend):
++        lens = two_glass_doublet()
++        before = marginal_slope(lens, 1)
++        linked(lens, 3, 1, attr="material")
++        lens.updater.update()
++        assert marginal_slope(lens, 1) != pytest.approx(before)
++
++    def test_a_material_chain_resolves_in_one_update(self, set_test_backend):
++        lens = two_glass_doublet()
++        linked(lens, 1, 4, attr="material")
++        linked(lens, 3, 1, attr="material")
++        lens.updater.update()
++        assert glass_index(lens, 4) == pytest.approx(glass_index(lens, 3))
++
++    def test_the_material_path_and_the_short_name_name_one_value(
++        self, set_test_backend
++    ):
++        lens = two_glass_doublet()
++        lens.pickups.add(1, MATERIAL_PATH, 4)
++        linked(lens, 3, 1, attr="material")
++        lens.updater.update()
++        assert glass_index(lens, 4) == pytest.approx(glass_index(lens, 3))
++
++    def test_a_solve_waits_on_an_upstream_material_pickup(self, set_test_backend):
++        lens = two_glass_doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        linked(lens, 3, 1, attr="material")
++        report = lens.updater.dependency_report()
++        waited_on = [needed for item, needed in report if hasattr(item, "height")]
++        assert len(waited_on) == 1
++        assert waited_on[0] == [report[0][0]]
++
++    def test_a_solve_reaches_its_target_after_a_material_pickup(
++        self, set_test_backend
++    ):
++        lens = two_glass_doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        linked(lens, 3, 1, attr="material")
++        lens.updater.update()
++        assert marginal_height(lens, 4) == pytest.approx(1.0, abs=1e-9)
++
++    def test_a_material_loop_is_rejected(self, set_test_backend):
++        lens = two_glass_doublet()
++        linked(lens, 1, 3, attr="material")
++        linked(lens, 3, 1, attr="material")
++        with pytest.raises(ValueError):
++            lens.updater.update()
++
++
++class TestDrivenValues:
++    def test_driven_values_names_a_radius(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 1, 3, scale=2.0)
++        assert list(lens.updater.driven_values()) == ["radius[3]"]
++
++    def test_driven_values_names_a_conic(self, set_test_backend):
++        lens = conic_doublet()
++        linked(lens, 1, 3, scale=2.0, attr="conic")
++        assert list(lens.updater.driven_values()) == ["conic[3]"]
++
++    def test_driven_values_names_a_material(self, set_test_backend):
++        lens = two_glass_doublet()
++        linked(lens, 3, 1, attr="material")
++        assert list(lens.updater.driven_values()) == ["material[1]"]
++
++    def test_driven_values_names_the_space_a_solve_sets(self, set_test_backend):
++        lens = doublet()
++        lens.solves.add("marginal_ray_height", 4, 1.0)
++        assert list(lens.updater.driven_values()) == ["thickness[3]"]
++
++    def test_driven_values_names_the_space_quick_focus_sets(self, set_test_backend):
++        lens = singlet()
++        lens.solves.add("quick_focus")
++        assert list(lens.updater.driven_values()) == ["thickness[2]"]
++
++    def test_driven_values_uses_the_attribute_path_for_other_values(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        lens.pickups.add(3, COMMENT_PATH, 4)
++        assert list(lens.updater.driven_values()) == [
++            "surfaces.surfaces[4].comment"
++        ]
++
++    def test_driven_values_uses_a_second_attribute_path(self, set_test_backend):
++        lens = doublet()
++        lens.surfaces[3].geometry.cs.x = 2.5
++        lens.pickups.add(3, OFFSET_PATH, 4)
++        assert list(lens.updater.driven_values()) == [
++            "surfaces.surfaces[4].geometry.cs.x"
++        ]
++        lens.updater.update()
++        assert scalar(lens.surfaces[4].geometry.cs.x) == pytest.approx(2.5)
++
++    def test_driven_values_credits_the_last_writer(self, set_test_backend):
++        lens = doublet()
++        first = lens.pickups
++        linked(lens, 1, 3, scale=2.0)
++        linked(lens, 2, 3, scale=0.0, offset=11.0)
++        driven = lens.updater.driven_values()
++        assert driven["radius[3]"] is first.pickups[1]
++
++    def test_driven_values_follows_resolution_order(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 3, 4, scale=-1.0)
++        linked(lens, 1, 3, scale=2.0)
++        assert list(lens.updater.driven_values()) == ["radius[3]", "radius[4]"]
++
++    def test_driven_values_moves_a_re_settled_value_to_its_last_writer(
++        self, set_test_backend
++    ):
++        lens = doublet()
++        linked(lens, 1, 3, scale=2.0)
++        linked(lens, 1, 4, scale=3.0)
++        linked(lens, 2, 3, scale=0.0, offset=11.0)
++        driven = lens.updater.driven_values()
++        assert list(driven) == ["radius[4]", "radius[3]"]
++        assert driven["radius[3]"] is lens.pickups.pickups[2]
++
++    def test_driven_values_reports_a_loop(self, set_test_backend):
++        lens = doublet()
++        linked(lens, 2, 1, offset=10.0)
++        linked(lens, 1, 2, offset=10.0)
++        with pytest.raises(ValueError):
++            lens.updater.driven_values()
++
++    def test_driven_values_is_empty_without_a_prescription(self, set_test_backend):
++        lens = doublet()
++        assert lens.updater.driven_values() == {}
++
++
++class TestChiefRaySolves:
++    def test_a_chief_ray_solve_waits_on_a_pickup_behind_the_stop(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(4)
++        lens.solves.add("chief_ray_height", 2, 1.0)
++        linked(lens, 1, 3, scale=-1.0)
++        report = lens.updater.dependency_report()
++        waited_on = [needed for item, needed in report if hasattr(item, "height")]
++        assert len(waited_on) == 1
++        assert waited_on[0] == [report[0][0]]
++
++    def test_a_ray_height_solve_ignores_a_pickup_behind_the_stop(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(4)
++        lens.solves.add("marginal_ray_height", 2, 1.0)
++        linked(lens, 1, 3, scale=-1.0)
++        report = lens.updater.dependency_report()
++        assert [needed for _, needed in report] == [[], []]
++
++    def test_a_chief_ray_solve_runs_after_a_pickup_behind_the_stop(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(4)
++        lens.solves.add("chief_ray_height", 2, 1.0)
++        linked(lens, 1, 3, scale=-1.0)
++        lens.updater.set_radius(52.0, 1)
++        before = chief_height(lens, 2)
++        lens.updater.update()
++        assert radius(lens, 3) == pytest.approx(-52.0)
++        assert chief_height(lens, 2) != pytest.approx(before)
++        assert lens.updater.resolution_order()[1] is lens.solves.solves[0]
++
++    def test_a_chief_ray_angle_solve_waits_on_a_pickup_behind_the_stop(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(4)
++        lens.solves.add("chief_ray_angle", 2, 0.05)
++        linked(lens, 1, 3, scale=-1.0)
++        report = lens.updater.dependency_report()
++        waited_on = [needed for item, needed in report if hasattr(item, "angle")]
++        assert len(waited_on) == 1
++        assert waited_on[0] == [report[0][0]]
++
++    def test_a_chief_ray_solve_reads_a_space_through_the_stop(self, set_test_backend):
++        lens = stopped_doublet(4)
++        lens.solves.add("chief_ray_height", 2, 1.0)
++        linked(lens, 2, 3, scale=2.0, attr="thickness")
++        report = lens.updater.dependency_report()
++        assert report[1][0] is lens.solves.solves[0]
++        assert report[1][1] == [lens.pickups.pickups[0]]
++
++    def test_a_ray_angle_solve_waits_on_an_upstream_glass(self, set_test_backend):
++        lens = two_glass_doublet()
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        linked(lens, 3, 1, attr="material")
++        report = lens.updater.dependency_report()
++        assert report[1][0] is lens.solves.solves[0]
++        assert report[1][1] == [lens.pickups.pickups[0]]
++
++    def test_a_ray_angle_solve_waits_on_the_glass_it_refracts_into(
++        self, set_test_backend
++    ):
++        lens = two_glass_doublet()
++        lens.solves.add("marginal_ray_angle", 3, -0.05)
++        linked(lens, 1, 3, attr="material")
++        report = lens.updater.dependency_report()
++        assert report[1][0] is lens.solves.solves[0]
++        assert report[1][1] == [lens.pickups.pickups[0]]
++
++    def test_the_stop_does_not_widen_a_chief_ray_solve_behind_it(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(1)
++        lens.solves.add("chief_ray_height", 2, 1.0)
++        linked(lens, 2, 3, scale=-1.0)
++        report = lens.updater.dependency_report()
++        assert [needed for _, needed in report] == [[], []]
++
++    def test_a_chief_ray_solve_does_not_wait_on_the_space_after_the_stop(
++        self, set_test_backend
++    ):
++        lens = stopped_doublet(4)
++        lens.solves.add("chief_ray_height", 2, 1.0)
++        lens.pickups.add(1, "thickness", 4, scale=1.0, offset=2.0)
++        order = lens.updater.resolution_order()
++        assert len(order) == 2
++        assert order[0] is lens.solves.solves[0]
++        assert order[1] is lens.pickups.pickups[0]

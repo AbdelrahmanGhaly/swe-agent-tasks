@@ -1,0 +1,1337 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..c13c3847
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,67 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() { echo "usage: $0 [--output_path <path>] base|new" >&2; exit 2; }
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new) MODE="$1"; MODE_COUNT=$((MODE_COUNT + 1)); shift ;;
++    --output_path) shift; [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }; OUTPUT_PATH="$1"; shift ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    *) echo "unknown argument: $1" >&2; usage ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++[ -n "$OUTPUT_PATH" ] || OUTPUT_PATH="$(pwd)/test-results-$MODE.xml"
++case "$OUTPUT_PATH" in /*) ;; *) OUTPUT_PATH="$(pwd)/$OUTPUT_PATH" ;; esac
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++rm -f "$OUTPUT_PATH"
++
++cd "$(dirname "$0")" || exit 1
++
++NEW_TESTS=(
++  vivisect/symboliks/tests/test_bytemem_9ebbd4.py
++  vivisect/symboliks/tests/test_xlatewidth_1196f2.py
++  vivisect/symboliks/tests/test_sympaths_8d69c4.py
++  vivisect/tests/test_symtrack_151487.py
++)
++
++PYTEST=(python3 -m pytest -p no:cacheprovider -o addopts= -o "python_files=test*.py" -v --junitxml="$OUTPUT_PATH")
++
++LOG="$(mktemp 2>/dev/null || echo "$OUTPUT_PATH.log")"
++
++if [ "$MODE" = "new" ]; then
++  timeout 1800 "${PYTEST[@]}" "${NEW_TESTS[@]}" 2>&1 | tee "$LOG"
++  STATUS=${PIPESTATUS[0]}
++else
++  IGNORES=()
++  for t in "${NEW_TESTS[@]}"; do
++    IGNORES+=("--ignore=$t")
++  done
++  # vtrace and vdb tests start child processes and attach to them with ptrace.
++  # cobra and testremote start localhost TCP servers on fixed ports from worker threads, so a socket
++  # that is still closing can make a later bind fail with "Address already in use" from run to run.
++  # testcconvs.py holds no tests and its TestCase subclass overrides __init__ without arguments, so it cannot be collected.
++  timeout 3000 "${PYTEST[@]}" "${IGNORES[@]}" \
++    --ignore=vtrace --ignore=vdb --ignore=cobra --ignore=vivisect/tests/testremote.py \
++    --ignore=vivisect/tests/testcconvs.py . 2>&1 | tee "$LOG"
++  STATUS=${PIPESTATUS[0]}
++fi
++
++if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  DETAIL="$(tail -n 200 "$LOG" 2>/dev/null | LC_ALL=C tr -cd '\11\12\15\40-\176' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++  cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="utf-8"?>
++<testsuites><testsuite name="pytest" tests="1" failures="1" errors="0" time="0">
++<testcase classname="test.sh" name="${MODE}_suite"><failure message="no test results">pytest exited with status ${STATUS} before reporting any test.
++${DETAIL}</failure></testcase>
++</testsuite></testsuites>
++XMLEOF
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++rm -f "$LOG"
++exit "$STATUS"
+diff --git a/vivisect/symboliks/tests/test_bytemem_9ebbd4.py b/vivisect/symboliks/tests/test_bytemem_9ebbd4.py
+new file mode 100644
+index 00000000..b6221dd2
+--- /dev/null
++++ b/vivisect/symboliks/tests/test_bytemem_9ebbd4.py
+@@ -0,0 +1,418 @@
++import unittest
++
++import vivisect.const as v_const
++
++from vivisect.symboliks.common import Const, Var, Mem
++from vivisect.symboliks.effects import WriteMemory, SetVariable
++from vivisect.symboliks.tests.helpers import MockEmulator
++
++from vivisect.tests.helpers import MockVw
++
++
++EAX = 0x11223344
++EBX = 0x55667788
++ECX = 0x99aabbcc
++AX = 0xabcd
++XMM0 = 0x00112233445566778899aabbccddeeff
++
++VALS = {'eax': EAX, 'ebx': EBX, 'ecx': ECX, 'ax': AX, 'xmm0': XMM0}
++
++
++def sp(off):
++    return Var('esp', 4) + Const(off, 4)
++
++
++def plain(addr, size):
++    return Mem(addr, Const(size, 4)).solve()
++
++
++def mask(size):
++    return (1 << (size * 8)) - 1
++
++
++class ByteMemoryTest(unittest.TestCase):
++
++    def setUp(self):
++        self.vw = MockVw()
++        self.emu = MockEmulator(self.vw)
++
++    def value(self, addr, size, emu=None):
++        emu = emu or self.emu
++        sym = emu.readSymMemory(addr, Const(size, 4))
++        self.assertIsNotNone(sym)
++        self.assertEqual(sym.getWidth(), size)
++        return sym.solve(vals=VALS)
++
++    def test_byte_reads_inside_a_dword_write(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.assertEqual(self.value(sp(0), 1), 0x44)
++        self.assertEqual(self.value(sp(1), 1), 0x33)
++        self.assertEqual(self.value(sp(2), 1), 0x22)
++        self.assertEqual(self.value(sp(3), 1), 0x11)
++
++    def test_word_reads_at_every_offset_of_a_dword_write(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.assertEqual(self.value(sp(0), 2), 0x3344)
++        self.assertEqual(self.value(sp(1), 2), 0x2233)
++        self.assertEqual(self.value(sp(2), 2), 0x1122)
++
++    def test_byte_store_into_a_stored_dword(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.emu.writeSymMemory(sp(1), Const(0x41, 4), symsize=1)
++        self.assertEqual(self.value(sp(0), 4), 0x11224144)
++        self.assertEqual(self.value(sp(0), 2), 0x4144)
++        self.assertEqual(self.value(sp(2), 2), 0x1122)
++
++    def test_three_overlapping_writes_keep_the_most_recent_byte(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.emu.writeSymMemory(sp(2), Const(0xbeef, 2))
++        self.emu.writeSymMemory(sp(1), Const(0x5a, 1))
++        self.assertEqual(self.value(sp(0), 4), 0xbeef5a44)
++        self.assertEqual(self.value(sp(1), 2), 0xef5a)
++        self.assertEqual(self.value(sp(3), 1), 0xbe)
++
++    def test_older_bytes_survive_between_newer_writes(self):
++        self.emu.writeSymMemory(sp(0), Var('ebx', 4))
++        self.emu.writeSymMemory(sp(4), Var('ecx', 4))
++        self.emu.writeSymMemory(sp(2), Var('eax', 4))
++        self.emu.writeSymMemory(sp(3), Const(0x99, 1))
++        self.assertEqual(self.value(sp(0), 8), 0x99aa112299447788)
++        self.assertEqual(self.value(sp(2), 4), 0x11229944)
++
++    def test_rewriting_the_same_start_hides_an_inner_byte(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.emu.writeSymMemory(sp(1), Const(0x41, 1))
++        self.emu.writeSymMemory(sp(0), Var('ebx', 4))
++        self.assertEqual(repr(self.emu.readSymMemory(sp(0), Const(4, 4))), repr(Var('ebx', 4)))
++        self.assertEqual(self.value(sp(1), 1), 0x77)
++        self.assertEqual(self.value(sp(0), 4), EBX)
++
++    def test_shorter_rewrite_at_the_same_start(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.emu.writeSymMemory(sp(0), Const(0x99, 1))
++        self.assertEqual(self.value(sp(0), 4), 0x11223399)
++        self.assertEqual(self.value(sp(0), 1), 0x99)
++
++    def test_read_spanning_two_adjacent_writes(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.emu.writeSymMemory(sp(4), Var('ebx', 4))
++        self.assertEqual(self.value(sp(0), 8), (EBX << 32) | EAX)
++        self.assertEqual(self.value(sp(2), 4), ((EBX & 0xffff) << 16) | (EAX >> 16))
++        self.assertEqual(self.value(sp(3), 2), ((EBX & 0xff) << 8) | (EAX >> 24))
++
++    def test_exact_match_returns_the_written_value_itself(self):
++        self.emu.writeSymMemory(sp(8), Var('ecx', 4))
++        self.emu.writeSymMemory(sp(12), Var('ax', 2), symsize=2)
++        self.assertEqual(repr(self.emu.readSymMemory(sp(8), Const(4, 4))), repr(Var('ecx', 4)))
++        self.assertEqual(repr(self.emu.readSymMemory(sp(12), Const(2, 4))), repr(Var('ax', 2)))
++        self.assertEqual(self.value(sp(9), 2), 0xaabb)
++
++    def test_wider_value_is_cut_to_its_write_size(self):
++        self.emu.writeSymMemory(sp(0), Const(0x12345678, 4), symsize=1)
++        self.assertEqual(self.value(sp(0), 1), 0x78)
++        self.assertEqual(self.value(sp(0), 4), 0x78 | (plain(sp(0), 4) & 0xffffff00))
++
++    def test_wider_symbolik_value_is_cut_to_its_write_size(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4), symsize=2)
++        self.assertEqual(self.value(sp(0), 2), 0x3344)
++        self.assertEqual(self.value(sp(0), 4), 0x3344 | (plain(sp(0), 4) & 0xffff0000))
++
++    def test_narrower_value_is_zero_extended_to_its_write_size(self):
++        self.emu.writeSymMemory(sp(0), Var('ax', 2), symsize=4)
++        self.assertEqual(self.value(sp(0), 4), AX)
++        self.assertEqual(self.value(sp(3), 1), 0)
++        self.assertEqual(self.value(sp(1), 2), AX >> 8)
++
++    def test_write_size_defaults_to_the_value_width(self):
++        self.emu.writeSymMemory(sp(0), Var('ax', 2))
++        self.assertEqual(self.value(sp(0), 4), AX | (plain(sp(0), 4) & 0xffff0000))
++        self.assertEqual(repr(self.emu.readSymMemory(sp(0), Const(2, 4))), repr(Var('ax', 2)))
++
++    def test_symsize_accepts_ints_and_symboliks(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4), symsize=2)
++        self.emu.writeSymMemory(sp(8), Var('ebx', 4), symsize=Const(1, 4))
++        self.assertEqual(self.value(sp(0), 2), 0x3344)
++        self.assertEqual(self.value(sp(8), 2), 0x88 | (plain(sp(8), 2) & 0xff00))
++
++    def test_unwritten_bytes_below_written_bytes(self):
++        self.emu.writeSymMemory(sp(3), Const(0x41, 1))
++        self.assertEqual(self.value(sp(0), 4), (0x41 << 24) | (plain(sp(0), 4) & 0x00ffffff))
++
++    def test_unwritten_bytes_around_a_written_byte(self):
++        self.emu.writeSymMemory(sp(1), Const(0x5a, 1))
++        self.assertEqual(self.value(sp(0), 4), (0x5a << 8) | (plain(sp(0), 4) & 0xffff00ff))
++        self.assertEqual(self.value(sp(1), 2), 0x5a | (plain(sp(1), 2) & 0xff00))
++
++    def test_unwritten_bytes_between_two_writes(self):
++        self.emu.writeSymMemory(sp(0), Const(0x11, 1))
++        self.emu.writeSymMemory(sp(3), Const(0x44, 1))
++        self.assertEqual(self.value(sp(0), 4), 0x44000011 | (plain(sp(0), 4) & 0x00ffff00))
++
++    def test_read_with_no_written_byte_is_none(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.assertIsNone(self.emu.readSymMemory(sp(4), Const(4, 4)))
++        self.assertIsNone(self.emu.readSymMemory(Var('esp', 4) - Const(4, 4), Const(4, 4)))
++        self.assertEqual(self.value(sp(2), 4), (EAX >> 16) | (plain(sp(2), 4) & 0xffff0000))
++
++    def test_import_slot_answers_only_when_nothing_was_written(self):
++        self.vw._addLocation(0x1000, 4, v_const.LOC_IMPORT, 'kernel32.CreateFileA')
++        slot = Const(0x1000, 4)
++        self.assertEqual(repr(self.emu.readSymMemory(slot, Const(4, 4))), repr(Var('kernel32.CreateFileA', 4)))
++        self.emu.writeSymMemory(Const(0x1001, 4), Const(0x41, 1))
++        self.assertEqual(self.value(slot, 4), 0x4100 | (plain(slot, 4) & 0xffff00ff))
++
++    def test_values_that_are_not_symboliks_keep_exact_address_reads(self):
++        self.emu.writeSymMemory(sp(0), 'opaque')
++        self.assertEqual(self.emu.readSymMemory(sp(0), Const(4, 4)), 'opaque')
++        self.assertEqual(self.emu.readSymMemory(sp(0), 1024), 'opaque')
++        self.assertIsNone(self.emu.readSymMemory(sp(1), Const(1, 4)))
++        self.emu.writeSymMemory(sp(0), Const(0x41, 4), symsize=1)
++        self.assertEqual(self.value(sp(0), 1), 0x41)
++        self.assertEqual(self.value(sp(0), 2), 0x41 | (plain(sp(0), 2) & 0xff00))
++
++    def test_int_values_keep_exact_address_reads(self):
++        self.emu.writeSymMemory(sp(0), 0x41424344)
++        self.assertEqual(self.emu.readSymMemory(sp(0), Const(4, 4)), 0x41424344)
++        self.assertIsNone(self.emu.readSymMemory(sp(1), Const(1, 4)))
++        self.assertIsNone(self.emu.readSymMemory(sp(2), Const(2, 4)))
++        self.emu.writeSymMemory(sp(0), Const(0x55, 1))
++        self.assertEqual(self.value(sp(0), 2), 0x55 | (plain(sp(0), 2) & 0xff00))
++
++    def test_non_symbolik_values_with_a_symsize_keep_exact_address_reads(self):
++        self.emu.writeSymMemory(sp(0), 0x41424344, symsize=4)
++        self.assertEqual(self.emu.readSymMemory(sp(0), Const(4, 4)), 0x41424344)
++        self.assertIsNone(self.emu.readSymMemory(sp(1), Const(1, 4)))
++        self.emu.writeSymMemory(sp(8), 'opaque', symsize=Const(4, 4))
++        self.assertEqual(self.emu.readSymMemory(sp(8), Const(4, 4)), 'opaque')
++        self.assertIsNone(self.emu.readSymMemory(sp(9), Const(1, 4)))
++
++
++    def test_sized_write_from_an_earlier_start_hides_older_values(self):
++        self.emu.writeSymMemory(sp(1), 0x41424344)
++        self.emu.writeSymMemory(sp(5), 'opaque')
++        self.emu.writeSymMemory(sp(9), Mem(Const(0x2000, 4), Var('n', 1)))
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.emu.writeSymMemory(sp(4), Var('ebx', 4))
++        self.emu.writeSymMemory(sp(8), Var('ecx', 4))
++        self.assertEqual(self.value(sp(1), 1), (EAX >> 8) & 0xff)
++        self.assertEqual(self.value(sp(5), 2), (EBX >> 8) & 0xffff)
++        self.assertEqual(self.value(sp(9), 1), (ECX >> 8) & 0xff)
++        self.assertIsNone(self.emu.readSymMemory(sp(1), Var('n', 1)))
++        self.assertIsNone(self.emu.readSymMemory(sp(5), Var('n', 1)))
++        self.assertIsNone(self.emu.readSymMemory(sp(9), Var('n', 1)))
++
++
++    def test_non_symbolik_value_over_a_sized_write_is_read_only_at_its_address(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.emu.writeSymMemory(sp(0), 0x1234)
++        self.assertEqual(self.emu.readSymMemory(sp(0), Const(4, 4)), 0x1234)
++        self.assertEqual(self.emu.readSymMemory(sp(0), Const(2, 4)), 0x1234)
++        self.assertEqual(self.value(sp(1), 2), (EAX >> 8) & 0xffff)
++
++    def test_non_symbolik_value_stays_readable_beside_a_later_byte_write(self):
++        self.emu.writeSymMemory(sp(0), 0x41424344)
++        self.emu.writeSymMemory(sp(2), Const(0x99, 1))
++        self.assertEqual(self.emu.readSymMemory(sp(0), Const(4, 4)), 0x41424344)
++        self.assertEqual(self.value(sp(1), 2), 0x9900 | (plain(sp(1), 2) & 0xff))
++
++    def test_value_of_unknown_width_is_cut_to_an_explicit_symsize(self):
++        m = Mem(Const(0x2000, 4), Var('n', 1))
++        self.emu.writeSymMemory(Const(0x1000, 4), m, symsize=2)
++        self.assertEqual(self.value(Const(0x1000, 4), 2), m.solve(vals=VALS) & 0xffff)
++        self.assertEqual(self.value(Const(0x1001, 4), 1), (m.solve(vals=VALS) >> 8) & 0xff)
++
++    def test_mem_values_without_a_known_width_keep_exact_address_reads(self):
++        m = Mem(Const(0x2000, 4), Var('n', 1))
++        self.emu.writeSymMemory(Const(0x1000, 4), m)
++        self.assertEqual(repr(self.emu.readSymMemory(Const(0x1000, 4), Const(4, 4))), repr(m))
++        self.assertIsNone(self.emu.readSymMemory(Const(0x1001, 4), Const(1, 4)))
++        self.emu.writeSymMemory(Const(0x1000, 4), Const(0x41, 1))
++        self.assertEqual(self.value(Const(0x1000, 4), 2), 0x41 | (plain(Const(0x1000, 4), 2) & 0xff00))
++
++    def test_read_of_unknown_size_sees_only_a_write_at_that_address(self):
++        size = Var('n', 4)
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.emu.writeSymMemory(sp(1), Const(0x41, 4), symsize=1)
++        self.assertEqual(self.emu.readSymMemory(sp(0), size).solve(vals=VALS), EAX)
++        self.assertEqual(self.emu.readSymMemory(sp(1), size).solve(vals=VALS), 0x41)
++        self.assertIsNone(self.emu.readSymMemory(sp(2), size))
++        self.assertEqual(self.value(sp(0), 4), 0x11224144)
++
++    def test_sizes_with_a_variable_stay_unknown_under_vals(self):
++        size = Var('n', 1)
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.emu.writeSymMemory(sp(8), Var('ebx', 4), vals=VALS, symsize=size)
++        self.assertEqual(self.emu.readSymMemory(sp(0), size, vals=VALS).solve(vals=VALS), EAX)
++        self.assertIsNone(self.emu.readSymMemory(sp(1), size, vals=VALS))
++        self.assertEqual(self.emu.readSymMemory(sp(8), Const(4, 4)).solve(vals=VALS), EBX)
++        self.assertIsNone(self.emu.readSymMemory(sp(9), Const(1, 4)))
++
++    def test_addresses_are_solved_with_the_vals_of_each_call(self):
++        foo = Var('bar', 4) * Const(5, 4)
++        self.emu.writeSymMemory(foo, Var('eax', 4), vals={'bar': 20})
++        self.assertEqual(self.value(Const(101, 4), 1), 0x33)
++        self.assertEqual(self.value(Const(98, 4), 4), 0x33440000 | (plain(Const(98, 4), 4) & 0xffff))
++        sym = self.emu.readSymMemory(foo, Const(2, 4), vals={'bar': 20})
++        self.assertEqual(sym.solve(vals=VALS), 0x3344)
++        self.assertIsNone(self.emu.readSymMemory(foo, Const(2, 4)))
++
++    def test_addresses_are_used_as_given(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.emu.setSymVariable('esp', Var('esp', 4) - Const(4, 4))
++        self.assertEqual(self.value(sp(1), 1), 0x33)
++        self.assertEqual(self.value(sp(0), 4), EAX)
++
++    def test_sixteen_byte_value_slices(self):
++        self.emu.writeSymMemory(sp(0), Var('xmm0', 16))
++        self.assertEqual(self.value(sp(4), 4), (XMM0 >> 32) & mask(4))
++        self.assertEqual(self.value(sp(12), 4), (XMM0 >> 96) & mask(4))
++        self.assertEqual(self.value(sp(6), 8), (XMM0 >> 48) & mask(8))
++        self.assertEqual(self.value(sp(15), 1), 0x00)
++
++
++
++    def test_thirty_two_byte_reads_compose(self):
++        self.emu.writeSymMemory(sp(5), Const(0x41, 1))
++        self.emu.writeSymMemory(sp(24), Var('eax', 4))
++        unwritten = plain(sp(0), 32) & mask(32) & ~((0xff << 40) | (mask(4) << 192))
++        self.assertEqual(self.value(sp(0), 32), (EAX << 192) | (0x41 << 40) | unwritten)
++
++class ByteMemoryEffectsTest(unittest.TestCase):
++
++    def setUp(self):
++        self.emu = MockEmulator(MockVw())
++
++    def test_write_effect_uses_its_own_size(self):
++        self.emu.applyEffects([
++            WriteMemory(0x10, sp(0), Const(4, 4), Var('eax', 4)),
++            WriteMemory(0x11, sp(1), Const(1, 4), Const(0x41414141, 4)),
++        ])
++        sym = self.emu.readSymMemory(sp(0), Const(4, 4))
++        self.assertEqual(sym.solve(vals=VALS), 0x11224144)
++
++    def test_write_effect_of_a_word_inside_a_qword(self):
++        self.emu.applyEffects([
++            WriteMemory(0x10, sp(0), Const(4, 4), Var('eax', 4)),
++            WriteMemory(0x11, sp(4), Const(4, 4), Var('ebx', 4)),
++            WriteMemory(0x12, sp(3), Const(2, 4), Var('ecx', 4)),
++        ])
++        sym = self.emu.readSymMemory(sp(0), Const(8, 4))
++        self.assertEqual(sym.solve(vals=VALS), 0x556677bbcc223344)
++
++    def test_set_variable_reads_composed_memory(self):
++        effs = self.emu.applyEffects([
++            WriteMemory(0x10, sp(0), Const(4, 4), Var('eax', 4)),
++            WriteMemory(0x11, sp(1), Const(1, 4), Const(0x41, 4)),
++            SetVariable(0x12, 'edx', Mem(sp(1), Const(2, 4))),
++        ])
++        edx = self.emu.getSymVariable('edx')
++        self.assertEqual(edx.getWidth(), 2)
++        self.assertEqual(edx.solve(vals=VALS), 0x2241)
++        self.assertEqual(effs[2].symobj.solve(vals=VALS), 0x2241)
++
++    def test_write_effect_of_unknown_size_is_hidden_by_a_sized_write(self):
++        self.emu.applyEffects([
++            WriteMemory(0x10, sp(0), Var('n', 4), Var('eax', 4)),
++        ])
++        self.assertEqual(repr(self.emu.readSymMemory(sp(0), Const(4, 4))), repr(Var('eax', 4)))
++        self.assertIsNone(self.emu.readSymMemory(sp(1), Const(1, 4)))
++        self.emu.applyEffects([
++            WriteMemory(0x11, sp(0), Const(1, 4), Const(0x41, 4)),
++        ])
++        sym = self.emu.readSymMemory(sp(0), Const(4, 4))
++        self.assertEqual(sym.solve(vals=VALS), 0x41 | (plain(sp(0), 4) & 0xffffff00))
++
++
++class ByteMemorySolveTest(unittest.TestCase):
++
++    def setUp(self):
++        self.vw = MockVw()
++        self.emu = MockEmulator(self.vw)
++
++    def test_solving_memory_with_an_emulator_uses_written_bytes(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.assertEqual(Mem(sp(1), Const(1, 4)).solve(emu=self.emu, vals=VALS), 0x33)
++        self.assertEqual(Mem(sp(0), Const(4, 4)).solve(emu=self.emu, vals=VALS), EAX)
++        self.assertEqual(Mem(sp(2), Const(2, 4)).solve(emu=self.emu, vals=VALS), 0x1122)
++
++    def test_solving_partly_written_memory_with_an_emulator(self):
++        self.emu.writeSymMemory(sp(1), Const(0x5a, 1))
++        expected = (0x5a << 8) | (plain(sp(0), 4) & 0xffff00ff)
++        self.assertEqual(Mem(sp(0), Const(4, 4)).solve(emu=self.emu), expected)
++        self.assertEqual(Mem(sp(0), Const(4, 4)).solve(emu=self.emu, vals=VALS), expected)
++
++    def test_solving_unwritten_memory_with_an_emulator_matches_the_plain_reference(self):
++        self.emu.writeSymMemory(sp(0), Const(0x41, 1))
++        self.assertEqual(Mem(sp(16), Const(4, 4)).solve(emu=self.emu), plain(sp(16), 4))
++        self.assertEqual(Mem(sp(0), Const(2, 4)).solve(emu=self.emu), 0x41 | (plain(sp(0), 2) & 0xff00))
++
++    def test_solving_an_import_slot_with_an_emulator(self):
++        self.vw._addLocation(0x2000, 4, v_const.LOC_IMPORT, 'kernel32.ExitProcess')
++        expected = Var('kernel32.ExitProcess', 4).solve()
++        self.assertEqual(Mem(Const(0x2000, 4), Const(4, 4)).solve(emu=self.emu), expected)
++
++    def test_solving_memory_of_unknown_size_with_an_emulator(self):
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.emu.writeSymMemory(sp(1), Const(0x41, 1))
++        self.assertEqual(Mem(sp(0), Var('n', 1)).solve(emu=self.emu, vals=VALS), EAX)
++
++    def test_solving_memory_through_a_pointer_in_emulator_memory(self):
++        self.emu.writeSymMemory(sp(0), Const(0x2000, 4))
++        self.emu.writeSymMemory(Const(0x2000, 4), Const(0x11, 1))
++        self.emu.writeSymMemory(Const(0x2001, 4), Const(0x22, 1))
++        self.assertEqual(Mem(Mem(sp(0), Const(4, 4)), Const(2, 4)).solve(emu=self.emu, vals=VALS), 0x2211)
++
++    def test_solving_memory_that_holds_a_raw_int_with_an_emulator(self):
++        self.emu.writeSymMemory(Const(0x1000, 4), 0x12345678)
++        self.assertEqual(Mem(Const(0x1000, 4), Const(4, 4)).solve(emu=self.emu), 0x12345678)
++        self.assertEqual(Mem(Const(0x1000, 4), Const(4, 4)).solve(emu=self.emu, vals=VALS), 0x12345678)
++        self.emu.writeSymMemory(sp(0), 0x2000)
++        self.emu.writeSymMemory(Const(0x2000, 4), Const(0x41, 1))
++        self.assertEqual(Mem(Mem(sp(0), Const(4, 4)), Const(1, 4)).solve(emu=self.emu, vals=VALS), 0x41)
++
++
++
++    def test_solving_with_an_emulator_never_reuses_an_earlier_plain_solve(self):
++        m = Mem(sp(0), Const(4, 4))
++        self.assertEqual(m.solve(), plain(sp(0), 4))
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++        self.assertEqual(m.solve(emu=self.emu, vals=VALS), EAX)
++        self.assertEqual(m.solve(emu=self.emu), Var('eax', 4).solve())
++
++class ByteMemorySnapshotTest(unittest.TestCase):
++
++    def setUp(self):
++        self.emu = MockEmulator(MockVw())
++        self.emu.writeSymMemory(sp(0), Var('eax', 4))
++
++    def restored(self, snap):
++        emu = MockEmulator(MockVw())
++        emu.setSymSnapshot(snap)
++        return emu
++
++    def value(self, emu, addr, size):
++        return emu.readSymMemory(addr, Const(size, 4)).solve(vals=VALS)
++
++    def test_restoring_one_snapshot_twice_gives_independent_memory(self):
++        snap = self.emu.getSymSnapshot()
++        emu1 = self.restored(snap)
++        emu2 = self.restored(snap)
++        emu1.writeSymMemory(sp(1), Const(0x41, 1))
++        self.assertEqual(self.value(emu1, sp(0), 4), 0x11224144)
++        self.assertEqual(self.value(emu2, sp(0), 4), EAX)
++        self.assertEqual(self.value(emu2, sp(1), 1), 0x33)
++        self.assertEqual(self.value(self.restored(snap), sp(1), 1), 0x33)
++
++    def test_writes_after_restoring_never_change_the_snapshot(self):
++        snap = self.emu.getSymSnapshot()
++        self.emu.setSymSnapshot(snap)
++        self.emu.writeSymMemory(sp(2), Const(0xbeef, 2))
++        self.assertEqual(self.value(self.emu, sp(0), 4), 0xbeef3344)
++        self.assertEqual(self.value(self.restored(snap), sp(2), 2), 0x1122)
++
++    def test_snapshot_taken_before_a_write_does_not_see_it(self):
++        snap = self.emu.getSymSnapshot()
++        self.emu.writeSymMemory(sp(3), Const(0x77, 1))
++        self.assertEqual(self.value(self.emu, sp(0), 4), 0x77223344)
++        self.assertEqual(self.value(self.restored(snap), sp(2), 2), 0x1122)
++        self.assertEqual(self.value(self.restored(snap), sp(3), 1), 0x11)
+diff --git a/vivisect/symboliks/tests/test_sympaths_8d69c4.py b/vivisect/symboliks/tests/test_sympaths_8d69c4.py
+new file mode 100644
+index 00000000..8df1bcef
+--- /dev/null
++++ b/vivisect/symboliks/tests/test_sympaths_8d69c4.py
+@@ -0,0 +1,139 @@
++import re
++import binascii
++import unittest
++
++import envi.const as e_const
++import envi.memcanvas as e_mcanvas
++
++import vivisect
++import vivisect.cli as viv_cli
++import vivisect.symboliks.analysis as vsym_analysis
++
++from vivisect.symboliks.common import Const
++
++
++FVA = 0x401000
++ARG0 = 0x11223344
++ARG1 = 0x55667788
++ARG4 = 0x0123456789abcdef
++VALS = {'arg0': ARG0, 'arg1': ARG1, 'arg4': ARG4}
++
++BRANCHY = (
++    '8b442404'
++    '894424f8'
++    'c64424f941'
++    '85c9'
++    '7405'
++    'c64424fa42'
++    '8b4424f8'
++    'c3'
++)
++
++
++def workspace(arch, hexcode, cconv='cdecl', argc=2, vw=None):
++    code = binascii.unhexlify(hexcode)
++    if vw is None:
++        vw = vivisect.VivWorkspace()
++    vw.setMeta('Architecture', arch)
++    vw.setMeta('Platform', 'windows')
++    vw.setMeta('Format', 'blob')
++    vw.addMemoryMap(FVA, e_const.MM_RWX, 'test', code)
++    vw.addSegment(FVA, len(code), '.text', 'test')
++    vw.addFuncAnalysisModule('vivisect.analysis.generic.codeblocks')
++    vw.makeFunction(FVA)
++    vw.setFunctionApi(FVA, ('int', None, cconv, 'func', [('int', None)] * argc))
++    return vw
++
++
++def returns(arch, hexcode, cconv='cdecl', argc=2):
++    vw = workspace(arch, hexcode, cconv=cconv, argc=argc)
++    ctx = vsym_analysis.getSymbolikAnalysisContext(vw)
++    return sorted(emu.getFunctionReturn().solve(vals=VALS) for emu, effs in ctx.getSymbolikPaths(FVA))
++
++
++class SymbolikPathMemoryTest(unittest.TestCase):
++
++    def test_paths_of_a_branching_function(self):
++        self.assertEqual(returns('i386', BRANCHY), [0x11224144, 0x11424144])
++
++    def test_walked_paths_of_a_branching_function(self):
++        vw = workspace('i386', BRANCHY)
++        ctx = vsym_analysis.getSymbolikAnalysisContext(vw)
++        rets = []
++        bytes6 = []
++        for emu, effs in ctx.walkSymbolikPaths(FVA):
++            rets.append(emu.getFunctionReturn().solve(vals=VALS))
++            byte6 = emu.readSymMemory(Const(0xbfbfeffa, 4), Const(1, 4))
++            bytes6.append(byte6.solve(vals=VALS))
++        self.assertEqual(sorted(rets), [0x11224144, 0x11424144])
++        self.assertEqual(sorted(bytes6), [0x22, 0x42])
++
++    def test_walked_path_memory_does_not_leak_between_paths(self):
++        vw = workspace('i386', BRANCHY)
++        ctx = vsym_analysis.getSymbolikAnalysisContext(vw)
++        seen = {}
++        for emu, effs in ctx.walkSymbolikPaths(FVA):
++            ret = emu.getFunctionReturn().solve(vals=VALS)
++            word = emu.readSymMemory(Const(0xbfbfeff9, 4), Const(2, 4))
++            seen[ret] = word.solve(vals=VALS)
++        self.assertEqual(seen, {0x11224144: 0x2241, 0x11424144: 0x4241})
++
++    def test_byte_of_an_argument(self):
++        self.assertEqual(returns('i386', '0fb6442405' 'c3'), [(ARG0 >> 8) & 0xff])
++
++    def test_word_of_an_argument(self):
++        self.assertEqual(returns('i386', '0fb7442406' 'c3'), [ARG0 >> 16])
++
++    def test_read_straddling_two_arguments(self):
++        self.assertEqual(returns('i386', '8b442406' 'c3'), [(ARG0 >> 16) | ((ARG1 & 0xffff) << 16)])
++
++    def test_function_patching_a_byte_of_its_argument(self):
++        self.assertEqual(returns('i386', 'c64424057f' '8b442404' 'c3'), [(ARG0 & 0xffff00ff) | 0x7f00])
++
++    def test_stdcall_argument_bytes(self):
++        self.assertEqual(returns('i386', '8a442407' '0fb6c0' 'c20800', cconv='stdcall'), [ARG0 >> 24])
++
++    def test_amd64_spilled_register_argument(self):
++        code = '48897c24f8' 'c64424f941' '488b4424f8' 'c3'
++        self.assertEqual(returns('amd64', code, cconv='sysvamd64call', argc=1), [(ARG0 & ~0xff00) | 0x4100])
++
++    def test_amd64_stack_argument_bytes(self):
++        self.assertEqual(returns('amd64', '0fb744242a' 'c3', cconv='msx64call', argc=5), [(ARG4 >> 16) & 0xffff])
++        self.assertEqual(returns('amd64', '8b44242c' 'c3', cconv='msx64call', argc=5), [ARG4 >> 32])
++
++    def test_outputs_include_every_repeated_store(self):
++        vw = workspace('i386', '8b7c2404' 'fc' 'b902000000' 'b841414141' 'f3ab' 'c3', argc=1)
++        ctx = vsym_analysis.getSymbolikAnalysisContext(vw)
++        outputs = list(ctx.getSymbolikOutputs(FVA))
++        self.assertEqual(len(outputs), 1)
++        ret, writes = outputs[0]
++        self.assertEqual(ret.solve(vals=VALS), 0x41414141)
++        self.assertEqual([eff.symaddr.solve(vals=VALS) for eff in writes], [ARG0, ARG0 + 4])
++        self.assertEqual([eff.symval.solve(vals=VALS) for eff in writes], [0x41414141, 0x41414141])
++
++    def test_walked_paths_apply_repeated_stores(self):
++        code = '8b7c2404' 'fc' 'b903000000' 'b841424344' 'f3aa' '8b442404' '8b00' 'c3'
++        vw = workspace('i386', code, argc=1)
++        ctx = vsym_analysis.getSymbolikAnalysisContext(vw)
++        rets = [emu.getFunctionReturn().solve(vals=VALS) for emu, effs in ctx.walkSymbolikPaths(FVA)]
++        self.assertEqual(len(rets), 1)
++        self.assertEqual(rets[0] & 0x00ffffff, 0x414141)
++
++    def test_cli_symboliks_lists_every_repeated_store(self):
++        code = 'bf00204000' 'b903000000' 'b041' 'fc' 'f3aa' 'c3'
++        vw = workspace('i386', code, argc=0, vw=viv_cli.VivCli())
++        vw.canvas = e_mcanvas.StringMemoryCanvas(vw)
++        vw.do_symboliks('0x%x' % FVA)
++        out = vw.canvas.strval
++        self.assertIn('RETURN', out)
++        writes = sorted(int(va, 16) for va in re.findall(r'\[ (0x[0-9a-fA-F]+) \]', out))
++        self.assertEqual(writes, [0x402000, 0x402001, 0x402002])
++
++    def test_cli_symboliks_lists_the_writes_of_each_path(self):
++        code = 'bf00204000' 'b041' 'fc' '85c9' '7407' 'b902000000' 'f3aa' 'c6050030400042' 'c3'
++        vw = workspace('i386', code, argc=0, vw=viv_cli.VivCli())
++        vw.canvas = e_mcanvas.StringMemoryCanvas(vw)
++        vw.do_symboliks('0x%x' % FVA)
++        paths = vw.canvas.strval.split('PATH ')[1:]
++        writes = sorted(sorted(int(va, 16) for va in re.findall(r'\[ (0x[0-9a-fA-F]+) \]', path)) for path in paths)
++        self.assertEqual(writes, [[0x402000, 0x402001, 0x403000], [0x403000]])
+diff --git a/vivisect/symboliks/tests/test_xlatewidth_1196f2.py b/vivisect/symboliks/tests/test_xlatewidth_1196f2.py
+new file mode 100644
+index 00000000..acd394b5
+--- /dev/null
++++ b/vivisect/symboliks/tests/test_xlatewidth_1196f2.py
+@@ -0,0 +1,531 @@
++import binascii
++import unittest
++
++import vivisect
++import vivisect.const as v_const
++import vivisect.symboliks.analysis as vsym_analysis
++
++from vivisect.symboliks.common import Const, Var
++
++
++EAX = 0x11223344
++EBX = 0x55667788
++ECX = 0x99aabbcc
++EDX = 0xddeeff01
++ESI = 0x00410000
++EDI = 0x00420000
++EFLAGS = 0x00000246
++XMM0 = 0x00112233445566778899aabbccddeeff
++
++RAX = 0x1122334455667788
++RBX = 0x8877665544332211
++RCX = 0x0123456789abcdef
++RSI = 0x0000000000510000
++RDI = 0x0000000000520000
++
++STACK = 0xbfbff000
++
++
++def later(emu, addr, value, size, width, vals=None):
++    if isinstance(addr, str):
++        addr = Var(addr, width)
++    else:
++        addr = Const(addr, width)
++    emu.writeSymMemory(addr, Const(value, size), vals=vals)
++
++
++def applied(arch, hexcode):
++    vw = vivisect.VivWorkspace()
++    vw.setMeta('Architecture', arch)
++    ctx = vsym_analysis.getSymbolikAnalysisContext(vw)
++    xlate = ctx.getTranslator()
++    code = binascii.unhexlify(hexcode)
++    off = 0
++    while off < len(code):
++        op = vw.arch.archParseOpcode(code, off, 0x1000 + off)
++        xlate.translateOpcode(op)
++        off += len(op)
++    emu = ctx.getFuncEmu(None)
++    return emu, emu.applyEffects(xlate.getEffects())
++
++
++def run(arch, hexcode):
++    return applied(arch, hexcode)[0]
++
++
++class I386WidthTest(unittest.TestCase):
++
++    def vals(self, df=0):
++        return {'eax': EAX, 'ebx': EBX, 'ecx': ECX, 'edx': EDX, 'esi': ESI, 'edi': EDI, 'eflags_df': df,
++                'eflags': EFLAGS, 'xmm0': XMM0}
++
++    def reg(self, emu, name, df=0):
++        return emu.getSymVariable(name).solve(vals=self.vals(df))
++
++    def solved(self, emu, name):
++        return emu.getSymVariable(name).solve(emu=emu, vals=self.vals())
++
++    def mem(self, emu, addr, size, df=0):
++        if isinstance(addr, str):
++            addr = Var(addr, 4)
++        else:
++            addr = Const(addr, 4)
++        sym = emu.readSymMemory(addr, Const(size, 4))
++        self.assertEqual(sym.getWidth(), size)
++        return sym.solve(vals=self.vals(df))
++
++    def test_stosb_stores_only_al(self):
++        emu = run('i386', '891f' 'aa')
++        self.assertEqual(self.mem(emu, 'edi', 4), (EBX & 0xffffff00) | (EAX & 0xff))
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 1)
++
++    def test_stosw_stores_only_ax(self):
++        emu = run('i386', '891f' '66ab')
++        self.assertEqual(self.mem(emu, 'edi', 4), (EBX & 0xffff0000) | (EAX & 0xffff))
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 2)
++
++    def test_stosd_stores_eax_and_keeps_the_next_dword(self):
++        emu = run('i386', '891f' '894f04' 'ab')
++        self.assertEqual(self.mem(emu, 'edi', 8), (ECX << 32) | EAX)
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 4)
++
++    def test_stos_moves_backwards_when_the_direction_flag_is_set(self):
++        emu = run('i386', 'aa')
++        self.assertEqual(self.reg(emu, 'edi', df=1), EDI - 1)
++        emu = run('i386', '66ab')
++        self.assertEqual(self.reg(emu, 'edi', df=1), EDI - 2)
++        emu = run('i386', '891f' '66ab')
++        self.assertEqual(self.mem(emu, 'edi', 4, df=1), (EBX & 0xffff0000) | (EAX & 0xffff))
++
++    def test_movsb_copies_one_byte(self):
++        emu = run('i386', '891e' '890f' 'a4')
++        self.assertEqual(self.mem(emu, 'edi', 4), (ECX & 0xffffff00) | (EBX & 0xff))
++        self.assertEqual(self.reg(emu, 'esi'), ESI + 1)
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 1)
++
++    def test_movsw_copies_two_bytes(self):
++        emu = run('i386', '891e' '890f' '66a5')
++        self.assertEqual(self.mem(emu, 'edi', 4), (ECX & 0xffff0000) | (EBX & 0xffff))
++        self.assertEqual(self.reg(emu, 'esi'), ESI + 2)
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 2)
++
++    def test_movsd_copies_four_bytes(self):
++        emu = run('i386', '891e' '890f' '895704' 'a5')
++        self.assertEqual(self.mem(emu, 'edi', 8), (EDX << 32) | EBX)
++        self.assertEqual(self.reg(emu, 'esi', df=1), ESI - 4)
++        self.assertEqual(self.reg(emu, 'edi', df=1), EDI - 4)
++
++    def test_lodsb_loads_al_and_keeps_the_rest_of_eax(self):
++        emu = run('i386', '891e' 'ac')
++        self.assertEqual(self.reg(emu, 'eax'), (EAX & 0xffffff00) | (EBX & 0xff))
++        self.assertEqual(self.reg(emu, 'esi'), ESI + 1)
++
++    def test_lodsw_loads_ax(self):
++        emu = run('i386', '891e' '66ad')
++        self.assertEqual(self.reg(emu, 'eax'), (EAX & 0xffff0000) | (EBX & 0xffff))
++        self.assertEqual(self.reg(emu, 'esi', df=1), ESI - 2)
++
++    def test_lodsd_loads_eax(self):
++        emu = run('i386', '891e' 'c6460141' 'ad')
++        self.assertEqual(self.reg(emu, 'eax'), (EBX & 0xffff00ff) | 0x4100)
++        self.assertEqual(self.reg(emu, 'esi'), ESI + 4)
++
++    def test_push_with_operand_size_prefix_moves_two_bytes(self):
++        emu = run('i386', 'c74424fc78563412' '6650')
++        self.assertEqual(self.reg(emu, 'esp'), STACK - 2)
++        self.assertEqual(self.mem(emu, STACK - 2, 2), EAX & 0xffff)
++        self.assertEqual(self.mem(emu, STACK - 4, 4), ((EAX & 0xffff) << 16) | 0x5678)
++
++    def test_pop_with_operand_size_prefix_moves_two_bytes(self):
++        emu = run('i386', 'c74424fc78563412' '83ec04' '665b')
++        self.assertEqual(self.reg(emu, 'ebx'), (EBX & 0xffff0000) | 0x5678)
++        self.assertEqual(self.reg(emu, 'esp'), STACK - 2)
++
++    def test_push_of_a_word_immediate(self):
++        emu = run('i386', 'c74424fc78563412' '666aff')
++        self.assertEqual(self.reg(emu, 'esp'), STACK - 2)
++        self.assertEqual(self.mem(emu, STACK - 4, 4), 0xffff5678)
++
++    def test_pushf_with_operand_size_prefix_moves_two_bytes(self):
++        emu = run('i386', 'c74424fc78563412' '669c')
++        self.assertEqual(self.reg(emu, 'esp'), STACK - 2)
++        self.assertEqual(self.mem(emu, STACK - 4, 4), ((EFLAGS & 0xffff) << 16) | 0x5678)
++
++    def test_cmps_compares_elements_of_the_operand_size(self):
++        emu = run('i386', '891e' '891f' 'c647037f' '66a7')
++        self.assertEqual(self.reg(emu, 'eflags_eq'), 1)
++        emu = run('i386', '891e' '891f' 'c647037f' 'a7')
++        self.assertEqual(self.reg(emu, 'eflags_eq'), 0)
++
++    def test_cmps_compares_bytes_and_dwords(self):
++        emu = run('i386', '891e' '891f' 'c6470141' 'a6')
++        self.assertEqual(self.reg(emu, 'eflags_eq'), 1)
++        emu = run('i386', '891e' '891f' 'c6470141' 'a7')
++        self.assertEqual(self.reg(emu, 'eflags_eq'), 0)
++
++    def test_cmps_steps_both_index_registers(self):
++        emu = run('i386', 'a6')
++        self.assertEqual(self.reg(emu, 'esi'), ESI + 1)
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 1)
++        self.assertEqual(self.reg(emu, 'esi', df=1), ESI - 1)
++        emu = run('i386', '66a7')
++        self.assertEqual(self.reg(emu, 'esi'), ESI + 2)
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 2)
++
++    def test_add_to_one_byte_of_a_stored_dword(self):
++        emu = run('i386', '894424fc' '804424fd41')
++        self.assertEqual(self.mem(emu, STACK - 4, 4), (EAX & 0xffff00ff) | ((((EAX >> 8) + 0x41) & 0xff) << 8))
++
++    def test_byte_poke_between_push_and_pop(self):
++        emu = run('i386', '50' 'c644240141' '5b')
++        self.assertEqual(self.reg(emu, 'ebx'), (EAX & 0xffff00ff) | 0x4100)
++        self.assertEqual(self.reg(emu, 'esp'), STACK)
++
++    def test_byte_immediate_store_writes_one_byte(self):
++        emu = run('i386', '894424f8' 'c64424f941' '8b5c24f8')
++        self.assertEqual(self.reg(emu, 'ebx'), 0x11224144)
++
++    def test_word_immediate_store_writes_two_bytes(self):
++        emu = run('i386', '894424f8' '66c74424fa3412' '8b5c24f8')
++        self.assertEqual(self.reg(emu, 'ebx'), 0x12343344)
++
++    def test_partial_register_loads_keep_the_other_bits(self):
++        emu = run('i386', '894424f8' '8a5c24f9' '8a7c24fa' '668b4c24fa')
++        self.assertEqual(self.reg(emu, 'ebx'), (EBX & 0xffff0000) | 0x2233)
++        self.assertEqual(self.reg(emu, 'ecx'), (ECX & 0xffff0000) | 0x1122)
++
++    def test_partial_register_loads_of_unwritten_memory_keep_the_other_bits(self):
++        emu = run('i386', '8a5c24f0' '8a7c24f1' '668b4c24f4')
++        later(emu, STACK - 16, 0x5aa5, 2, 4)
++        later(emu, STACK - 12, 0x1234, 2, 4)
++        self.assertEqual(self.solved(emu, 'ebx'), (EBX & 0xffff0000) | 0x5aa5)
++        self.assertEqual(self.solved(emu, 'ecx'), (ECX & 0xffff0000) | 0x1234)
++
++
++    def test_partial_loads_from_memory_never_written_keep_the_other_bits(self):
++        emu = run('i386', '8a4424f8' '668b5c24f8' '8a6c24f9')
++        self.assertEqual(self.reg(emu, 'eax') & 0xffffff00, EAX & 0xffffff00)
++        self.assertEqual(self.reg(emu, 'ebx') & 0xffff0000, EBX & 0xffff0000)
++        self.assertEqual(self.reg(emu, 'ecx') & 0xffff00ff, ECX & 0xffff00ff)
++        emu = run('i386', '66ad')
++        self.assertEqual(self.reg(emu, 'eax') & 0xffff0000, EAX & 0xffff0000)
++
++    def test_zero_extending_loads_of_unwritten_memory(self):
++        emu = run('i386', '0fb65c24f0' '0fb74c24f4' 'ac')
++        later(emu, STACK - 16, 0xa5, 1, 4)
++        later(emu, STACK - 12, 0x1234, 2, 4)
++        later(emu, 'esi', 0x77, 1, 4, vals=self.vals())
++        self.assertEqual(self.solved(emu, 'ebx'), 0xa5)
++        self.assertEqual(self.solved(emu, 'ecx'), 0x1234)
++        self.assertEqual(self.solved(emu, 'eax'), (EAX & 0xffffff00) | 0x77)
++
++    def test_register_to_register_partial_writes(self):
++        emu = run('i386', '88c4' '88d9')
++        self.assertEqual(self.reg(emu, 'eax'), 0x11224444)
++        self.assertEqual(self.reg(emu, 'ecx'), (ECX & 0xffffff00) | 0x88)
++
++    def test_byte_and_word_stores_through_a_register_base(self):
++        emu = run('i386', '8903' 'c6430141' '66894b02' '8b13')
++        self.assertEqual(self.reg(emu, 'edx'), ((ECX & 0xffff) << 16) | 0x4144)
++        self.assertEqual(self.mem(emu, 'ebx', 1), 0x44)
++
++    def test_movzx_word_from_a_partly_overwritten_slot(self):
++        emu = run('i386', '894424f8' 'c64424fa41' '0fb75c24f9')
++        self.assertEqual(self.reg(emu, 'ebx'), 0x4133)
++
++
++class Amd64WidthTest(unittest.TestCase):
++
++    def vals(self, df=0):
++        return {'rax': RAX, 'rbx': RBX, 'rcx': RCX, 'rsi': RSI, 'rdi': RDI, 'eflags_df': df, 'eflags': EFLAGS}
++
++    def reg(self, emu, name, df=0):
++        return emu.getSymVariable(name).solve(vals=self.vals(df))
++
++    def solved(self, emu, name):
++        return emu.getSymVariable(name).solve(emu=emu, vals=self.vals())
++
++    def mem(self, emu, addr, size, df=0):
++        if isinstance(addr, str):
++            addr = Var(addr, 8)
++        else:
++            addr = Const(addr, 8)
++        sym = emu.readSymMemory(addr, Const(size, 8))
++        self.assertEqual(sym.getWidth(), size)
++        return sym.solve(vals=self.vals(df))
++
++    def test_stosb_stores_only_al(self):
++        emu = run('amd64', '48891f' 'aa')
++        self.assertEqual(self.mem(emu, 'rdi', 8), (RBX & ~0xff) | (RAX & 0xff))
++        self.assertEqual(self.reg(emu, 'rdi'), RDI + 1)
++
++    def test_stosw_stores_only_ax(self):
++        emu = run('amd64', '48891f' '66ab')
++        self.assertEqual(self.mem(emu, 'rdi', 8), (RBX & ~0xffff) | (RAX & 0xffff))
++        self.assertEqual(self.reg(emu, 'rdi'), RDI + 2)
++
++    def test_stosd_stores_only_eax(self):
++        emu = run('amd64', '48891f' 'ab')
++        self.assertEqual(self.mem(emu, 'rdi', 8), (RBX & ~0xffffffff) | (RAX & 0xffffffff))
++        self.assertEqual(self.reg(emu, 'rdi'), RDI + 4)
++
++    def test_stosq_stores_rax(self):
++        emu = run('amd64', '48891f' '48894f08' '48ab')
++        self.assertEqual(self.mem(emu, 'rdi', 8), RAX)
++        self.assertEqual(self.mem(emu, 'rdi', 16), (RCX << 64) | RAX)
++        self.assertEqual(self.reg(emu, 'rdi'), RDI + 8)
++
++    def test_movsq_copies_eight_bytes(self):
++        emu = run('amd64', '48891e' '48890f' '48a5')
++        self.assertEqual(self.mem(emu, 'rdi', 8), RBX)
++        self.assertEqual(self.reg(emu, 'rsi'), RSI + 8)
++        self.assertEqual(self.reg(emu, 'rdi', df=1), RDI - 8)
++
++    def test_movsw_copies_two_bytes(self):
++        emu = run('amd64', '48891e' '48890f' '66a5')
++        self.assertEqual(self.mem(emu, 'rdi', 8), (RCX & ~0xffff) | (RBX & 0xffff))
++        self.assertEqual(self.reg(emu, 'rsi'), RSI + 2)
++
++    def test_movsd_copies_four_bytes(self):
++        emu = run('amd64', '48891e' '48890f' 'a5')
++        self.assertEqual(self.mem(emu, 'rdi', 8), (RCX & ~0xffffffff) | (RBX & 0xffffffff))
++        self.assertEqual(self.reg(emu, 'rdi'), RDI + 4)
++
++    def test_lodsb_loads_al_and_keeps_the_rest_of_rax(self):
++        emu = run('amd64', '48891e' 'ac')
++        self.assertEqual(self.reg(emu, 'rax'), (RAX & ~0xff) | (RBX & 0xff))
++        self.assertEqual(self.reg(emu, 'rsi'), RSI + 1)
++
++    def test_lodsd_zero_extends_into_rax(self):
++        emu = run('amd64', '48891e' 'ad')
++        self.assertEqual(self.reg(emu, 'rax'), RBX & 0xffffffff)
++        self.assertEqual(self.reg(emu, 'rsi'), RSI + 4)
++
++    def test_lodsq_loads_rax(self):
++        emu = run('amd64', '48891e' 'c6460341' '48ad')
++        self.assertEqual(self.reg(emu, 'rax'), (RBX & ~0xff000000) | 0x41000000)
++        self.assertEqual(self.reg(emu, 'rsi', df=1), RSI - 8)
++
++    def test_push_with_operand_size_prefix_moves_two_bytes(self):
++        emu = run('amd64', '48c74424f801000000' '6650')
++        self.assertEqual(self.reg(emu, 'rsp'), STACK - 2)
++        self.assertEqual(self.mem(emu, STACK - 8, 8), ((RAX & 0xffff) << 48) | 1)
++
++    def test_cmps_compares_bytes_and_qwords(self):
++        emu = run('amd64', '48891e' '48891f' 'c6470141' 'a6')
++        self.assertEqual(self.reg(emu, 'eflags_eq'), 1)
++        emu = run('amd64', '48891e' '48891f' 'c6470541' '48a7')
++        self.assertEqual(self.reg(emu, 'eflags_eq'), 0)
++
++    def test_cmps_compares_words_and_dwords(self):
++        emu = run('amd64', '48891e' '48891f' 'c6470241' '66a7')
++        self.assertEqual(self.reg(emu, 'eflags_eq'), 1)
++        emu = run('amd64', '48891e' '48891f' 'c6470141' '66a7')
++        self.assertEqual(self.reg(emu, 'eflags_eq'), 0)
++        emu = run('amd64', '48891e' '48891f' 'c6470441' 'a7')
++        self.assertEqual(self.reg(emu, 'eflags_eq'), 1)
++        emu = run('amd64', '48891e' '48891f' 'c6470341' 'a7')
++        self.assertEqual(self.reg(emu, 'eflags_eq'), 0)
++
++    def test_cmps_steps_both_index_registers(self):
++        emu = run('amd64', '48a7')
++        self.assertEqual(self.reg(emu, 'rsi'), RSI + 8)
++        self.assertEqual(self.reg(emu, 'rdi', df=1), RDI - 8)
++
++    def test_ret_pops_a_patched_return_address(self):
++        emu = run('amd64', '50' 'c644240141' 'c3')
++        self.assertEqual(self.reg(emu, 'rip'), (RAX & ~0xff00) | 0x4100)
++
++    def test_pushf_with_operand_size_prefix_moves_two_bytes(self):
++        emu = run('amd64', '48c74424f801000000' '669c')
++        self.assertEqual(self.reg(emu, 'rsp'), STACK - 2)
++        self.assertEqual(self.mem(emu, STACK - 8, 8), ((EFLAGS & 0xffff) << 48) | 1)
++
++    def test_pop_with_operand_size_prefix_moves_two_bytes(self):
++        emu = run('amd64', '48c74424f844332211' '4883ec08' '665b')
++        self.assertEqual(self.reg(emu, 'rbx'), (RBX & ~0xffff) | 0x3344)
++        self.assertEqual(self.reg(emu, 'rsp'), STACK - 6)
++
++    def test_byte_and_word_stores_through_a_register_base(self):
++        emu = run('amd64', '488903' 'c6430141' '66894b02' '488b13')
++        self.assertEqual(self.reg(emu, 'rdx'), (RAX & ~0xffffff00) | ((RCX & 0xffff) << 16) | 0x4100)
++
++    def test_loads_of_unwritten_memory_keep_their_width(self):
++        emu = run('amd64', '8a5c24f0' '0fb64c24f4' '8b7424f8')
++        later(emu, STACK - 16, 0xa5, 1, 8)
++        later(emu, STACK - 12, 0x5a, 1, 8)
++        later(emu, STACK - 8, 0x87654321, 4, 8)
++        self.assertEqual(self.solved(emu, 'rbx'), (RBX & ~0xff) | 0xa5)
++        self.assertEqual(self.solved(emu, 'rcx'), 0x5a)
++        self.assertEqual(self.solved(emu, 'rsi'), 0x87654321)
++
++
++    def test_loads_from_memory_never_written_keep_the_other_bits(self):
++        emu = run('amd64', '8a4424f8' '8b5c24f8')
++        self.assertEqual(self.reg(emu, 'rax') & ~0xff, RAX & ~0xff)
++        self.assertEqual(self.reg(emu, 'rbx') >> 32, 0)
++        emu = run('amd64', 'ad')
++        self.assertEqual(self.reg(emu, 'rax') >> 32, 0)
++
++    def test_partial_register_load_keeps_the_other_bits(self):
++        emu = run('amd64', '48894424f0' '8a5c24f1' '668b4c24f2')
++        self.assertEqual(self.reg(emu, 'rbx'), (RBX & ~0xff) | 0x77)
++        self.assertEqual(self.reg(emu, 'rcx'), (RCX & ~0xffff) | 0x5566)
++
++    def test_high_byte_register_write(self):
++        emu = run('amd64', '88c4')
++        self.assertEqual(self.reg(emu, 'rax'), (RAX & ~0xff00) | ((RAX & 0xff) << 8))
++
++
++
++    def test_32_bit_arithmetic_wraps_before_the_upper_half_is_zeroed(self):
++        emu = run('amd64', 'c74424f800ffffff' 'c64424f8ff' '8b4424f8' '83c001')
++        self.assertEqual(self.reg(emu, 'rax'), 0)
++        emu = run('amd64', '31c0' '83e801')
++        self.assertEqual(self.reg(emu, 'rax'), 0xffffffff)
++        emu = run('amd64', '41b8ffffffff' '4183c001')
++        self.assertEqual(self.reg(emu, 'r8'), 0)
++
++class RepeatedStringTest(unittest.TestCase):
++
++    def vals(self):
++        return {'eax': EAX, 'ebx': EBX, 'ecx': ECX, 'edx': EDX, 'esi': ESI, 'edi': EDI, 'eflags_df': 0}
++
++    def reg(self, emu, name):
++        return emu.getSymVariable(name).solve(vals=self.vals())
++
++    def mem(self, emu, reg, off, size):
++        addr = Var(reg, 4) + Const(off, 4)
++        sym = emu.readSymMemory(addr, Const(size, 4))
++        self.assertEqual(sym.getWidth(), size)
++        return sym.solve(vals=self.vals())
++
++    def test_rep_stosd_fills_count_dwords(self):
++        emu = run('i386', 'fc' 'b903000000' 'f3ab')
++        self.assertEqual(self.mem(emu, 'edi', 0, 8), (EAX << 32) | EAX)
++        self.assertEqual(self.mem(emu, 'edi', 8, 4), EAX)
++        self.assertIsNone(emu.readSymMemory(Var('edi', 4) + Const(12, 4), Const(4, 4)))
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 12)
++        self.assertEqual(self.reg(emu, 'ecx'), 0)
++
++    def test_rep_stosb_over_a_stored_dword(self):
++        emu = run('i386', 'fc' '891f' 'b902000000' 'f3aa')
++        self.assertEqual(self.mem(emu, 'edi', 0, 4), (EBX & 0xffff0000) | ((EAX & 0xff) * 0x0101))
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 2)
++
++    def test_rep_stosw_with_operand_size_prefix(self):
++        emu = run('i386', 'fc' 'b903000000' 'f366ab')
++        self.assertEqual(self.mem(emu, 'edi', 2, 4), ((EAX & 0xffff) << 16) | (EAX & 0xffff))
++        self.assertEqual(self.mem(emu, 'edi', 4, 2), EAX & 0xffff)
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 6)
++
++    def test_rep_movsb_overlapping_forward_copy_repeats_the_first_byte(self):
++        emu = run('i386', '891e' '8d7e01' 'fc' 'b903000000' 'f3a4')
++        self.assertEqual(self.mem(emu, 'esi', 0, 4), (EBX & 0xff) * 0x01010101)
++        self.assertEqual(self.reg(emu, 'esi'), ESI + 3)
++        self.assertEqual(self.reg(emu, 'edi'), ESI + 4)
++        self.assertEqual(self.reg(emu, 'ecx'), 0)
++
++    def test_rep_movsd_copies_count_dwords(self):
++        emu = run('i386', '891e' '895604' 'fc' 'b902000000' 'f3a5')
++        self.assertEqual(self.mem(emu, 'edi', 0, 8), (EDX << 32) | EBX)
++        self.assertEqual(self.reg(emu, 'esi'), ESI + 8)
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 8)
++
++    def test_rep_lodsb_leaves_the_last_byte_in_al(self):
++        emu = run('i386', '891e' 'fc' 'b903000000' 'f3ac')
++        self.assertEqual(self.reg(emu, 'eax'), (EAX & 0xffffff00) | ((EBX >> 16) & 0xff))
++        self.assertEqual(self.reg(emu, 'esi'), ESI + 3)
++
++    def test_rep_moves_backwards_when_the_direction_flag_is_set(self):
++        emu = run('i386', 'fd' 'b902000000' 'f3ab')
++        self.assertEqual(self.mem(emu, 'edi', 0, 4), EAX)
++        addr = Var('edi', 4) - Const(4, 4)
++        self.assertEqual(emu.readSymMemory(addr, Const(4, 4)).solve(vals=self.vals()), EAX)
++        self.assertEqual(self.reg(emu, 'edi'), EDI - 8)
++
++    def test_rep_with_a_zero_count_changes_nothing(self):
++        emu = run('i386', '891f' 'fc' 'b900000000' 'f3aa')
++        self.assertEqual(self.mem(emu, 'edi', 0, 4), EBX)
++        self.assertEqual(self.reg(emu, 'edi'), EDI)
++        self.assertEqual(self.reg(emu, 'ecx'), 0)
++
++    def test_applied_effects_of_a_zero_count_rep_are_only_the_reset(self):
++        emu, effs = applied('i386', 'b900000000' 'f3aa')
++        self.assertEqual([eff.efftype for eff in effs], [v_const.EFFTYPE_SETVAR, v_const.EFFTYPE_SETVAR])
++        self.assertEqual([eff.varname for eff in effs], ['ecx', 'ecx'])
++        self.assertEqual(effs[-1].symobj.solve(), 0)
++
++    def test_rep_with_an_unknown_count_takes_a_single_step(self):
++        emu = run('i386', '891f' 'f3aa')
++        self.assertEqual(self.mem(emu, 'edi', 0, 4), (EBX & 0xffffff00) | (EAX & 0xff))
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 1)
++        self.assertEqual(self.reg(emu, 'ecx'), ECX)
++
++    def test_applied_effects_list_every_repetition(self):
++        vw = vivisect.VivWorkspace()
++        vw.setMeta('Architecture', 'i386')
++        ctx = vsym_analysis.getSymbolikAnalysisContext(vw)
++        xlate = ctx.getTranslator()
++        code = binascii.unhexlify('fc' 'b903000000' 'f3ab')
++        off = 0
++        while off < len(code):
++            op = vw.arch.archParseOpcode(code, off, 0x1000 + off)
++            xlate.translateOpcode(op)
++            off += len(op)
++        emu = ctx.getFuncEmu(None)
++        effs = emu.applyEffects(xlate.getEffects())
++        writes = [eff for eff in effs if eff.efftype == v_const.EFFTYPE_WRITEMEM]
++        self.assertEqual(len(writes), 3)
++        self.assertEqual([eff.symaddr.solve(vals=self.vals()) for eff in writes], [EDI, EDI + 4, EDI + 8])
++        self.assertEqual([eff.symsize.solve() for eff in writes], [4, 4, 4])
++        setvars = [eff for eff in effs if eff.efftype == v_const.EFFTYPE_SETVAR]
++        edis = [eff.symobj.solve(vals=self.vals()) for eff in setvars if eff.varname == 'edi']
++        self.assertEqual(edis, [EDI + 4, EDI + 8, EDI + 12])
++        counts = [eff.symobj.solve() for eff in setvars if eff.varname == 'ecx']
++        self.assertEqual(counts[-1], 0)
++        self.assertEqual(emu.getSymVariable('ecx').solve(), 0)
++
++    def test_applied_effects_list_every_movs_repetition(self):
++        emu, effs = applied('i386', 'fc' 'b903000000' 'f3a5')
++        writes = [eff for eff in effs if eff.efftype == v_const.EFFTYPE_WRITEMEM]
++        self.assertEqual([eff.symaddr.solve(vals=self.vals()) for eff in writes], [EDI, EDI + 4, EDI + 8])
++        self.assertEqual([eff.symsize.solve() for eff in writes], [4, 4, 4])
++        setvars = [eff for eff in effs if eff.efftype == v_const.EFFTYPE_SETVAR]
++        esis = [eff.symobj.solve(vals=self.vals()) for eff in setvars if eff.varname == 'esi']
++        self.assertEqual(esis, [ESI + 4, ESI + 8, ESI + 12])
++        counts = [eff.symobj.solve() for eff in setvars if eff.varname == 'ecx']
++        self.assertEqual(counts[-1], 0)
++
++    def test_applied_effects_list_every_lods_repetition(self):
++        emu, effs = applied('i386', 'fc' 'b903000000' 'f3ad')
++        setvars = [eff for eff in effs if eff.efftype == v_const.EFFTYPE_SETVAR]
++        self.assertEqual(len([eff for eff in setvars if eff.varname == 'eax']), 3)
++        esis = [eff.symobj.solve(vals=self.vals()) for eff in setvars if eff.varname == 'esi']
++        self.assertEqual(esis, [ESI + 4, ESI + 8, ESI + 12])
++        counts = [eff.symobj.solve() for eff in setvars if eff.varname == 'ecx']
++        self.assertEqual(counts[-1], 0)
++
++    def test_rep_movs_and_lods_with_an_unknown_count_take_a_single_step(self):
++        emu = run('i386', 'f3a4')
++        self.assertEqual(self.reg(emu, 'esi'), ESI + 1)
++        self.assertEqual(self.reg(emu, 'edi'), EDI + 1)
++        self.assertEqual(self.reg(emu, 'ecx'), ECX)
++        emu = run('i386', 'f3ac')
++        self.assertEqual(self.reg(emu, 'esi'), ESI + 1)
++        self.assertEqual(self.reg(emu, 'ecx'), ECX)
++
++    def test_amd64_rep_stosq(self):
++        emu = run('amd64', 'fc' '48c7c102000000' 'f348ab')
++        vals = {'rax': RAX, 'rdi': RDI}
++        sym = emu.readSymMemory(Var('rdi', 8), Const(16, 8))
++        self.assertEqual(sym.solve(vals=vals), (RAX << 64) | RAX)
++        self.assertEqual(emu.getSymVariable('rdi').solve(vals=vals), RDI + 16)
++        self.assertEqual(emu.getSymVariable('rcx').solve(vals=vals), 0)
++
++    def test_amd64_rep_movsd_with_rex_w_copies_qwords(self):
++        emu = run('amd64', '48891e' '48895608' 'fc' '48c7c102000000' 'f348a5')
++        vals = {'rbx': RBX, 'rdx': RCX, 'rsi': RSI, 'rdi': RDI}
++        sym = emu.readSymMemory(Var('rdi', 8), Const(16, 8))
++        self.assertEqual(sym.solve(vals=vals), (RCX << 64) | RBX)
++        self.assertEqual(emu.getSymVariable('rsi').solve(vals=vals), RSI + 16)
+diff --git a/vivisect/tests/test_symtrack_151487.py b/vivisect/tests/test_symtrack_151487.py
+new file mode 100644
+index 00000000..83a6bf96
+--- /dev/null
++++ b/vivisect/tests/test_symtrack_151487.py
+@@ -0,0 +1,152 @@
++import unittest
++
++import envi.const as e_const
++
++import vivisect
++import vivisect.const as v_const
++
++from vivisect.analysis.generic.symswitchcase import TrackingSymbolikEmulator
++from vivisect.symboliks.common import Const, Var, Mem
++
++
++TABLE = 0x402000
++DATA = bytes(range(0x10, 0x30))
++EAX = 0x11223344
++VALS = {'eax': EAX}
++
++
++def workspace():
++    vw = vivisect.VivWorkspace()
++    vw.setMeta('Architecture', 'i386')
++    vw.setMeta('Platform', 'windows')
++    vw.setMeta('Format', 'blob')
++    vw.addMemoryMap(TABLE, e_const.MM_READ, 'test', DATA)
++    return vw
++
++
++def addr(va):
++    return Const(va, 4)
++
++
++def plain(va, size):
++    return Mem(addr(va), Const(size, 4)).solve()
++
++
++class TrackingEmulatorMemoryTest(unittest.TestCase):
++
++    def setUp(self):
++        self.vw = workspace()
++        self.emu = TrackingSymbolikEmulator(self.vw)
++
++    def read(self, va, size, vals=VALS):
++        sym = self.emu.readSymMemory(addr(va), Const(size, 4))
++        self.assertEqual(sym.getWidth(), size)
++        return sym.solve(vals=vals)
++
++    def test_written_byte_inside_mapped_memory(self):
++        self.assertEqual(self.read(TABLE + 4, 4), 0x17161514)
++        self.emu.writeSymMemory(addr(TABLE + 5), Const(0x41, 1))
++        self.assertEqual(self.read(TABLE + 4, 4), 0x17164114)
++        self.assertEqual(self.read(TABLE + 5, 2), 0x1641)
++
++    def test_written_dword_read_back_in_pieces(self):
++        self.emu.writeSymMemory(addr(TABLE), Var('eax', 4))
++        self.assertEqual(self.read(TABLE + 2, 1), 0x22)
++        self.assertEqual(self.read(TABLE + 2, 4), 0x15141122)
++        self.assertEqual(repr(self.emu.readSymMemory(addr(TABLE), Const(4, 4))), repr(Var('eax', 4)))
++
++    def test_unwritten_bytes_outside_any_map_stay_unknown(self):
++        self.emu.writeSymMemory(addr(0x500001), Const(0x41, 1))
++        self.assertEqual(self.read(0x500000, 4), 0x4100 | (plain(0x500000, 4) & 0xffff00ff))
++
++    def test_read_running_past_the_end_of_a_map(self):
++        self.emu.writeSymMemory(addr(TABLE + 31), Const(0x99, 1))
++        self.assertEqual(self.read(TABLE + 30, 4), 0x992e | (plain(TABLE + 30, 4) & 0xffff0000))
++
++    def test_import_slot_with_a_written_byte_uses_workspace_bytes(self):
++        self.vw.addLocation(TABLE + 16, 4, v_const.LOC_IMPORT, 'kernel32.GetProcAddress')
++        sym = self.emu.readSymMemory(addr(TABLE + 16), Const(4, 4))
++        self.assertEqual(repr(sym), repr(Var('kernel32.GetProcAddress', 4)))
++        self.emu.writeSymMemory(addr(TABLE + 17), Const(0x41, 1))
++        self.assertEqual(self.read(TABLE + 16, 4), 0x23224120)
++
++    def test_composed_reads_are_tracked(self):
++        self.emu.setMeta('va', 0x401010)
++        self.emu.writeSymMemory(addr(TABLE + 8), Const(0xbeef, 2))
++        sym = self.emu.readSymMemory(addr(TABLE + 7), Const(4, 4))
++        self.assertEqual(sym.solve(), 0x1abeef17)
++        track = self.emu.getTrackInfo()
++        self.assertEqual(len(track), 1)
++        self.assertEqual(track[0][0], 0x401010)
++        self.assertEqual(track[0][2].solve(), sym.solve())
++
++    def test_unwritten_mapped_reads_keep_todays_answers(self):
++        self.emu.writeSymMemory(addr(TABLE + 12), Const(0x41, 1))
++        sym = self.emu.readSymMemory(addr(TABLE + 4), Const(4, 4))
++        self.assertEqual(repr(sym), repr(Const(0x17161514, 4)))
++        self.assertEqual(self.emu.getTrackInfo()[-1][2], 0x17161514)
++        self.assertEqual(self.read(TABLE + 12, 2), 0x1d41)
++
++    def test_solving_a_table_entry_under_vals(self):
++        self.emu.writeSymMemory(addr(TABLE), Var('eax', 4))
++        entry = Mem(addr(TABLE) + Var('idx', 4), Const(1, 4))
++        self.assertEqual(entry.solve(emu=self.emu, vals={'idx': 3, 'eax': EAX}), 0x11)
++        self.assertEqual(entry.solve(emu=self.emu, vals={'idx': 6, 'eax': EAX}), 0x16)
++
++    def test_addresses_are_used_as_given(self):
++        esp = Var('esp', 4)
++        self.emu.writeSymMemory(esp, Var('eax', 4))
++        self.emu.setSymVariable('esp', esp - Const(4, 4))
++        sym = self.emu.readSymMemory(esp + Const(1, 4), Const(1, 4))
++        self.assertEqual(sym.solve(vals=VALS), 0x33)
++
++    def test_mem_value_without_a_known_width_is_only_read_at_its_address(self):
++        m = Mem(addr(0x500000), Var('n', 1))
++        self.emu.writeSymMemory(addr(TABLE), m)
++        self.assertEqual(repr(self.emu.readSymMemory(addr(TABLE), Const(4, 4))), repr(m))
++        self.assertEqual(self.read(TABLE + 1, 1), 0x11)
++        self.emu.writeSymMemory(addr(TABLE), Const(0x41, 1))
++        self.assertEqual(self.read(TABLE, 2), 0x1141)
++
++
++    def test_sized_write_covering_an_older_raw_value_hides_it(self):
++        self.emu.writeSymMemory(addr(0x500001), 0x41424344)
++        self.emu.writeSymMemory(addr(0x500000), Var('eax', 4))
++        self.assertEqual(self.read(0x500001, 1), 0x33)
++        self.emu.writeSymMemory(addr(TABLE + 1), 'opaque')
++        self.emu.writeSymMemory(addr(TABLE), Var('eax', 4))
++        self.assertEqual(self.read(TABLE + 1, 2), 0x2233)
++
++
++    def test_raw_values_are_read_only_at_their_address(self):
++        self.emu.writeSymMemory(addr(0x500000), Var('eax', 4))
++        self.emu.writeSymMemory(addr(0x500000), 0x1234)
++        self.assertEqual(self.emu.readSymMemory(addr(0x500000), Const(4, 4)), 0x1234)
++        self.assertEqual(self.read(0x500001, 1), 0x33)
++        self.emu.writeSymMemory(addr(TABLE), 0x41424344)
++        self.emu.writeSymMemory(addr(TABLE + 2), Const(0x99, 1))
++        self.assertEqual(self.emu.readSymMemory(addr(TABLE), Const(4, 4)), 0x41424344)
++        self.assertEqual(self.read(TABLE + 1, 2), 0x9911)
++
++    def test_reads_with_nothing_written_outside_a_map_are_not_tracked(self):
++        self.emu.writeSymMemory(addr(0x500011), Const(0x41, 1))
++        self.read(0x500010, 4)
++        self.assertEqual(len(self.emu.getTrackInfo()), 1)
++        sym = self.emu.readSymMemory(addr(0x500000), Const(4, 4))
++        self.assertEqual(sym.solve(), plain(0x500000, 4))
++        self.assertEqual(len(self.emu.getTrackInfo()), 1)
++
++    def test_thirty_two_byte_reads_compose(self):
++        self.emu.writeSymMemory(addr(TABLE + 5), Const(0x41, 1))
++        expected = bytearray(DATA)
++        expected[5] = 0x41
++        self.assertEqual(self.read(TABLE, 32), int.from_bytes(expected, 'little'))
++
++    def test_snapshot_restored_into_a_second_tracking_emulator(self):
++        self.emu.writeSymMemory(addr(TABLE), Var('eax', 4))
++        other = TrackingSymbolikEmulator(self.vw)
++        other.setSymSnapshot(self.emu.getSymSnapshot())
++        other.writeSymMemory(addr(TABLE + 1), Const(0x41, 1))
++        self.assertEqual(other.readSymMemory(addr(TABLE), Const(4, 4)).solve(vals=VALS), 0x11224144)
++        self.assertEqual(self.read(TABLE, 4), EAX)
++        self.assertEqual(self.read(TABLE + 1, 1), 0x33)

@@ -1,0 +1,506 @@
+diff --git a/SCons/CacheDir.py b/SCons/CacheDir.py
+index f152562f..2089edfb 100644
+--- a/SCons/CacheDir.py
++++ b/SCons/CacheDir.py
+@@ -138,6 +138,98 @@ def CachePushFunc(target, source, env) -> None:
+ CachePush = SCons.Action.Action(CachePushFunc, None)
+ 
+ 
++def _copy_tree(cd, env, fs, src, dst, to_cache: bool, skip) -> None:
++    """Copy the directory tree at *src* to *dst*, keeping symlinks as links.
++
++    Entries whose path in the build tree is in *skip* belong to other
++    targets and are left alone.
++    """
++    fs.makedirs(dst, exist_ok=True)
++    for name in sorted(fs.listdir(src)):
++        src_path = os.path.join(src, name)
++        dst_path = os.path.join(dst, name)
++        if (src_path if to_cache else dst_path) in skip:
++            continue
++        if fs.islink(src_path):
++            fs.symlink(fs.readlink(src_path), dst_path)
++        elif fs.isdir(src_path):
++            _copy_tree(cd, env, fs, src_path, dst_path, to_cache, skip)
++        elif to_cache:
++            cd.copy_to_cache(env, src_path, dst_path)
++        else:
++            cd.copy_from_cache(env, src_path, dst_path)
++            fs.chmod(dst_path, stat.S_IMODE(fs.stat(src_path).st_mode))
++
++
++def CacheRetrieveDirFunc(target, source, env) -> int:
++    t = target[0]
++    fs = t.fs
++    cd = env.get_CacheDir()
++    cd.requests += 1
++    cachefile = cd.cachepath(t)[1]
++    if not fs.isdir(cachefile):
++        cd.CacheDebug('CacheRetrieve(%s):  %s not in cache\n', t, cachefile)
++        return 1
++    cd.hits += 1
++    cd.CacheDebug('CacheRetrieve(%s):  retrieving from %s\n', t, cachefile)
++    if SCons.Action.execute_actions:
++        path = t.get_internal_path()
++        if fs.islink(path) or fs.isfile(path):
++            fs.unlink(path)
++        elif fs.isdir(path):
++            t.remove_contents()
++        skip = [n.get_internal_path() for n in t.get_contained_targets()]
++        _copy_tree(cd, env, fs, cachefile, path, False, skip)
++    return 0
++
++
++def CacheRetrieveDirString(target, source, env) -> str:
++    t = target[0]
++    cachefile = env.get_CacheDir().cachepath(t)[1]
++    if t.fs.isdir(cachefile):
++        return f"Retrieved `{t.get_internal_path()}' from cache"
++    return ""
++
++
++CacheRetrieveDir = SCons.Action.Action(CacheRetrieveDirFunc, CacheRetrieveDirString)
++
++CacheRetrieveDirSilent = SCons.Action.Action(CacheRetrieveDirFunc, None)
++
++
++def CachePushDirFunc(target, source, env) -> None:
++    if cache_readonly:
++        return
++
++    t = target[0]
++    if t.nocache:
++        return
++    fs = t.fs
++    cd = env.get_CacheDir()
++    cachedir, cachefile = cd.cachepath(t)
++    if fs.exists(cachefile):
++        cd.CacheDebug('CachePush(%s):  %s already exists in cache\n', t, cachefile)
++        return
++
++    cd.CacheDebug('CachePush(%s):  pushing to %s\n', t, cachefile)
++
++    try:
++        fs.makedirs(cachedir, exist_ok=True)
++        skip = [n.get_internal_path() for n in t.get_contained_targets()]
++        with tempfile.TemporaryDirectory(dir=cachedir) as temp_dir:
++            temp_tree = os.path.join(temp_dir, os.path.basename(cachefile))
++            _copy_tree(cd, env, fs, t.get_internal_path(), temp_tree, True, skip)
++            fs.rename(temp_tree, cachefile)
++    except OSError:
++        msg = f"Unable to copy {t} to cache. Cache file is {cachefile}"
++        cd.CacheDebug(
++            "Unable to copy %s to cache. Cache file is %s\n", str(t), cachefile
++        )
++        SCons.Warnings.warn(SCons.Warnings.CacheWriteErrorWarning, msg)
++
++
++CachePushDir = SCons.Action.Action(CachePushDirFunc, None)
++
++
+ class CacheDir:
+ 
+     def __init__(self, path) -> None:
+@@ -374,3 +466,30 @@ class CacheDir:
+     def push_if_forced(self, node):
+         if cache_force:
+             return self.push(node)
++
++    def retrieve_dir(self, node) -> bool:
++        """Retrieve a built directory tree from cache.
++
++        Returns ``True`` if the whole tree was retrieved.
++        """
++        if not self.is_enabled():
++            return False
++
++        env = node.get_build_env()
++        if cache_show:
++            if CacheRetrieveDirSilent(node, [], env, execute=1) == 0:
++                node.build(presub=0, execute=0)
++                return True
++        elif CacheRetrieveDir(node, [], env, execute=1) == 0:
++            return True
++
++        return False
++
++    def push_dir(self, node):
++        if self.is_readonly() or not self.is_enabled():
++            return
++        return CachePushDir(node, [], node.get_build_env())
++
++    def push_dir_if_forced(self, node):
++        if cache_force:
++            return self.push_dir(node)
+diff --git a/SCons/Node/FS.py b/SCons/Node/FS.py
+index 4420a83c..1b496e28 100644
+--- a/SCons/Node/FS.py
++++ b/SCons/Node/FS.py
+@@ -1581,7 +1581,7 @@ class FS(LocalFS):
+         return cwd.glob(pathname, ondisk, source, strings, exclude)
+ 
+ class DirNodeInfo(SCons.Node.NodeInfoBase):
+-    __slots__ = ()
++    __slots__ = ('csig',)
+     # This should get reset by the FS initialization.
+     current_version_id = 2
+ 
+@@ -1702,6 +1702,9 @@ class Dir(Base):
+             l.insert(0, a)
+             self.get_executor().set_action_list(l)
+ 
++        if self.is_built_directory():
++            self.changed_since_last_build = 1
++
+     def diskcheck_match(self) -> None:
+         diskcheck_match(self, self.isfile,
+                         "File %s found where directory expected.")
+@@ -1858,10 +1861,32 @@ class Dir(Base):
+         import SCons.Defaults
+         return SCons.Defaults.DirEntryScanner
+ 
+-    def get_target_scanner(self) -> ScannerBase:
++    def get_target_scanner(self) -> ScannerBase | None:
++        if self.is_built_directory():
++            return None
+         import SCons.Defaults  # pylint: disable=import-outside-toplevel
+         return SCons.Defaults.DirEntryScanner
+ 
++    def _children_get(self) -> list[Node]:
++        """Return this directory's children.
++
++        A built directory's entries are not scanned in as dependencies,
++        but they stay children so the targets inside it are visited first.
++        """
++        try:
++            return self._memo['_children_get']
++        except KeyError:
++            pass
++        children = SCons.Node.Node._children_get(self)
++        if self.is_built_directory():
++            from SCons.Scanner.Dir import scan_in_memory
++
++            seen = set(children)
++            entries = [e for e in scan_in_memory(self, None) if e not in seen]
++            children = children + entries
++            self._memo['_children_get'] = children
++        return children
++
+     def get_found_includes(self, env: EnvironmentBase, scanner: ScannerBase | None, path: str) -> list[Node]:
+         """Return this directory's implicit dependencies.
+ 
+@@ -1960,17 +1985,39 @@ class Dir(Base):
+         general, this is not needed and the content signature is not
+         stored in the DirNodeInfo. However, if get_contents on a Dir
+         node is called which has a child directory, the child
+-        directory should return the hash of its contents."""
+-        contents = self.get_contents()
+-        return hash_signature(contents)
++        directory should return the hash of its contents.
++
++        A directory built by a builder is signed by what it holds on
++        disk, and the signature is stored so that the targets using it
++        as a source can tell when that changes."""
++        if not self.is_built_directory():
++            contents = self.get_contents()
++            return hash_signature(contents)
++        ninfo = self.get_ninfo()
++        try:
++            return ninfo.csig
++        except AttributeError:
++            pass
++        try:
++            lines = self._tree_signatures(self.get_internal_path(), '')
++        except OSError:
++            lines = [SCons.Util.NOFILE]
++        ninfo.csig = hash_signature('\n'.join(lines))
++        return ninfo.csig
+ 
+     def do_duplicate(self, src: Node) -> None:
+         pass
+ 
+     def is_up_to_date(self) -> bool:
+-        """If any child is not up-to-date, then this directory isn't, either."""
++        """If any child is not up-to-date, then this directory isn't, either.
++
++        A directory built by a builder is compared against the sources,
++        dependencies and action recorded when it was last built.
++        """
+         if self.builder is not MkdirBuilder and not self.exists():
+             return False
++        if self.is_built_directory():
++            return not self.always_build and not self.changed_build_inputs()
+         up_to_date = SCons.Node.up_to_date
+         for kid in self.children():
+             if kid.get_state() > up_to_date:
+@@ -1999,13 +2046,245 @@ class Dir(Base):
+         return Base.srcnode(self)
+ 
+     def get_timestamp(self) -> int:
+-        """Return the latest timestamp from among our children"""
++        """Return the latest timestamp from among our children.
++
++        A directory built by a builder is as new as the newest entry in its
++        tree on disk, so that its sources can be compared against it.
++        """
++        if self.is_built_directory():
++            try:
++                return self._memo['get_timestamp']
++            except KeyError:
++                pass
++            path = self.get_internal_path()
++            stamp = self._tree_timestamp(path) if self.fs.isdir(path) else 0
++            self._memo['get_timestamp'] = stamp
++            return stamp
+         stamp = 0
+         for kid in self.children():
+             if kid.get_timestamp() > stamp:
+                 stamp = kid.get_timestamp()
+         return stamp
+ 
++    def _tree_timestamp(self, path: str) -> int:
++        stamp = self.fs.lstat(path)[stat.ST_MTIME]
++        if self.fs.isdir(path) and not self.fs.islink(path):
++            for name in self.fs.listdir(path):
++                stamp = max(stamp, self._tree_timestamp(os.path.join(path, name)))
++        return stamp
++
++    def is_built_directory(self) -> bool:
++        """Return whether this directory is the target of a builder other than Mkdir."""
++        return self.has_builder() and self.builder is not MkdirBuilder
++
++    def is_cacheable(self) -> bool:
++        """Return whether a CacheDir may store and restore this directory."""
++        return self.is_built_directory() and not self.nocache
++
++    def new_binfo(self) -> BuildInfoBase:
++        """A directory built by a builder records its build like a file does."""
++        if self.is_built_directory():
++            return FileBuildInfo()
++        return SCons.Node.Node.new_binfo(self)
++
++    def get_stored_info(self) -> SConsignEntry | None:
++        if not self.is_built_directory():
++            return None
++        try:
++            return self._memo['get_stored_info']
++        except KeyError:
++            pass
++        try:
++            sconsign_entry = self.dir.sconsign().get_entry(self.name)
++        except (KeyError, OSError):
++            sconsign_entry = SCons.SConsign.SConsignEntry()
++            sconsign_entry.binfo = self.new_binfo()
++            sconsign_entry.ninfo = self.new_ninfo()
++        self._memo['get_stored_info'] = sconsign_entry
++        return sconsign_entry
++
++    def builder_set(self, builder: BuilderBase | None) -> None:
++        SCons.Node.Node.builder_set(self, builder)
++        self.changed_since_last_build = 1 if self.is_built_directory() else 3
++
++    def changed_build_inputs(self) -> bool:
++        """Return whether the sources, dependencies or action of a built
++        directory differ from the ones recorded when it was last built."""
++        old = self.get_stored_info().binfo
++        then = (
++            getattr(old, 'bsourcesigs', [])
++            + getattr(old, 'bdependsigs', [])
++            + getattr(old, 'bimplicitsigs', [])
++        )
++        new = self.get_binfo()
++        kids = new.bsources + new.bdepends + new.bimplicit
++        changed = len(kids) != len(then)
++        then.extend([None] * (len(kids) - len(then)))
++        for kid, prev_ni in zip(kids, then):
++            if SCons.Node._decider_map[kid.changed_since_last_build](
++                kid, self, prev_ni, self
++            ):
++                changed = True
++        if getattr(old, 'bactsig', None) != new.bactsig:
++            changed = True
++        return changed
++
++    def get_contents_sig(self) -> str:
++        """Return the signature of the action that builds this directory."""
++        try:
++            return self.contentsig
++        except AttributeError:
++            pass
++        self.contentsig = hash_signature(self.get_executor().get_contents())
++        return self.contentsig
++
++    def get_cachedir_bsig(self) -> str:
++        """Return the CacheDir signature for a built directory.
++
++        The entries found inside the directory are left out: they only exist
++        once the directory has been built, so including them would give the
++        same build a different signature before and after it runs.
++        """
++        try:
++            return self.cachesig
++        except AttributeError:
++            pass
++        binfo = self.get_binfo()
++        sigs = [
++            n.get_cachedir_csig()
++            for n in binfo.bsources + binfo.bdepends + binfo.bimplicit
++        ]
++        sigs.append(self.get_contents_sig())
++        sigs.append(self.get_internal_path())
++        self.cachesig = hash_collect(sigs)
++        return self.cachesig
++
++    def _tree_signatures(self, path: str, prefix: str) -> list[str]:
++        """Return a line naming each entry below *path* and what it holds."""
++        lines = []
++        for name in sorted(self.fs.listdir(path)):
++            entry = os.path.join(path, name)
++            if self.fs.islink(entry):
++                lines.append(f'{prefix}{name} -> {self.fs.readlink(entry)}')
++            elif self.fs.isdir(entry):
++                lines.append(f'{prefix}{name}/')
++                lines.extend(self._tree_signatures(entry, prefix + name + '/'))
++            else:
++                csig = hash_file_signature(entry, chunksize=File.hash_chunksize)
++                lines.append(f'{prefix}{name} {csig}')
++        return lines
++
++    def get_contained_targets(self) -> list[Base]:
++        """Return the Nodes below this directory that other builders produce."""
++        found = []
++        for name, node in self.entries.items():
++            if name in ('.', '..'):
++                continue
++            if isinstance(node, Dir) and not node.is_built_directory():
++                found.extend(node.get_contained_targets())
++            elif node.is_derived():
++                found.append(node)
++        return found
++
++    def remove_contents(self) -> None:
++        """Remove what this directory holds on disk, except the entries
++        that belong to other targets and the directories leading to them."""
++        keep = [n.get_internal_path() for n in self.get_contained_targets()]
++        self._remove_entries(self.get_internal_path(), keep)
++        self._forget_disk_state()
++
++    def _remove_entries(self, path: str, keep: list[str]) -> None:
++        for name in self.fs.listdir(path):
++            entry = os.path.join(path, name)
++            if entry in keep:
++                continue
++            if self.fs.isdir(entry) and not self.fs.islink(entry):
++                if any(k.startswith(entry + OS_SEP) for k in keep):
++                    self._remove_entries(entry, keep)
++                else:
++                    self._remove_tree(entry)
++            else:
++                self._remove_entry(entry)
++
++    def _remove_tree(self, path: str) -> None:
++        """Remove a directory and everything below it."""
++        for name in self.fs.listdir(path):
++            entry = os.path.join(path, name)
++            if self.fs.isdir(entry) and not self.fs.islink(entry):
++                self._remove_tree(entry)
++            else:
++                self._remove_entry(entry)
++        try:
++            os.rmdir(path)
++        except OSError:
++            self._make_writable(path)
++            os.rmdir(path)
++
++    def _remove_entry(self, path: str) -> None:
++        """Remove a file or a link, a read-only one included."""
++        try:
++            self.fs.unlink(path)
++        except OSError:
++            self._make_writable(path)
++            self.fs.unlink(path)
++
++    def _make_writable(self, path: str) -> None:
++        """Clear the read-only bit the restored tree may carry."""
++        mode = stat.S_IMODE(self.fs.lstat(path)[stat.ST_MODE])
++        self.fs.chmod(path, mode | stat.S_IWRITE)
++
++    def push_to_cache(self) -> bool:
++        """Try to push this built directory tree into a cache."""
++        if not self.is_cacheable():
++            return False
++        self.clear_memoized_values()
++        if self.exists():
++            return self.get_build_env().get_CacheDir().push_dir(self)
++        return False
++
++    def retrieve_from_cache(self) -> bool:
++        """Try to retrieve this directory tree from a cache.
++
++        Returns True if the tree was successfully retrieved.
++        """
++        if not self.is_cacheable():
++            return False
++        if not self.get_build_env().get_CacheDir().retrieve_dir(self):
++            return False
++        self._forget_disk_state()
++        return True
++
++    def _forget_disk_state(self) -> None:
++        """Drop what this directory and the Nodes below it remember about the disk."""
++        self.clear_memoized_values()
++        try:
++            del self.on_disk_entries
++        except AttributeError:
++            pass
++        for name, node in list(self.entries.items()):
++            if name in ('.', '..'):
++                continue
++            if isinstance(node, Dir):
++                node._forget_disk_state()
++            else:
++                node.clear_memoized_values()
++
++    def visited(self) -> None:
++        if not self.is_built_directory():
++            SCons.Node.Node.visited(self)
++            return
++        if self.executor is not None and not self.nocache and self.exists():
++            self.get_build_env().get_CacheDir().push_dir_if_forced(self)
++        # Deciding computes the signatures of the sources that get recorded.
++        self.changed_build_inputs()
++        if SCons.Node.do_store_info:
++            entry = SCons.SConsign.SConsignEntry()
++            entry.binfo = self.new_binfo()
++            entry.binfo.merge(self.get_binfo())
++            entry.ninfo = self.get_ninfo()
++            self.dir.sconsign().set_entry(self.name, entry)
++            self._memo.pop('get_stored_info', None)
++
+     def get_abspath(self) -> str:
+         """Get the absolute path of the file."""
+         return self._abspath
+diff --git a/SCons/Taskmaster/__init__.py b/SCons/Taskmaster/__init__.py
+index 6a5d0bbd..11c5f48b 100644
+--- a/SCons/Taskmaster/__init__.py
++++ b/SCons/Taskmaster/__init__.py
+@@ -54,6 +54,7 @@ import logging
+ 
+ import SCons.Errors
+ import SCons.Node
++import SCons.Node.FS
+ import SCons.Warnings
+ from SCons.Util import DispatchingFormatter
+ 
+@@ -239,7 +240,10 @@ class Task(ABC):
+                 #
+                 for t in cached_targets:
+                     try:
+-                        t.fs.unlink(t.get_internal_path())
++                        if isinstance(t, SCons.Node.FS.Dir):
++                            t.remove_contents()
++                        else:
++                            t.fs.unlink(t.get_internal_path())
+                     except OSError as e:
+                         SCons.Warnings.warn(SCons.Warnings.CacheCleanupErrorWarning,
+                             "Failed copying all target files from cache, Error while attempting to remove file %s retrieved from cache: %s" % (t.get_internal_path(), e))

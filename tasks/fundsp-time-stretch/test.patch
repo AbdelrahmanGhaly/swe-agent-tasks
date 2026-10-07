@@ -1,0 +1,1593 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..f3a05c7
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,117 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || { echo "missing value for --output_path" >&2; usage; }
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 2
++
++export CARGO_HOME="${CARGO_HOME:-/opt/cargo}"
++export PATH="$CARGO_HOME/bin:$PATH"
++export CARGO_NET_OFFLINE=true
++export CARGO_TERM_COLOR=never
++export RUSTC_BOOTSTRAP=1
++
++NEW_TARGET="time_stretch_f63a60"
++TEST_JSON="$(mktemp)"
++TEST_ERR="$(mktemp)"
++trap 'rm -f "$TEST_JSON" "$TEST_ERR"' EXIT
++
++LIMIT=""
++if command -v timeout >/dev/null 2>&1; then
++  LIMIT="timeout 1800"
++fi
++
++if [ "$MODE" = "base" ]; then
++  $LIMIT cargo test --offline --lib \
++    --test test_basic --test test_dynamics --test test_flow --test test_follow \
++    -- -Z unstable-options --format json --report-time >"$TEST_JSON" 2>"$TEST_ERR"
++  STATUS=$?
++else
++  $LIMIT cargo test --offline --test "$NEW_TARGET" \
++    -- -Z unstable-options --format json --report-time >"$TEST_JSON" 2>"$TEST_ERR"
++  STATUS=$?
++fi
++tail -n 200 "$TEST_ERR" >&2
++
++xml_escape() {
++  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
++}
++
++expected_tests() {
++  awk '/#\[test\]/ { want = 1; next }
++       want && /fn [A-Za-z0-9_]+/ { sub(/.*fn /, ""); sub(/\(.*/, ""); print; want = 0 }' \
++    "tests/$NEW_TARGET.rs"
++}
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  cargo2junit <"$TEST_JSON" >"$OUTPUT_PATH" 2>/dev/null || true
++  DETAIL="$({ tail -c 3000 "$TEST_ERR"; tail -c 1000 "$TEST_JSON"; } | xml_escape)"
++  if [ "$MODE" = "new" ]; then
++    MISSING=0
++    for name in $(expected_tests); do
++      grep -q "name=\"$name\"" "$OUTPUT_PATH" 2>/dev/null || MISSING=1
++    done
++    if [ "$MISSING" -eq 1 ]; then
++      [ "$STATUS" -eq 0 ] && STATUS=1
++      {
++        echo '<?xml version="1.0" encoding="UTF-8"?>'
++        echo '<testsuites>'
++        echo '  <testsuite name="cargo test #0" errors="0">'
++        for name in $(expected_tests); do
++          if grep -q "\"name\": \"$name\", \"event\": \"ok\"" "$TEST_JSON"; then
++            echo "    <testcase name=\"$name\" classname=\"\" />"
++          else
++            echo "    <testcase name=\"$name\" classname=\"\"><failure message=\"test did not run to completion\">$DETAIL</failure></testcase>"
++          fi
++        done
++        echo '  </testsuite>'
++        echo '</testsuites>'
++      } >"$OUTPUT_PATH"
++    fi
++  elif ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    {
++      echo '<?xml version="1.0" encoding="UTF-8"?>'
++      echo '<testsuites>'
++      echo '  <testsuite name="cargo test #0" errors="0">'
++      echo "    <testcase name=\"compilation\" classname=\"\"><failure message=\"build failed\">$DETAIL</failure></testcase>"
++      echo '  </testsuite>'
++      echo '</testsuites>'
++    } >"$OUTPUT_PATH"
++  fi
++fi
++
++exit "$STATUS"
+diff --git a/tests/time_stretch_f63a60.rs b/tests/time_stretch_f63a60.rs
+new file mode 100644
+index 0000000..dfa34d9
+--- /dev/null
++++ b/tests/time_stretch_f63a60.rs
+@@ -0,0 +1,1464 @@
++use fundsp::prelude64::*;
++use std::sync::Arc;
++
++const TAU64: f64 = std::f64::consts::TAU;
++
++fn as_f64<T: Into<f64>>(x: T) -> f64 {
++    x.into()
++}
++
++fn sine_samples(sample_rate: f64, frequency: f64, amplitude: f64, samples: usize) -> Vec<f32> {
++    (0..samples)
++        .map(|i| (amplitude * (TAU64 * frequency * i as f64 / sample_rate).sin()) as f32)
++        .collect()
++}
++
++fn sine(sample_rate: f64, frequency: f64, amplitude: f64, seconds: f64) -> Wave {
++    let samples = (sample_rate * seconds).round() as usize;
++    Wave::from_samples(
++        sample_rate,
++        &sine_samples(sample_rate, frequency, amplitude, samples),
++    )
++}
++
++fn overtone_samples(sample_rate: f64, frequency: f64, amplitude: f64, samples: usize) -> Vec<f32> {
++    (0..samples)
++        .map(|i| {
++            let phase = TAU64 * frequency * i as f64 / sample_rate;
++            (amplitude * (phase.sin() + 0.6 * (2.0 * phase).sin() + 0.35 * (3.0 * phase).sin()))
++                as f32
++        })
++        .collect()
++}
++
++fn sine_amplitude_of(samples: &[f32]) -> f64 {
++    (2.0 * samples.iter().map(|&x| x as f64 * x as f64).sum::<f64>() / samples.len() as f64).sqrt()
++}
++
++fn noise_samples(seed: u64, samples: usize) -> Vec<f32> {
++    let mut state = seed;
++    (0..samples)
++        .map(|i| {
++            state = state
++                .wrapping_mul(6364136223846793005)
++                .wrapping_add(1442695040888963407);
++            let x = (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
++            x * (1.2 + (i as f32 * 0.0021).sin())
++        })
++        .collect()
++}
++
++fn swell_samples(sample_rate: f64, samples: usize) -> Vec<f32> {
++    (0..samples)
++        .map(|i| {
++            let amplitude = 0.05 + 0.9 * i as f64 / samples as f64;
++            (amplitude * (TAU64 * 441.0 * i as f64 / sample_rate).sin()) as f32
++        })
++        .collect()
++}
++
++fn frequency_of(samples: &[f32], sample_rate: f64) -> f64 {
++    let mut crossings = Vec::new();
++    for i in 1..samples.len() {
++        let (a, b) = (samples[i - 1] as f64, samples[i] as f64);
++        if a <= 0.0 && b > 0.0 {
++            crossings.push((i - 1) as f64 + -a / (b - a));
++        }
++    }
++    assert!(crossings.len() >= 3, "no steady tone found");
++    (crossings.len() - 1) as f64 * sample_rate / (crossings[crossings.len() - 1] - crossings[0])
++}
++
++fn correlation_at(samples: &[f32], lag: usize) -> f64 {
++    let (mut xy, mut xx, mut yy) = (0.0, 0.0, 0.0);
++    for i in 0..samples.len() - lag {
++        let (a, b) = (samples[i] as f64, samples[i + lag] as f64);
++        xy += a * b;
++        xx += a * a;
++        yy += b * b;
++    }
++    if xx > 0.0 && yy > 0.0 {
++        xy / (xx * yy).sqrt()
++    } else {
++        0.0
++    }
++}
++
++fn repeat_frequency_of(samples: &[f32], sample_rate: f64, frequency: f64) -> f64 {
++    let period = sample_rate / frequency;
++    let first = (0.3 * period).floor() as usize;
++    let last = (1.25 * period).ceil() as usize;
++    let correlations: Vec<f64> = (first..=last + 1)
++        .map(|lag| correlation_at(samples, lag))
++        .collect();
++    let i = (1..correlations.len() - 1)
++        .find(|&i| {
++            correlations[i] > 0.9
++                && correlations[i] >= correlations[i - 1]
++                && correlations[i] >= correlations[i + 1]
++        })
++        .expect("no steady tone found");
++    let (a, b, c) = (correlations[i - 1], correlations[i], correlations[i + 1]);
++    let curve = a - 2.0 * b + c;
++    let shift = if curve < 0.0 {
++        0.5 * (a - c) / curve
++    } else {
++        0.0
++    };
++    sample_rate / ((first + i) as f64 + shift)
++}
++
++fn assert_steady_tone(
++    samples: &[f32],
++    sample_rate: f64,
++    frequency: f64,
++    amplitude: f64,
++    skip: usize,
++    label: &str,
++) {
++    assert_steady(
++        samples,
++        sample_rate,
++        frequency,
++        amplitude,
++        skip,
++        label,
++        |part| frequency_of(part, sample_rate),
++    );
++}
++
++fn assert_steady_tone_with_overtones(
++    samples: &[f32],
++    sample_rate: f64,
++    frequency: f64,
++    amplitude: f64,
++    skip: usize,
++    label: &str,
++) {
++    assert_steady(
++        samples,
++        sample_rate,
++        frequency,
++        amplitude,
++        skip,
++        label,
++        |part| repeat_frequency_of(part, sample_rate, frequency),
++    );
++}
++
++fn assert_steady(
++    samples: &[f32],
++    sample_rate: f64,
++    frequency: f64,
++    amplitude: f64,
++    skip: usize,
++    label: &str,
++    measure: impl Fn(&[f32]) -> f64,
++) {
++    assert!(
++        samples.len() > 2 * skip + (0.1 * sample_rate) as usize,
++        "{label}: too short"
++    );
++    let body = &samples[skip..samples.len() - skip];
++    let measured = measure(body);
++    assert!(
++        (measured / frequency - 1.0).abs() <= 0.02,
++        "{label}: frequency {measured} Hz, expected {frequency} Hz"
++    );
++    let expected = amplitude / 2.0f64.sqrt();
++    let window = (0.05 * sample_rate).round() as usize;
++    let mut start = 0;
++    while start + window <= body.len() {
++        let part = &body[start..start + window];
++        let power = part.iter().map(|&x| x as f64 * x as f64).sum::<f64>() / window as f64;
++        let level = 10.0 * (power / (expected * expected)).log10();
++        assert!(
++            level.abs() <= 1.5,
++            "{label}: level {level} dB in the window at sample {}",
++            skip + start
++        );
++        let local = measure(part);
++        assert!(
++            (local / frequency - 1.0).abs() <= 0.02,
++            "{label}: frequency {local} Hz in the window at sample {}, expected {frequency} Hz",
++            skip + start
++        );
++        start += window / 8;
++    }
++}
++
++fn edge(sample_rate: f64) -> usize {
++    (0.05 * sample_rate).ceil() as usize
++}
++
++fn stretched_edge(sample_rate: f64, factor: f64) -> usize {
++    (0.05 * sample_rate * factor.max(1.0)).ceil() as usize
++}
++
++fn play(
++    node: &mut An<impl AudioNode<Inputs = U1, Outputs = U1>>,
++    speed: f32,
++    samples: usize,
++) -> Vec<f32> {
++    (0..samples).map(|_| node.filter_mono(speed)).collect()
++}
++
++fn click_wave(sample_rate: f64, length: usize, clicks: &[usize]) -> Wave {
++    let mut samples = vec![0.0f32; length];
++    for &i in clicks {
++        samples[i] = 1.0;
++    }
++    Wave::from_samples(sample_rate, &samples)
++}
++
++fn peak_near(samples: &[f32], sample_rate: f64, time: f64) -> f32 {
++    let near = 0.05 * sample_rate;
++    samples
++        .iter()
++        .enumerate()
++        .filter(|(i, _)| (*i as f64 - time).abs() <= near)
++        .fold(0.0f32, |peak, (_, &x)| peak.max(x.abs()))
++}
++
++fn assert_click_survives(output: &Wave, sample_rate: f64, stretched: f64, label: &str) {
++    assert_click_height(output.channel(0), sample_rate, stretched, 1.0, label);
++}
++
++fn assert_click_height(
++    samples: &[f32],
++    sample_rate: f64,
++    stretched: f64,
++    height: f32,
++    label: &str,
++) {
++    let peak = peak_near(samples, sample_rate, stretched);
++    assert!(
++        peak >= 0.5 * height.abs(),
++        "{label}: click of height {height} peaks at {peak} near {stretched}"
++    );
++}
++
++fn assert_quiet_away_from(output: &Wave, sample_rate: f64, stretched: &[f64], label: &str) {
++    assert_quiet_below(output.channel(0), sample_rate, stretched, 0.01, label);
++}
++
++fn assert_quiet_below(
++    samples: &[f32],
++    sample_rate: f64,
++    stretched: &[f64],
++    limit: f32,
++    label: &str,
++) {
++    let far = 0.1 * sample_rate;
++    for (i, &x) in samples.iter().enumerate() {
++        if stretched.iter().all(|&t| (i as f64 - t).abs() >= far) {
++            assert!(x.abs() <= limit, "{label}: {x} at sample {i}");
++        }
++    }
++}
++
++struct Seeded(u64);
++
++impl Seeded {
++    fn next(&mut self) -> f64 {
++        self.0 = self
++            .0
++            .wrapping_mul(6364136223846793005)
++            .wrapping_add(1442695040888963407);
++        (self.0 >> 11) as f64 / (1u64 << 53) as f64
++    }
++
++    fn range(&mut self, low: f64, high: f64) -> f64 {
++        low + (high - low) * self.next()
++    }
++
++    fn pick(&mut self, values: &[f64]) -> f64 {
++        values[std::cmp::min(
++            (self.next() * values.len() as f64) as usize,
++            values.len() - 1,
++        )]
++    }
++}
++
++fn sawtooth_samples(sample_rate: f64, frequency: f64, samples: usize) -> Vec<f32> {
++    (0..samples)
++        .map(|i| {
++            let phase = (frequency * i as f64 / sample_rate).fract();
++            (0.8 * phase - 0.4) as f32
++        })
++        .collect()
++}
++
++fn falling_fraction(samples: &[f32]) -> f64 {
++    let steps: Vec<f32> = samples
++        .windows(2)
++        .map(|w| w[1] - w[0])
++        .filter(|&d| d != 0.0)
++        .collect();
++    steps.iter().filter(|&&d| d < 0.0).count() as f64 / steps.len() as f64
++}
++
++#[test]
++fn stretched_length_rounds_to_nearest_sample() {
++    for &(length, factor, expected) in &[
++        (1001usize, 1.5f64, 1502usize),
++        (10, 0.25, 3),
++        (3, 0.5, 2),
++        (7, 1.3, 9),
++        (44100, 0.37, 16317),
++        (1000, 2.0004, 2000),
++        (999, 2.0006, 1999),
++        (12345, 4.0, 49380),
++        (12345, 0.333, 4111),
++    ] {
++        let wave = Wave::from_samples(44100.0, &noise_samples(length as u64, length));
++        let output = wave.stretch(factor as _);
++        assert_eq!(output.len(), expected, "length {length} factor {factor}");
++        assert_eq!(output.channel(0).len(), expected);
++    }
++}
++
++#[test]
++fn stretch_keeps_sample_rate_and_channels() {
++    let mut wave = Wave::new(0, 32000.0);
++    for channel in 0..3 {
++        wave.push_channel(&noise_samples(channel + 7, 5000));
++    }
++    let output = wave.stretch(1.75);
++    assert_eq!(output.channels(), 3);
++    assert_eq!(output.sample_rate(), 32000.0);
++    assert_eq!(output.len(), 8750);
++    for channel in 0..3 {
++        assert_eq!(output.channel(channel).len(), 8750);
++    }
++}
++
++#[test]
++fn empty_wave_stretches_to_empty_wave() {
++    let wave = Wave::new(2, 48000.0);
++    let output = wave.stretch(3.0);
++    assert_eq!(output.len(), 0);
++    assert_eq!(output.channels(), 2);
++    assert_eq!(output.sample_rate(), 48000.0);
++}
++
++#[test]
++fn factor_one_returns_the_same_samples() {
++    let mut wave = Wave::new(0, 44100.0);
++    wave.push_channel(&noise_samples(1, 30000));
++    wave.push_channel(&sine_samples(44100.0, 333.0, 0.7, 30000));
++    wave.push_channel(&swell_samples(44100.0, 30000));
++    let output = wave.stretch(1.0);
++    assert_eq!(output.len(), 30000);
++    for channel in 0..3 {
++        for i in 0..30000 {
++            let error = (output.at(channel, i) - wave.at(channel, i)).abs();
++            assert!(
++                error <= 1.0e-6,
++                "channel {channel} sample {i}: error {error}"
++            );
++        }
++    }
++}
++
++#[test]
++fn silence_stretches_to_silence() {
++    for &factor in &[0.25, 0.6, 1.0, 2.5, 4.0] {
++        let wave = Wave::zero(2, 44100.0, 1.0);
++        let output = wave.stretch(factor);
++        for channel in 0..2 {
++            assert!(
++                output.channel(channel).iter().all(|&x| x == 0.0),
++                "factor {factor}"
++            );
++        }
++    }
++}
++
++#[test]
++fn silent_channel_stays_silent_beside_sound() {
++    let mut wave = Wave::new(0, 44100.0);
++    wave.push_channel(&noise_samples(3, 44100));
++    wave.push_channel(&vec![0.0; 44100]);
++    for &factor in &[0.5, 1.7, 3.0] {
++        let output = wave.stretch(factor);
++        assert!(
++            output.channel(1).iter().all(|&x| x == 0.0),
++            "factor {factor}"
++        );
++        assert!(
++            output.channel(0).iter().any(|&x| x != 0.0),
++            "factor {factor}"
++        );
++    }
++}
++
++#[test]
++fn channels_that_stop_together_stop_on_the_same_sample() {
++    let sample_rate = 44100.0;
++    for &factor in &[0.5, 0.8, 1.3, 2.0, 3.1] {
++        let mut left = sine_samples(sample_rate, 310.0, 0.5, 66150);
++        let mut right = sine_samples(sample_rate, 1730.0, 0.5, 66150);
++        let mut tail = noise_samples(9, 66150);
++        for i in 44100..66150 {
++            left[i] = 0.0;
++            right[i] = 0.0;
++            tail[i] = 0.0;
++        }
++        let mut wave = Wave::new(0, sample_rate);
++        wave.push_channel(&left);
++        wave.push_channel(&right);
++        wave.push_channel(&tail);
++        let output = wave.stretch(factor);
++        let last = |channel: usize| output.channel(channel).iter().rposition(|&x| x != 0.0);
++        assert!(last(0).is_some());
++        assert_eq!(last(0), last(1), "factor {factor}");
++        assert_eq!(last(0), last(2), "factor {factor}");
++    }
++}
++
++#[test]
++fn slowing_down_keeps_pitch_and_level() {
++    let sample_rate = 44100.0;
++    for &frequency in &[100.0, 440.0, 1000.0, 3150.0, 5000.0] {
++        for &factor in &[1.25, 1.5, 2.0, 3.0, 4.0] {
++            let wave = sine(sample_rate, frequency, 0.5, 0.8);
++            let output = wave.stretch(factor);
++            assert_steady_tone(
++                output.channel(0),
++                sample_rate,
++                frequency,
++                0.5,
++                stretched_edge(sample_rate, factor),
++                &format!("{frequency} Hz factor {factor}"),
++            );
++        }
++    }
++}
++
++#[test]
++fn speeding_up_keeps_pitch_and_level() {
++    let sample_rate = 44100.0;
++    for &frequency in &[100.0, 523.0, 1200.0, 2711.0, 5000.0] {
++        for &factor in &[0.25, 0.4, 0.5, 0.8] {
++            let wave = sine(sample_rate, frequency, 0.5, 2.5);
++            let output = wave.stretch(factor);
++            assert_steady_tone(
++                output.channel(0),
++                sample_rate,
++                frequency,
++                0.5,
++                stretched_edge(sample_rate, factor),
++                &format!("{frequency} Hz factor {factor}"),
++            );
++        }
++    }
++}
++
++#[test]
++fn stretching_keeps_pitch_at_other_sample_rates() {
++    for &sample_rate in &[22050.0, 32000.0, 48000.0, 96000.0] {
++        for &(frequency, factor) in &[(150.0, 2.0), (880.0, 0.5), (3600.0, 3.0), (2100.0, 0.3)] {
++            let wave = sine(sample_rate, frequency, 0.4, 1.0);
++            let output = wave.stretch(factor);
++            assert_steady_tone(
++                output.channel(0),
++                sample_rate,
++                frequency,
++                0.4,
++                stretched_edge(sample_rate, factor),
++                &format!("{sample_rate} Hz rate, {frequency} Hz factor {factor}"),
++            );
++        }
++    }
++}
++
++#[test]
++fn stretching_keeps_pitch_of_a_tone_with_overtones() {
++    for &sample_rate in &[44100.0, 32000.0] {
++        let samples = overtone_samples(sample_rate, 330.0, 0.3, sample_rate as usize);
++        let amplitude = sine_amplitude_of(&samples);
++        let wave = Wave::from_samples(sample_rate, &samples);
++        for &factor in &[0.5, 1.7, 3.0] {
++            let output = wave.stretch(factor);
++            assert_steady_tone_with_overtones(
++                output.channel(0),
++                sample_rate,
++                330.0,
++                amplitude,
++                stretched_edge(sample_rate, factor),
++                &format!("{sample_rate} Hz rate, factor {factor}"),
++            );
++        }
++    }
++}
++
++#[test]
++fn stretching_keeps_overtones_close_to_a_sixth_of_the_rate() {
++    for &(sample_rate, frequency) in &[(44100.0, 2400.0), (32000.0, 1700.0), (22050.0, 1200.0)] {
++        let samples = overtone_samples(sample_rate, frequency, 0.3, sample_rate as usize);
++        let amplitude = sine_amplitude_of(&samples);
++        let wave = Wave::from_samples(sample_rate, &samples);
++        for &factor in &[0.5, 3.0] {
++            let output = wave.stretch(factor);
++            assert_steady_tone_with_overtones(
++                output.channel(0),
++                sample_rate,
++                frequency,
++                amplitude,
++                stretched_edge(sample_rate, factor),
++                &format!("{sample_rate} Hz rate, {frequency} Hz factor {factor}"),
++            );
++        }
++    }
++}
++
++#[test]
++fn stretching_keeps_quiet_and_loud_levels() {
++    let sample_rate = 44100.0;
++    for &amplitude in &[0.02, 0.9] {
++        for &factor in &[0.7, 2.2] {
++            let wave = sine(sample_rate, 660.0, amplitude, 1.0);
++            let output = wave.stretch(factor);
++            assert_steady_tone(
++                output.channel(0),
++                sample_rate,
++                660.0,
++                amplitude,
++                stretched_edge(sample_rate, factor),
++                &format!("amplitude {amplitude} factor {factor}"),
++            );
++        }
++    }
++}
++
++#[test]
++fn every_channel_keeps_its_own_pitch() {
++    let sample_rate = 44100.0;
++    let mut wave = Wave::new(0, sample_rate);
++    wave.push_channel(&sine_samples(sample_rate, 200.0, 0.5, 44100));
++    wave.push_channel(&sine_samples(sample_rate, 2500.0, 0.3, 44100));
++    for &factor in &[0.5, 1.6, 2.5] {
++        let output = wave.stretch(factor);
++        let skip = stretched_edge(sample_rate, factor);
++        assert_steady_tone(
++            output.channel(0),
++            sample_rate,
++            200.0,
++            0.5,
++            skip,
++            &format!("left {factor}"),
++        );
++        assert_steady_tone(
++            output.channel(1),
++            sample_rate,
++            2500.0,
++            0.3,
++            skip,
++            &format!("right {factor}"),
++        );
++    }
++}
++
++#[test]
++fn click_in_the_middle_stays_sharp() {
++    let sample_rate = 44100.0;
++    for &factor in &[1.25, 1.5, 2.0, 3.0, 4.0] {
++        for &position in &[11025usize, 30001, 52917] {
++            let wave = click_wave(sample_rate, 66150, &[position]);
++            let output = wave.stretch(factor);
++            let stretched = position as f64 * factor;
++            assert_click_survives(
++                &output,
++                sample_rate,
++                stretched,
++                &format!("factor {factor} click {position}"),
++            );
++            assert_quiet_away_from(
++                &output,
++                sample_rate,
++                &[stretched],
++                &format!("factor {factor} click {position}"),
++            );
++        }
++    }
++}
++
++#[test]
++fn click_on_the_first_sample_stays_sharp() {
++    let sample_rate = 44100.0;
++    for &factor in &[1.2, 2.0, 3.5, 4.0] {
++        let wave = click_wave(sample_rate, 22050, &[0]);
++        let output = wave.stretch(factor);
++        assert_click_survives(&output, sample_rate, 0.0, &format!("factor {factor}"));
++        assert_quiet_away_from(&output, sample_rate, &[0.0], &format!("factor {factor}"));
++    }
++}
++
++#[test]
++fn click_on_the_last_sample_stays_sharp() {
++    let sample_rate = 44100.0;
++    for &factor in &[1.2, 2.0, 3.5, 4.0] {
++        let wave = click_wave(sample_rate, 22050, &[22049]);
++        let output = wave.stretch(factor);
++        let stretched = 22049.0 * factor;
++        assert_click_survives(&output, sample_rate, stretched, &format!("factor {factor}"));
++        assert_quiet_away_from(
++            &output,
++            sample_rate,
++            &[stretched],
++            &format!("factor {factor}"),
++        );
++    }
++}
++
++#[test]
++fn clicks_stay_sharp_in_very_short_waves() {
++    let sample_rate = 44100.0;
++    for &(length, click, factor) in &[
++        (1usize, 0usize, 1.5f64),
++        (1, 0, 2.0),
++        (1, 0, 4.0),
++        (100, 99, 4.0),
++        (300, 150, 3.0),
++        (2000, 0, 2.5),
++    ] {
++        let wave = click_wave(sample_rate, length, &[click]);
++        let output = wave.stretch(factor as _);
++        assert_eq!(output.len(), (length as f64 * factor).round() as usize);
++        assert_click_survives(
++            &output,
++            sample_rate,
++            click as f64 * factor,
++            &format!("length {length} click {click} factor {factor}"),
++        );
++    }
++}
++
++#[test]
++fn several_clicks_each_stay_sharp() {
++    let sample_rate = 48000.0;
++    let clicks = [100usize, 14500, 29000, 43900, 59999];
++    let wave = click_wave(sample_rate, 60000, &clicks);
++    for &factor in &[1.6, 2.7] {
++        let output = wave.stretch(factor);
++        let stretched: Vec<f64> = clicks.iter().map(|&i| i as f64 * factor).collect();
++        for &t in stretched.iter() {
++            assert_click_survives(&output, sample_rate, t, &format!("factor {factor} at {t}"));
++        }
++        assert_quiet_away_from(
++            &output,
++            sample_rate,
++            &stretched,
++            &format!("factor {factor}"),
++        );
++    }
++}
++
++#[test]
++fn player_is_an_opcode_in_every_prelude() {
++    let samples = noise_samples(5, 5000);
++    let wave = Arc::new(Wave::from_samples(44100.0, &samples));
++    let mut a = fundsp::prelude::playwave_stretch(&wave, 0, None);
++    let mut b = fundsp::prelude32::playwave_stretch(&wave, 0, None);
++    let mut c = fundsp::prelude64::playwave_stretch(&wave, 0, Some(1000));
++    assert_eq!((a.inputs(), a.outputs()), (1, 1));
++    assert_eq!((b.inputs(), b.outputs()), (1, 1));
++    assert_eq!((c.inputs(), c.outputs()), (1, 1));
++    for i in 0..5000 {
++        let x = a.filter_mono(1.0);
++        let y = b.filter_mono(1.0);
++        let z = c.filter_mono(1.0);
++        assert!((x - samples[i]).abs() <= 1.0e-6);
++        assert!((y - samples[i]).abs() <= 1.0e-6);
++        assert!((z - samples[i]).abs() <= 1.0e-6);
++    }
++}
++
++#[test]
++fn speed_one_reproduces_the_recorded_samples() {
++    let samples = noise_samples(11, 50000);
++    let wave = Arc::new(Wave::from_samples(44100.0, &samples));
++    let mut node = playwave_stretch(&wave, 0, None);
++    for (i, &expected) in samples.iter().enumerate() {
++        let x = node.filter_mono(1.0);
++        assert!(
++            (x - expected).abs() <= 1.0e-6,
++            "sample {i}: {x} vs {expected}"
++        );
++    }
++}
++
++#[test]
++fn speed_one_reproduces_a_swelling_tone() {
++    let samples = swell_samples(44100.0, 44100);
++    let wave = Arc::new(Wave::from_samples(44100.0, &samples));
++    let mut node = playwave_stretch(&wave, 0, None);
++    for (i, &expected) in samples.iter().enumerate() {
++        let x = node.filter_mono(1.0);
++        assert!(
++            (x - expected).abs() <= 1.0e-6,
++            "sample {i}: {x} vs {expected}"
++        );
++    }
++}
++
++#[test]
++fn speed_one_reproduces_samples_of_the_chosen_channel_at_any_rate() {
++    for &sample_rate in &[22050.0, 48000.0, 96000.0] {
++        let mut wave = Wave::new(0, sample_rate);
++        wave.push_channel(&noise_samples(1, 20000));
++        wave.push_channel(&noise_samples(2, 20000));
++        let wave = Arc::new(wave);
++        let mut node = playwave_stretch(&wave, 1, None);
++        node.set_sample_rate(sample_rate);
++        for i in 0..20000 {
++            let x = node.filter_mono(1.0);
++            assert!(
++                (x - wave.at(1, i)).abs() <= 1.0e-6,
++                "rate {sample_rate} sample {i}"
++            );
++        }
++    }
++}
++
++#[test]
++fn player_renders_inside_a_graph() {
++    let samples = noise_samples(21, 30000);
++    let wave = Arc::new(Wave::from_samples(44100.0, &samples));
++    let mut graph = dc(1.0) >> playwave_stretch(&wave, 0, None);
++    let output = Wave::render(44100.0, 30000.0 / 44100.0, &mut graph);
++    assert_eq!(output.len(), 30000);
++    for i in 0..30000 {
++        assert!((output.at(0, i) - samples[i]).abs() <= 1.0e-6, "sample {i}");
++    }
++}
++
++#[test]
++fn position_starts_at_zero_and_follows_speed() {
++    let wave = Arc::new(Wave::from_samples(44100.0, &noise_samples(4, 10000)));
++    let mut node = playwave_stretch(&wave, 0, None);
++    assert_eq!(as_f64(node.position()), 0.0);
++    node.filter_mono(0.5);
++    assert_eq!(as_f64(node.position()), 0.5);
++    play(&mut node, 2.0, 100);
++    assert_eq!(as_f64(node.position()), 200.5);
++    play(&mut node, -0.25, 40);
++    assert_eq!(as_f64(node.position()), 190.5);
++    play(&mut node, 0.0, 1000);
++    assert_eq!(as_f64(node.position()), 190.5);
++    play(&mut node, -1.0, 500);
++    assert_eq!(as_f64(node.position()), -309.5);
++    play(&mut node, 4.0, 4000);
++    assert_eq!(as_f64(node.position()), 15690.5);
++}
++
++#[test]
++fn position_scales_with_the_sample_rates() {
++    let wave = Arc::new(Wave::from_samples(22050.0, &noise_samples(4, 30000)));
++    let mut node = playwave_stretch(&wave, 0, None);
++    node.set_sample_rate(44100.0);
++    play(&mut node, 1.0, 1000);
++    assert_eq!(as_f64(node.position()), 500.0);
++    play(&mut node, -2.0, 100);
++    assert_eq!(as_f64(node.position()), 400.0);
++
++    let wave = Arc::new(Wave::from_samples(48000.0, &noise_samples(4, 30000)));
++    let mut node = playwave_stretch(&wave, 0, None);
++    node.set_sample_rate(44100.0);
++    play(&mut node, 1.0, 4410);
++    assert!((as_f64(node.position()) - 4800.0).abs() < 1.0e-3);
++    play(&mut node, 0.5, 4410);
++    assert!((as_f64(node.position()) - 7200.0).abs() < 1.0e-3);
++
++    let wave = Arc::new(Wave::from_samples(44100.0, &noise_samples(4, 30000)));
++    let mut node = playwave_stretch(&wave, 0, None);
++    node.set_sample_rate(88200.0);
++    play(&mut node, 1.0, 1000);
++    assert_eq!(as_f64(node.position()), 500.0);
++}
++
++#[test]
++fn player_keeps_pitch_and_level_at_any_speed() {
++    let sample_rate = 44100.0;
++    let wave = Arc::new(sine(sample_rate, 997.0, 0.6, 4.0));
++    for &speed in &[-2.0f32, -1.0, -0.5, 0.5, 0.75, 1.0, 1.25, 2.0] {
++        let mut node = playwave_stretch(&wave, 0, None);
++        play(&mut node, 1.0, 88200);
++        let output = play(&mut node, speed, 30870);
++        assert_steady_tone(
++            &output,
++            sample_rate,
++            997.0,
++            0.6,
++            edge(sample_rate),
++            &format!("speed {speed}"),
++        );
++    }
++}
++
++#[test]
++fn player_keeps_pitch_of_low_and_high_tones() {
++    let sample_rate = 48000.0;
++    for &frequency in &[100.0, 4900.0] {
++        let wave = Arc::new(sine(sample_rate, frequency, 0.5, 4.0));
++        for &speed in &[-1.5f32, 0.3, 1.8] {
++            let mut node = playwave_stretch(&wave, 0, None);
++            node.set_sample_rate(sample_rate);
++            play(&mut node, 1.0, 96000);
++            let output = play(&mut node, speed, 33600);
++            assert_steady_tone(
++                &output,
++                sample_rate,
++                frequency,
++                0.5,
++                edge(sample_rate),
++                &format!("{frequency} Hz speed {speed}"),
++            );
++        }
++    }
++}
++
++#[test]
++fn player_keeps_pitch_of_a_tone_with_overtones() {
++    for &(wave_rate, output_rate, speed) in &[
++        (44100.0, 44100.0, 0.5f32),
++        (44100.0, 44100.0, -0.75),
++        (44100.0, 44100.0, 0.0),
++        (44100.0, 44100.0, 1.5),
++        (32000.0, 48000.0, 0.7),
++        (48000.0, 44100.0, -1.3),
++    ] {
++        let samples = overtone_samples(wave_rate, 330.0, 0.3, 2 * wave_rate as usize);
++        let amplitude = sine_amplitude_of(&samples);
++        let wave = Arc::new(Wave::from_samples(wave_rate, &samples));
++        let mut node = playwave_stretch(&wave, 0, None);
++        node.set_sample_rate(output_rate);
++        while as_f64(node.position()) < wave_rate {
++            node.filter_mono(1.0);
++        }
++        let output = play(&mut node, speed, (0.6 * output_rate) as usize);
++        assert_steady_tone_with_overtones(
++            &output,
++            output_rate,
++            330.0,
++            amplitude,
++            edge(output_rate),
++            &format!("wave {wave_rate} output {output_rate} speed {speed}"),
++        );
++    }
++}
++
++#[test]
++fn holding_keeps_sounding_at_the_position() {
++    let sample_rate = 44100.0;
++    let wave = Arc::new(sine(sample_rate, 1234.0, 0.5, 2.0));
++    let mut node = playwave_stretch(&wave, 0, None);
++    play(&mut node, 1.0, 44100);
++    let output = play(&mut node, 0.0, 66150);
++    assert_eq!(as_f64(node.position()), 44100.0);
++    assert_steady_tone(&output, sample_rate, 1234.0, 0.5, edge(sample_rate), "hold");
++}
++
++#[test]
++fn pitch_ignores_the_output_sample_rate() {
++    for &(wave_rate, output_rate) in &[(22050.0, 44100.0), (48000.0, 44100.0), (44100.0, 96000.0)] {
++        let wave = Arc::new(sine(wave_rate, 1000.0, 0.5, 4.0));
++        for &speed in &[1.0f32, 0.5, -1.0, 0.0] {
++            let mut node = playwave_stretch(&wave, 0, None);
++            node.set_sample_rate(output_rate);
++            while as_f64(node.position()) < 2.0 * wave_rate {
++                node.filter_mono(1.0);
++            }
++            let output = play(&mut node, speed, (0.7 * output_rate) as usize);
++            assert_steady_tone(
++                &output,
++                output_rate,
++                1000.0,
++                0.5,
++                edge(output_rate),
++                &format!("wave {wave_rate} output {output_rate} speed {speed}"),
++            );
++        }
++    }
++}
++
++#[test]
++fn player_is_silent_past_the_end() {
++    let wave = Arc::new(sine(44100.0, 500.0, 0.5, 0.5));
++    let mut node = playwave_stretch(&wave, 0, None);
++    play(&mut node, 1.0, 22050 + 22050);
++    let output = play(&mut node, 1.0, 10000);
++    assert!(output.iter().all(|&x| x == 0.0));
++    let output = play(&mut node, 0.5, 10000);
++    assert!(output.iter().all(|&x| x == 0.0));
++    assert_eq!(as_f64(node.position()), 59100.0);
++}
++
++#[test]
++fn fresh_reverse_without_a_loop_is_silent_before_the_start() {
++    let sample_rate = 44100.0;
++    let samples: Vec<f32> = (0..44100)
++        .map(|i| (0.5 * (TAU64 * 500.0 * i as f64 / sample_rate).cos()) as f32)
++        .collect();
++    let wave = Arc::new(Wave::from_samples(sample_rate, &samples));
++    let mut node = playwave_stretch(&wave, 0, None);
++    let output = play(&mut node, -1.0, 22050);
++    assert_eq!(as_f64(node.position()), -22050.0);
++    assert!(output[2205..].iter().all(|&x| x == 0.0));
++    let output = play(&mut node, 1.0, 33075);
++    assert_eq!(as_f64(node.position()), 11025.0);
++    assert!(output[2205..19845].iter().all(|&x| x == 0.0));
++    assert!(output[24255..].iter().any(|&x| x.abs() > 0.1));
++}
++
++#[test]
++fn slow_playback_is_silent_once_past_either_end() {
++    let wave = Arc::new(sine(44100.0, 500.0, 0.5, 1.0));
++    let mut node = playwave_stretch(&wave, 0, None);
++    play(&mut node, 1.0, 4410);
++    let output = play(&mut node, -0.5, 22050);
++    assert_eq!(as_f64(node.position()), -6615.0);
++    assert!(output[..8820].iter().any(|&x| x.abs() > 0.1));
++    assert!(output[13230..].iter().all(|&x| x == 0.0));
++
++    let mut node = playwave_stretch(&wave, 0, None);
++    play(&mut node, 1.0, 39690);
++    let output = play(&mut node, 0.5, 22050);
++    assert_eq!(as_f64(node.position()), 50715.0);
++    assert!(output[..8820].iter().any(|&x| x.abs() > 0.1));
++    assert!(output[13230..].iter().all(|&x| x == 0.0));
++}
++
++#[test]
++fn holding_past_either_end_stays_silent() {
++    let wave = Arc::new(sine(44100.0, 500.0, 0.5, 1.0));
++    let mut node = playwave_stretch(&wave, 0, None);
++    play(&mut node, 1.0, 46305);
++    let output = play(&mut node, 0.0, 22050);
++    assert_eq!(as_f64(node.position()), 46305.0);
++    assert!(output.iter().all(|&x| x == 0.0));
++
++    let mut node = playwave_stretch(&wave, 0, None);
++    play(&mut node, 1.0, 2205);
++    play(&mut node, -1.0, 4410);
++    let output = play(&mut node, 0.0, 22050);
++    assert_eq!(as_f64(node.position()), -2205.0);
++    assert!(output.iter().all(|&x| x == 0.0));
++}
++
++#[test]
++fn position_goes_below_zero_and_comes_back() {
++    let wave = Arc::new(sine(44100.0, 500.0, 0.5, 1.0));
++    let mut node = playwave_stretch(&wave, 0, None);
++    play(&mut node, 1.0, 4410);
++    play(&mut node, -1.0, 4410 + 32050);
++    assert_eq!(as_f64(node.position()), -32050.0);
++    play(&mut node, 0.0, 10000);
++    assert_eq!(as_f64(node.position()), -32050.0);
++    play(&mut node, 2.0, 22050);
++    assert_eq!(as_f64(node.position()), 12050.0);
++    let output = play(&mut node, 1.0, 4410);
++    assert!(output.iter().any(|&x| x.abs() > 0.1));
++}
++
++#[test]
++fn silent_wave_plays_silence() {
++    let wave = Arc::new(Wave::zero(1, 44100.0, 1.0));
++    for &speed in &[1.0f32, 0.0, -0.7, 1.9] {
++        let mut node = playwave_stretch(&wave, 0, Some(100));
++        let output = play(&mut node, speed, 50000);
++        assert!(output.iter().all(|&x| x == 0.0), "speed {speed}");
++    }
++}
++
++#[test]
++fn loop_wraps_from_the_end_to_the_loop_point() {
++    let wave = Arc::new(Wave::from_samples(44100.0, &noise_samples(8, 1000)));
++    let mut node = playwave_stretch(&wave, 0, Some(600));
++    play(&mut node, 1.0, 999);
++    assert_eq!(as_f64(node.position()), 999.0);
++    node.filter_mono(1.0);
++    assert_eq!(as_f64(node.position()), 600.0);
++    play(&mut node, 1.5, 300);
++    assert_eq!(as_f64(node.position()), 650.0);
++    play(&mut node, 0.25, 2);
++    assert_eq!(as_f64(node.position()), 650.5);
++}
++
++#[test]
++fn loop_wraps_many_times_in_one_step() {
++    let wave = Arc::new(Wave::from_samples(44100.0, &noise_samples(8, 20)));
++    let mut node = playwave_stretch(&wave, 0, Some(17));
++    play(&mut node, 1.0, 17);
++    assert_eq!(as_f64(node.position()), 17.0);
++    node.filter_mono(7.0);
++    assert_eq!(as_f64(node.position()), 18.0);
++    node.filter_mono(31.5);
++    assert_eq!(as_f64(node.position()), 19.5);
++    node.filter_mono(-10.0);
++    assert_eq!(as_f64(node.position()), 18.5);
++    node.filter_mono(-100.25);
++    assert_eq!(as_f64(node.position()), 17.25);
++}
++
++#[test]
++fn loop_wraps_backwards_from_the_loop_point_to_the_end() {
++    let wave = Arc::new(Wave::from_samples(44100.0, &noise_samples(8, 1000)));
++    let mut node = playwave_stretch(&wave, 0, Some(600));
++    play(&mut node, 1.0, 700);
++    assert_eq!(as_f64(node.position()), 700.0);
++    play(&mut node, -1.0, 100);
++    assert_eq!(as_f64(node.position()), 600.0);
++    node.filter_mono(-1.0);
++    assert_eq!(as_f64(node.position()), 999.0);
++    play(&mut node, -2.0, 250);
++    assert_eq!(as_f64(node.position()), 899.0);
++}
++
++#[test]
++fn backwards_before_the_loop_point_does_not_wrap() {
++    let wave = Arc::new(Wave::from_samples(44100.0, &noise_samples(8, 1000)));
++    let mut node = playwave_stretch(&wave, 0, Some(600));
++    play(&mut node, 1.0, 300);
++    play(&mut node, -1.0, 500);
++    assert_eq!(as_f64(node.position()), -200.0);
++    play(&mut node, 1.0, 799);
++    assert_eq!(as_f64(node.position()), 599.0);
++    play(&mut node, -1.0, 10);
++    assert_eq!(as_f64(node.position()), 589.0);
++}
++
++#[test]
++fn loop_wraps_with_unequal_sample_rates() {
++    let wave = Arc::new(Wave::from_samples(22050.0, &noise_samples(8, 1000)));
++    let mut node = playwave_stretch(&wave, 0, Some(600));
++    node.set_sample_rate(44100.0);
++    play(&mut node, 1.5, 1000);
++    assert_eq!(as_f64(node.position()), 750.0);
++    play(&mut node, 1.5, 400);
++    assert_eq!(as_f64(node.position()), 650.0);
++    play(&mut node, -1.25, 200);
++    assert_eq!(as_f64(node.position()), 925.0);
++    play(&mut node, 0.75, 3);
++    assert_eq!(as_f64(node.position()), 926.125);
++    play(&mut node, -7.5, 100);
++    assert_eq!(as_f64(node.position()), 951.125);
++
++    let wave = Arc::new(Wave::from_samples(48000.0, &noise_samples(8, 1000)));
++    let mut node = playwave_stretch(&wave, 0, Some(600));
++    node.set_sample_rate(44100.0);
++    let ratio = 48000.0 / 44100.0;
++    play(&mut node, 0.5, 1000);
++    let expected = 500.0 * ratio;
++    assert!((as_f64(node.position()) - expected).abs() < 1.0e-3);
++    play(&mut node, 0.5, 1000);
++    let expected = 600.0 + (1000.0 * ratio - 600.0) % 400.0;
++    assert!((as_f64(node.position()) - expected).abs() < 1.0e-3);
++    play(&mut node, -0.7, 500);
++    let expected = 600.0 + (expected - 600.0 - 350.0 * ratio).rem_euclid(400.0);
++    assert!((as_f64(node.position()) - expected).abs() < 1.0e-3);
++}
++
++#[test]
++fn loop_from_the_start_repeats_the_whole_wave() {
++    let wave = Arc::new(Wave::from_samples(44100.0, &noise_samples(8, 500)));
++    let mut node = playwave_stretch(&wave, 0, Some(0));
++    node.filter_mono(-1.0);
++    assert_eq!(as_f64(node.position()), 499.0);
++    play(&mut node, 2.0, 1000);
++    assert_eq!(as_f64(node.position()), 499.0);
++}
++
++#[test]
++fn speed_one_reproduces_looped_samples() {
++    let samples = noise_samples(13, 7000);
++    let wave = Arc::new(Wave::from_samples(44100.0, &samples));
++    for &point in &[0usize, 2500, 6100, 6999] {
++        let mut node = playwave_stretch(&wave, 0, Some(point));
++        for i in 0..30000 {
++            let expected = if i < 7000 {
++                samples[i]
++            } else {
++                samples[point + (i - 7000) % (7000 - point)]
++            };
++            let x = node.filter_mono(1.0);
++            assert!(
++                (x - expected).abs() <= 1.0e-6,
++                "loop point {point} sample {i}: {x} vs {expected}"
++            );
++        }
++    }
++}
++
++#[test]
++fn loops_are_seamless_at_other_speeds() {
++    let sample_rate = 44100.0;
++    let wave = Arc::new(Wave::from_samples(
++        sample_rate,
++        &sine_samples(sample_rate, 630.0, 0.5, 50400),
++    ));
++    for &(point, speed) in &[
++        (0usize, 0.5f32),
++        (0, 1.5),
++        (14000, 2.0),
++        (14000, 0.7),
++        (35000, -1.0),
++        (35000, -0.6),
++    ] {
++        let mut node = playwave_stretch(&wave, 0, Some(point));
++        while as_f64(node.position()) < 40000.0 {
++            node.filter_mono(1.0);
++        }
++        let output = play(&mut node, speed, 132300);
++        assert_steady_tone(
++            &output,
++            sample_rate,
++            630.0,
++            0.5,
++            edge(sample_rate),
++            &format!("loop {point} speed {speed}"),
++        );
++    }
++}
++
++#[test]
++fn loops_that_start_mid_cycle_are_seamless() {
++    let sample_rate = 44100.0;
++    for &(frequency, length, point, speeds) in &[
++        (
++            630.0,
++            50417usize,
++            14017usize,
++            &[0.7f32, -0.6, 1.5, -1.3][..],
++        ),
++        (441.0, 42345, 12345, &[1.8, -0.45][..]),
++    ] {
++        let wave = Arc::new(Wave::from_samples(
++            sample_rate,
++            &sine_samples(sample_rate, frequency, 0.5, length),
++        ));
++        for &speed in speeds {
++            let mut node = playwave_stretch(&wave, 0, Some(point));
++            while as_f64(node.position()) < 30000.0 {
++                node.filter_mono(1.0);
++            }
++            let output = play(&mut node, speed, 132300);
++            assert_steady_tone(
++                &output,
++                sample_rate,
++                frequency,
++                0.5,
++                edge(sample_rate),
++                &format!("{frequency} Hz loop {point} to {length} speed {speed}"),
++            );
++        }
++    }
++}
++
++#[test]
++fn loops_of_a_tone_with_overtones_are_seamless() {
++    for &(wave_rate, output_rate, frequency, length, point, speed) in &[
++        (44100.0, 44100.0, 441.0, 49945usize, 12345usize, 0.7f32),
++        (44100.0, 44100.0, 441.0, 49945, 12345, -1.3),
++        (44100.0, 44100.0, 441.0, 49945, 12345, 0.0),
++        (32000.0, 44100.0, 400.0, 36070, 9030, 1.6),
++        (32000.0, 44100.0, 400.0, 36070, 9030, -0.55),
++    ] {
++        let samples = overtone_samples(wave_rate, frequency, 0.3, length);
++        let amplitude = sine_amplitude_of(&samples);
++        let wave = Arc::new(Wave::from_samples(wave_rate, &samples));
++        let mut node = playwave_stretch(&wave, 0, Some(point));
++        node.set_sample_rate(output_rate);
++        while as_f64(node.position()) < 0.6 * length as f64 {
++            node.filter_mono(1.0);
++        }
++        let output = play(&mut node, speed, (3.0 * output_rate) as usize);
++        assert_steady_tone_with_overtones(
++            &output,
++            output_rate,
++            frequency,
++            amplitude,
++            edge(output_rate),
++            &format!("{frequency} Hz loop {point} to {length} speed {speed}"),
++        );
++    }
++}
++
++#[test]
++fn negative_speed_plays_the_material_backwards() {
++    let sample_rate = 44100.0;
++    let wave = Arc::new(Wave::from_samples(
++        sample_rate,
++        &sawtooth_samples(sample_rate, 110.0, 176400),
++    ));
++    for &speed in &[-1.0f32, -0.5, -1.7, -0.2] {
++        let mut node = playwave_stretch(&wave, 0, None);
++        play(&mut node, 1.0, 88200);
++        let output = play(&mut node, speed, 22050);
++        let falling = falling_fraction(&output[2205..]);
++        assert!(
++            falling > 0.8,
++            "speed {speed}: only {falling} of the steps fall"
++        );
++    }
++    for &speed in &[0.5f32, 1.7, 0.2] {
++        let mut node = playwave_stretch(&wave, 0, None);
++        play(&mut node, 1.0, 88200);
++        let output = play(&mut node, speed, 22050);
++        let falling = falling_fraction(&output[2205..]);
++        assert!(falling < 0.2, "speed {speed}: {falling} of the steps fall");
++    }
++}
++
++#[test]
++fn reverse_loop_from_the_start_reaches_the_end_first() {
++    let sample_rate = 44100.0;
++    let mut samples = vec![0.0f32; 44100];
++    samples[1] = 1.0;
++    samples[30000] = 1.0;
++    let wave = Arc::new(Wave::from_samples(sample_rate, &samples));
++    let mut node = playwave_stretch(&wave, 0, Some(0));
++    let output = play(&mut node, -1.0, 46000);
++    assert!(output[..9690].iter().all(|&x| x == 0.0));
++    let first = output.iter().position(|&x| x.abs() > 0.1).unwrap();
++    assert!(
++        (first as f64 - 14100.0).abs() <= 0.05 * sample_rate,
++        "first sound at {first}"
++    );
++    assert!(peak_near(&output, sample_rate, 44099.0) > 0.1);
++}
++
++#[test]
++fn stretch_tone_quality_holds_near_the_range_limits() {
++    for &sample_rate in &[44100.0, 48000.0] {
++        for &frequency in &[100.0, 101.3, 613.7, 2048.5, 4987.0, 5000.0] {
++            for &factor in &[0.25, 0.2531, 0.97, 1.03, 3.977, 4.0] {
++                let seconds = (0.5f64).max(0.45 / factor);
++                let wave = sine(sample_rate, frequency, 0.5, seconds);
++                let output = wave.stretch(factor);
++                assert_steady_tone(
++                    output.channel(0),
++                    sample_rate,
++                    frequency,
++                    0.5,
++                    stretched_edge(sample_rate, factor),
++                    &format!("{sample_rate} Hz rate, {frequency} Hz factor {factor}"),
++                );
++            }
++        }
++    }
++}
++
++#[test]
++fn stretch_tone_quality_holds_across_seeded_settings() {
++    let mut random = Seeded(20261004);
++    let rates = [22050.0, 32000.0, 44100.0, 48000.0, 96000.0];
++    for case in 0..24 {
++        let sample_rate = random.pick(&rates);
++        let frequency = random.range(100.0, (5000.0f64).min(sample_rate / 6.0));
++        let factor = random.range(0.25, 4.0);
++        let amplitude = random.range(0.02, 0.9);
++        let wave = sine(
++            sample_rate,
++            frequency,
++            amplitude,
++            (0.6f64).max(0.5 / factor),
++        );
++        let output = wave.stretch(factor);
++        assert_steady_tone(
++            output.channel(0),
++            sample_rate,
++            frequency,
++            amplitude,
++            stretched_edge(sample_rate, factor),
++            &format!(
++                "case {case}: {sample_rate} Hz rate, {frequency} Hz, factor {factor}, amplitude {amplitude}"
++            ),
++        );
++    }
++}
++
++#[test]
++fn player_tone_quality_holds_across_seeded_settings() {
++    let mut random = Seeded(4102026);
++    let rates = [22050.0, 32000.0, 44100.0, 48000.0, 96000.0];
++    for case in 0..24 {
++        let wave_rate = random.pick(&rates);
++        let output_rate = random.pick(&rates);
++        let frequency = random
++            .range(100.0, (5000.0f64).min(wave_rate / 6.0))
++            .floor();
++        let speed = random.range(-2.0, 2.0) as f32;
++        let amplitude = random.range(0.05, 0.9);
++        let wave = Arc::new(sine(wave_rate, frequency, amplitude, 1.0));
++        let mut node = playwave_stretch(&wave, 0, Some(0));
++        node.set_sample_rate(output_rate);
++        let output = play(&mut node, speed, (0.5 * output_rate) as usize);
++        assert_steady_tone(
++            &output,
++            output_rate,
++            frequency,
++            amplitude,
++            edge(output_rate),
++            &format!(
++                "case {case}: wave {wave_rate} output {output_rate} {frequency} Hz speed {speed}"
++            ),
++        );
++    }
++}
++
++#[test]
++fn player_tone_quality_holds_near_the_range_limits() {
++    for &(wave_rate, output_rate, frequencies) in &[
++        (44100.0, 44100.0, &[100.0, 5000.0][..]),
++        (32000.0, 44100.0, &[100.0, 5000.0][..]),
++        (22050.0, 48000.0, &[100.0, 3600.0][..]),
++        (96000.0, 44100.0, &[100.0, 5000.0][..]),
++        (44100.0, 22050.0, &[100.0, 5000.0][..]),
++        (11025.0, 48000.0, &[100.0, 1800.0][..]),
++    ] {
++        for &frequency in frequencies {
++            let wave = Arc::new(sine(wave_rate, frequency, 0.5, 1.0));
++            for &speed in &[-2.0f32, -1.99, -0.37, -0.01, 0.01, 1.01, 1.99, 2.0] {
++                let mut node = playwave_stretch(&wave, 0, Some(0));
++                node.set_sample_rate(output_rate);
++                let output = play(&mut node, speed, (0.4 * output_rate) as usize);
++                assert_steady_tone(
++                    &output,
++                    output_rate,
++                    frequency,
++                    0.5,
++                    edge(output_rate),
++                    &format!("wave {wave_rate} output {output_rate} {frequency} Hz speed {speed}"),
++                );
++            }
++        }
++    }
++}
++
++#[test]
++fn clicks_of_any_height_and_sign_stay_sharp() {
++    let sample_rate = 44100.0;
++    let clicks = [
++        (3000usize, -1.0f32),
++        (20000, 0.35),
++        (37000, -0.08),
++        (54000, 0.6),
++    ];
++    let mut samples = vec![0.0f32; 60000];
++    for &(i, height) in clicks.iter() {
++        samples[i] = height;
++    }
++    let wave = Wave::from_samples(sample_rate, &samples);
++    for &factor in &[1.3, 2.4, 4.0] {
++        let output = wave.stretch(factor);
++        for &(i, height) in clicks.iter() {
++            assert_click_height(
++                output.channel(0),
++                sample_rate,
++                i as f64 * factor,
++                height,
++                &format!("factor {factor} click {i}"),
++            );
++        }
++        let stretched: Vec<f64> = clicks.iter().map(|&(i, _)| i as f64 * factor).collect();
++        assert_quiet_below(
++            output.channel(0),
++            sample_rate,
++            &stretched,
++            0.0008,
++            &format!("factor {factor}"),
++        );
++    }
++}
++
++#[test]
++fn clicks_stay_sharp_across_seeded_settings() {
++    let mut random = Seeded(777);
++    for case in 0..24 {
++        let sample_rate = random.pick(&[44100.0, 48000.0]);
++        let length = (sample_rate * random.range(0.3, 1.5)) as usize;
++        let position = match case % 6 {
++            0 => 0,
++            1 => length - 1,
++            _ => std::cmp::min((random.next() * length as f64) as usize, length - 1),
++        };
++        let sign = if random.next() < 0.5 { -1.0 } else { 1.0 };
++        let height = (sign * random.range(0.05, 1.0)) as f32;
++        let factor = random.range(1.05, 4.0);
++        let mut samples = vec![0.0f32; length];
++        samples[position] = height;
++        let output = Wave::from_samples(sample_rate, &samples).stretch(factor);
++        let stretched = position as f64 * factor;
++        let label = format!(
++            "case {case}: length {length} click {position} height {height} factor {factor}"
++        );
++        assert_click_height(output.channel(0), sample_rate, stretched, height, &label);
++        assert_quiet_below(
++            output.channel(0),
++            sample_rate,
++            &[stretched],
++            0.01 * height.abs(),
++            &label,
++        );
++    }
++}
++
++#[test]
++fn clicks_in_different_channels_stay_sharp() {
++    let sample_rate = 48000.0;
++    let mut left = vec![0.0f32; 48000];
++    let mut right = vec![0.0f32; 48000];
++    left[9000] = -0.6;
++    right[31000] = 0.25;
++    let mut wave = Wave::new(0, sample_rate);
++    wave.push_channel(&left);
++    wave.push_channel(&right);
++    for &factor in &[1.5, 2.0, 3.2] {
++        let output = wave.stretch(factor);
++        let label = format!("factor {factor}");
++        assert_click_height(
++            output.channel(0),
++            sample_rate,
++            9000.0 * factor,
++            -0.6,
++            &label,
++        );
++        assert_click_height(
++            output.channel(1),
++            sample_rate,
++            31000.0 * factor,
++            0.25,
++            &label,
++        );
++        assert_quiet_below(
++            output.channel(0),
++            sample_rate,
++            &[9000.0 * factor],
++            0.006,
++            &label,
++        );
++        assert_quiet_below(
++            output.channel(1),
++            sample_rate,
++            &[31000.0 * factor],
++            0.0025,
++            &label,
++        );
++    }
++}
++
++#[test]
++fn reset_starts_playback_over() {
++    let samples = noise_samples(17, 20000);
++    let wave = Arc::new(Wave::from_samples(44100.0, &samples));
++    let mut node = playwave_stretch(&wave, 0, Some(5000));
++    play(&mut node, 0.7, 30000);
++    node.reset();
++    assert_eq!(as_f64(node.position()), 0.0);
++    for i in 0..20000 {
++        let x = node.filter_mono(1.0);
++        assert!((x - samples[i]).abs() <= 1.0e-6, "sample {i}");
++    }
++}

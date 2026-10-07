@@ -1,0 +1,602 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1f0bc1a..131c666 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,11 @@
+ # Changelog
+ 
++## TBD
++
++### Features
++
++* Margin calls and liquidations for `MarginLoans` in the backtesting exchange.
++
+ ## 1.11
+ 
+ ### Features
+diff --git a/basana/backtesting/exchange.py b/basana/backtesting/exchange.py
+index 28661de..342b81d 100644
+--- a/basana/backtesting/exchange.py
++++ b/basana/backtesting/exchange.py
+@@ -21,7 +21,7 @@ import dataclasses
+ import logging
+ import uuid
+ 
+-from basana.backtesting import account_balances, config, errors, fees, lending, loan_mgr, liquidity, \
++from basana.backtesting import account_balances, config, errors, fees, lending, liquidation, loan_mgr, liquidity, \
+     orders, order_mgr, prices, requests
+ from basana.core import bar, dispatcher, enums, event, logs
+ from basana.core.pair import Pair, PairInfo
+@@ -33,7 +33,10 @@ logger = logging.getLogger(__name__)
+ BarEventHandler = bar.BarEventHandler
+ Error = errors.Error
+ Fill = orders.Fill
++LiquidationInfo = liquidation.LiquidationInfo
+ LiquidityStrategyFactory = Callable[[], liquidity.LiquidityStrategy]
++MarginCallEvent = liquidation.MarginCallEvent
++MarginCallEventHandler = liquidation.MarginCallEventHandler
+ OrderEvent = order_mgr.OrderEvent
+ OrderEventHandler = order_mgr.OrderEventHandler
+ OrderInfo = orders.OrderInfo
+@@ -128,6 +131,13 @@ class Exchange:
+             ),
+             immediate_order_processing=immediate_order_processing
+         )
++        self._liquidator = liquidation.Liquidator(
++            liquidation.ExchangeContext(
++                dispatcher=dispatcher, account_balances=self._balances, config=self._config,
++                loan_mgr=self._loan_mgr, order_mgr=self._order_mgr
++            ),
++            lending_strategy if isinstance(lending_strategy, lending.MarginLoans) else None
++        )
+ 
+     async def get_balance(self, symbol: str) -> Balance:
+         """
+@@ -158,6 +168,8 @@ class Exchange:
+         return self._prices.get_bid_ask(pair)
+ 
+     async def create_order(self, order_request: requests.ExchangeOrder) -> CreatedOrder:
++        self._check_not_liquidating()
++
+         # Validate request parameters.
+         pair_info = await self.get_pair_info(order_request.pair)
+         order_request.validate(pair_info)
+@@ -400,6 +412,7 @@ class Exchange:
+         :param amount: The amount to borrow.
+         """
+ 
++        self._check_not_liquidating()
+         return self._loan_mgr.create_loan(symbol, amount)
+ 
+     async def get_loans(
+@@ -432,14 +445,33 @@ class Exchange:
+         """
+         return self._loan_mgr.repay_loan(loan_id)
+ 
++    def subscribe_to_margin_call_events(self, event_handler: MarginCallEventHandler):
++        """
++        Registers an async callable that will be called when a margin call is issued.
++
++        :param event_handler: The event handler.
++        """
++        self._liquidator.subscribe_to_margin_call_events(event_handler)
++
++    async def get_liquidations(self) -> List[LiquidationInfo]:
++        """
++        Returns the liquidations, in the order they started.
++        """
++        return self._liquidator.get_liquidations()
++
+     def _get_pair_info(self, pair: Pair) -> PairInfo:
+         return self._config.get_pair_info(pair)
+ 
++    def _check_not_liquidating(self):
++        if self._liquidator.in_progress:
++            raise errors.Error("Liquidation in progress")
++
+     async def _on_bar_event(self, event: event.Event):
+         assert isinstance(event, bar.BarEvent), f"{event} is not an instance of bar.BarEvent"
+ 
+         self._prices.on_bar_event(event)
+         self._order_mgr.on_bar_event(event)
++        self._liquidator.on_bar_event(event)
+ 
+         # Forward the event if necessary.
+         event_source = self._bar_event_source.get(event.bar.pair)
+diff --git a/basana/backtesting/lending/margin.py b/basana/backtesting/lending/margin.py
+index 4d15c96..a13ff02 100644
+--- a/basana/backtesting/lending/margin.py
++++ b/basana/backtesting/lending/margin.py
+@@ -26,6 +26,9 @@ from basana.backtesting.lending import base
+ from basana.backtesting.value_map import ValueMap, ValueMapDict
+ 
+ 
++MIN_MARGIN_LEVEL = Decimal(100)
++
++
+ @dataclasses.dataclass
+ class MarginLoanConditions:
+     #: The symbol for the interest.
+@@ -73,20 +76,69 @@ class MarginLoans(base.LendingStrategy):
+     :param quote_symbol: The symbol to use to normalize balances.
+     :param margin_requirement: Minimum threshold for the value of the collateral relative to the total position.
+     :param default_conditions: The default margin loan conditions.
++    :param margin_call_level: If set, a margin call will be issued when the margin level drops below this value.
++    :param liquidation_level: If set, the account will be liquidated when the margin level drops below this value.
++    :param liquidation_fee: The fee charged by liquidation trades, as a percentage of the quote amount.
++    :param margin_call_timeout: If set, the account will be liquidated when a margin call is not met within this
++        period.
+     """
+     def __init__(
+             self, quote_symbol: str, margin_requirement: Decimal,
+-            default_conditions: Optional[MarginLoanConditions] = None
++            default_conditions: Optional[MarginLoanConditions] = None,
++            margin_call_level: Optional[Decimal] = None, liquidation_level: Optional[Decimal] = None,
++            liquidation_fee: Decimal = Decimal(0), margin_call_timeout: Optional[datetime.timedelta] = None
+     ):
+         assert margin_requirement > 0, "Margin requirement must be greater than zero"
++        for level in (margin_call_level, liquidation_level):
++            assert level is None or level < MIN_MARGIN_LEVEL, f"Margin levels must be lower than {MIN_MARGIN_LEVEL}"
++        assert liquidation_fee >= 0, "Liquidation fee can't be negative"
+ 
+         self._quote_symbol = quote_symbol
+         self._margin_requirement = margin_requirement
+         self._conditions: Dict[str, MarginLoanConditions] = {}
+         self._default_conditions = default_conditions
++        self._margin_call_level = margin_call_level
++        self._liquidation_level = liquidation_level
++        self._liquidation_fee = liquidation_fee
++        self._margin_call_timeout = margin_call_timeout
+         self._loan_mgr: Optional[loan_mgr.LoanManager] = None
+         self._exchange_ctx: Optional[base.ExchangeContext] = None
+ 
++    @property
++    def quote_symbol(self) -> str:
++        """
++        The symbol used to normalize balances.
++        """
++        return self._quote_symbol
++
++    @property
++    def margin_call_level(self) -> Optional[Decimal]:
++        """
++        The margin level below which a margin call is issued.
++        """
++        return self._margin_call_level
++
++    @property
++    def liquidation_level(self) -> Optional[Decimal]:
++        """
++        The margin level below which the account gets liquidated.
++        """
++        return self._liquidation_level
++
++    @property
++    def liquidation_fee(self) -> Decimal:
++        """
++        The fee charged by liquidation trades, as a percentage of the quote amount.
++        """
++        return self._liquidation_fee
++
++    @property
++    def margin_call_timeout(self) -> Optional[datetime.timedelta]:
++        """
++        The period after which a margin call that was not met leads to a liquidation.
++        """
++        return self._margin_call_timeout
++
+     def set_conditions(self, symbol: str, conditions: MarginLoanConditions):
+         """
+         Set the lending conditions for a given symbol.
+@@ -156,7 +208,7 @@ class MarginLoans(base.LendingStrategy):
+ class CheckMarginLevel(account_balances.UpdateRule):
+     def __init__(self, margin_loans: MarginLoans):
+         self._margin_loans = margin_loans
+-        self._threshold = Decimal(100)
++        self._threshold = MIN_MARGIN_LEVEL
+ 
+     def check(
+             self, updated_balances: ValueMap, updated_holds: ValueMap, updated_borrowed: ValueMap,
+diff --git a/basana/backtesting/liquidation.py b/basana/backtesting/liquidation.py
+new file mode 100644
+index 0000000..65f775e
+--- /dev/null
++++ b/basana/backtesting/liquidation.py
+@@ -0,0 +1,283 @@
++# Basana
++#
++# Copyright 2022 Gabriel Martin Becedillas Ruiz
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from decimal import Decimal
++from typing import Any, Awaitable, Callable, List, Optional, cast
++import dataclasses
++import datetime
++import decimal
++import logging
++import uuid
++
++from basana.backtesting import account_balances, config, errors, helpers, loan_mgr, order_mgr, orders
++from basana.backtesting.lending import margin
++from basana.backtesting.value_map import ValueMap
++from basana.core import dispatcher, helpers as core_helpers, logs
++from basana.core.bar import Bar, BarEvent
++from basana.core.enums import OrderOperation
++from basana.core.pair import PairInfo
++import basana as bs
++
++
++logger = logging.getLogger(__name__)
++
++MarginCallEventHandler = Callable[["MarginCallEvent"], Awaitable[Any]]
++MARGIN_CALL_PRIORITY = order_mgr.ORDER_UPDATE_PRIORITY + 1
++MAX_SIZING_STEPS = 128
++
++
++class MarginCallEvent(bs.Event):
++    """
++    An event for margin calls.
++    """
++
++    def __init__(self, when: datetime.datetime, margin_level: Decimal):
++        super().__init__(when)
++        #: The margin level that triggered the margin call.
++        self.margin_level: Decimal = margin_level
++
++
++@dataclasses.dataclass
++class LiquidationInfo:
++    #: When the liquidation started.
++    started_at: datetime.datetime
++    #: The margin level that triggered the liquidation.
++    margin_level: Decimal
++    #: When the liquidation ended, or None if it is still in progress.
++    ended_at: Optional[datetime.datetime] = None
++    #: The ids of the orders that were canceled when the liquidation started.
++    canceled_order_ids: List[str] = dataclasses.field(default_factory=list)
++    #: The ids of the orders placed by the liquidation.
++    order_ids: List[str] = dataclasses.field(default_factory=list)
++    #: The ids of the loans repaid by the liquidation.
++    repaid_loan_ids: List[str] = dataclasses.field(default_factory=list)
++
++
++@dataclasses.dataclass
++class ExchangeContext:
++    dispatcher: dispatcher.BacktestingDispatcher
++    account_balances: account_balances.AccountBalances
++    config: config.Config
++    loan_mgr: loan_mgr.LoanManager
++    order_mgr: order_mgr.OrderManager
++
++
++class Liquidator:
++    """
++    Issues margin calls and liquidates the account when the margin level gets too low.
++
++    :param exchange_ctx: The exchange context that provides access to balances, loans, orders, etc.
++    :param margin_loans: The margin lending strategy, or None if the exchange is not lending on margin.
++    """
++
++    def __init__(self, exchange_ctx: ExchangeContext, margin_loans: Optional[margin.MarginLoans]):
++        self._ctx = exchange_ctx
++        self._margin_loans = margin_loans
++        self._liquidations: List[LiquidationInfo] = []
++        self._margin_call_at: Optional[datetime.datetime] = None
++        self._check_scheduled_at: Optional[datetime.datetime] = None
++        self._margin_calls = core_helpers.LazyProxy(lambda: bs.FifoQueueEventSource(priority=MARGIN_CALL_PRIORITY))
++
++    @property
++    def in_progress(self) -> bool:
++        return bool(self._liquidations) and self._liquidations[-1].ended_at is None
++
++    def get_liquidations(self) -> List[LiquidationInfo]:
++        return [
++            dataclasses.replace(
++                liquidation, canceled_order_ids=list(liquidation.canceled_order_ids),
++                order_ids=list(liquidation.order_ids), repaid_loan_ids=list(liquidation.repaid_loan_ids)
++            )
++            for liquidation in self._liquidations
++        ]
++
++    def subscribe_to_margin_call_events(self, event_handler: MarginCallEventHandler):
++        self._ctx.dispatcher.subscribe(self._margin_calls.obj, cast(dispatcher.EventHandler, event_handler))
++
++    def on_bar_event(self, bar_event: BarEvent):
++        # This should be called once the orders for the bar have been processed.
++        margin_loans = self._margin_loans
++        if margin_loans is None or (margin_loans.margin_call_level is None and margin_loans.liquidation_level is None):
++            return
++
++        # Nothing is traded or repaid once the account owes nothing; the liquidation ends at the next check.
++        if self.in_progress and self._ctx.loan_mgr.get_loans(is_open=True):
++            liquidation = self._liquidations[-1]
++            if order := self._build_order(bar_event.bar, margin_loans):
++                self._ctx.order_mgr.execute_order(order, bar_event.bar)
++                liquidation.order_ids.append(order.id)
++            liquidation.repaid_loan_ids.extend(self._repay_loans())
++
++        # Scheduled jobs run once every event for the current time has been dispatched, so the margin level gets
++        # checked after all the bars sharing this timestamp were processed, and before they get forwarded.
++        now = self._ctx.dispatcher.now()
++        if self._check_scheduled_at != now:
++            self._check_scheduled_at = now
++            self._ctx.dispatcher.schedule(now, self._on_check_scheduled)
++
++    async def _on_check_scheduled(self):
++        assert self._margin_loans is not None
++        self._check_margin_level(self._margin_loans)
++
++    def _check_margin_level(self, margin_loans: margin.MarginLoans):
++        now = self._ctx.dispatcher.now()
++        margin_level = margin_loans.margin_level
++
++        # A single margin call is issued until the margin level recovers.
++        margin_call_level = margin_loans.margin_call_level
++        if margin_call_level is not None:
++            if margin_level >= margin_call_level:
++                self._margin_call_at = None
++            elif self._margin_call_at is None:
++                self._margin_call_at = now
++                logger.debug(logs.StructuredMessage("Margin call", margin_level=margin_level))
++                if self._margin_calls.initialized:
++                    self._margin_calls.push(MarginCallEvent(now, margin_level))
++
++        if self.in_progress:
++            if margin_level >= margin.MIN_MARGIN_LEVEL or not self._ctx.loan_mgr.get_loans(is_open=True):
++                logger.debug(logs.StructuredMessage("Liquidation finished", margin_level=margin_level))
++                self._liquidations[-1].ended_at = now
++        elif self._should_liquidate(margin_loans, margin_level, now):
++            logger.debug(logs.StructuredMessage("Liquidation started", margin_level=margin_level))
++            canceled_order_ids = self._ctx.order_mgr.cancel_open_orders()
++            self._liquidations.append(
++                LiquidationInfo(started_at=now, margin_level=margin_level, canceled_order_ids=canceled_order_ids)
++            )
++
++    def _should_liquidate(
++            self, margin_loans: margin.MarginLoans, margin_level: Decimal, now: datetime.datetime
++    ) -> bool:
++        liquidation_level = margin_loans.liquidation_level
++        if liquidation_level is not None and margin_level < liquidation_level:
++            return True
++        # A margin call that was not met in time also leads to a liquidation.
++        timeout = margin_loans.margin_call_timeout
++        return timeout is not None and self._margin_call_at is not None and now - self._margin_call_at >= timeout
++
++    def _build_order(self, bar: Bar, margin_loans: margin.MarginLoans) -> Optional[orders.Order]:
++        pair = bar.pair
++        if pair.quote_symbol != margin_loans.quote_symbol:
++            return None
++
++        pair_info = self._ctx.config.get_pair_info(pair)
++        liquidity_strategy = self._ctx.order_mgr.get_liquidity_strategy(pair)
++        owed = self._get_owed_balances().get(pair.base_symbol, Decimal(0))
++        available = self._ctx.account_balances.get_available_balance(pair.base_symbol)
++
++        # Buy what is missing to repay what is owed in the base symbol, or sell whatever is not needed for that.
++        if owed > available:
++            operation = OrderOperation.BUY
++            amount = self._calculate_buy_amount(bar, pair_info, owed - available, margin_loans)
++        else:
++            operation = OrderOperation.SELL
++            amount = available - owed
++        amount = pair_info.truncate_base(min(amount, liquidity_strategy.available_liquidity))
++        if amount:
++            amount = self._calculate_feasible_amount(bar, pair_info, operation, amount, available - owed, margin_loans)
++        if not amount:
++            return None
++        # Orders whose quote amount rounds to zero can't be filled, and the fill uses the slipped price.
++        probe = self._build_probe_order(bar, pair_info, operation, amount, margin_loans)
++        if not pair_info.round_quote(orders.slipped_price(bar.open, amount, probe, liquidity_strategy) * amount):
++            return None
++
++        return orders.LiquidationOrder(
++            uuid.uuid4().hex, operation, pair, pair_info, amount, margin_loans.liquidation_fee
++        )
++
++    def _calculate_buy_amount(
++            self, bar: Bar, pair_info: PairInfo, shortfall: Decimal, margin_loans: margin.MarginLoans
++    ) -> Decimal:
++        # Fees charged in the base symbol reduce the amount received, so we may need to buy a bit more.
++        amount = pair_info.round_base(shortfall, rounding=decimal.ROUND_UP)
++        for _ in range(MAX_SIZING_STEPS):
++            order = self._build_probe_order(bar, pair_info, OrderOperation.BUY, amount, margin_loans)
++            received = self._estimate_fill(order, bar.open)[bar.pair.base_symbol]
++            if received >= shortfall:
++                break
++            amount = pair_info.round_base(amount + shortfall - received, rounding=decimal.ROUND_UP)
++        return amount
++
++    def _calculate_feasible_amount(
++            self, bar: Bar, pair_info: PairInfo, operation: OrderOperation, amount: Decimal, excess: Decimal,
++            margin_loans: margin.MarginLoans
++    ) -> Decimal:
++        base_available = self._ctx.account_balances.get_available_balance(bar.pair.base_symbol)
++        quote_available = self._ctx.account_balances.get_available_balance(bar.pair.quote_symbol)
++        liquidity_strategy = self._ctx.order_mgr.get_liquidity_strategy(bar.pair)
++
++        # The account has to be able to pay for the trade, slippage and fees included: no balance the fill touches
++        # can end up negative, and fees charged in the base symbol for selling come out of what is not owed.
++        def is_feasible(amount: Decimal) -> bool:
++            order = self._build_probe_order(bar, pair_info, operation, amount, margin_loans)
++            price = orders.slipped_price(bar.open, amount, order, liquidity_strategy)
++            updates = self._estimate_fill(order, price)
++            if quote_available + updates.get(bar.pair.quote_symbol, Decimal(0)) < 0:
++                return False
++            base_update = updates.get(bar.pair.base_symbol, Decimal(0))
++            if base_available + base_update < 0:
++                return False
++            return operation == OrderOperation.BUY or -base_update <= excess
++
++        # If the whole amount is not feasible, we look for the largest amount that is.
++        if is_feasible(amount):
++            return amount
++        # Precision modes like significant digits have no smallest positive amount, so the steps are bounded.
++        low, high = Decimal(0), amount
++        for _ in range(MAX_SIZING_STEPS):
++            mid = pair_info.truncate_base((low + high) / Decimal(2))
++            if mid <= low:
++                break
++            if is_feasible(mid):
++                low = mid
++            else:
++                high = mid
++        return low
++
++    def _build_probe_order(
++            self, bar: Bar, pair_info: PairInfo, operation: OrderOperation, amount: Decimal,
++            margin_loans: margin.MarginLoans
++    ) -> orders.LiquidationOrder:
++        return orders.LiquidationOrder("", operation, bar.pair, pair_info, amount, margin_loans.liquidation_fee)
++
++    def _estimate_fill(self, order: orders.Order, price: Decimal) -> ValueMap:
++        # Balance updates for filling the order at the given price, including fees.
++        base_sign = helpers.get_base_sign_for_operation(order.operation)
++        balance_updates = ValueMap({
++            order.pair.base_symbol: order.amount * base_sign,
++            order.pair.quote_symbol: order.pair_info.round_quote(price * order.amount * -base_sign),
++        })
++        balance_updates.prune()
++        return balance_updates + self._ctx.order_mgr.calculate_fees(order, balance_updates)
++
++    def _get_owed_balances(self) -> ValueMap:
++        ret = ValueMap()
++        for loan in self._ctx.loan_mgr.get_loans(is_open=True):
++            ret += {loan.borrowed_symbol: loan.borrowed_amount}
++            ret += loan.outstanding_interest
++        return ret
++
++    def _repay_loans(self) -> List[str]:
++        # Loans are repaid in the order they were taken out, skipping the ones that can't be repaid in full.
++        ret = []
++        for loan in self._ctx.loan_mgr.get_loans(is_open=True):
++            try:
++                self._ctx.loan_mgr.repay_loan(loan.id)
++                ret.append(loan.id)
++            except errors.NotEnoughBalance:
++                pass
++        return ret
+diff --git a/basana/backtesting/order_mgr.py b/basana/backtesting/order_mgr.py
+index 34a9bc1..1449aa4 100644
+--- a/basana/backtesting/order_mgr.py
++++ b/basana/backtesting/order_mgr.py
+@@ -152,6 +152,32 @@ class OrderManager:
+         self._order_closed(order)
+         self._push_order_update(order)
+ 
++    def cancel_open_orders(self) -> List[str]:
++        canceled_order_ids = []
++        for order in list(self._orders.get_open()):
++            self.cancel_order(order.id)
++            canceled_order_ids.append(order.id)
++        return canceled_order_ids
++
++    def execute_order(self, order: Order, bar: Bar):
++        """
++        Accepts an order and processes it right away using the given bar.
++
++        :param order: The order to execute.
++        :param bar: The bar to use for processing the order.
++        """
++        self._orders.add(order)
++        self._process_order(order, bar, self._liquidity_strategies[bar.pair])
++
++    def get_liquidity_strategy(self, pair: Pair) -> liquidity.LiquidityStrategy:
++        return self._liquidity_strategies[pair]
++
++    def calculate_fees(self, order: Order, balance_updates: ValueMapDict) -> ValueMap:
++        fees = ValueMap(self._ctx.fee_strategy.calculate_fees(order, balance_updates))
++        fees += order.calculate_additional_fees(balance_updates)
++        round_fees(order, fees)
++        return fees
++
+     def subscribe_to_order_events(self, event_handler: OrderEventHandler):
+         """
+         Registers an async callable that will be called when an order is updated.
+@@ -289,8 +315,7 @@ class OrderManager:
+             return self._order_not_filled(order)
+ 
+         # Calculate fees.
+-        fees = ValueMap(self._ctx.fee_strategy.calculate_fees(order, balance_updates))
+-        round_fees(order, fees)
++        fees = self.calculate_fees(order, balance_updates)
+         logger.debug(logs.StructuredMessage("Order fees", order_id=order.id, fees=fees))
+ 
+         ret = False
+diff --git a/basana/backtesting/orders.py b/basana/backtesting/orders.py
+index c46f220..0dd3d29 100644
+--- a/basana/backtesting/orders.py
++++ b/basana/backtesting/orders.py
+@@ -230,6 +230,12 @@ class Order(metaclass=abc.ABCMeta):
+         """
+         return None
+ 
++    def calculate_additional_fees(self, balance_updates: Dict[str, Decimal]) -> Dict[str, Decimal]:
++        """
++        Optionally override to charge fees on top of the ones calculated by the fee strategy.
++        """
++        return {}
++
+     def not_filled(self):
+         """Called every time the order was processed but no fill took place."""
+         pass
+@@ -274,6 +280,23 @@ class MarketOrder(Order):
+         )
+ 
+ 
++class LiquidationOrder(MarketOrder):
++    def __init__(
++            self, id: str, operation: OrderOperation, pair: Pair, pair_info: PairInfo,
++            amount: Decimal, fee_percentage: Decimal
++    ):
++        super().__init__(id, operation, pair, pair_info, amount)
++        self._fee_percentage = fee_percentage
++
++    def calculate_additional_fees(self, balance_updates: Dict[str, Decimal]) -> Dict[str, Decimal]:
++        # The liquidation fee is charged in quote currency.
++        ret = {}
++        quote_amount = abs(balance_updates.get(self.pair.quote_symbol, Decimal(0)))
++        if fee := quote_amount * self._fee_percentage / Decimal(100):
++            ret[self.pair.quote_symbol] = -fee
++        return ret
++
++
+ class LimitOrder(Order):
+     def __init__(
+             self, id: str, operation: OrderOperation, pair: Pair, pair_info: PairInfo,
+diff --git a/docs/backtesting_exchange.rst b/docs/backtesting_exchange.rst
+index bba5161..040a1f1 100644
+--- a/docs/backtesting_exchange.rst
++++ b/docs/backtesting_exchange.rst
+@@ -22,3 +22,7 @@ basana.backtesting.exchange
+     :members:
+ .. autoclass:: basana.backtesting.exchange.OrderEvent
+     :members:
++.. autoclass:: basana.backtesting.exchange.MarginCallEvent
++    :members:
++.. autoclass:: basana.backtesting.exchange.LiquidationInfo
++    :members:
+diff --git a/docs/backtesting_lending.rst b/docs/backtesting_lending.rst
+index 6fdf8ec..d857231 100644
+--- a/docs/backtesting_lending.rst
++++ b/docs/backtesting_lending.rst
+@@ -3,7 +3,8 @@ basana.backtesting.lending
+  
+ Lending strategies are used by the backtesting exchange to support different lending schemes, or no lending at all.
+ 
+-**Margin calls are not yet implemented.**
++:class:`basana.backtesting.lending.MarginLoans` can optionally issue margin calls and liquidate the account when the
++margin level drops too low.
+ 
+ .. module:: basana.backtesting.lending
+ 

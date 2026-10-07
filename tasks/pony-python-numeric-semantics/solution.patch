@@ -1,0 +1,787 @@
+diff --git a/pony/orm/dbproviders/mysql.py b/pony/orm/dbproviders/mysql.py
+index c6a57ef..cb175ab
+--- a/pony/orm/dbproviders/mysql.py
++++ b/pony/orm/dbproviders/mysql.py
+@@ -42,7 +42,7 @@ from pony.orm.dbapiprovider import (
+     get_version_tuple,
+     wrap_dbapi_exceptions,
+ )
+-from pony.orm.sqlbuilding import Param, SQLBuilder, Value, join
++from pony.orm.sqlbuilding import Param, SQLBuilder, Value, join, make_unary_func
+ from pony.orm.sqltranslation import SQLTranslator, TranslationError
+ from pony.utils import throw
+ 
+@@ -96,11 +96,25 @@ class MySQLBuilder(SQLBuilder):
+             return "rtrim(", self(expr), ")"
+         return "trim(trailing ", self(chars), " from ", self(expr), ")"
+ 
+-    def TO_INT(self, expr):
+-        return "CAST(", self(expr), " AS SIGNED)"
++    CHAR_LENGTH = make_unary_func("char_length")
+ 
+-    def TO_REAL(self, expr):
+-        return "CAST(", self(expr), " AS DOUBLE)"
++    def STRING_POSITION(self, expr, sub):
++        prefix = ("char_length(substring_index(", self(expr), ", ", self(sub), ", 1))")
++        return (
++            "(case when ",
++            prefix,
++            " = char_length(",
++            self(expr),
++            ") then 0 else ",
++            prefix,
++            " + 1 end)",
++        )
++
++    def to_int_sql(self, value):
++        return "CAST(", value, " AS SIGNED)"
++
++    def to_real_sql(self, value):
++        return "CAST(", value, " AS DOUBLE)"
+ 
+     def TO_STR(self, expr):
+         return "CAST(", self(expr), " AS CHAR)"
+diff --git a/pony/orm/dbproviders/oracle.py b/pony/orm/dbproviders/oracle.py
+index d265e19..fae0679
+--- a/pony/orm/dbproviders/oracle.py
++++ b/pony/orm/dbproviders/oracle.py
+@@ -160,6 +160,7 @@ class OraConstMonad(sqltranslation.ConstMonad):
+ class OraTranslator(sqltranslation.SQLTranslator):
+     dialect = "Oracle"
+     rowid_support = True
++    empty_string_is_null = True
+     json_path_wildcard_syntax = True
+     json_values_are_comparable = False
+     NoneMonad = OraNoneMonad
+@@ -279,8 +280,8 @@ class OraBuilder(SQLBuilder):
+     def LIMIT(self, limit, offset=None):
+         assert False  # pragma: no cover
+ 
+-    def TO_REAL(self, expr):
+-        return "CAST(", self(expr), " AS NUMBER)"
++    def to_real_sql(self, value):
++        return "CAST(", value, " AS NUMBER)"
+ 
+     def TO_STR(self, expr):
+         return "TO_CHAR(", self(expr), ")"
+@@ -291,8 +292,29 @@ class OraBuilder(SQLBuilder):
+     def RANDOM(self):
+         return "dbms_random.value"
+ 
+-    def MOD(self, a, b):
+-        return "MOD(", self(a), ", ", self(b), ")"
++    def int_remainder(self, a, b):
++        return "MOD(", a, ", ", b, ")"
++
++    def binary_float(self, value):
++        return "CAST(", value, " AS BINARY_DOUBLE)"
++
++    def STRING_REPEAT(self, expr, times):
++        return (
++            "(case when ",
++            self(times),
++            " > 0 then RPAD(",
++            self(expr),
++            ", LENGTH(",
++            self(expr),
++            ") * ",
++            self(times),
++            ", ",
++            self(expr),
++            ") else '' end)",
++        )
++
++    def STRING_POSITION(self, expr, sub):
++        return "INSTR(", self(expr), ", ", self(sub), ")"
+ 
+     def DATE_ADD(self, expr, delta):
+         return "(", self(expr), " + ", self(delta), ")"
+diff --git a/pony/orm/dbproviders/postgres.py b/pony/orm/dbproviders/postgres.py
+index 21e1a0a..e94848c
+--- a/pony/orm/dbproviders/postgres.py
++++ b/pony/orm/dbproviders/postgres.py
+@@ -70,14 +70,29 @@ class PGSQLBuilder(SQLBuilder):
+             result.extend([" RETURNING ", self.quote_name(returning)])
+         return result
+ 
+-    def TO_INT(self, expr):
+-        return "(", self(expr), ")::int"
++    def to_int_sql(self, value):
++        return "(", value, ")::int"
+ 
+     def TO_STR(self, expr):
+         return "(", self(expr), ")::text"
+ 
+-    def TO_REAL(self, expr):
+-        return "(", self(expr), ")::double precision"
++    def to_real_sql(self, value):
++        return "(", value, ")::double precision"
++
++    def to_numeric_sql(self, value):
++        return "(", value, ")::numeric"
++
++    def truncated(self, value):
++        return "trunc(", self.to_numeric_sql(value), ")"
++
++    def int_quotient(self, a, b):
++        return "div(", self.to_numeric_sql(a), ", ", self.to_numeric_sql(b), ")"
++
++    def float_remainder(self, a, b):
++        return "(", a, " - ", b, " * trunc((", a, ") / (", b, ")))"
++
++    def STRING_REPEAT(self, expr, times):
++        return "repeat(", self(expr), ", ", self.to_int_sql(self(times)), ")"
+ 
+     def DATE(self, expr):
+         return "(", self(expr), ")::date"
+diff --git a/pony/orm/dbproviders/sqlite.py b/pony/orm/dbproviders/sqlite.py
+index eb91a5d..fbbc224
+--- a/pony/orm/dbproviders/sqlite.py
++++ b/pony/orm/dbproviders/sqlite.py
+@@ -117,6 +117,51 @@ class SQLiteBuilder(SQLBuilder):
+             ")",
+         )
+ 
++    def integral_part(self, value):
++        return (
++            "(case when ",
++            value,
++            " > -9.0e18 and ",
++            value,
++            " < 9.0e18 then ",
++            self.to_int_sql(value),
++            " else ",
++            value,
++            " end)",
++        )
++
++    def truncated(self, value):
++        return self.integral_part(value)
++
++    def PY_DECIMAL_TRUEDIV(self, a, b):
++        return self.PY_TRUEDIV(a, b)
++
++    def PY_FLOORDIV_REAL(self, a, b):
++        return "py_floordiv(", self(a), ", ", self(b), ")"
++
++    def PY_MOD_REAL(self, a, b):
++        return "py_mod(", self(a), ", ", self(b), ")"
++
++    def floor_of(self, value):
++        integral = self.integral_part(value)
++        return "(", integral, " - (", value, " < ", integral, "))"
++
++    def ceil_of(self, value):
++        integral = self.integral_part(value)
++        return "(", integral, " + (", value, " > ", integral, "))"
++
++    def STRING_REPEAT(self, expr, times):
++        return (
++            "replace(hex(zeroblob(max(",
++            self(times),
++            ", 0))), '00', ",
++            self(expr),
++            ")",
++        )
++
++    def STRING_POSITION(self, expr, sub):
++        return "instr(", self(expr), ", ", self(sub), ")"
++
+     def IN(self, expr1, x):
+         if not x:
+             return "0 = 1"
+@@ -700,6 +745,18 @@ py_upper = make_string_function("py_upper", str.upper)
+ py_lower = make_string_function("py_lower", str.lower)
+ 
+ 
++def py_floordiv(x, y):
++    if x is None or y is None or not y:
++        return None
++    return x // y
++
++
++def py_mod(x, y):
++    if x is None or y is None or not y:
++        return None
++    return x % y
++
++
+ def py_json_unwrap(value):
+     # "[null,some_json]" -> "some_json"
+     if isinstance(value, str) and value.startswith("[null,"):
+@@ -885,6 +942,8 @@ class SQLitePool(Pool):
+         create_function("rand", 0, random)
+         create_function("py_upper", 1, py_upper)
+         create_function("py_lower", 1, py_lower)
++        create_function("py_floordiv", 2, py_floordiv)
++        create_function("py_mod", 2, py_mod)
+         create_function("py_json_unwrap", 1, py_json_unwrap)
+         create_function("py_json_extract", -1, py_json_extract)
+         create_function("py_json_contains", 3, py_json_contains)
+diff --git a/pony/orm/ormtypes.py b/pony/orm/ormtypes.py
+index 85c5a2d..b387f04
+--- a/pony/orm/ormtypes.py
++++ b/pony/orm/ormtypes.py
+@@ -286,6 +286,35 @@ def coerce_types(t1, t2):
+     return result
+ 
+ 
++python_division_ops = {
++    ("/", float): "PY_TRUEDIV",
++    ("/", Decimal): "PY_DECIMAL_TRUEDIV",
++    ("//", int): "PY_FLOORDIV_INT",
++    ("//", float): "PY_FLOORDIV_REAL",
++    ("//", Decimal): "PY_DECIMAL_DIV",
++    ("%", int): "PY_MOD_INT",
++    ("%", float): "PY_MOD_REAL",
++    ("%", Decimal): "PY_DECIMAL_MOD",
++}
++
++
++def python_numeric_type(op, coerced_type):
++    if op not in ("/", "//", "%") or coerced_type not in numeric_types:
++        return coerced_type
++    if coerced_type is Decimal:
++        return Decimal
++    if op == "/":
++        return float
++    if coerced_type is bool:
++        return int
++    return coerced_type
++
++
++def python_numeric_binop(op, sqlop, coerced_type):
++    result_type = python_numeric_type(op, coerced_type)
++    return result_type, python_division_ops.get((op, result_type), sqlop)
++
++
+ def are_comparable_types(t1, t2, op="=="):
+     # types must be normalized already!
+     tt1 = type(t1)
+diff --git a/pony/orm/sqlbuilding.py b/pony/orm/sqlbuilding.py
+index 0880155..b8181a2
+--- a/pony/orm/sqlbuilding.py
++++ b/pony/orm/sqlbuilding.py
+@@ -554,9 +554,182 @@ class SQLBuilder:
+     DIV = make_binary_op(" / ", True)
+     FLOORDIV = make_binary_op(" / ", True)
+ 
+-    def MOD(self, a, b):
++    def int_remainder(self, a, b):
+         symbol = " %% " if self.paramstyle in ("format", "pyformat") else " % "
+-        return "(", self(a), symbol, self(b), ")"
++        return "(", a, symbol, b, ")"
++
++    def int_quotient(self, a, b):
++        return self.truncated(("(", a, " / ", b, ")"))
++
++    def MOD(self, a, b):
++        return self.int_remainder(self(a), self(b))
++
++    def nonzero_divisor(self, b):
++        return "nullif(", self(b), ", 0)"
++
++    def to_int_sql(self, value):
++        return "CAST(", value, " AS integer)"
++
++    def to_real_sql(self, value):
++        return "CAST(", value, " AS real)"
++
++    def truncated(self, value):
++        return "(sign(", value, ") * floor(abs(", value, ")))"
++
++    def floor_of(self, value):
++        return "floor(", value, ")"
++
++    def ceil_of(self, value):
++        return "ceil(", value, ")"
++
++    def binary_float(self, value):
++        return value
++
++    def float_remainder(self, a, b):
++        return "mod(", a, ", ", b, ")"
++
++    def PY_TRUEDIV(self, a, b):
++        return "(", self.to_real_sql(self(a)), " / ", self.nonzero_divisor(b), ")"
++
++    def PY_DECIMAL_TRUEDIV(self, a, b):
++        return "(", self(a), " / ", self.nonzero_divisor(b), ")"
++
++    def opposite_signs(self, value, divisor):
++        return (
++            "(",
++            value,
++            " <> 0 and ((",
++            value,
++            " < 0 and ",
++            divisor,
++            " > 0) or (",
++            value,
++            " > 0 and ",
++            divisor,
++            " < 0)))",
++        )
++
++    def PY_MOD_INT(self, a, b):
++        right = self(b)
++        remainder = self.int_remainder(self(a), self.nonzero_divisor(b))
++        return (
++            "(case when ",
++            self.opposite_signs(remainder, right),
++            " then ",
++            remainder,
++            " + ",
++            right,
++            " else ",
++            remainder,
++            " end)",
++        )
++
++    def PY_FLOORDIV_INT(self, a, b):
++        divisor = self.nonzero_divisor(b)
++        right = self(b)
++        remainder = self.int_remainder(self(a), divisor)
++        quotient = self.int_quotient(self(a), divisor)
++        return (
++            "(case when ",
++            self.opposite_signs(remainder, right),
++            " then ",
++            quotient,
++            " - 1 else ",
++            quotient,
++            " end)",
++        )
++
++    def PY_MOD_REAL(self, a, b):
++        right = self.binary_float(self(b))
++        remainder = self.float_remainder(
++            self.binary_float(self(a)), self.binary_float(self.nonzero_divisor(b))
++        )
++        return (
++            "(case when ",
++            remainder,
++            " = 0 then 0.0 * ",
++            right,
++            " when ",
++            self.opposite_signs(remainder, right),
++            " then ",
++            remainder,
++            " + ",
++            right,
++            " else ",
++            remainder,
++            " end)",
++        )
++
++    def PY_FLOORDIV_REAL(self, a, b):
++        exact = ("(", self.binary_float(self(a)), " - ", self.PY_MOD_REAL(a, b), ")")
++        quotient = ("(", exact, " / ", self.binary_float(self.nonzero_divisor(b)), ")")
++        below = self.floor_of(quotient)
++        return (
++            "(case when ",
++            quotient,
++            " - ",
++            below,
++            " > 0.5 then ",
++            below,
++            " + 1 else ",
++            below,
++            " end)",
++        )
++
++    def PY_DECIMAL_DIV(self, a, b):
++        return self.truncated(self.PY_DECIMAL_TRUEDIV(a, b))
++
++    def PY_DECIMAL_MOD(self, a, b):
++        return (
++            "(",
++            self(a),
++            " - ",
++            self(b),
++            " * ",
++            self.PY_DECIMAL_DIV(a, b),
++            ")",
++        )
++
++    def PY_FLOOR(self, expr):
++        return self.floor_of(self(expr))
++
++    def PY_CEIL(self, expr):
++        return self.ceil_of(self(expr))
++
++    def PY_TRUNC(self, expr):
++        return self.truncated(self(expr))
++
++    def PY_ROUND(self, expr):
++        value = self(expr)
++        below = self.floor_of(value)
++        fraction = ("(", value, " - ", below, ")")
++        is_even = ("(", self.floor_of(("(", below, " / 2)")), " * 2 = ", below, ")")
++        next_up = ("(", below, " + 1)")
++        return (
++            (
++                "case when ",
++                fraction,
++                " > 0.5 then ",
++                next_up,
++                " when ",
++                fraction,
++                " < 0.5 then ",
++                below,
++                " when ",
++                is_even,
++                " then ",
++                below,
++                " else ",
++                next_up,
++                " end",
++            )
++        )
++
++    def STRING_REPEAT(self, expr, times):
++        return "repeat(", self(expr), ", ", self(times), ")"
++
++    def STRING_POSITION(self, expr, sub):
++        return "position(", self(sub), " in ", self(expr), ")"
+ 
+     def FLOAT_EQ(self, a, b):
+         a, b = self(a), self(b)
+@@ -682,6 +855,7 @@ class SQLBuilder:
+     UPPER = make_unary_func("upper")
+     LOWER = make_unary_func("lower")
+     LENGTH = make_unary_func("length")
++    CHAR_LENGTH = make_unary_func("length")
+     ABS = make_unary_func("abs")
+ 
+     def COALESCE(self, *args):
+@@ -891,13 +1065,13 @@ class SQLBuilder:
+         return "replace(", self(str), ", ", self(from_), ", ", self(to), ")"
+ 
+     def TO_INT(self, expr):
+-        return "CAST(", self(expr), " AS integer)"
++        return self.to_int_sql(self(expr))
+ 
+     def TO_STR(self, expr):
+         return "CAST(", self(expr), " AS text)"
+ 
+     def TO_REAL(self, expr):
+-        return "CAST(", self(expr), " AS real)"
++        return self.to_real_sql(self(expr))
+ 
+     def TODAY(self):
+         return "CURRENT_DATE"
+diff --git a/pony/orm/sqltranslation.py b/pony/orm/sqltranslation.py
+index 25c7363..eb059bd
+--- a/pony/orm/sqltranslation.py
++++ b/pony/orm/sqltranslation.py
+@@ -1,6 +1,7 @@
+ import ast
+ import inspect
+ import itertools
++import math
+ import re
+ import sys
+ import types
+@@ -47,6 +48,7 @@ from pony.orm.ormtypes import (
+     normalize,
+     normalize_type,
+     numeric_types,
++    python_numeric_binop,
+     raw_sql,
+ )
+ from pony.py23compat import PY310, buffer, int_types
+@@ -157,6 +159,7 @@ class SQLTranslator(ASTTranslator):
+     json_path_wildcard_syntax = False
+     json_values_are_comparable = True
+     rowid_support = False
++    empty_string_is_null = False
+ 
+     def __enter__(self):
+         local.translators.append(self)
+@@ -2463,6 +2466,8 @@ def make_numeric_binop(op, sqlop):
+     def numeric_binop(monad, monad2):
+         if isinstance(monad2, (AttrSetMonad, NumericSetExprMonad)):
+             return NumericSetExprMonad(op, sqlop, monad, monad2)
++        if op == "*" and isinstance(monad2, StringMixin):
++            return monad2 * monad
+         if monad2.type == "METHOD":
+             raise_forgot_parentheses(monad2)
+         result_type, monad, monad2 = coerce_monads(monad, monad2)
+@@ -2471,9 +2476,10 @@ def make_numeric_binop(op, sqlop):
+                 TypeError,
+                 _binop_errmsg % (type2str(monad.type), type2str(monad2.type), op),
+             )
++        result_type, result_sqlop = python_numeric_binop(op, sqlop, result_type)
+         left_sql = monad.getsql()[0]
+         right_sql = monad2.getsql()[0]
+-        return NumericExprMonad(result_type, [sqlop, left_sql, right_sql])
++        return NumericExprMonad(result_type, [result_sqlop, left_sql, right_sql])
+ 
+     numeric_binop.__name__ = sqlop
+     return numeric_binop
+@@ -2839,7 +2845,38 @@ class StringMixin(MonadMixin):
+     call_upper = make_string_func("UPPER")
+     call_lower = make_string_func("LOWER")
+ 
+-    def call_startswith(self, arg):
++    def __mul__(self, monad2):
++        if not isinstance(monad2, NumericMixin) or monad2.type not in (bool, int):
++            throw(
++                TypeError,
++                _binop_errmsg % (type2str(self.type), type2str(monad2.type), "*"),
++            )
++        sql = ["STRING_REPEAT", self.getsql()[0], self._integer_sql(monad2)]
++        return StringExprMonad(
++            self.type, sql, nullable=self.nullable or monad2.nullable
++        )
++
++    def _is_empty_const(self, arg):
++        if isinstance(arg, StringConstMonad):
++            return arg.value == ""
++        return isinstance(arg, NoneMonad) and self.translator.empty_string_is_null
++
++    def _text_length(self, arg_sql):
++        length = ["CHAR_LENGTH", arg_sql]
++        if self.translator.empty_string_is_null:
++            length = ["COALESCE", length, ["VALUE", 0]]
++        return length
++
++    def _empty_arg_condition(self, arg_sql):
++        return ["EQ", self._text_length(arg_sql), ["VALUE", 0]]
++
++    def _integer_sql(self, monad):
++        sql = monad.getsql()[0]
++        if monad.type is bool and self.translator.dialect == "PostgreSQL":
++            sql = ["TO_INT", sql]
++        return sql
++
++    def _check_substring_arg(self, arg):
+         if not are_comparable_types(self.type, arg.type, None):
+             if arg.type == "METHOD":
+                 raise_forgot_parentheses(arg)
+@@ -2848,9 +2885,111 @@ class StringMixin(MonadMixin):
+                 "Expected %r argument but got %r in expression {EXPR}"
+                 % (type2str(self.type), type2str(arg.type)),
+             )
+-        return self._like(arg, after="%")
++        return arg.getsql()[0]
+ 
+-    def call_endswith(self, arg):
++    def call_count(self, arg):
++        sql = self.getsql()[0]
++        whole_string = ["ADD", ["CHAR_LENGTH", sql], ["VALUE", 1]]
++        if self._is_empty_const(arg):
++            return NumericExprMonad(int, whole_string, nullable=self.nullable)
++        arg_sql = self._check_substring_arg(arg)
++        stripped = ["REPLACE", sql, arg_sql, ["VALUE", ""]]
++        occurrences = [
++            "PY_FLOORDIV_INT",
++            ["SUB", ["CHAR_LENGTH", sql], self._text_length(stripped)],
++            ["CHAR_LENGTH", arg_sql],
++        ]
++        if isinstance(arg, StringConstMonad):
++            result_sql = occurrences
++        else:
++            empty_arg = self._empty_arg_condition(arg_sql)
++            result_sql = ["IF", empty_arg, whole_string, occurrences]
++        return NumericExprMonad(
++            int, result_sql, nullable=self.nullable or arg.nullable
++        )
++
++    def call_find(self, arg):
++        if self._is_empty_const(arg):
++            return NumericExprMonad(int, ["VALUE", 0], nullable=False)
++        arg_sql = self._check_substring_arg(arg)
++        sql = self.getsql()[0]
++        position = ["SUB", ["STRING_POSITION", sql, arg_sql], ["VALUE", 1]]
++        if not isinstance(arg, StringConstMonad):
++            empty_arg = self._empty_arg_condition(arg_sql)
++            position = ["IF", empty_arg, ["VALUE", 0], position]
++        return NumericExprMonad(
++            int, position, nullable=self.nullable or arg.nullable
++        )
++
++    def _fill_sql(self, fillchar, default):
++        if fillchar is None:
++            return ["VALUE", default]
++        if not isinstance(fillchar, StringConstMonad) or len(fillchar.value) != 1:
++            throw(
++                TypeError,
++                "The fill character must be a string literal "
++                "exactly one character long in {EXPR}",
++            )
++        return fillchar.getsql()[0]
++
++    def _padding_sql(self, width, fill_sql):
++        if not isinstance(width, NumericMixin) or width.type not in (bool, int):
++            throw(
++                TypeError,
++                "Expected 'int' argument but got %r in expression {EXPR}"
++                % type2str(width.type),
++            )
++        missing = ["SUB", self._integer_sql(width), ["CHAR_LENGTH", self.getsql()[0]]]
++        return ["STRING_REPEAT", fill_sql, missing]
++
++    def call_ljust(self, width, fillchar=None):
++        fill_sql = self._fill_sql(fillchar, " ")
++        sql = ["CONCAT", self.getsql()[0], self._padding_sql(width, fill_sql)]
++        return StringExprMonad(self.type, sql, nullable=self.nullable)
++
++    def call_rjust(self, width, fillchar=None):
++        fill_sql = self._fill_sql(fillchar, " ")
++        sql = ["CONCAT", self._padding_sql(width, fill_sql), self.getsql()[0]]
++        return StringExprMonad(self.type, sql, nullable=self.nullable)
++
++    def call_zfill(self, width):
++        sql = self.getsql()[0]
++        zeros = self._padding_sql(width, ["VALUE", "0"])
++        first = ["SUBSTR", sql, ["VALUE", 1], ["VALUE", 1]]
++        signed = ["IN", first, [["VALUE", "+"], ["VALUE", "-"]]]
++        with_sign = ["CONCAT", first, zeros, ["SUBSTR", sql, ["VALUE", 2]]]
++        without_sign = ["CONCAT", zeros, sql]
++        return StringExprMonad(
++            self.type, ["IF", signed, with_sign, without_sign], nullable=self.nullable
++        )
++
++    def _any_affix(self, arg, before=None, after=None):
++        results = [
++            self._like(item, before=before, after=after) for item in arg.items
++        ]
++        if not results:
++            return BoolExprMonad(["EQ", ["VALUE", 0], ["VALUE", 1]], nullable=False)
++        sql = results[0].getsql()[0]
++        for result in results[1:]:
++            sql = ["OR", sql, result.getsql()[0]]
++        return BoolExprMonad(sql, nullable=False)
++
++    def _affix_alternatives(self, arg):
++        if isinstance(arg, ArrayParamMonad) and arg.list_monad is not None:
++            return arg.list_monad
++        if isinstance(arg, ListMonad) and isinstance(getattr(arg, "node", None), ast.List):
++            throw(
++                TypeError,
++                "Expected %r argument or a tuple of them in expression {EXPR}"
++                % type2str(self.type),
++            )
++        return arg
++
++    def _check_affix_arg(self, arg):
++        if isinstance(arg, ListMonad):
++            for item in arg.items:
++                self._check_affix_arg(item)
++            return
+         if not are_comparable_types(self.type, arg.type, None):
+             if arg.type == "METHOD":
+                 raise_forgot_parentheses(arg)
+@@ -2859,6 +2998,19 @@ class StringMixin(MonadMixin):
+                 "Expected %r argument but got %r in expression {EXPR}"
+                 % (type2str(self.type), type2str(arg.type)),
+             )
++
++    def call_startswith(self, arg):
++        arg = self._affix_alternatives(arg)
++        self._check_affix_arg(arg)
++        if isinstance(arg, ListMonad):
++            return self._any_affix(arg, after="%")
++        return self._like(arg, after="%")
++
++    def call_endswith(self, arg):
++        arg = self._affix_alternatives(arg)
++        self._check_affix_arg(arg)
++        if isinstance(arg, ListMonad):
++            return self._any_affix(arg, before="%")
+         return self._like(arg, before="%")
+ 
+     def _like(self, item, before=None, after=None, not_like=False):
+@@ -4267,6 +4419,42 @@ class FuncAbsMonad(FuncMonad):
+         return x.abs()
+ 
+ 
++def make_numeric_func_monad(sqlop):
++    def call(self, x):
++        if not isinstance(x, NumericMixin):
++            throw(
++                TypeError,
++                "Argument of %s() function must be a number. Got: %s"
++                % (self.func.__name__, type2str(x.type)),
++            )
++        sql = x.getsql()[0]
++        if x.type is bool and x.translator.dialect == "PostgreSQL":
++            sql = ["TO_INT", sql]
++        return NumericExprMonad(int, [sqlop, sql], nullable=x.nullable)
++
++    return call
++
++
++class FuncRoundMonad(FuncMonad):
++    func = round
++    call = make_numeric_func_monad("PY_ROUND")
++
++
++class FuncFloorMonad(FuncMonad):
++    func = math.floor
++    call = make_numeric_func_monad("PY_FLOOR")
++
++
++class FuncCeilMonad(FuncMonad):
++    func = math.ceil
++    call = make_numeric_func_monad("PY_CEIL")
++
++
++class FuncTruncMonad(FuncMonad):
++    func = math.trunc
++    call = make_numeric_func_monad("PY_TRUNC")
++
++
+ class FuncSumMonad(FuncMonad):
+     func = sum, core.sum
+ 
+@@ -4939,6 +5127,7 @@ class AttrSetMonad(SetMixin, Monad):
+     __mul__ = make_attrset_binop("*", "MUL")
+     __truediv__ = make_attrset_binop("/", "DIV")
+     __floordiv__ = make_attrset_binop("//", "FLOORDIV")
++    __mod__ = make_attrset_binop("%", "MOD")
+ 
+ 
+ def make_numericset_binop(op, sqlop):
+@@ -4957,12 +5146,22 @@ class NumericSetExprMonad(SetMixin, Monad):
+                 TypeError,
+                 _binop_errmsg % (type2str(left.type), type2str(right.type), op),
+             )
++        item_type, sqlop = python_numeric_binop(op, sqlop, result_type.item_type)
++        result_type = SetType(item_type)
+         Monad.__init__(self, result_type)
+         self.op = op
+         self.sqlop = sqlop
+         self.left = left
+         self.right = right
+ 
++    def integer_operand(self, monad, expr):
++        monad_type = monad.type
++        if type(monad_type) is SetType:
++            monad_type = monad_type.item_type
++        if monad_type is bool and self.translator.dialect == "PostgreSQL":
++            return ["TO_INT", expr]
++        return expr
++
+     def aggregate(self, func_name, distinct=None, sep=None):
+         distinct = distinct_from_monad(
+             distinct, default=self.forced_distinct and func_name in ("SUM", "AVG")
+@@ -5031,6 +5230,8 @@ class NumericSetExprMonad(SetMixin, Monad):
+                 "Cartesian product detected in %s" % ast2src(self.node),
+             )
+         self.tableref = tableref
++        left_expr = self.integer_operand(left, left_expr)
++        right_expr = self.integer_operand(right, right_expr)
+         return [[self.sqlop, left_expr, right_expr]]
+ 
+     __add__ = make_numericset_binop("+", "ADD")
+@@ -5038,6 +5239,7 @@ class NumericSetExprMonad(SetMixin, Monad):
+     __mul__ = make_numericset_binop("*", "MUL")
+     __truediv__ = make_numericset_binop("/", "DIV")
+     __floordiv__ = make_numericset_binop("//", "FLOORDIV")
++    __mod__ = make_numericset_binop("%", "MOD")
+ 
+ 
+ class QuerySetMonad(SetMixin, Monad):

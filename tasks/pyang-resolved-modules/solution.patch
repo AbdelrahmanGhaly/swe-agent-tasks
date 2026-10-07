@@ -1,0 +1,684 @@
+diff --git a/doc/pyang.1.md b/doc/pyang.1.md
+index e53c25b..51b64e9 100644
+--- a/doc/pyang.1.md
++++ b/doc/pyang.1.md
+@@ -1020,6 +1020,11 @@ Options for the *yang* output format:
+ :   Try to format each line with a maximum line length of *len*.  Does
+     not reformat long lines within strings.
+ 
++**-\-yang-resolve**
++:   Print the module in resolved form, with groupings, augments of the
++    module's own nodes, deviations and features resolved, so that the
++    output compiles on its own.
++
+ # YIN OUTPUT
+ 
+ Options for the *yin* output format:
+@@ -1033,6 +1038,11 @@ Options for the *yin* output format:
+     significant within the strings in XML, but the output is more
+     readable.
+ 
++**-\-yin-resolve**
++:   Print the module in resolved form, with groupings, augments of the
++    module's own nodes, deviations and features resolved, so that the
++    output compiles on its own.
++
+ # YANG XPATH EXTENSIONS
+ 
+ This section describes XPath functions that can be used in
+diff --git a/etc/bash_completion.d/pyang b/etc/bash_completion.d/pyang
+index 739aeaa..56aa5a7 100644
+--- a/etc/bash_completion.d/pyang
++++ b/etc/bash_completion.d/pyang
+@@ -97,11 +97,13 @@ _pyang()
+ 
+     local opts_yang="
+         --yang-canonical
+-        --yang-remove-unused-imports"
++        --yang-remove-unused-imports
++        --yang-resolve"
+ 
+     local opts_yin="
+         --yin-canonical
+-        --yin-pretty-strings"
++        --yin-pretty-strings
++        --yin-resolve"
+ 
+     COMPREPLY=()
+     _get_comp_words_by_ref cur prev cword words
+diff --git a/man/man1/pyang.1 b/man/man1/pyang.1
+index 804fd1f..f059dc8 100644
+--- a/man/man1/pyang.1
++++ b/man/man1/pyang.1
+@@ -1202,6 +1202,11 @@ Remove all comments from the output.
+ \f[B]--yang-line-length\f[R] \f[I]len\f[R]
+ Try to format each line with a maximum line length of \f[I]len\f[R].
+ Does not reformat long lines within strings.
++.TP
++\f[B]--yang-resolve\f[R]
++Print the module in resolved form, with groupings, augments of the
++module\[aq]s own nodes, deviations and features resolved, so that the
++output compiles on its own.
+ .SH YIN OUTPUT
+ .PP
+ Options for the \f[I]yin\f[R] output format:
+@@ -1213,6 +1218,11 @@ Generate all statements in the canonical order.
+ Pretty print strings, i.e., print with extra whitespace in the string.
+ This is not strictly correct, since the whitespace is significant within
+ the strings in XML, but the output is more readable.
++.TP
++\f[B]--yin-resolve\f[R]
++Print the module in resolved form, with groupings, augments of the
++module\[aq]s own nodes, deviations and features resolved, so that the
++output compiles on its own.
+ .SH YANG XPATH EXTENSIONS
+ .PP
+ This section describes XPath functions that can be used in
+diff --git a/pyang/resolve.py b/pyang/resolve.py
+new file mode 100644
+index 0000000..716ebf6
+--- /dev/null
++++ b/pyang/resolve.py
+@@ -0,0 +1,349 @@
++"""Resolved module output"""
++
++from . import statements
++from . import syntax
++from . import util
++from . import xpath
++from . import xpath_lexer
++from . import xpath_parser
++
++_schema_keywords = ('container', 'leaf', 'leaf-list', 'list', 'choice', 'case',
++                    'anydata', 'anyxml', 'rpc', 'action', 'notification',
++                    'input', 'output')
++
++_dropped_keywords = ('uses', 'grouping', 'augment', 'refine', 'include',
++                     'import', 'when', 'typedef', '_comment')
++
++_meta_keywords = ('organization', 'contact', 'description', 'reference',
++                  'revision')
++
++_definition_keywords = ('typedef', 'identity', 'feature', 'extension')
++
++_if_feature_prec = {'or': 1, 'and': 2, 'not': 3}
++
++
++def resolve_module(ctx, module):
++    """Return a copy of `module` where groupings, augments of the module
++    itself, deviations and features are resolved."""
++    return _Resolver(ctx, module).resolve()
++
++
++def _is_schema_keyword(keyword):
++    return keyword in _schema_keywords or keyword in statements.data_keywords
++
++
++def _context_node(node):
++    while node.keyword in ('choice', 'case', 'input', 'output'):
++        node = node.parent
++    return node
++
++
++def _data_depth(node):
++    node = _context_node(node)
++    depth = 0
++    while node.keyword not in ('module', 'submodule'):
++        depth += 1
++        node = _context_node(node.parent)
++    return depth
++
++
++def _if_feature_to_string(expr, ref, outer=0):
++    if isinstance(expr, str):
++        return ref(expr)
++    (op, op1, op2) = expr
++    prec = _if_feature_prec[op]
++    if op == 'not':
++        s = 'not ' + _if_feature_to_string(op1, ref, prec)
++    else:
++        s = '%s %s %s' % (_if_feature_to_string(op2, ref, prec), op,
++                          _if_feature_to_string(op1, ref, prec))
++    if prec < outer:
++        return '(' + s + ')'
++    return s
++
++
++class _Resolver(object):
++
++    def __init__(self, ctx, module):
++        self.ctx = ctx
++        self.module = module
++        self.modulename = module.i_modulename
++        self.res = None
++        self.prefixes = {}
++        self.taken_prefixes = set([module.i_prefix])
++        self.used_prefixes = set()
++        self.new_imports = []
++        self.typedef_names = set(t.arg for t in module.search('typedef'))
++        self.hoisted_names = {}
++        self.hoisted = []
++        for imp in module.search('import'):
++            prefix = imp.search_one('prefix').arg
++            self.prefixes.setdefault(imp.arg, prefix)
++            self.taken_prefixes.add(prefix)
++
++    def resolve(self):
++        m = self.module
++        res = statements.new_statement(None, None, m.pos, m.keyword, m.arg)
++        res.top = res
++        res.i_ctx = m.i_ctx
++        res.i_unused_prefixes = {}
++        self.res = res
++        header = []
++        meta = []
++        body = []
++        for s in m.substmts:
++            if s.keyword in ('yang-version', 'namespace', 'prefix'):
++                header.append(self.copy(s, res))
++            elif s.keyword in _meta_keywords:
++                meta.append(self.copy(s, res))
++            elif (s.keyword in _definition_keywords
++                  or (util.is_prefixed(s.raw_keyword)
++                      and not _is_schema_keyword(s.keyword))):
++                body.append(self.copy(s, res))
++        for ch in m.i_children:
++            if hasattr(ch, 'i_target_node'):
++                continue
++            node = self.copy_node(ch, res)
++            if node is not None:
++                body.append(node)
++        for s in m.substmts:
++            if hasattr(s, 'i_target_node') and not self.is_own(s):
++                body.append(self.copy_target_stmt(s, res))
++        res.substmts = (header + self.import_stmts(res) + meta +
++                        self.hoisted + body)
++        return res
++
++    def is_own(self, stmt):
++        target = getattr(stmt, 'i_target_node', None)
++        return (target is not None and target.i_module is not None
++                and target.i_module.i_modulename == self.modulename)
++
++    def merged_augment(self, node):
++        augment = getattr(node, 'i_augment', None)
++        if augment is None:
++            return None
++        if augment.parent.keyword == 'uses' or self.is_own(augment):
++            return augment
++        return None
++
++    def source(self, stmt):
++        return getattr(stmt, 'i_orig_module', None) or self.module
++
++    def new_stmt(self, parent, stmt, keyword, arg):
++        new = statements.new_statement(self.res, parent, stmt.pos, keyword, arg)
++        if util.is_prefixed(stmt.raw_keyword):
++            (prefix, identifier) = stmt.raw_keyword
++            new.raw_keyword = (self.remap(self.source(stmt), prefix, True),
++                               identifier)
++            new.keyword = stmt.keyword
++            new.i_extension = getattr(stmt, 'i_extension', None)
++        return new
++
++    def copy(self, stmt, parent, up=0, owner=None):
++        new = self.new_stmt(parent, stmt, stmt.keyword,
++                            self.arg(stmt, up, owner))
++        for s in stmt.substmts:
++            if _is_schema_keyword(s.keyword) or s.keyword in _dropped_keywords:
++                continue
++            new.substmts.append(self.copy(s, new, owner=stmt))
++        return new
++
++    def copy_node(self, node, parent):
++        if getattr(node, 'i_not_implemented', False):
++            return None
++        if (node.i_module is None
++            or node.i_module.i_modulename != self.modulename):
++            return None
++        children = getattr(node, 'i_children', [])
++        if node.keyword in ('input', 'output') and len(children) == 0:
++            return None
++        new = self.copy(node, parent)
++        when = self.when_stmt(node, new)
++        if when is not None:
++            new.substmts.insert(0, when)
++        augment = self.merged_augment(node)
++        if augment is not None:
++            new.substmts.extend([self.copy(s, new)
++                                 for s in augment.search('if-feature')])
++        for ch in children:
++            c = self.copy_node(ch, new)
++            if c is not None:
++                new.substmts.append(c)
++        if node.keyword == 'choice':
++            self.drop_lost_default(new)
++        return new
++
++    def drop_lost_default(self, new):
++        default = new.search_one('default')
++        if default is None:
++            return
++        cases = [s.arg for s in new.substmts if _is_schema_keyword(s.keyword)]
++        if default.arg not in cases:
++            new.substmts.remove(default)
++
++    def copy_target_stmt(self, stmt, parent):
++        new = self.copy(stmt, parent)
++        for s in stmt.search('when'):
++            new.substmts.insert(0, self.copy(s, new))
++        for ch in getattr(stmt, 'i_children', []):
++            c = self.copy_node(ch, new)
++            if c is not None:
++                new.substmts.append(c)
++        return new
++
++    def when_stmt(self, node, parent):
++        up = _data_depth(node) - _data_depth(node.parent)
++        whens = []
++        for s in node.search('when'):
++            if getattr(s, 'i_origin', None) == 'uses':
++                whens.append((s, up))
++            else:
++                whens.append((s, 0))
++        augment = self.merged_augment(node)
++        if augment is not None:
++            whens.extend([(s, up) for s in augment.search('when')])
++        if len(whens) == 0:
++            return None
++        exprs = [self.xpath_ast(s, up_) for (s, up_) in whens]
++        if None in exprs:
++            return self.copy(whens[0][0], parent, whens[0][1])
++        q = exprs[0]
++        for e in exprs[1:]:
++            q = ('bool', 'and', q, e)
++        new = self.new_stmt(parent, whens[0][0], 'when',
++                            xpath.xpath_to_string(q))
++        for s in whens[0][0].substmts:
++            new.substmts.append(self.copy(s, new))
++        for (s, _up) in whens[1:]:
++            new.substmts.extend([self.copy(e, new) for e in s.substmts
++                                 if util.is_prefixed(e.raw_keyword)])
++        return new
++
++    def arg(self, stmt, up=0, owner=None):
++        keyword = stmt.keyword
++        if stmt.arg is None or keyword in ('input', 'output'):
++            return None
++        src = self.source(stmt)
++        if keyword == 'type':
++            return self.type_arg(stmt)
++        if keyword == 'base':
++            return self.identifier_ref(stmt.arg, src)
++        if keyword == 'if-feature':
++            expr = syntax.parse_if_feature_expr(stmt.arg)
++            if expr is None:
++                return stmt.arg
++            return _if_feature_to_string(
++                expr, lambda i: self.identifier_ref(i, src))
++        if keyword in ('must', 'when', 'path'):
++            q = self.xpath_ast(stmt, up)
++            if q is None:
++                return stmt.arg
++            return xpath.xpath_to_string(q)
++        if keyword == 'default':
++            spec = getattr((owner or stmt.parent).search_one('type'),
++                           'i_type_spec', None)
++            if spec is not None and spec.name == 'identityref':
++                return self.identifier_ref(stmt.arg, src)
++        if hasattr(stmt, 'i_target_node'):
++            return self.schema_node_ids(stmt.arg, src)
++        return stmt.arg
++
++    def xpath_ast(self, stmt, up):
++        src = self.source(stmt)
++        try:
++            q = xpath_parser.parse(stmt.arg)
++        except (xpath_lexer.XPathError, SyntaxError):
++            return None
++        return xpath.rewrite_xpath(
++            q, lambda prefix, is_identity:
++            self.remap(src, prefix, is_identity), up)
++
++    def type_arg(self, stmt):
++        typedef = getattr(stmt, 'i_typedef', None)
++        if typedef is None:
++            return stmt.arg
++        owner = typedef.parent
++        if owner.keyword in ('module', 'submodule'):
++            if owner.i_modulename == self.modulename:
++                return typedef.arg
++            (prefix, _name) = util.split_identifier(stmt.arg)
++            return '%s:%s' % (self.prefix_for(owner.i_modulename, prefix),
++                              typedef.arg)
++        return self.hoist(typedef)
++
++    def hoist(self, typedef):
++        name = self.hoisted_names.get(typedef)
++        if name is None:
++            name = typedef.arg
++            i = 0
++            while name in self.typedef_names:
++                i += 1
++                name = '%s-%d' % (typedef.arg, i)
++            self.typedef_names.add(name)
++            self.hoisted_names[typedef] = name
++            new = self.copy(typedef, self.res)
++            new.arg = name
++            self.hoisted.append(new)
++        return name
++
++    def identifier_ref(self, arg, src):
++        (prefix, name) = util.split_identifier(arg)
++        prefix = self.remap(src, prefix, True)
++        if prefix is None:
++            return name
++        return '%s:%s' % (prefix, name)
++
++    def schema_node_ids(self, arg, src):
++        def remap_part(part):
++            (prefix, name) = util.split_identifier(part)
++            if prefix is None:
++                return part
++            return '%s:%s' % (self.remap(src, prefix, False), name)
++        return ' '.join(['/'.join([remap_part(p) for p in ids.split('/')])
++                         for ids in arg.split()])
++
++    def remap(self, src, prefix, is_identity):
++        if prefix is None and not is_identity:
++            return None
++        if prefix is None or prefix == src.i_prefix:
++            modulename = src.i_modulename
++        elif prefix in src.i_prefixes:
++            modulename = src.i_prefixes[prefix][0]
++        else:
++            return prefix
++        return self.prefix_for(modulename, prefix)
++
++    def prefix_for(self, modulename, src_prefix):
++        if modulename == self.modulename:
++            return self.module.i_prefix
++        prefix = self.prefixes.get(modulename)
++        if prefix is None:
++            base = src_prefix
++            if base is None:
++                imported = self.ctx.get_module(modulename)
++                base = imported.i_prefix if imported is not None else modulename
++            prefix = base
++            i = 0
++            while prefix in self.taken_prefixes:
++                i += 1
++                prefix = '%s%d' % (base, i)
++            self.prefixes[modulename] = prefix
++            self.taken_prefixes.add(prefix)
++            self.new_imports.append((modulename, prefix))
++        self.used_prefixes.add(prefix)
++        return prefix
++
++    def import_stmts(self, parent):
++        stmts = []
++        for imp in self.module.search('import'):
++            prefix = imp.search_one('prefix').arg
++            if (prefix in self.used_prefixes
++                and self.prefixes.get(imp.arg) == prefix):
++                stmts.append(self.copy(imp, parent))
++        for (modulename, prefix) in self.new_imports:
++            imp = statements.new_statement(self.res, parent, self.module.pos,
++                                           'import', modulename)
++            imp.substmts.append(statements.new_statement(
++                self.res, imp, self.module.pos, 'prefix', prefix))
++            stmts.append(imp)
++        return stmts
+diff --git a/pyang/translators/yang.py b/pyang/translators/yang.py
+index 777cdc9..e83c36b 100644
+--- a/pyang/translators/yang.py
++++ b/pyang/translators/yang.py
+@@ -5,6 +5,7 @@ import optparse
+ from .. import plugin
+ from .. import util
+ from .. import grammar
++from .. import resolve
+ 
+ def pyang_plugin_init():
+     plugin.register_plugin(YANGPlugin())
+@@ -30,6 +31,12 @@ class YANGPlugin(plugin.PyangPlugin):
+                                  type="int",
+                                  dest="yang_line_length",
+                                  help="Maximum line length"),
++            optparse.make_option("--yang-resolve",
++                                 dest="yang_resolve",
++                                 action="store_true",
++                                 help="Print the module with groupings, "
++                                 "augments, deviations and features "
++                                 "resolved"),
+             ]
+         g = optparser.add_option_group("YANG output specific options")
+         g.add_options(optlist)
+@@ -43,6 +50,8 @@ class YANGPlugin(plugin.PyangPlugin):
+ 
+     def emit(self, ctx, modules, fd):
+         module = modules[0]
++        if ctx.opts.yang_resolve:
++            module = resolve.resolve_module(ctx, module)
+         emit_yang(ctx, module, fd)
+ 
+ def emit_yang(ctx, module, fd):
+diff --git a/pyang/translators/yin.py b/pyang/translators/yin.py
+index a1cbf5c..e3e8491 100644
+--- a/pyang/translators/yin.py
++++ b/pyang/translators/yin.py
+@@ -11,6 +11,7 @@ from .. import util
+ from .. import grammar
+ from .. import syntax
+ from .. import statements
++from .. import resolve
+ 
+ yin_namespace = "urn:ietf:params:xml:ns:yang:yin:1"
+ 
+@@ -28,6 +29,12 @@ class YINPlugin(plugin.PyangPlugin):
+                                  dest="yin_pretty_strings",
+                                  action="store_true",
+                                  help="Pretty print strings"),
++            optparse.make_option("--yin-resolve",
++                                 dest="yin_resolve",
++                                 action="store_true",
++                                 help="Print the module with groupings, "
++                                 "augments, deviations and features "
++                                 "resolved"),
+             ]
+         g = optparser.add_option_group("YIN output specific options")
+         g.add_options(optlist)
+@@ -35,6 +42,8 @@ class YINPlugin(plugin.PyangPlugin):
+         fmts['yin'] = self
+     def emit(self, ctx, modules, fd):
+         module = modules[0]
++        if ctx.opts.yin_resolve:
++            module = resolve.resolve_module(ctx, module)
+         emit_yin(ctx, module, fd)
+ 
+ def emit_yin(ctx, module, fd):
+diff --git a/pyang/xpath.py b/pyang/xpath.py
+index af5ce33..f9d9142 100644
+--- a/pyang/xpath.py
++++ b/pyang/xpath.py
+@@ -2,7 +2,8 @@ from . import xpath_lexer
+ from . import xpath_parser
+ from . import types
+ from .error import err_add
+-from .util import prefix_to_module, search_data_node, data_node_up
++from .util import prefix_to_module, search_data_node, data_node_up, \
++    split_identifier
+ from .syntax import re_identifier
+ 
+ core_functions = {
+@@ -349,3 +350,170 @@ def chk_xpath_path(ctx, mod, pos, initial, node, path):
+         for p in preds:
+             chk_xpath_expr(ctx, mod, pos, initial, node1, p, None)
+         return chk_xpath_path(ctx, mod, pos, initial, node1, path[1:])
++
++_binary_prec = {
++    'or': 1,
++    'and': 2,
++    '=': 3, '!=': 3,
++    '<': 4, '<=': 4, '>': 4, '>=': 4,
++    '+': 5, '-': 5,
++    '*': 6, 'div': 6, 'mod': 6,
++}
++
++def _prec(q):
++    if isinstance(q, list):
++        return 9
++    if q[0] in ('bool', 'comp', 'arith'):
++        return _binary_prec[q[1]]
++    if q[0] == 'negative':
++        return 7
++    if q[0] == 'union':
++        return 8
++    return 9
++
++def _wrap(q, parens):
++    s = xpath_to_string(q)
++    if parens:
++        return '(' + s + ')'
++    return s
++
++def xpath_to_string(q):
++    """Return the XPath string for the parsed expression `q`."""
++    if isinstance(q, list):
++        return '/'.join([_primary_to_string(q[0])] +
++                        [_step_to_string(s) for s in q[1:]])
++    kind = q[0]
++    if kind in ('bool', 'comp', 'arith'):
++        p = _binary_prec[q[1]]
++        return '%s %s %s' % (_wrap(q[2], _prec(q[2]) < p), q[1],
++                             _wrap(q[3], _prec(q[3]) <= p))
++    if kind == 'negative':
++        return '-' + _wrap(q[1], _prec(q[1]) <= 7)
++    if kind == 'union':
++        return ' | '.join([_wrap(m, _prec(m) < 9) for m in q[1]])
++    if kind == 'relative':
++        return '/'.join([_step_to_string(s) for s in q[1]])
++    if kind == 'absolute':
++        return '/' + '/'.join([_step_to_string(s) for s in q[1]])
++    if kind == 'path_expr':
++        return _primary_to_string(q[1])
++    return _primary_to_string(q)
++
++def _primary_to_string(q):
++    kind = q[0]
++    if kind in ('literal', 'number'):
++        return q[1]
++    if kind == 'variable':
++        return '$' + q[1]
++    if kind == 'function_call':
++        return '%s(%s)' % (q[1], ', '.join([xpath_to_string(a)
++                                            for a in q[2]]))
++    if kind == 'path':
++        return '%s[%s]' % (_primary_to_string(q[2]), xpath_to_string(q[3]))
++    return '(' + xpath_to_string(q) + ')'
++
++def _step_to_string(step):
++    (_, axis, test, preds) = step
++    if axis == 'self' and test == ('node_type', 'node') and not preds:
++        s = '.'
++    elif axis == 'parent' and test == ('node_type', 'node') and not preds:
++        s = '..'
++    else:
++        s = _node_test_to_string(test)
++        if axis == 'attribute':
++            s = '@' + s
++        elif axis != 'child':
++            s = axis + '::' + s
++    return s + ''.join(['[%s]' % xpath_to_string(p) for p in preds])
++
++def _node_test_to_string(test):
++    if test == 'wildcard':
++        return '*'
++    if not isinstance(test, tuple):
++        return test
++    if test[0] == 'name':
++        if test[1] is None:
++            return test[2]
++        return '%s:%s' % (test[1], test[2])
++    if test[0] == 'has_namespace':
++        return test[1]
++    if test[0] == 'node_type':
++        return test[1] + '()'
++    return 'processing-instruction(%s)' % test[1]
++
++def rewrite_xpath(q, remap, up=0):
++    """Return a copy of the parsed expression `q` with rewritten prefixes.
++
++    `remap(prefix, is_identity)` returns the prefix to use instead of
++    `prefix` (None for no prefix).  If `up` is greater than zero, the
++    expression is moved `up` data node levels below its original context
++    node, and the paths that start at the context node are adjusted."""
++    return _rewrite(q, remap, up, True)
++
++def _parent_steps(up):
++    return [('step', 'parent', ('node_type', 'node'), [])
++            for _i in range(up)]
++
++def _rewrite(q, remap, up, at_context):
++    if isinstance(q, list):
++        head = q[0]
++        rest = [_rewrite_step(s, remap, up) for s in q[1:]]
++        if head[0] == 'function_call' and head[1] == 'current':
++            return [head] + _parent_steps(up) + rest
++        return [_rewrite(head, remap, up, at_context)] + rest
++    kind = q[0]
++    if kind in ('bool', 'comp', 'arith'):
++        return (kind, q[1], _rewrite(q[2], remap, up, at_context),
++                _rewrite(q[3], remap, up, at_context))
++    if kind == 'negative':
++        return (kind, _rewrite(q[1], remap, up, at_context))
++    if kind == 'union':
++        return (kind, [_rewrite(m, remap, up, at_context) for m in q[1]])
++    if kind == 'relative':
++        steps = [_rewrite_step(s, remap, up) for s in q[1]]
++        if at_context:
++            steps = _parent_steps(up) + steps
++        return (kind, steps)
++    if kind == 'absolute':
++        return (kind, [_rewrite_step(s, remap, up) for s in q[1]])
++    if kind == 'path_expr':
++        inner = q[1]
++        if (up > 0 and inner[0] == 'function_call'
++            and inner[1] == 'current'):
++            return [inner] + _parent_steps(up)
++        return (kind, _rewrite(inner, remap, up, at_context))
++    if kind == 'path':
++        return (kind, q[1], _rewrite(q[2], remap, up, at_context),
++                _rewrite(q[3], remap, up, False))
++    if kind == 'function_call':
++        args = [_rewrite(a, remap, up, at_context) for a in q[2]]
++        if (q[1] in ('derived-from', 'derived-from-or-self')
++            and len(args) == 2
++            and q[2][1][0] == 'path_expr' and q[2][1][1][0] == 'literal'):
++            args[1] = ('path_expr', _rewrite_literal(q[2][1][1], remap))
++        return (kind, q[1], args)
++    return q
++
++def _rewrite_step(step, remap, up):
++    (_, axis, test, preds) = step
++    if isinstance(test, tuple) and test[0] == 'name':
++        test = ('name', remap(test[1], False), test[2])
++    elif isinstance(test, tuple) and test[0] == 'has_namespace':
++        prefix = remap(test[1][:-2], False)
++        test = ('has_namespace', '%s:*' % prefix)
++    return ('step', axis, test, [_rewrite(p, remap, up, False) for p in preds])
++
++def _rewrite_literal(lit, remap):
++    text = lit[1]
++    body = text[1:-1]
++    name = body.strip()
++    (prefix, identifier) = split_identifier(name)
++    if (re_identifier.search(identifier) is None
++        or (prefix is not None and re_identifier.search(prefix) is None)):
++        return lit
++    prefix = remap(prefix, True)
++    if prefix is not None:
++        identifier = '%s:%s' % (prefix, identifier)
++    start = body.index(name)
++    return ('literal', text[0] + body[:start] + identifier +
++            body[start + len(name):] + text[0])
