@@ -1,0 +1,1160 @@
+diff --git a/README.md b/README.md
+index c19cbf58..8445ac64 100644
+--- a/README.md
++++ b/README.md
+@@ -669,6 +669,17 @@ Returns a list of supported MIME-types. This may include some MIME-types which a
+   When `true`, tag headers located at the end of the file will not be read.
+   This is particularly beneficial for streaming input, as it avoids the need to read the entire stream.
+ 
++- `verifyChecksums`: `boolean` (default: `false`)
++
++  When `true`, the checksums stored in the file are compared with the data they cover,
++  and `metadata.quality.checksums` reports for each kind checked how many were `checked` and how many `failed`.
++  This may read the whole file; `format`, `common` and `native` stay the same. The kinds are:
++  - `mpegFrame`: the CRC of MPEG audio Layer I, II and III frames which have one.
++  - `lameTag` and `lameMusic`: the tag CRC and the music CRC of a LAME (3.90 or later) Info tag.
++  - `ebml`: the CRC-32 element at the start of a top-level element in the Segment of a Matroska or WebM file.
++
++  A checksum is only checked when the file contains every byte it covers.
++
+ > [!NOTE]
+ > - `format.duration` may be available without enabling `duration`. Set `duration: true` to allow additional scanning when needed; duration can still be unavailable.
+ > - Using `mkvUseIndex` can improve performance in Matroska files, but be aware of potential side effects, such as missing metadata due to skipped elements.
+@@ -682,6 +693,7 @@ If the returned promise resolves, the metadata (TypeScript `IAudioMetadata` inte
+ - [`metadata.format.trackInfo`](#metadataformattrackinfo) Describes individual audio and video tracks when available.
+ - `metadata.native` Maps each tag format to an array of native (original) tags found in the parsed audio file.
+ - `metadata.quality.warnings` Contains non-fatal parsing warnings, each with a `message` string.
++- `metadata.quality.checksums` Checksums verified per kind, when the `verifyChecksums` option is enabled.
+ 
+ #### `metadata.format`
+ 
+diff --git a/lib/common/Checksum.ts b/lib/common/Checksum.ts
+new file mode 100644
+index 00000000..a99e2ed4
+--- /dev/null
++++ b/lib/common/Checksum.ts
+@@ -0,0 +1,68 @@
++function makeTable(polynomial: number, width: 16 | 32, reflected: boolean): Uint32Array {
++  const table = new Uint32Array(256);
++  const topBit = 2 ** (width - 1);
++  const mask = 2 ** width - 1;
++  for (let n = 0; n < 256; ++n) {
++    let crc = reflected ? n : n * 2 ** (width - 8);
++    for (let bit = 0; bit < 8; ++bit) {
++      if (reflected) {
++        crc = crc & 1 ? (crc >>> 1) ^ polynomial : crc >>> 1;
++      } else {
++        crc = crc >= topBit ? (((crc - topBit) * 2) ^ polynomial) >>> 0 : crc * 2;
++      }
++    }
++    table[n] = (crc & mask) >>> 0;
++  }
++  return table;
++}
++
++const crc16AnsiTable = makeTable(0x8005, 16, false);
++const crc16ArcTable = makeTable(0xa001, 16, true);
++const crc32IeeeTable = makeTable(0xedb88320, 32, true);
++
++/**
++ * CRC-16 of MPEG audio frames (ISO/IEC 11172-3), polynomial 0x8005, computed over the first `bitLength` bits
++ * @param data Data covered by the CRC
++ * @param bitLength Number of bits to include, may end within a byte
++ * @param crc Running CRC value, initially 0xffff
++ */
++export function crc16Mpeg(data: Uint8Array, bitLength: number = data.length * 8, crc = 0xffff): number {
++  const bytes = bitLength >> 3;
++  for (let i = 0; i < bytes; ++i) {
++    crc = ((crc << 8) & 0xffff) ^ crc16AnsiTable[((crc >> 8) ^ data[i]) & 0xff];
++  }
++  for (let bit = 0; bit < (bitLength & 7); ++bit) {
++    const input = (data[bytes] >> (7 - bit)) & 1;
++    const top = (crc >> 15) & 1;
++    crc = (crc << 1) & 0xffff;
++    if (top ^ input) {
++      crc ^= 0x8005;
++    }
++  }
++  return crc;
++}
++
++/**
++ * CRC-16 used by the LAME Info tag (CRC-16/ARC)
++ * @param data Data covered by the CRC
++ * @param crc Running CRC value, initially 0
++ */
++export function crc16Lame(data: Uint8Array, crc = 0): number {
++  for (const byte of data) {
++    crc = (crc >>> 8) ^ crc16ArcTable[(crc ^ byte) & 0xff];
++  }
++  return crc;
++}
++
++/**
++ * IEEE CRC-32 (ISO 3309), as used by EBML
++ * @param data Data covered by the CRC
++ * @param crc CRC of the preceding data, initially 0
++ */
++export function crc32(data: Uint8Array, crc = 0): number {
++  let value = ~crc >>> 0;
++  for (const byte of data) {
++    value = (value >>> 8) ^ crc32IeeeTable[(value ^ byte) & 0xff];
++  }
++  return ~value >>> 0;
++}
+diff --git a/lib/common/MetadataCollector.ts b/lib/common/MetadataCollector.ts
+index 6261339c..992dcecf 100644
+--- a/lib/common/MetadataCollector.ts
++++ b/lib/common/MetadataCollector.ts
+@@ -3,6 +3,7 @@ import { fileTypeFromBuffer } from 'file-type';
+ import { parseLyrics } from '../lrc/LyricsParser.js';
+ import {
+   type AnyTagValue,
++  type ChecksumKind,
+   type IAudioMetadata,
+   type IComment,
+   type ICommonTagsResult,
+@@ -53,7 +54,16 @@ export interface IWarningCollector {
+   addWarning(warning: string): void;
+ }
+ 
+-export interface INativeMetadataCollector extends IWarningCollector {
++export interface IChecksumCollector {
++  /**
++   * Register a verified checksum
++   * @param kind Kind of checksum
++   * @param valid true if the stored checksum matches the data it covers
++   */
++  addChecksum(kind: ChecksumKind, valid: boolean): void;
++}
++
++export interface INativeMetadataCollector extends IWarningCollector, IChecksumCollector {
+   /**
+    * Only use this for reading
+    */
+@@ -121,6 +131,9 @@ export class MetadataCollector implements INativeMetadataCollector {
+ 
+   public constructor(opts?: IOptions) {
+     this.opts = opts;
++    if (opts?.verifyChecksums) {
++      this.quality.checksums = {};
++    }
+     let priority = 1;
+     for (const tagType of TagPriority) {
+       this.originPriority[tagType] = priority++;
+@@ -186,6 +199,15 @@ export class MetadataCollector implements INativeMetadataCollector {
+     this.quality.warnings.push({ message: warning });
+   }
+ 
++  public addChecksum(kind: ChecksumKind, valid: boolean) {
++    const checksums = (this.quality.checksums ??= {});
++    const count = (checksums[kind] ??= { checked: 0, failed: 0 });
++    count.checked++;
++    if (!valid) {
++      count.failed++;
++    }
++  }
++
+   public async postMap(tagType: TagType | 'artificial', tag: IGenericTag): Promise<void> {
+     // Common tag (alias) found
+ 
+diff --git a/lib/core.ts b/lib/core.ts
+index 7050deea..62a5dc19 100644
+--- a/lib/core.ts
++++ b/lib/core.ts
+@@ -23,9 +23,12 @@ export type { IFileInfo } from 'strtok3';
+ export * from './ParseError.js';
+ export { CouldNotDetermineFileTypeError, UnsupportedFileTypeError } from './ParseError.js';
+ export {
++  type ChecksumKind,
+   type IAudioMetadata,
+   type IAudioTrack,
+   type IChapter,
++  type IChecksumCount,
++  type IChecksums,
+   type ICommonTagsResult,
+   type IFormat,
+   type ILyricsTag,
+diff --git a/lib/ebml/EbmlIterator.ts b/lib/ebml/EbmlIterator.ts
+index c0063bb6..a1d43a98 100644
+--- a/lib/ebml/EbmlIterator.ts
++++ b/lib/ebml/EbmlIterator.ts
+@@ -3,6 +3,8 @@ import { EndOfStreamError, type ITokenizer, isRandomAccessTokenizer } from 'strt
+ import * as Token from 'token-types';
+ import { Float32_BE, Float64_BE, StringType, UINT8 } from 'token-types';
+ import { getMaxMemoryAllocation, getMaxMetadataEntries, readBuffer } from '../common/Allocation.js';
++import { crc32 } from '../common/Checksum.js';
++import type { IChecksumCollector } from '../common/MetadataCollector.js';
+ import { makeUnexpectedFileContentError } from '../ParseError.js';
+ import type { IOptions } from '../type.js';
+ import {
+@@ -33,6 +35,29 @@ export const ParseAction = {
+ 
+ export type ParseAction = (typeof ParseAction)[keyof typeof ParseAction];
+ 
++const crc32ElementId = 0xbf;
++const segmentElementId = 0x18538067;
++
++/**
++ * CRC-32 element of a master element, covering the data following it up to the end of the master element
++ */
++interface IChecksumScope {
++  /**
++   * Position of the next byte to add
++   */
++  next: number;
++  end: number;
++  /**
++   * Bytes of the first child element, until they show whether it is a CRC-32 element
++   */
++  head: number[];
++  /**
++   * Stored CRC, known once the whole CRC-32 element has been read
++   */
++  stored?: number;
++  crc: number;
++}
++
+ /** Traversal callbacks and optional subtree retention. */
+ export type IElementListener<S extends IElementType = IElementType> = {
+   startNext: (element: IElementContext) => ParseAction | Promise<ParseAction>;
+@@ -64,17 +89,23 @@ export class EbmlIterator {
+   private tokenizer: ITokenizer;
+   private readonly elementHeader: Uint8Array;
+ 
++  private checksumScopes: IChecksumScope[] = [];
++  private currentElementEnd = 0;
++  private readonly checksumChunk: Uint8Array;
++
+   /**
+    * @param {ITokenizer} tokenizer Input
+    * @param tokenizer
+    */
+   constructor(
+     tokenizer: ITokenizer,
+-    private readonly options: IOptions = {}
++    private readonly options: IOptions = {},
++    private readonly checksums?: IChecksumCollector
+   ) {
+     this.tokenizer = tokenizer;
+     const maxMemoryAllocation = getMaxMemoryAllocation(options);
+     this.elementHeader = new Uint8Array(Math.min(12, maxMemoryAllocation));
++    this.checksumChunk = new Uint8Array(checksums ? Math.min(65536, maxMemoryAllocation) : 0);
+     this.parserMap.set(DataType.uint, e => this.readUint(e));
+     this.parserMap.set(DataType.int, e => this.readInt(e));
+     this.parserMap.set(DataType.string, e => this.readString(e));
+@@ -129,6 +160,10 @@ export class EbmlIterator {
+       const definition = dtdElement.container?.[element.id];
+       if (definition) {
+         const child: IElementContext = { ...definition, id: element.id, parent: dtdElement };
++        this.currentElementEnd = Math.min(posDone, this.tokenizer.position + element.len);
++        if (child.container && dtdElement.id === segmentElementId) {
++          this.openChecksumScope(this.tokenizer.position + element.len);
++        }
+         const action = await listener.startNext(child);
+         switch (action) {
+           case ParseAction.ReadNext:
+@@ -206,13 +241,114 @@ export class EbmlIterator {
+             debug(
+               `parseEbml: parent=${getElementPath(dtdElement)}, unknown child: id=${element.id.toString(16)} at position=${elementPosition}`
+             );
++            if (dtdElement.id === segmentElementId && element.id !== crc32ElementId) {
++              this.openChecksumScope(this.tokenizer.position + element.len);
++            }
+             await this.ignore(element.len, posDone);
+         }
+       }
++      this.closeChecksumScopes();
+     }
+     return tree;
+   }
+ 
++  /**
++   * Skip the given number of bytes, continuing from the element announced by the last startNext() call.
++   * Bytes covered by a CRC-32 element, and the CRC-32 elements of skipped top-level elements, are still verified.
++   * @param length Number of bytes to skip
++   */
++  public async skip(length: number): Promise<void> {
++    const target = this.tokenizer.position + length;
++    if (!this.checksums) {
++      await this.tokenizer.ignore(length);
++      return;
++    }
++    let elementEnd = this.currentElementEnd;
++    while (this.tokenizer.position < target) {
++      if (this.tokenizer.position >= elementEnd) {
++        const element = await this.readElement();
++        elementEnd = this.tokenizer.position + element.len;
++        if (element.id !== crc32ElementId && element.id !== 0xec) {
++          this.openChecksumScope(elementEnd);
++        }
++      }
++      await this.consume(Math.min(elementEnd, target) - this.tokenizer.position);
++      this.closeChecksumScopes();
++    }
++  }
++
++  /**
++   * Start verifying the element data from the current position up to the given end,
++   * if its first child turns out to be a CRC-32 element
++   */
++  private openChecksumScope(end: number): void {
++    if (this.checksums) {
++      this.checksumScopes.push({ next: this.tokenizer.position, end, head: [], crc: 0 });
++    }
++  }
++
++  /**
++   * Drop the checksum scopes ending at or before the current position, which were not complete
++   */
++  private closeChecksumScopes(): void {
++    this.checksumScopes = this.checksumScopes.filter(scope => scope.end > this.tokenizer.position);
++  }
++
++  /**
++   * Add data to the open checksum scopes, a scope is verified as soon as it reaches its end
++   * @param data Data read from the tokenizer
++   * @param position Position of the first byte of data
++   */
++  private feed(data: Uint8Array, position: number): void {
++    if (this.checksumScopes.length === 0) {
++      return;
++    }
++    this.checksumScopes = this.checksumScopes.filter(scope => {
++      if (position > scope.next) {
++        return false;
++      }
++      let offset = scope.next - position;
++      const end = Math.min(data.length, scope.end - position);
++      while (scope.stored === undefined && offset < end) {
++        if (!readCrcElementByte(scope, data[offset++])) {
++          return false;
++        }
++      }
++      if (scope.stored !== undefined && offset < end) {
++        scope.crc = crc32(data.subarray(offset, end), scope.crc);
++      }
++      scope.next = Math.max(scope.next, position + end);
++      if (scope.next === scope.end) {
++        if (scope.stored !== undefined) {
++          this.checksums?.addChecksum('ebml', scope.crc === scope.stored);
++        }
++        return false;
++      }
++      return true;
++    });
++  }
++
++  /**
++   * Consume bytes, reading them if a CRC-32 element covers them or may do so
++   */
++  private async consume(length: number): Promise<void> {
++    for (let remaining = length; remaining > 0; ) {
++      if (this.checksumScopes.length === 0) {
++        await this.tokenizer.ignore(remaining);
++        return;
++      }
++      // Read the first child elements in small steps, until they show whether they are CRC-32 elements
++      const pending = this.checksumScopes.some(scope => scope.stored === undefined);
++      const part = this.checksumChunk.subarray(
++        0,
++        Math.min(remaining, this.checksumChunk.length, pending ? 13 : remaining)
++      );
++      await this.tokenizer.readBuffer(part);
++      this.feed(part, this.tokenizer.position - part.length);
++      remaining -= part.length;
++    }
++  }
++
+   private collect(tree: ITree, element: IElementType, value: ValueType): void {
+     if (element.multiple) {
+       const values = (tree[element.name] ??= []);
+@@ -235,7 +371,7 @@ export class EbmlIterator {
+     if (!Number.isSafeInteger(boundedLength) || boundedLength < 0) {
+       throw new EbmlContentError(`Invalid element length: ${length}`);
+     }
+-    await this.tokenizer.ignore(boundedLength);
++    await this.consume(boundedLength);
+   }
+ 
+   private async readVintData(maxLength: number): Promise<Uint8Array> {
+@@ -278,6 +414,7 @@ export class EbmlIterator {
+       };
+       const idLength = width(0, this.ebmlMaxIDLength);
+       const sizeLength = width(idLength, this.ebmlMaxSizeLength);
++      this.feed(this.elementHeader.subarray(0, idLength + sizeLength), this.tokenizer.position);
+       const id = readUIntBE(this.elementHeader.subarray(0, idLength), idLength);
+       const lenField = this.elementHeader.subarray(idLength, idLength + sizeLength);
+       lenField[0] ^= 0x80 >> (sizeLength - 1);
+@@ -286,6 +423,8 @@ export class EbmlIterator {
+     }
+     const id = await this.readVintData(this.ebmlMaxIDLength);
+     const lenField = await this.readVintData(this.ebmlMaxSizeLength);
++    this.feed(id, this.tokenizer.position - id.length - lenField.length);
++    this.feed(lenField, this.tokenizer.position - lenField.length);
+     lenField[0] ^= 0x80 >> (lenField.length - 1);
+     return {
+       id: readUIntBE(id, id.length),
+@@ -298,11 +437,10 @@ export class EbmlIterator {
+       case 0:
+         return 0.0;
+       case 4:
+-        return this.tokenizer.readNumber(Float32_BE);
++        return Float32_BE.get(await this.readBuffer({ ...e, len: 4 }), 0);
+       case 8:
+-        return this.tokenizer.readNumber(Float64_BE);
+       case 10:
+-        return this.tokenizer.readNumber(Float64_BE);
++        return Float64_BE.get(await this.readBuffer({ ...e, len: 8 }), 0);
+       default:
+         throw new EbmlContentError(`Invalid IEEE-754 float length: ${e.len}`);
+     }
+@@ -330,8 +468,70 @@ export class EbmlIterator {
+   }
+ 
+   private async readBuffer(e: IHeader): Promise<Uint8Array> {
+-    return readBuffer(this.tokenizer, e.len, this.options, undefined, message => new EbmlContentError(message));
++    const buffer = await readBuffer(
++      this.tokenizer,
++      e.len,
++      this.options,
++      undefined,
++      message => new EbmlContentError(message)
++    );
++    this.feed(buffer, this.tokenizer.position - buffer.length);
++    return buffer;
++  }
++}
++
++/**
++ * Whether the bytes read so far can start a CRC-32 element, an ID of 0xBF and a size of 4
++ */
++function isCrcElementStart(head: number[]): boolean {
++  if (head.length === 0) {
++    return true;
++  }
++  if (head[0] !== crc32ElementId) {
++    return false;
++  }
++  if (head.length === 1) {
++    return true;
++  }
++  const sizeLength = vintLength(head[1], 8);
++  if (sizeLength === 0) {
++    return false;
++  }
++  if (head.length < 1 + sizeLength) {
++    return true;
++  }
++  const size = Uint8Array.from(head.slice(1, 1 + sizeLength));
++  size[0] ^= 0x80 >> (sizeLength - 1);
++  return readUIntBE(size, sizeLength) === 4;
++}
++
++/**
++ * Add a byte of the first child element of a checksum scope, and the stored CRC once the CRC-32 element is complete
++ * @returns false if the first child element is not a CRC-32 element
++ */
++function readCrcElementByte(scope: IChecksumScope, byte: number): boolean {
++  const head = scope.head;
++  head.push(byte);
++  if (!isCrcElementStart(head)) {
++    return false;
++  }
++  const sizeLength = head.length > 1 ? vintLength(head[1], 8) : 0;
++  if (sizeLength > 0 && head.length === 1 + sizeLength + 4) {
++    scope.stored = Token.UINT32_LE.get(Uint8Array.from(head.slice(1 + sizeLength)), 0);
++  }
++  return true;
++}
++
++/**
++ * Length of a variable size integer from its first byte, 0 if it exceeds the maximum length
++ */
++function vintLength(firstByte: number | undefined, maxLength: number): number {
++  for (let length = 1; length <= maxLength; ++length) {
++    if (((firstByte ?? 0) & (0x80 >> (length - 1))) !== 0) {
++      return length;
++    }
+   }
++  return 0;
+ }
+ 
+ function readUIntBE(buf: Uint8Array, len: number): number {
+diff --git a/lib/id3v2/AbstractID3Parser.ts b/lib/id3v2/AbstractID3Parser.ts
+index 6f3d2d66..f32c15ba 100644
+--- a/lib/id3v2/AbstractID3Parser.ts
++++ b/lib/id3v2/AbstractID3Parser.ts
+@@ -17,6 +17,13 @@ export abstract class AbstractID3Parser extends BasicParser {
+ 
+   private id3parser = new ID3v2Parser();
+ 
++  /**
++   * Bytes after the last ID3v2 tag which the tag parser has already read
++   */
++  protected get id3v2Overrun(): Uint8Array {
++    return this.id3parser.overrun;
++  }
++
+   public async parse(): Promise<void> {
+     try {
+       await this.parseID3v2();
+diff --git a/lib/id3v2/ID3v2Parser.ts b/lib/id3v2/ID3v2Parser.ts
+index 71518025..7afedb85 100644
+--- a/lib/id3v2/ID3v2Parser.ts
++++ b/lib/id3v2/ID3v2Parser.ts
+@@ -89,6 +89,12 @@ export class ID3v2Parser {
+ 
+   private headerType: TagType = undefined as unknown as TagType;
+   private options: IOptions = undefined as unknown as IOptions;
++  private tagEnd = 0;
++
++  /**
++   * Bytes read past the end of the last parsed tag: the extended header handling can read up to 4 bytes too far
++   */
++  public overrun = new Uint8Array(0);
+ 
+   public async parse(metadata: INativeMetadataCollector, tokenizer: ITokenizer, options: IOptions): Promise<void> {
+     this.tokenizer = tokenizer;
+@@ -96,6 +102,8 @@ export class ID3v2Parser {
+     this.options = options;
+ 
+     const id3Header = await this.tokenizer.readToken(ID3v2Header);
++    this.tagEnd = this.tokenizer.position + id3Header.size;
++    this.overrun = new Uint8Array(0);
+ 
+     if (id3Header.fileIdentifier !== 'ID3') {
+       throw new Id3v2ContentError("expected ID3-header file-identifier 'ID3' was not found");
+@@ -141,6 +149,9 @@ export class ID3v2Parser {
+       undefined,
+       message => new Id3v2ContentError(message)
+     );
++    if (this.tokenizer.position > this.tagEnd) {
++      this.overrun = uint8Array.slice(Math.max(0, uint8Array.length - (this.tokenizer.position - this.tagEnd)));
++    }
+     for (const tag of this.parseMetadata(uint8Array)) {
+       switch (tag.id) {
+         case 'TXXX':
+diff --git a/lib/matroska/MatroskaParser.ts b/lib/matroska/MatroskaParser.ts
+index 5adc8df4..af6f77da 100644
+--- a/lib/matroska/MatroskaParser.ts
++++ b/lib/matroska/MatroskaParser.ts
+@@ -71,7 +71,11 @@ export class MatroskaParser extends BasicParser {
+     const containerSize = this.tokenizer.fileInfo.size ?? Number.MAX_SAFE_INTEGER;
+ 
+     const attachmentMimeTypes = new WeakMap<IElementContext, string>();
+-    const matroskaIterator = new EbmlIterator(this.tokenizer, this.options);
++    const matroskaIterator = new EbmlIterator(
++      this.tokenizer,
++      this.options,
++      this.options.verifyChecksums ? this.metadata : undefined
++    );
+     debug('Initializing DTD end MatroskaIterator');
+     await matroskaIterator.iterate(matroskaDtd, containerSize, {
+       // Process tags and attachments one at a time. Never assemble a Segment/root tree.
+@@ -109,7 +113,7 @@ export class MatroskaParser extends BasicParser {
+                 // Go to next index position
+                 const ignoreSize = index.position + this.seekHeadOffset - this.tokenizer.position;
+                 debug(`Use index to go to next position, ignoring ${ignoreSize} bytes`);
+-                await this.tokenizer.ignore(ignoreSize);
++                await matroskaIterator.skip(ignoreSize);
+                 return ParseAction.SkipElement;
+               }
+             }
+diff --git a/lib/mpeg/MpegChecksum.ts b/lib/mpeg/MpegChecksum.ts
+new file mode 100644
+index 00000000..187118ce
+--- /dev/null
++++ b/lib/mpeg/MpegChecksum.ts
+@@ -0,0 +1,396 @@
++import { EndOfStreamError, type ITokenizer } from 'strtok3';
++
++import { crc16Lame, crc16Mpeg } from '../common/Checksum.js';
++import type { IChecksumCollector } from '../common/MetadataCollector.js';
++import { AdtsFrameHeader } from './AdtsFrameHeader.js';
++import { MpegFrameHeader } from './MpegFrameHeader.js';
++
++/**
++ * Bit allocation field widths per sub-band, ISO/IEC 11172-3 tables B.2a-d and ISO/IEC 13818-3 table B.1
++ */
++const layer2Allocations = [
++  [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2],
++  [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2],
++  [4, 4, 3, 3, 3, 3, 3, 3],
++  [4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
++  [4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
++];
++
++const layer1Allocations = new Array<number>(32).fill(4);
++
++const crcFieldEnd = MpegFrameHeader.len + 2;
++
++function selectLayer2Allocations(header: MpegFrameHeader): number[] {
++  if (header.version !== 1) {
++    return layer2Allocations[4];
++  }
++  const channelBitrate = header.bitrate / 1000 / header.numberOfChannels;
++  const rate = header.samplingRate;
++  if ((rate === 48000 && channelBitrate >= 56) || (channelBitrate >= 56 && channelBitrate <= 80)) {
++    return layer2Allocations[0];
++  }
++  if (rate !== 48000 && channelBitrate >= 96) {
++    return layer2Allocations[1];
++  }
++  return rate !== 32000 && channelBitrate <= 48 ? layer2Allocations[2] : layer2Allocations[3];
++}
++
++/**
++ * Number of bits after the CRC field protected by the frame CRC.
++ * @returns undefined if the frame is too short to determine the protected bits
++ */
++function protectedBitLength(frame: Uint8Array, header: MpegFrameHeader): number | undefined {
++  if (header.layer === 3) {
++    return 8 * header.sideInfoLength;
++  }
++  const allocations = header.layer === 1 ? layer1Allocations : selectLayer2Allocations(header);
++  const channels = header.numberOfChannels;
++  const bound =
++    header.channelMode === 1 ? Math.min(4 * (header.modeExtension + 1), allocations.length) : allocations.length;
++  let bitPosition = 8 * crcFieldEnd;
++  const readBits = (length: number): number | undefined => {
++    let value = 0;
++    for (let n = 0; n < length; ++n, ++bitPosition) {
++      const byte = frame[bitPosition >> 3];
++      if (byte === undefined) {
++        return undefined;
++      }
++      value = (value << 1) | ((byte >> (7 - (bitPosition & 7))) & 1);
++    }
++    return value;
++  };
++  let allocatedSubbands = 0;
++  for (let subband = 0; subband < allocations.length; ++subband) {
++    const subbandChannels = subband < bound ? channels : 1;
++    for (let channel = 0; channel < subbandChannels; ++channel) {
++      const allocation = readBits(allocations[subband]);
++      if (allocation === undefined) {
++        return undefined;
++      }
++      if (allocation !== 0) {
++        allocatedSubbands += subband < bound ? 1 : channels;
++      }
++    }
++  }
++  // Layer II also protects the 2-bit scale factor selection of every allocated sub-band
++  const scfsiBits = header.layer === 2 ? 2 * allocatedSubbands : 0;
++  return bitPosition - 8 * crcFieldEnd + scfsiBits;
++}
++
++/**
++ * Frame length in bytes, a Layer I frame consists of 4-byte slots: (12 * bitrate / sampling rate + padding) * 4
++ */
++function frameLength(header: MpegFrameHeader): number {
++  return header.layer === 1
++    ? (Math.floor((12 * header.bitrate) / header.samplingRate) + (header.padding ? 1 : 0)) * 4
++    : header.frameSize;
++}
++
++interface IMusicRange {
++  next: number;
++  end: number;
++  crc: number;
++  stored: number;
++}
++
++/**
++ * The bits covered by a frame CRC and the CRCs of the LAME tag lie within the first 192 bytes of a frame
++ */
++const frameHeadLength = 192;
++
++/**
++ * An ID3v1 tag takes the last 128 bytes of a file
++ */
++const id3v1Length = 128;
++
++/**
++ * The MPEG parser peeks 1024 bytes ahead to find a frame, so a tokenizer it reads allows at least this lookahead
++ */
++const maxLookahead = 1024;
++
++/**
++ * Verifies MPEG audio frame CRCs and the CRCs of the LAME Info tag.
++ * Starting at the audio, the frames are found by their length and peeked, independent of the frames the parser reads.
++ * The parser skips bytes with skip(), which first verifies what a stream is about to pass,
++ * so the metadata parsing is left as it is. Peeks never go further ahead than the parser's own frame search.
++ */
++export class MpegChecksumVerifier {
++  private audioStart = 0;
++  private audioEnd = Number.POSITIVE_INFINITY;
++  private nextFrame = 0;
++  private frameNumber = 0;
++  private music?: IMusicRange;
++  private consumed: Uint8Array = new Uint8Array(0);
++  private readonly head = new Uint8Array(frameHeadLength);
++  private readonly tag = new Uint8Array(3);
++  private readonly chunk: Uint8Array;
++
++  /**
++   * @param collector Receives the verified checksums
++   * @param maxReadSize Maximum number of bytes to read at once, `IOptions.maxMemoryAllocation`
++   */
++  public constructor(
++    private readonly collector: IChecksumCollector,
++    maxReadSize: number
++  ) {
++    this.chunk = new Uint8Array(Math.min(4096, maxReadSize));
++  }
++
++  /**
++   * Start at the audio, which follows the ID3v2 tags
++   * @param tokenizer Tokenizer positioned after the ID3v2 tags
++   * @param consumed Bytes of the audio the tag parser has already read, up to the tokenizer position
++   */
++  public start(tokenizer: ITokenizer, consumed: Uint8Array): void {
++    this.audioStart = tokenizer.position - consumed.length;
++    this.nextFrame = this.audioStart;
++    this.consumed = consumed;
++  }
++
++  /**
++   * Skip bytes like tokenizer.ignore(), after verifying what the skipped bytes contain
++   * @param tokenizer Tokenizer
++   * @param length Number of bytes to skip
++   */
++  public async skip(tokenizer: ITokenizer, length: number): Promise<void> {
++    const end = tokenizer.position + length;
++    while (true) {
++      await this.verifyAhead(tokenizer);
++      const target = Math.min(end, this.pending());
++      await tokenizer.ignore(target - tokenizer.position);
++      if (target === end || tokenizer.position < target) {
++        return;
++      }
++    }
++  }
++
++  /**
++   * Verify what is left after the parser is done.
++   * A stream is read as far as needed, but not into the last 128 bytes, which the ID3v1 parser reads next.
++   * @param tokenizer Tokenizer
++   */
++  public async finish(tokenizer: ITokenizer): Promise<void> {
++    const size = tokenizer.fileInfo.size;
++    const readEnd = size ? size - id3v1Length : Number.POSITIVE_INFINITY;
++    try {
++      while (true) {
++        await this.verifyAhead(tokenizer);
++        const pending = this.pending();
++        const target = Math.min(pending, readEnd);
++        if (pending === Number.POSITIVE_INFINITY || target <= tokenizer.position) {
++          return;
++        }
++        await tokenizer.ignore(target - tokenizer.position);
++      }
++    } catch (error) {
++      if (!(error instanceof EndOfStreamError)) {
++        throw error;
++      }
++    }
++  }
++
++  /**
++   * Verify the frames, and add the music bytes to the music CRC, as far as they can be peeked
++   */
++  private async verifyAhead(tokenizer: ITokenizer): Promise<void> {
++    await this.walkFrames(tokenizer);
++    await this.hashMusic(tokenizer);
++  }
++
++  /**
++   * Position of the first byte which is still to be verified
++   */
++  private pending(): number {
++    const frame = this.nextFrame + MpegFrameHeader.len <= this.audioEnd ? this.nextFrame : Number.POSITIVE_INFINITY;
++    return this.music ? Math.min(frame, this.music.next) : frame;
++  }
++
++  /**
++   * Verify the frames as far as their heads can be peeked, bytes which are not a frame are skipped up to the next sync
++   */
++  private async walkFrames(tokenizer: ITokenizer): Promise<void> {
++    const head = this.head;
++    while (this.nextFrame + MpegFrameHeader.len <= this.audioEnd) {
++      const peekLength = Math.min(head.length, this.reach(tokenizer) - this.nextFrame);
++      if (peekLength < MpegFrameHeader.len + id3v1Length) {
++        return; // Wait until the parser moves on, as the header could be part of an ID3v1 tag
++      }
++      const length = await this.peek(tokenizer, head.subarray(0, peekLength), this.nextFrame);
++      if (length < peekLength) {
++        this.audioEnd = Math.min(this.audioEnd, await this.findAudioEnd(tokenizer, this.nextFrame + length));
++        if (this.nextFrame + MpegFrameHeader.len > this.audioEnd) {
++          return;
++        }
++      }
++      const sync = head[0] === 0xff && (head[1] & 0xe0) === 0xe0;
++      if (sync && AdtsFrameHeader.matches(head)) {
++        this.audioEnd = this.nextFrame; // ADTS is not verified
++        return;
++      }
++      const header = sync ? parseFrameHeader(head) : undefined;
++      if (!header) {
++        const next = head.subarray(1, length).indexOf(0xff);
++        this.nextFrame += next === -1 ? length : next + 1;
++        continue;
++      }
++      const headLength = Math.min(frameLength(header), head.length);
++      if (length === peekLength && length < headLength) {
++        return; // Wait until the head of the frame can be peeked
++      }
++      this.verifyFrame(head.subarray(0, Math.min(headLength, length)), header, this.nextFrame);
++      this.nextFrame += frameLength(header);
++    }
++  }
++
++  /**
++   * Verify the CRC of a frame, and the LAME tag in the first frame
++   * @param frame The first bytes of the frame
++   * @param header Parsed frame header
++   * @param frameStart Position of the frame
++   */
++  private verifyFrame(frame: Uint8Array, header: MpegFrameHeader, frameStart: number): void {
++    if (header.isProtectedByCRC) {
++      const bitLength = protectedBitLength(frame, header);
++      if (bitLength !== undefined && 8 * crcFieldEnd + bitLength <= 8 * frame.length) {
++        let crc = crc16Mpeg(frame.subarray(2, MpegFrameHeader.len));
++        crc = crc16Mpeg(frame.subarray(crcFieldEnd), bitLength, crc);
++        this.collector.addChecksum('mpegFrame', crc === ((frame[4] << 8) | frame[5]));
++      }
++    }
++    if (++this.frameNumber === 1) {
++      this.verifyLameTag(frame, header, frameStart);
++    }
++  }
++
++  private verifyLameTag(frame: Uint8Array, header: MpegFrameHeader, frameStart: number): void {
++    if (header.layer !== 3) {
++      return;
++    }
++    const tagOffset = MpegFrameHeader.len + header.sideInfoLength;
++    const id = String.fromCharCode(...frame.subarray(tagOffset, tagOffset + 4));
++    if (id !== 'Info' && id !== 'Xing') {
++      return;
++    }
++    const flags = frame[tagOffset + 7] ?? 0;
++    const lameOffset =
++      tagOffset + 8 + (flags & 1 ? 4 : 0) + (flags & 2 ? 4 : 0) + (flags & 4 ? 100 : 0) + (flags & 8 ? 4 : 0);
++    if (String.fromCharCode(...frame.subarray(lameOffset, lameOffset + 4)) !== 'LAME') {
++      return;
++    }
++    const version = String.fromCharCode(...frame.subarray(lameOffset + 4, lameOffset + 9)).match(/^(\d+)\.(\d+)/);
++    const [major, minor] = version ? [Number.parseInt(version[1], 10), Number.parseInt(version[2], 10)] : [0, 0];
++    if (major < 3 || (major === 3 && minor < 90)) {
++      return;
++    }
++    // LAME tag: 9 bytes version, then music length at 19, music CRC at 23 and the tag CRC at 25
++    const extension = lameOffset + 9;
++    const tagCrcOffset = extension + 25;
++    if (frame.length < tagCrcOffset + 2) {
++      return;
++    }
++    const tagCrc = (frame[tagCrcOffset] << 8) | frame[tagCrcOffset + 1];
++    this.collector.addChecksum('lameTag', crc16Lame(frame.subarray(0, tagCrcOffset)) === tagCrc);
++
++    const musicLength =
++      (frame[extension + 19] << 24) |
++      (frame[extension + 20] << 16) |
++      (frame[extension + 21] << 8) |
++      frame[extension + 22];
++    const musicStart = frameStart + frameLength(header);
++    const musicEnd = frameStart + (musicLength >>> 0);
++    if (musicEnd > musicStart) {
++      this.music = {
++        next: musicStart,
++        end: musicEnd,
++        crc: 0,
++        stored: (frame[extension + 23] << 8) | frame[extension + 24]
++      };
++    }
++  }
++
++  /**
++   * Add the music bytes to the music CRC as far as they can be peeked
++   */
++  private async hashMusic(tokenizer: ITokenizer): Promise<void> {
++    const music = this.music;
++    if (!music) {
++      return;
++    }
++    while (music.next < music.end) {
++      const available = this.reach(tokenizer) - music.next;
++      if (available <= 0) {
++        return;
++      }
++      const part = this.chunk.subarray(0, Math.min(this.chunk.length, music.end - music.next, available));
++      const length = await this.peek(tokenizer, part, music.next);
++      music.crc = crc16Lame(part.subarray(0, length), music.crc);
++      music.next += length;
++      if (length < part.length) {
++        this.music = undefined; // The file ends before the music does
++        return;
++      }
++    }
++    this.collector.addChecksum('lameMusic', music.crc === music.stored);
++    this.music = undefined;
++  }
++
++  /**
++   * The audio ends at an ID3v1 tag, or else at the end of the file
++   * @param tokenizer Tokenizer
++   * @param fileEnd End of the file
++   */
++  private async findAudioEnd(tokenizer: ITokenizer, fileEnd: number): Promise<number> {
++    const tagStart = fileEnd - id3v1Length;
++    if (tagStart >= this.audioStart && (await this.peek(tokenizer, this.tag, tagStart)) === this.tag.length) {
++      return isID3v1(this.tag) ? tagStart : fileEnd;
++    }
++    return fileEnd;
++  }
++
++  /**
++   * End of the bytes which can be peeked, a stream allows peeking maxLookahead bytes ahead of its position
++   */
++  private reach(tokenizer: ITokenizer): number {
++    return tokenizer.supportsRandomAccess() ? Number.POSITIVE_INFINITY : tokenizer.position + maxLookahead;
++  }
++
++  /**
++   * Peek bytes at a position. Bytes of the audio the ID3v2 parser has already read are taken from what it read.
++   * @returns Number of bytes peeked, fewer at the end of the file or when the bytes have been read already
++   */
++  private async peek(tokenizer: ITokenizer, buffer: Uint8Array, position: number): Promise<number> {
++    let length = 0;
++    if (position < tokenizer.position) {
++      const offset = position - this.audioStart;
++      if (offset < 0 || offset >= this.consumed.length) {
++        return 0;
++      }
++      length = Math.min(buffer.length, this.consumed.length - offset);
++      buffer.set(this.consumed.subarray(offset, offset + length));
++      if (length === buffer.length || position + length < tokenizer.position) {
++        return length;
++      }
++    }
++    const peeked = await tokenizer
++      .peekBuffer(buffer.subarray(length), { position: position + length, mayBeLess: true })
++      .catch(error => {
++        if (error instanceof EndOfStreamError) {
++          return 0;
++        }
++        throw error;
++      });
++    return length + peeked;
++  }
++}
++
++function isID3v1(tail: Uint8Array): boolean {
++  return tail[0] === 0x54 && tail[1] === 0x41 && tail[2] === 0x47;
++}
++
++function parseFrameHeader(bytes: Uint8Array): MpegFrameHeader | undefined {
++  try {
++    return new MpegFrameHeader(bytes);
++  } catch {
++    return undefined;
++  }
++}
+diff --git a/lib/mpeg/MpegFrameHeader.ts b/lib/mpeg/MpegFrameHeader.ts
+index 504d4f81..c5c8512c 100644
+--- a/lib/mpeg/MpegFrameHeader.ts
++++ b/lib/mpeg/MpegFrameHeader.ts
+@@ -49,7 +49,11 @@ export class MpegFrameHeader {
+ 
+   public readonly container = 'MPEG';
+   public readonly codec: string;
++  public readonly version: number;
+   public readonly layer: number;
++  public readonly channelMode: number;
++  public readonly modeExtension: number;
++  public readonly padding: boolean;
+   public readonly isProtectedByCRC: boolean;
+   public readonly bitrate: number;
+   public readonly samplingRate: number;
+@@ -63,12 +67,16 @@ export class MpegFrameHeader {
+     if (version === null) {
+       throw new MpegContentError('Cannot determine bit-rate');
+     }
++    this.version = version;
+     this.layer = MpegFrameHeader.layers[common.getBitAllignedNumber(buf, 1, 5, 2)];
+     this.isProtectedByCRC = !common.isBitSet(buf, 1, 7);
+     const bitrateIndex = common.getBitAllignedNumber(buf, 2, 0, 4);
+     const samplingRateIndex = common.getBitAllignedNumber(buf, 2, 4, 2);
+     const padding = common.isBitSet(buf, 2, 6);
+-    this.numberOfChannels = common.getBitAllignedNumber(buf, 3, 0, 2) === 3 ? 1 : 2;
++    this.padding = padding;
++    this.channelMode = common.getBitAllignedNumber(buf, 3, 0, 2);
++    this.modeExtension = common.getBitAllignedNumber(buf, 3, 2, 2);
++    this.numberOfChannels = this.channelMode === 3 ? 1 : 2;
+     this.codec = `MPEG ${version} Layer ${this.layer}`;
+ 
+     const bitrate = MpegFrameHeader.bitrates[bitrateIndex]?.[10 * Math.floor(version) + this.layer];
+diff --git a/lib/mpeg/MpegParser.ts b/lib/mpeg/MpegParser.ts
+index c8a34cd6..8e573eda 100644
+--- a/lib/mpeg/MpegParser.ts
++++ b/lib/mpeg/MpegParser.ts
+@@ -1,9 +1,11 @@
+ import initDebug from 'debug';
+ import { EndOfStreamError } from 'strtok3';
+ 
++import { getMaxMemoryAllocation } from '../common/Allocation.js';
+ import * as common from '../common/Util.js';
+ import { AbstractID3Parser } from '../id3v2/AbstractID3Parser.js';
+ import { AdtsFrameHeader } from './AdtsFrameHeader.js';
++import { MpegChecksumVerifier } from './MpegChecksum.js';
+ import { MpegContentError, MpegFrameHeader } from './MpegFrameHeader.js';
+ import { InfoTagHeaderTag, type IXingInfoTag, LameEncoderVersion, readXingHeader } from './XingTag.js';
+ 
+@@ -34,6 +36,10 @@ export class MpegParser extends AbstractID3Parser {
+   private calculateEofDuration = false;
+   private samplesPerFrame: number | null = null;
+ 
++  private checksumVerifier = this.options.verifyChecksums
++    ? new MpegChecksumVerifier(this.metadata, getMaxMemoryAllocation(this.options))
++    : undefined;
++
+   private frameHeaderBuffer = new Uint8Array(MpegFrameHeader.len);
+   private frameHeaderTail = this.frameHeaderBuffer.subarray(1);
+   private adtsHeaderBuffer = new Uint8Array(3);
+@@ -55,6 +61,7 @@ export class MpegParser extends AbstractID3Parser {
+   public async postId3v2Parse(): Promise<void> {
+     this.metadata.setFormat('lossless', false);
+     this.metadata.setAudioOnly();
++    this.checksumVerifier?.start(this.tokenizer, this.id3v2Overrun);
+ 
+     try {
+       let quit = false;
+@@ -80,6 +87,7 @@ export class MpegParser extends AbstractID3Parser {
+         throw err;
+       }
+     }
++    await this.checksumVerifier?.finish(this.tokenizer);
+   }
+ 
+   /**
+@@ -123,7 +131,7 @@ export class MpegParser extends AbstractID3Parser {
+         if (gotFirstSync && (this.syncPeek.buf[bo] & 0xe0) === 0xe0) {
+           this.frameHeaderBuffer[0] = 0xff;
+           this.frameHeaderBuffer[1] = this.syncPeek.buf[bo];
+-          await this.tokenizer.ignore(bo);
++          await this.skip(bo);
+           debug(`Sync at offset=${this.tokenizer.position - 1}, frameCount=${this.frameCount}`);
+           if (this.syncFrameCount === this.frameCount) {
+             debug(`Re-synced MPEG stream, frameCount=${this.frameCount}`);
+@@ -139,7 +147,7 @@ export class MpegParser extends AbstractID3Parser {
+           if (this.syncPeek.len < this.syncPeek.buf.length) {
+             throw new EndOfStreamError();
+           }
+-          await this.tokenizer.ignore(this.syncPeek.len);
++          await this.skip(this.syncPeek.len);
+           break; // continue with next buffer
+         }
+         ++bo;
+@@ -165,14 +173,14 @@ export class MpegParser extends AbstractID3Parser {
+         ? new AdtsFrameHeader(this.frameHeaderBuffer)
+         : new MpegFrameHeader(this.frameHeaderBuffer);
+     } catch (err) {
+-      await this.tokenizer.ignore(1);
++      await this.skip(1);
+       if (err instanceof Error) {
+         this.metadata.addWarning(`Parse error: ${err.message}`);
+         return false; // sync
+       }
+       throw err;
+     }
+-    await this.tokenizer.ignore(3);
++    await this.skip(3);
+ 
+     this.metadata.setFormat('container', header.container);
+     this.metadata.setFormat('codec', header.codec);
+@@ -238,7 +246,7 @@ export class MpegParser extends AbstractID3Parser {
+ 
+     this.offset = MpegFrameHeader.len;
+     if (header.isProtectedByCRC) {
+-      await this.tokenizer.ignore(2);
++      await this.skip(2);
+       this.offset += 2;
+     }
+     await this.skipSideInformation();
+@@ -259,7 +267,7 @@ export class MpegParser extends AbstractID3Parser {
+       debug(`frame-count=${this.frameCount}, size=${frameLength} bytes, bit-rate=${bitrate}`);
+     }
+ 
+-    await this.tokenizer.ignore(frameLength > 7 ? frameLength - 7 : 1);
++    await this.skip(frameLength > 7 ? frameLength - 7 : 1);
+ 
+     // Consume remaining header and frame data
+     if (this.frameCount === 3) {
+@@ -370,6 +378,13 @@ export class MpegParser extends AbstractID3Parser {
+     if (frameDataLeft < 0) {
+       throw new MpegContentError('frame-data-left cannot be negative');
+     }
+-    await this.tokenizer.ignore(frameDataLeft);
++    await this.skip(frameDataLeft);
++  }
++
++  /**
++   * Skip bytes, letting the checksum verifier check them first
++   */
++  private async skip(length: number): Promise<void> {
++    await (this.checksumVerifier ? this.checksumVerifier.skip(this.tokenizer, length) : this.tokenizer.ignore(length));
+   }
+ }
+diff --git a/lib/type.ts b/lib/type.ts
+index 126e823d..bafa99e9 100644
+--- a/lib/type.ts
++++ b/lib/type.ts
+@@ -644,8 +644,32 @@ export interface IQualityInformation {
+    * Warnings
+    */
+   warnings: IParserWarning[];
++
++  /**
++   * Checksums verified per kind, only set when `IOptions.verifyChecksums` is enabled
++   */
++  checksums?: IChecksums;
+ }
+ 
++/**
++ * Checksum kinds verified by `IOptions.verifyChecksums`
++ */
++export type ChecksumKind = 'mpegFrame' | 'lameTag' | 'lameMusic' | 'ebml';
++
++export interface IChecksumCount {
++  /**
++   * Number of checksums compared with the data they cover
++   */
++  checked: number;
++
++  /**
++   * Number of checked checksums not matching their data
++   */
++  failed: number;
++}
++
++export type IChecksums = Partial<Record<ChecksumKind, IChecksumCount>>;
++
+ export interface IParserWarning {
+   message: string;
+ }
+@@ -737,6 +761,12 @@ export interface IOptions {
+    * Ref: https://www.matroska.org/technical/diagram.html
+    */
+   mkvUseIndex?: boolean;
++
++  /**
++   * default: `false`, if set to `true`, it will verify the checksums stored in the file, reported in `quality.checksums`.
++   * May read the whole file; does not change the format, native or common metadata.
++   */
++  verifyChecksums?: boolean;
+ }
+ 
+ export interface IApeHeader extends IOptions {

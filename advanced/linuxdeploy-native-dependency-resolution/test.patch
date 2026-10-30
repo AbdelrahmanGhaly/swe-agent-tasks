@@ -1,0 +1,2234 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..7cfc9b7
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,228 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++    echo "usage: $0 [--output_path <path>] base|new" >&2
++    exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++
++while [ $# -gt 0 ]; do
++    case "$1" in
++        base|new)
++            MODE="$1"
++            MODE_COUNT=$((MODE_COUNT + 1))
++            shift
++            ;;
++        --output_path)
++            shift
++            if [ $# -lt 1 ] || [ -z "$1" ]; then
++                echo "missing value for --output_path" >&2
++                usage
++            fi
++            OUTPUT_PATH="$1"
++            shift
++            ;;
++        --output_path=*)
++            OUTPUT_PATH="${1#--output_path=}"
++            if [ -z "$OUTPUT_PATH" ]; then
++                echo "missing value for --output_path" >&2
++                usage
++            fi
++            shift
++            ;;
++        *)
++            echo "unknown argument: $1" >&2
++            usage
++            ;;
++    esac
++done
++
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++case "$OUTPUT_PATH" in
++    ""|/*) ;;
++    *) OUTPUT_PATH="$(pwd)/$OUTPUT_PATH" ;;
++esac
++
++REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/linuxdeploy-tests.XXXXXX" 2>/dev/null || mktemp -d /tmp/linuxdeploy-tests.XXXXXX)" || exit 1
++trap 'rm -rf "$WORK_DIR"' EXIT
++
++if [ -z "$OUTPUT_PATH" ]; then
++    OUTPUT_PATH="$WORK_DIR/results.xml"
++else
++    mkdir -p "$(dirname "$OUTPUT_PATH")"
++fi
++
++mkdir -p "$WORK_DIR/tmp"
++export TMPDIR="$WORK_DIR/tmp"
++export LC_ALL=C
++export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
++unset LD_LIBRARY_PATH LD_PRELOAD
++
++JOBS="$(nproc 2>/dev/null || echo 2)"
++[ "$JOBS" -gt 8 ] && JOBS=8
++
++CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DUSE_CCACHE=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
++
++if [ "$MODE" = base ]; then
++    SOURCE_DIR="$REPO_DIR"
++    CMAKE_ARGS+=(-DBUILD_TESTING=ON)
++    TARGETS=(test_appdir test_linuxdeploy test_elf_file)
++    SOURCES=(tests/core/test_appdir.cpp tests/core/test_linuxdeploy.cpp tests/core/test_elf_file.cpp)
++else
++    SOURCE_DIR="$REPO_DIR/tests/native_deps_9414f5"
++    TARGETS=(test_native_deps_9414f5)
++    SOURCES=(tests/native_deps_9414f5/test_native_deps_9414f5.cpp)
++fi
++
++SOURCE_PATHS=()
++for source in "${SOURCES[@]}"; do
++    SOURCE_PATHS+=("$REPO_DIR/$source")
++done
++
++cat > "$WORK_DIR/junit.py" <<'PYEOF'
++import os
++import re
++import sys
++import xml.etree.ElementTree as ET
++
++
++def tests_in(source):
++    try:
++        with open(source, errors="replace") as f:
++            text = f.read()
++    except OSError:
++        return []
++    return re.findall(r"^\s*TEST(?:_F)?\(\s*(\w+)\s*,\s*(\w+)\s*\)", text, re.M)
++
++
++def tail(path, lines=120):
++    try:
++        with open(path, errors="replace") as f:
++            return "".join(f.readlines()[-lines:])
++    except OSError:
++        return ""
++
++
++def failing_cases(tests, message, detail):
++    suites = {}
++    for suite_name, test_name in tests:
++        suite = suites.get(suite_name)
++        if suite is None:
++            suite = suites[suite_name] = ET.Element("testsuite", {"name": suite_name})
++        case = ET.SubElement(suite, "testcase", {"name": test_name, "classname": suite_name, "status": "run", "time": "0"})
++        failure = ET.SubElement(case, "failure", {"message": message})
++        failure.text = detail
++    return list(suites.values())
++
++
++def write(path, suites):
++    root = ET.Element("testsuites", {"name": "AllTests"})
++    total = failed = 0
++    for suite in suites:
++        cases = suite.findall("testcase")
++        failures = sum(1 for case in cases if case.find("failure") is not None or case.find("error") is not None)
++        suite.set("tests", str(len(cases)))
++        suite.set("failures", str(failures))
++        suite.set("errors", "0")
++        total += len(cases)
++        failed += failures
++        root.append(suite)
++    root.set("tests", str(total))
++    root.set("failures", str(failed))
++    root.set("errors", "0")
++    ET.ElementTree(root).write(path, encoding="UTF-8", xml_declaration=True)
++
++
++def main():
++    output, action = sys.argv[1], sys.argv[2]
++
++    if action == "build-failed":
++        log, sources = sys.argv[3], sys.argv[4:]
++        tests = [test for source in sources for test in tests_in(source)]
++        write(output, failing_cases(tests, "the tests did not build", "The test binaries did not build.\n\n" + tail(log)))
++        return 1
++
++    suites = []
++    synthesized = False
++    entries = sys.argv[3:]
++    for i in range(0, len(entries), 4):
++        report, log, status, source = entries[i:i + 4]
++        expected = tests_in(source)
++        try:
++            found = ET.parse(report).getroot().iter("testsuite")
++            found = [suite for suite in found if suite.findall("testcase")]
++        except Exception:
++            found = None
++
++        if found is None:
++            detail = "The test binary exited with status %s without writing a report.\n\n%s" % (status, tail(log))
++            suites.extend(failing_cases(expected, "the test binary did not report", detail))
++            synthesized = True
++            continue
++
++        reported = {(case.get("classname"), case.get("name")) for suite in found for case in suite.findall("testcase")}
++        suites.extend(found)
++        missing = [test for test in expected if test not in reported]
++        if missing:
++            detail = "The test binary exited with status %s before reporting this test.\n\n%s" % (status, tail(log))
++            suites.extend(failing_cases(missing, "the test did not report", detail))
++            synthesized = True
++            continue
++
++        failed = any(case.find("failure") is not None or case.find("error") is not None
++                     for suite in found for case in suite.findall("testcase"))
++        if status != "0" and not failed:
++            binary = os.path.splitext(os.path.basename(report))[0]
++            detail = "The test binary exited with status %s after reporting every test as passed.\n\n%s" % (status, tail(log))
++            suites.extend(failing_cases([(binary, "exitStatus")], "the test binary exited with status " + status, detail))
++            synthesized = True
++
++    write(output, suites)
++    return 1 if synthesized else 0
++
++
++sys.exit(main())
++PYEOF
++
++echo "configuring and building ${TARGETS[*]}"
++cmake -S "$SOURCE_DIR" -B "$WORK_DIR/build" "${CMAKE_ARGS[@]}" > "$WORK_DIR/build.log" 2>&1 &&
++    cmake --build "$WORK_DIR/build" -j"$JOBS" --target "${TARGETS[@]}" >> "$WORK_DIR/build.log" 2>&1
++BUILD_STATUS=$?
++
++if [ "$BUILD_STATUS" -ne 0 ]; then
++    tail -n 80 "$WORK_DIR/build.log"
++    python3 "$WORK_DIR/junit.py" "$OUTPUT_PATH" build-failed "$WORK_DIR/build.log" "${SOURCE_PATHS[@]}"
++    exit 1
++fi
++
++STATUS=0
++MERGE_ARGS=()
++
++for i in "${!TARGETS[@]}"; do
++    target="${TARGETS[$i]}"
++    binary="$(find "$WORK_DIR/build" -type f -name "$target" -perm -u+x | head -n 1)"
++    report="$WORK_DIR/$target.xml"
++    log="$WORK_DIR/$target.log"
++    status=127
++
++    if [ -n "$binary" ]; then
++        (cd "$(dirname "$binary")" && timeout -k 10 1800 "$binary" --gtest_output="xml:$report") 2>&1 | tee "$log"
++        status=${PIPESTATUS[0]}
++    else
++        echo "$target was not built" | tee "$log"
++    fi
++
++    [ "$status" -ne 0 ] && STATUS=1
++    MERGE_ARGS+=("$report" "$log" "$status" "${SOURCE_PATHS[$i]}")
++done
++
++python3 "$WORK_DIR/junit.py" "$OUTPUT_PATH" merge "${MERGE_ARGS[@]}" || STATUS=1
++
++exit "$STATUS"
+diff --git a/tests/native_deps_9414f5/CMakeLists.txt b/tests/native_deps_9414f5/CMakeLists.txt
+new file mode 100644
+index 0000000..c15fff8
+--- /dev/null
++++ b/tests/native_deps_9414f5/CMakeLists.txt
+@@ -0,0 +1,16 @@
++cmake_minimum_required(VERSION 3.13)
++
++project(linuxdeploy_native_deps_test C CXX)
++
++set(CMAKE_CXX_STANDARD 17)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++
++set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
++set(USE_CCACHE OFF CACHE BOOL "" FORCE)
++add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../.. linuxdeploy)
++
++find_package(GTest REQUIRED)
++
++add_executable(test_native_deps_9414f5 test_native_deps_9414f5.cpp)
++target_link_libraries(test_native_deps_9414f5 PRIVATE linuxdeploy_core GTest::gtest GTest::gtest_main)
++target_include_directories(test_native_deps_9414f5 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+diff --git a/tests/native_deps_9414f5/test_native_deps_9414f5.cpp b/tests/native_deps_9414f5/test_native_deps_9414f5.cpp
+new file mode 100644
+index 0000000..810cb4c
+--- /dev/null
++++ b/tests/native_deps_9414f5/test_native_deps_9414f5.cpp
+@@ -0,0 +1,1972 @@
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <elf.h>
++#include <filesystem>
++#include <fnmatch.h>
++#include <fstream>
++#include <initializer_list>
++#include <iostream>
++#include <iterator>
++#include <link.h>
++#include <linux/audit.h>
++#include <linux/filter.h>
++#include <linux/seccomp.h>
++#include <map>
++#include <optional>
++#include <poll.h>
++#include <random>
++#include <signal.h>
++#include <sstream>
++#include <string>
++#include <sys/prctl.h>
++#include <sys/resource.h>
++#include <sys/syscall.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#include <utility>
++#include <vector>
++
++#include "gtest/gtest.h"
++
++#include "linuxdeploy/core/elf_file.h"
++
++namespace fs = std::filesystem;
++
++using namespace linuxdeploy::core::elf_file;
++
++namespace {
++    using Environment = std::map<std::string, std::string>;
++
++    struct ProcessResult {
++        int status = -1;
++        std::string output;
++
++        bool succeeded() const {
++            return WIFEXITED(status) && WEXITSTATUS(status) == 0;
++        }
++    };
++
++    std::string readAll(int fd) {
++        std::string data;
++        char buffer[4096];
++
++        while (true) {
++            const auto count = read(fd, buffer, sizeof(buffer));
++
++            if (count < 0 && errno == EINTR)
++                continue;
++
++            if (count <= 0)
++                break;
++
++            data.append(buffer, static_cast<size_t>(count));
++        }
++
++        return data;
++    }
++
++    void writeAll(int fd, const std::string& data) {
++        size_t written = 0;
++
++        while (written < data.size()) {
++            const auto count = write(fd, data.data() + written, data.size() - written);
++
++            if (count < 0 && errno == EINTR)
++                continue;
++
++            if (count <= 0)
++                return;
++
++            written += static_cast<size_t>(count);
++        }
++    }
++
++    void flushOutput() {
++        std::cout.flush();
++        std::cerr.flush();
++        fflush(nullptr);
++    }
++
++    ProcessResult runProcess(const std::vector<std::string>& arguments, const fs::path& workingDirectory, const Environment& environment) {
++        std::vector<std::string> environmentStrings;
++        for (const auto& variable : environment)
++            environmentStrings.push_back(variable.first + "=" + variable.second);
++
++        std::vector<char*> argv;
++        for (const auto& argument : arguments)
++            argv.push_back(const_cast<char*>(argument.c_str()));
++        argv.push_back(nullptr);
++
++        std::vector<char*> envp;
++        for (const auto& variable : environmentStrings)
++            envp.push_back(const_cast<char*>(variable.c_str()));
++        envp.push_back(nullptr);
++
++        int fds[2];
++        if (pipe(fds) != 0)
++            throw std::runtime_error("pipe() failed");
++
++        flushOutput();
++        const auto pid = fork();
++
++        if (pid < 0)
++            throw std::runtime_error("fork() failed");
++
++        if (pid == 0) {
++            dup2(fds[1], STDOUT_FILENO);
++            dup2(fds[1], STDERR_FILENO);
++            close(fds[0]);
++            close(fds[1]);
++
++            if (chdir(workingDirectory.c_str()) != 0)
++                _exit(126);
++
++            execve(argv[0], argv.data(), envp.data());
++            _exit(127);
++        }
++
++        close(fds[1]);
++
++        ProcessResult result;
++        result.output = readAll(fds[0]);
++        close(fds[0]);
++
++        while (waitpid(pid, &result.status, 0) < 0 && errno == EINTR) {}
++
++        return result;
++    }
++
++    void runOrThrow(const std::vector<std::string>& arguments) {
++        const auto result = runProcess(arguments, fs::current_path(), {{"PATH", "/usr/bin:/bin"}, {"LC_ALL", "C"}});
++
++        if (!result.succeeded()) {
++            std::string command;
++            for (const auto& argument : arguments)
++                command += argument + " ";
++
++            throw std::runtime_error("command failed: " + command + "\n" + result.output);
++        }
++    }
++
++    void writeFile(const fs::path& path, const std::string& contents) {
++        std::ofstream ofs(path, std::ios::binary);
++        ofs << contents;
++    }
++
++    fs::path makeTemporaryDirectory(const std::string& prefix) {
++        auto pattern = (fs::temp_directory_path() / (prefix + "-XXXXXX")).string();
++
++        if (mkdtemp(pattern.data()) == nullptr)
++            throw std::runtime_error("mkdtemp() failed");
++
++        return fs::canonical(pattern);
++    }
++
++    template<typename Ehdr_T, typename Phdr_T>
++    std::string interpreterOf(const std::vector<char>& data) {
++        Ehdr_T ehdr;
++        memcpy(&ehdr, data.data(), sizeof(ehdr));
++
++        for (size_t i = 0; i < ehdr.e_phnum; ++i) {
++            Phdr_T phdr;
++            memcpy(&phdr, data.data() + ehdr.e_phoff + i * sizeof(Phdr_T), sizeof(phdr));
++
++            if (phdr.p_type == PT_INTERP)
++                return std::string(data.data() + phdr.p_offset, strnlen(data.data() + phdr.p_offset, phdr.p_filesz));
++        }
++
++        return {};
++    }
++
++    struct HostElf {
++        unsigned char elfClass = ELFCLASSNONE;
++        uint16_t machine = EM_NONE;
++        fs::path interpreter;
++    };
++
++    const HostElf& hostElf() {
++        static const HostElf host = []() {
++            std::ifstream ifs("/proc/self/exe", std::ios::binary);
++            const std::vector<char> data{std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>()};
++
++            HostElf result;
++            result.elfClass = static_cast<unsigned char>(data[EI_CLASS]);
++            memcpy(&result.machine, data.data() + offsetof(Elf64_Ehdr, e_machine), sizeof(result.machine));
++
++            if (result.elfClass == ELFCLASS64)
++                result.interpreter = interpreterOf<Elf64_Ehdr, Elf64_Phdr>(data);
++            else
++                result.interpreter = interpreterOf<Elf32_Ehdr, Elf32_Phdr>(data);
++
++            return result;
++        }();
++
++        return host;
++    }
++
++    class Links {
++        public:
++            std::vector<std::string> needed;
++            std::vector<std::string> filtees;
++            std::vector<std::string> auxiliaries;
++            std::optional<std::string> rpath;
++            std::optional<std::string> runpath;
++            std::optional<std::string> soname;
++            bool withoutSoname = false;
++            bool nodeflib = false;
++
++            Links& needs(const std::string& name) {
++                needed.push_back(name);
++                return *this;
++            }
++
++            Links& withRpath(const std::string& value) {
++                rpath = value;
++                return *this;
++            }
++
++            Links& withRunpath(const std::string& value) {
++                runpath = value;
++                return *this;
++            }
++
++            Links& withSoname(const std::string& value) {
++                soname = value;
++                return *this;
++            }
++
++            Links& noSoname() {
++                withoutSoname = true;
++                return *this;
++            }
++
++            Links& noDefaultLibraries() {
++                nodeflib = true;
++                return *this;
++            }
++
++            Links& filter(const std::string& name) {
++                filtees.push_back(name);
++                return *this;
++            }
++
++            Links& auxiliary(const std::string& name) {
++                auxiliaries.push_back(name);
++                return *this;
++            }
++    };
++
++    Links needs(std::initializer_list<std::string> names) {
++        Links links;
++
++        for (const auto& name : names)
++            links.needs(name);
++
++        return links;
++    }
++
++    class Toolchain {
++        private:
++            fs::path directory;
++            std::map<std::string, fs::path> stubs;
++
++            void compile(const std::string& name, bool positionIndependent) {
++                std::vector<std::string> arguments{"/usr/bin/gcc", "-c", "-o", (directory / (name + ".o")).string(), (directory / (name + ".c")).string()};
++
++                if (positionIndependent)
++                    arguments.emplace_back("-fPIC");
++
++                runOrThrow(arguments);
++            }
++
++            fs::path stubFor(const std::string& name) {
++                const auto existing = stubs.find(name);
++
++                if (existing != stubs.end())
++                    return existing->second;
++
++                const auto stub = directory / ("stub" + std::to_string(stubs.size()) + ".so");
++
++                runOrThrow({
++                    "/usr/bin/gcc", "-shared", "-nostdlib", "-o", stub.string(), (directory / "stub.o").string(),
++                    "-Xlinker", "-soname", "-Xlinker", name,
++                });
++
++                stubs.emplace(name, stub);
++                return stub;
++            }
++
++        public:
++            Toolchain() : directory(makeTemporaryDirectory("native-deps-toolchain")) {
++                writeFile(directory / "library.c", "#include <unistd.h>\n__attribute__((constructor)) static void refuseToBeLoaded(void) { _exit(86); }\n");
++                writeFile(directory / "executable.c", "int main(void) { return 0; }\n");
++                writeFile(directory / "stub.c", "int stub;\n");
++
++                compile("library", true);
++                compile("executable", false);
++                compile("stub", true);
++            }
++
++            ~Toolchain() {
++                std::error_code error;
++                fs::remove_all(directory, error);
++            }
++
++            void link(const fs::path& output, bool sharedLibrary, const Links& links) {
++                fs::create_directories(output.parent_path());
++
++                std::vector<std::string> arguments{"/usr/bin/gcc", "-o", output.string()};
++
++                if (sharedLibrary) {
++                    arguments.emplace_back("-shared");
++                    arguments.push_back((directory / "library.o").string());
++                } else {
++                    arguments.push_back((directory / "executable.o").string());
++                }
++
++                arguments.emplace_back("-Wl,--no-as-needed");
++
++                for (const auto& name : links.needed)
++                    arguments.push_back(stubFor(name).string());
++
++                const auto addLinkerArguments = [&arguments](std::initializer_list<std::string> values) {
++                    for (const auto& value : values) {
++                        arguments.emplace_back("-Xlinker");
++                        arguments.push_back(value);
++                    }
++                };
++
++                if (sharedLibrary && !links.withoutSoname)
++                    addLinkerArguments({"-soname", links.soname.value_or(output.filename().string())});
++
++                if (links.rpath.has_value())
++                    addLinkerArguments({"--disable-new-dtags", "-rpath", links.rpath.value()});
++
++                if (links.runpath.has_value())
++                    addLinkerArguments({"--enable-new-dtags", "-rpath", links.runpath.value()});
++
++                if (links.nodeflib)
++                    addLinkerArguments({"-z", "nodefaultlib"});
++
++                for (const auto& name : links.filtees)
++                    addLinkerArguments({"--filter=" + name});
++
++                for (const auto& name : links.auxiliaries)
++                    addLinkerArguments({"--auxiliary=" + name});
++
++                runOrThrow(arguments);
++            }
++    };
++
++    Toolchain& toolchain() {
++        static Toolchain instance;
++        return instance;
++    }
++
++    fs::path buildLibrary(const fs::path& path, const Links& links = Links()) {
++        toolchain().link(path, true, links);
++        return path;
++    }
++
++    fs::path buildExecutable(const fs::path& path, const Links& links = Links()) {
++        toolchain().link(path, false, links);
++        return path;
++    }
++
++    void patchFile(const fs::path& path, size_t offset, const std::vector<unsigned char>& bytes) {
++        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
++        file.seekp(static_cast<std::streamoff>(offset));
++        file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++    }
++
++    fs::path copyForOtherMachine(const fs::path& from, const fs::path& to) {
++        fs::create_directories(to.parent_path());
++        fs::copy_file(from, to, fs::copy_options::overwrite_existing);
++
++        const uint16_t machine = hostElf().machine == EM_X86_64 ? EM_AARCH64 : EM_X86_64;
++        patchFile(to, offsetof(Elf64_Ehdr, e_machine), {static_cast<unsigned char>(machine & 0xff), static_cast<unsigned char>(machine >> 8)});
++
++        return to;
++    }
++
++    fs::path copyForOtherClass(const fs::path& from, const fs::path& to) {
++        fs::create_directories(to.parent_path());
++        fs::copy_file(from, to, fs::copy_options::overwrite_existing);
++
++        const unsigned char elfClass = hostElf().elfClass == ELFCLASS64 ? ELFCLASS32 : ELFCLASS64;
++        patchFile(to, EI_CLASS, {elfClass});
++
++        return to;
++    }
++
++    fs::path makeSymlink(const fs::path& target, const fs::path& link) {
++        fs::create_directories(link.parent_path());
++        fs::create_symlink(target, link);
++        return link;
++    }
++
++    struct Call {
++        fs::path workingDirectory;
++        std::optional<std::string> ldLibraryPath;
++        std::vector<std::string> excludes;
++    };
++
++    bool isExcluded(const std::string& name, const std::vector<std::string>& patterns) {
++        for (const auto& pattern : patterns) {
++            if (pattern == name || fnmatch(pattern.c_str(), name.c_str(), FNM_PATHNAME) == 0)
++                return true;
++        }
++
++        return false;
++    }
++
++    fs::path resolveFrom(const fs::path& workingDirectory, const fs::path& path) {
++        return path.is_absolute() ? path : workingDirectory / path;
++    }
++
++    bool sameFile(const fs::path& a, const fs::path& b) {
++        std::error_code error;
++        return fs::equivalent(a, b, error);
++    }
++
++    struct LddEntry {
++        std::string name;
++        std::optional<fs::path> path;
++    };
++
++    struct LddListing {
++        bool succeeded = false;
++        std::string output;
++        std::vector<LddEntry> entries;
++    };
++
++    Environment environmentFor(const Call& call) {
++        Environment environment{{"PATH", "/usr/bin:/bin"}, {"LC_ALL", "C"}};
++
++        if (call.ldLibraryPath.has_value())
++            environment["LD_LIBRARY_PATH"] = call.ldLibraryPath.value();
++
++        return environment;
++    }
++
++    LddListing runLdd(const fs::path& file, const Call& call) {
++        const auto result = runProcess({"/usr/bin/ldd", file.string()}, call.workingDirectory, environmentFor(call));
++
++        LddListing listing;
++        listing.succeeded = result.succeeded();
++        listing.output = result.output;
++
++        std::istringstream lines(result.output);
++        std::string line;
++
++        while (std::getline(lines, line)) {
++            if (line.empty() || line.front() != '\t')
++                continue;
++
++            line.erase(0, 1);
++
++            LddEntry entry;
++            const auto arrow = line.find(" => ");
++
++            if (arrow != std::string::npos) {
++                entry.name = line.substr(0, arrow);
++                const auto target = line.substr(arrow + 4);
++
++                if (target != "not found")
++                    entry.path = target.substr(0, target.rfind(" ("));
++            } else {
++                entry.name = line.substr(0, line.rfind(" ("));
++                entry.path = entry.name;
++            }
++
++            if (entry.name.rfind("linux-vdso.so", 0) == 0 || entry.name.rfind("linux-gate.so", 0) == 0)
++                continue;
++
++            if (entry.path.has_value() && sameFile(resolveFrom(call.workingDirectory, entry.path.value()), hostElf().interpreter))
++                continue;
++
++            listing.entries.push_back(entry);
++        }
++
++        return listing;
++    }
++
++    struct Traced {
++        std::string failure;
++        bool notFound = false;
++        std::string message;
++        std::vector<fs::path> paths;
++        std::vector<fs::path> loaded;
++    };
++
++    std::vector<std::string> loadedObjects() {
++        std::vector<std::string> names;
++
++        dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) {
++            if (info->dlpi_name != nullptr && info->dlpi_name[0] != '\0')
++                static_cast<std::vector<std::string>*>(data)->emplace_back(info->dlpi_name);
++
++            return 0;
++        }, &names);
++
++        return names;
++    }
++
++    int programAttemptFd = -1;
++
++    void reportProgramAttempt(int) {
++        const char marker = 'x';
++        if (write(programAttemptFd, &marker, 1) < 0) {}
++        _exit(87);
++    }
++
++    bool forbidRunningPrograms() {
++        const uint32_t trap = SECCOMP_RET_TRAP;
++        const uint32_t allow = SECCOMP_RET_ALLOW;
++
++        struct sock_filter filter[] = {
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 3, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 7, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_I386, 10, 0),
++            BPF_STMT(BPF_RET | BPF_K, trap),
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
++            BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 11, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 59, 10, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 322, 9, 0),
++            BPF_STMT(BPF_RET | BPF_K, allow),
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 221, 6, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 281, 5, 0),
++            BPF_STMT(BPF_RET | BPF_K, allow),
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 11, 2, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 358, 1, 0),
++            BPF_STMT(BPF_RET | BPF_K, allow),
++            BPF_STMT(BPF_RET | BPF_K, trap),
++        };
++
++        struct sock_fprog program{};
++        program.len = static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0]));
++        program.filter = filter;
++
++        struct sigaction action{};
++        action.sa_handler = reportProgramAttempt;
++        sigemptyset(&action.sa_mask);
++
++        return sigaction(SIGSYS, &action, nullptr) == 0 &&
++               prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 &&
++               syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program) == 0;
++    }
++
++    const char loadedSeparator = '\x1d';
++
++    std::vector<fs::path> splitPaths(const std::string& data) {
++        std::vector<fs::path> paths;
++        size_t start = 0;
++
++        while (start < data.size()) {
++            const auto end = data.find('\0', start);
++            paths.emplace_back(data.substr(start, end - start));
++
++            if (end == std::string::npos)
++                break;
++
++            start = end + 1;
++        }
++
++        return paths;
++    }
++
++    std::string tracedPayload(const fs::path& file, const Call& call) {
++        if (chdir(call.workingDirectory.c_str()) != 0)
++            return "Xcould not change into " + call.workingDirectory.string();
++
++        clearenv();
++        for (const auto& variable : environmentFor(call))
++            setenv(variable.first.c_str(), variable.second.c_str(), 1);
++
++        const auto loadedBefore = loadedObjects();
++        std::string payload;
++
++        try {
++            const auto paths = ElfFile(file).traceDynamicDependencies(call.excludes);
++
++            payload = "P";
++            for (const auto& path : paths) {
++                payload += path.string();
++                payload += '\0';
++            }
++        } catch (const DependencyNotFoundError& error) {
++            payload = std::string("N") + error.what();
++        } catch (const std::exception& error) {
++            payload = std::string("Xthrew an exception other than DependencyNotFoundError: ") + error.what();
++        } catch (...) {
++            payload = "Xthrew an unknown exception";
++        }
++
++        payload += loadedSeparator;
++        for (const auto& name : loadedObjects()) {
++            if (std::find(loadedBefore.begin(), loadedBefore.end(), name) == loadedBefore.end()) {
++                payload += name;
++                payload += '\0';
++            }
++        }
++
++        return payload;
++    }
++
++    const char recordSeparator = '\x1e';
++
++    Traced parseRecord(const std::string& record) {
++        Traced traced;
++
++        const auto separator = record.find(loadedSeparator);
++        const auto result = record.substr(0, separator);
++
++        if (separator != std::string::npos)
++            traced.loaded = splitPaths(record.substr(separator + 1));
++
++        if (result.empty()) {
++            traced.failure = "returned no result";
++        } else if (result.front() == 'X') {
++            traced.failure = result.substr(1);
++        } else if (result.front() == 'N') {
++            traced.notFound = true;
++            traced.message = result.substr(1);
++        } else {
++            traced.paths = splitPaths(result.substr(1));
++        }
++
++        return traced;
++    }
++
++    std::vector<Traced> traceInChild(const fs::path& file, const std::vector<Call>& calls) {
++        std::vector<Traced> results(calls.size());
++
++        int resultFds[2];
++        int attemptFds[2];
++
++        if (pipe(resultFds) != 0 || pipe(attemptFds) != 0) {
++            for (auto& traced : results)
++                traced.failure = "could not be run: pipe() failed";
++
++            return results;
++        }
++
++        flushOutput();
++        const auto pid = fork();
++
++        if (pid == 0) {
++            close(resultFds[0]);
++            close(attemptFds[0]);
++            programAttemptFd = attemptFds[1];
++
++            const bool filtered = forbidRunningPrograms();
++
++            for (const auto& call : calls)
++                writeAll(resultFds[1], tracedPayload(file, call) + recordSeparator);
++
++            struct rusage children{};
++            if (!filtered && getrusage(RUSAGE_CHILDREN, &children) == 0 && children.ru_maxrss > 0)
++                reportProgramAttempt(0);
++
++            _exit(0);
++        }
++
++        close(resultFds[1]);
++        close(attemptFds[1]);
++
++        std::string data;
++        bool timedOut = false;
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
++
++        while (true) {
++            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
++
++            if (remaining <= 0) {
++                timedOut = true;
++                break;
++            }
++
++            pollfd descriptor{resultFds[0], POLLIN, 0};
++            const auto ready = poll(&descriptor, 1, static_cast<int>(remaining));
++
++            if (ready < 0 && errno == EINTR)
++                continue;
++
++            if (ready == 0) {
++                timedOut = true;
++                break;
++            }
++
++            char buffer[4096];
++            const auto count = read(resultFds[0], buffer, sizeof(buffer));
++
++            if (count < 0 && errno == EINTR)
++                continue;
++
++            if (count <= 0)
++                break;
++
++            data.append(buffer, static_cast<size_t>(count));
++        }
++
++        close(resultFds[0]);
++
++        if (timedOut)
++            kill(pid, SIGKILL);
++
++        int status = 0;
++        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
++
++        pollfd attempt{attemptFds[0], POLLIN, 0};
++        const bool programAttempted = poll(&attempt, 1, 0) > 0 && (attempt.revents & POLLIN) != 0;
++        close(attemptFds[0]);
++
++        std::string problem;
++
++        if (programAttempted)
++            problem = "tried to run a program, which is not allowed";
++        else if (timedOut)
++            problem = "did not return within 120 seconds";
++        else if (WIFEXITED(status) && WEXITSTATUS(status) == 86)
++            problem = "loaded a library into the process (the library's constructor ran)";
++        else if (WIFSIGNALED(status))
++            problem = "crashed with signal " + std::to_string(WTERMSIG(status));
++        else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
++            problem = "ended with exit status " + std::to_string(WEXITSTATUS(status));
++
++        size_t start = 0;
++
++        for (auto& traced : results) {
++            if (!problem.empty()) {
++                traced.failure = problem;
++                continue;
++            }
++
++            const auto end = data.find(recordSeparator, start);
++
++            if (end == std::string::npos) {
++                traced.failure = "returned no result";
++                start = data.size();
++                continue;
++            }
++
++            traced = parseRecord(data.substr(start, end - start));
++            start = end + 1;
++        }
++
++        return results;
++    }
++
++    std::string describe(const std::vector<fs::path>& paths) {
++        std::string description;
++
++        for (const auto& path : paths)
++            description += "\n    " + path.string();
++
++        return description.empty() ? "\n    (none)" : description;
++    }
++
++    void compareWithLdd(const fs::path& file, const Call& call, const Traced& traced) {
++        const auto listing = runLdd(fs::canonical(file), call);
++
++        std::ostringstream context;
++        context << "\nfile: " << file.string()
++                << "\nworking directory: " << call.workingDirectory.string()
++                << "\nLD_LIBRARY_PATH: " << call.ldLibraryPath.value_or("(unset)")
++                << "\nexcludes:";
++        for (const auto& pattern : call.excludes)
++            context << " " << pattern;
++        context << "\nldd output:\n" << listing.output;
++
++        EXPECT_TRUE(listing.succeeded) << "ldd failed" << context.str();
++
++        std::optional<std::string> expectedMissing;
++        std::vector<std::string> missingNames;
++        std::vector<fs::path> expectedPaths;
++
++        for (const auto& entry : listing.entries) {
++            if (entry.path.has_value()) {
++                expectedPaths.push_back(resolveFrom(call.workingDirectory, entry.path.value()));
++                continue;
++            }
++
++            missingNames.push_back(entry.name);
++
++            if (!expectedMissing.has_value() && !isExcluded(entry.name, call.excludes))
++                expectedMissing = entry.name;
++        }
++
++        for (const auto& loaded : traced.loaded) {
++            const auto loadedPath = resolveFrom(call.workingDirectory, loaded);
++
++            bool dependency = sameFile(loadedPath, file);
++            for (const auto& expected : expectedPaths)
++                dependency = dependency || sameFile(loadedPath, expected);
++
++            EXPECT_FALSE(dependency) << "traceDynamicDependencies loaded " << loaded.string() << " into the process" << context.str();
++        }
++
++        if (!traced.failure.empty()) {
++            ADD_FAILURE() << "traceDynamicDependencies " << traced.failure << context.str();
++            return;
++        }
++
++        if (expectedMissing.has_value()) {
++            if (!traced.notFound) {
++                ADD_FAILURE() << "expected DependencyNotFoundError for " << expectedMissing.value()
++                              << ", but got:" << describe(traced.paths) << context.str();
++                return;
++            }
++
++            EXPECT_NE(traced.message.find(expectedMissing.value()), std::string::npos)
++                << "DependencyNotFoundError should name " << expectedMissing.value() << ", got: " << traced.message << context.str();
++
++            for (const auto& other : missingNames) {
++                if (other == expectedMissing.value() || expectedMissing.value().find(other) != std::string::npos)
++                    continue;
++
++                EXPECT_EQ(traced.message.find(other), std::string::npos)
++                    << "DependencyNotFoundError names " << other << " instead of the first missing library "
++                    << expectedMissing.value() << ": " << traced.message << context.str();
++            }
++
++            return;
++        }
++
++        if (traced.notFound) {
++            ADD_FAILURE() << "unexpected DependencyNotFoundError: " << traced.message << context.str();
++            return;
++        }
++
++        for (const auto& path : traced.paths)
++            EXPECT_TRUE(path.is_absolute()) << "returned path is not absolute: " << path.string() << context.str();
++
++        bool same = traced.paths.size() == expectedPaths.size();
++        for (size_t i = 0; same && i < expectedPaths.size(); ++i)
++            same = sameFile(traced.paths[i], expectedPaths[i]);
++
++        EXPECT_TRUE(same) << "expected (in this order):" << describe(expectedPaths)
++                          << "\nbut got:" << describe(traced.paths) << context.str();
++    }
++
++    std::vector<Traced> expectSequenceSameAsLdd(const fs::path& file, const std::vector<Call>& calls) {
++        const auto results = traceInChild(file, calls);
++
++        for (size_t i = 0; i < calls.size(); ++i) {
++            SCOPED_TRACE("call " + std::to_string(i + 1) + " of " + std::to_string(calls.size()));
++            compareWithLdd(file, calls[i], results[i]);
++        }
++
++        return results;
++    }
++
++    Traced expectSameAsLdd(const fs::path& file, const Call& call) {
++        const auto results = traceInChild(file, {call});
++        compareWithLdd(file, call, results.front());
++        return results.front();
++    }
++
++    std::optional<size_t> positionOf(const Traced& traced, const fs::path& path) {
++        for (size_t i = 0; i < traced.paths.size(); ++i) {
++            if (sameFile(traced.paths[i], path))
++                return i;
++        }
++
++        return std::nullopt;
++    }
++
++    void expectListed(const Traced& traced, const fs::path& path) {
++        EXPECT_TRUE(positionOf(traced, path).has_value()) << path.string() << " is not in the result:" << describe(traced.paths);
++    }
++
++    void expectNotListed(const Traced& traced, const fs::path& path) {
++        EXPECT_FALSE(positionOf(traced, path).has_value()) << path.string() << " should not be in the result:" << describe(traced.paths);
++    }
++
++    void expectInOrder(const Traced& traced, const std::vector<fs::path>& paths) {
++        std::optional<size_t> previous;
++
++        for (const auto& path : paths) {
++            const auto position = positionOf(traced, path);
++            ASSERT_TRUE(position.has_value()) << path.string() << " is not in the result:" << describe(traced.paths);
++
++            if (previous.has_value())
++                EXPECT_LT(previous.value(), position.value()) << path.string() << " is listed too early:" << describe(traced.paths);
++
++            previous = position;
++        }
++    }
++
++    void expectMissing(const Traced& traced, const std::string& name) {
++        EXPECT_TRUE(traced.notFound) << "expected DependencyNotFoundError for " << name << ", got:" << describe(traced.paths);
++        EXPECT_NE(traced.message.find(name), std::string::npos) << traced.message;
++    }
++
++    void expectCount(const Traced& traced, const fs::path& path, size_t count) {
++        size_t found = 0;
++
++        for (const auto& listed : traced.paths) {
++            if (sameFile(listed, path))
++                ++found;
++        }
++
++        EXPECT_EQ(found, count) << path.string() << " in:" << describe(traced.paths);
++    }
++
++    std::optional<fs::path> systemLibrary(const std::string& name) {
++        static std::map<std::string, std::optional<fs::path>> known;
++
++        const auto existing = known.find(name);
++        if (existing != known.end())
++            return existing->second;
++
++        const auto directory = makeTemporaryDirectory("native-deps-probe");
++        const auto probe = buildLibrary(directory / "libprobe.so", needs({name}));
++        const auto listing = runLdd(probe, Call{directory, std::nullopt, {}});
++
++        std::optional<fs::path> path;
++        for (const auto& entry : listing.entries) {
++            if (entry.name == name && entry.path.has_value())
++                path = fs::canonical(entry.path.value());
++        }
++
++        std::error_code error;
++        fs::remove_all(directory, error);
++
++        known.emplace(name, path);
++        return path;
++    }
++
++    fs::path requireSystemLibrary(const std::string& name) {
++        const auto path = systemLibrary(name);
++
++        if (!path.has_value())
++            throw std::runtime_error("the test environment lacks " + name);
++
++        return path.value();
++    }
++
++    std::string systemFileName(const std::string& name) {
++        return requireSystemLibrary(name).filename().string();
++    }
++
++    bool lddListsDependenciesOf(const fs::path& file) {
++        std::ifstream ifs(file, std::ios::binary);
++        char magic[SELFMAG] = {};
++
++        if (!ifs.read(magic, SELFMAG) || memcmp(magic, ELFMAG, SELFMAG) != 0)
++            return false;
++
++        return runLdd(fs::canonical(file), Call{"/", std::nullopt, {}}).succeeded;
++    }
++
++    std::optional<std::pair<std::string, fs::path>> cachedLibraryOutsideTheDefaultDirectories() {
++        static const auto found = []() -> std::optional<std::pair<std::string, fs::path>> {
++            const auto listing = runProcess({"/sbin/ldconfig", "-p"}, "/", {{"PATH", "/usr/bin:/bin"}, {"LC_ALL", "C"}});
++
++            std::istringstream lines(listing.output);
++            std::string line;
++
++            while (std::getline(lines, line)) {
++                const auto arrow = line.find(" => ");
++                if (line.empty() || line.front() != '\t' || arrow == std::string::npos)
++                    continue;
++
++                const auto name = line.substr(1, line.find(' ') - 1);
++                const auto path = line.substr(arrow + 4);
++
++                bool inDefaultDirectory = false;
++                for (const auto* prefix : {"/lib/", "/usr/lib/", "/lib32/", "/usr/lib32/", "/lib64/", "/usr/lib64/", "/libx32/", "/usr/libx32/"})
++                    inDefaultDirectory = inDefaultDirectory || path.rfind(prefix, 0) == 0;
++
++                if (inDefaultDirectory)
++                    continue;
++
++                const auto resolved = systemLibrary(name);
++                if (resolved.has_value() && sameFile(resolved.value(), path))
++                    return std::make_pair(name, resolved.value());
++            }
++
++            return std::nullopt;
++        }();
++
++        return found;
++    }
++
++    class Random {
++        private:
++            std::mt19937 engine;
++
++        public:
++            explicit Random(uint32_t seed) : engine(seed) {}
++
++            size_t below(size_t count) {
++                return static_cast<size_t>(engine() % count);
++            }
++
++            bool chance(unsigned percent) {
++                return below(100) < percent;
++            }
++
++            template<typename T>
++            const T& pick(const std::vector<T>& values) {
++                return values[below(values.size())];
++            }
++    };
++
++    struct GraphOptions {
++        bool searchPathVariety = false;
++        bool systemLibraries = false;
++        bool missingLibraries = false;
++    };
++
++    struct Scenario {
++        fs::path input;
++        Call call;
++    };
++
++    class ScenarioBuilder {
++        private:
++            Random& random;
++            const fs::path base;
++            const GraphOptions options;
++
++            std::vector<std::string> directories;
++            std::vector<std::string> names;
++            std::vector<fs::path> files;
++            std::vector<std::string> systemNames;
++            std::string aliasDirectory;
++
++            std::string pickDirectory() {
++                return random.pick(directories);
++            }
++
++            std::vector<std::string> shuffledDirectories() {
++                auto shuffled = directories;
++
++                for (size_t i = shuffled.size(); i > 1; --i)
++                    std::swap(shuffled[i - 1], shuffled[random.below(i)]);
++
++                return shuffled;
++            }
++
++            std::string directoryReference(const std::string& directory, const std::string& owner) {
++                const auto choice = random.below(options.searchPathVariety ? 15 : 10);
++                const auto relative = fs::path(directory).lexically_relative(owner).string();
++
++                if (choice < 5)
++                    return (base / directory).string();
++
++                if (choice < 8)
++                    return "$ORIGIN/" + relative;
++
++                if (choice < 10)
++                    return "${ORIGIN}/" + relative;
++
++                if (choice == 10)
++                    return directory;
++
++                if (choice == 11)
++                    return "$ORIGIN/../" + directory;
++
++                if (choice == 12)
++                    return aliasDirectory + "/../" + directory;
++
++                return directory == "d1" ? aliasDirectory : (base / directory).string();
++            }
++
++            std::string searchPath(size_t minimum, bool forEnvironment, const std::string& owner) {
++                const auto shuffled = shuffledDirectories();
++                const auto count = std::min(shuffled.size(), minimum + random.below(shuffled.size()));
++                const std::string separator = forEnvironment && random.chance(30) ? ";" : ":";
++
++                std::string value;
++                for (size_t i = 0; i < count; ++i) {
++                    if (i > 0)
++                        value += separator;
++
++                    value += directoryReference(shuffled[i], owner);
++                }
++
++                if (options.searchPathVariety && random.chance(15))
++                    value += random.chance(50) ? separator : separator + "$ORIGIN";
++
++                return value;
++            }
++
++            std::string neededName(const std::string& owner) {
++                if (options.systemLibraries && random.chance(15))
++                    return random.pick(systemNames);
++
++                if (!files.empty() && random.chance(6)) {
++                    const auto& target = random.pick(files);
++                    const auto relative = fs::relative(target, base);
++
++                    switch (random.below(3)) {
++                        case 0:
++                            return target.string();
++                        case 1:
++                            return "$ORIGIN/" + relative.lexically_relative(owner).string();
++                        default:
++                            return relative.string();
++                    }
++                }
++
++                return random.pick(names);
++            }
++
++            Links randomLinks(bool executable, const std::string& owner) {
++                Links links;
++
++                const auto count = executable ? 2 + random.below(4) : (random.chance(25) ? 0 : 1 + random.below(3));
++                for (size_t i = 0; i < count; ++i)
++                    links.needs(neededName(owner));
++
++                const auto choice = random.below(20);
++
++                if (executable) {
++                    if (choice < 12)
++                        links.withRpath(searchPath(2, false, owner));
++                    else if (choice < 17)
++                        links.withRunpath(searchPath(2, false, owner));
++                } else {
++                    if (choice < 5)
++                        links.withRpath(searchPath(1, false, owner));
++                    else if (choice < 9)
++                        links.withRunpath(searchPath(1, false, owner));
++                }
++
++                if (random.chance(options.systemLibraries ? 12 : 4))
++                    links.noDefaultLibraries();
++
++                return links;
++            }
++
++        public:
++            ScenarioBuilder(Random& random, fs::path base, GraphOptions options)
++                : random(random), base(std::move(base)), options(options) {}
++
++            Scenario build() {
++                const auto directoryCount = 3 + random.below(3);
++                for (size_t i = 0; i < directoryCount; ++i)
++                    directories.push_back("d" + std::to_string(i));
++
++                if (random.chance(60))
++                    directories.push_back("d" + std::to_string(random.below(directoryCount)) + "/n");
++
++                for (const auto& directory : directories)
++                    fs::create_directories(base / directory);
++
++                if (options.searchPathVariety) {
++                    fs::create_directories(base / "v");
++                    makeSymlink("../d1", base / "v" / "w");
++                    aliasDirectory = (base / "v" / "w").string();
++                }
++
++                if (options.systemLibraries) {
++                    systemNames = {"libz.so.1", systemFileName("libz.so.1"), "libfakeroot-0.so", "libstdc++.so.6", "libm.so.6"};
++
++                    if (const auto cached = cachedLibraryOutsideTheDefaultDirectories())
++                        systemNames.push_back(cached->first);
++                }
++
++                const auto nameCount = 5 + random.below(4);
++                for (size_t i = 0; i < nameCount; ++i)
++                    names.push_back(std::string("libq") + static_cast<char>('a' + i) + ".so");
++
++                std::vector<std::pair<fs::path, std::string>> planned;
++                for (const auto& name : names) {
++                    if (random.chance(options.missingLibraries ? 25 : 10))
++                        continue;
++
++                    const auto copies = 1 + random.below(options.searchPathVariety ? 3 : 2);
++                    std::vector<std::string> used;
++
++                    for (size_t i = 0; i < copies; ++i) {
++                        const auto directory = pickDirectory();
++
++                        if (std::find(used.begin(), used.end(), directory) != used.end())
++                            continue;
++
++                        used.push_back(directory);
++                        planned.emplace_back(base / directory / name, name);
++                        files.push_back(base / directory / name);
++                    }
++                }
++
++                for (const auto& entry : planned) {
++                    auto links = randomLinks(false, fs::relative(entry.first.parent_path(), base).string());
++
++                    const auto sonameChoice = random.below(20);
++                    if (sonameChoice < 3)
++                        links.withSoname(random.pick(names));
++                    else if (sonameChoice == 3)
++                        links.noSoname();
++
++                    buildLibrary(entry.first, links);
++
++                    if (options.searchPathVariety && random.chance(30)) {
++                        const auto decoy = base / "v" / fs::relative(entry.first, base);
++
++                        if (!fs::exists(decoy))
++                            buildLibrary(decoy, randomLinks(false, fs::relative(decoy.parent_path(), base).string()));
++                    }
++                }
++
++                const auto aliases = random.below(options.searchPathVariety ? 3 : 2);
++                for (size_t i = 0; i < aliases && !files.empty(); ++i) {
++                    const auto link = base / pickDirectory() / random.pick(names);
++
++                    if (fs::exists(link) || fs::is_symlink(link))
++                        continue;
++
++                    const auto& target = random.pick(files);
++
++                    if (random.chance(50))
++                        makeSymlink(target, link);
++                    else
++                        makeSymlink(fs::relative(target, link.parent_path()), link);
++                }
++
++                if (options.searchPathVariety) {
++                    const auto decoys = random.below(3);
++
++                    for (size_t i = 0; i < decoys && !files.empty(); ++i) {
++                        const auto target = base / pickDirectory() / random.pick(names);
++
++                        if (fs::exists(target) || fs::is_symlink(target))
++                            continue;
++
++                        if (random.chance(50))
++                            copyForOtherMachine(random.pick(files), target);
++                        else
++                            copyForOtherClass(random.pick(files), target);
++                    }
++                }
++
++                const auto executable = base / "bin" / "app";
++                buildExecutable(executable, randomLinks(true, "bin"));
++
++                Scenario scenario;
++                const auto inputChoice = random.below(10);
++
++                if (inputChoice < 2 && !files.empty())
++                    scenario.input = random.pick(files);
++                else if (inputChoice < 3 && options.searchPathVariety)
++                    scenario.input = makeSymlink("../bin/app", base / "link" / "app");
++                else
++                    scenario.input = executable;
++
++                const auto directoryChoice = random.below(20);
++                if (directoryChoice < 12)
++                    scenario.call.workingDirectory = base;
++                else if (directoryChoice < 17)
++                    scenario.call.workingDirectory = base / pickDirectory();
++                else
++                    scenario.call.workingDirectory = base / "bin";
++
++                if (random.chance(options.searchPathVariety ? 50 : 25))
++                    scenario.call.ldLibraryPath = searchPath(2, true, fs::relative(fs::canonical(scenario.input).parent_path(), base).string());
++
++                return scenario;
++            }
++    };
++
++    void expectRandomScenariosMatchLdd(const fs::path& root, uint32_t seed, size_t count, const GraphOptions& options) {
++        size_t compared = 0;
++
++        for (size_t i = 0; i < count; ++i) {
++            SCOPED_TRACE("scenario " + std::to_string(i) + " of seed " + std::to_string(seed));
++
++            Random random(seed + static_cast<uint32_t>(i) * 7919u);
++            auto scenario = ScenarioBuilder(random, root / ("scenario" + std::to_string(i)), options).build();
++
++            const auto listing = runLdd(fs::canonical(scenario.input), scenario.call);
++            if (!listing.succeeded)
++                continue;
++
++            for (const auto& entry : listing.entries) {
++                if (!entry.path.has_value() && (!options.missingLibraries || random.chance(60)))
++                    scenario.call.excludes.push_back(entry.name);
++            }
++
++            if (options.missingLibraries && random.chance(15))
++                scenario.call.excludes.emplace_back("libq[a-c].so");
++
++            expectSameAsLdd(scenario.input, scenario.call);
++            ++compared;
++
++            if (::testing::Test::HasFailure())
++                return;
++        }
++
++        EXPECT_GE(compared, count * 9 / 10) << "ldd failed on too many scenarios";
++    }
++}
++
++namespace LinuxDeployTest {
++    class NativeDependencyTracingTest : public ::testing::Test {
++        protected:
++            fs::path root;
++
++            void SetUp() override {
++                root = makeTemporaryDirectory("native-deps");
++            }
++
++            void TearDown() override {
++                std::error_code error;
++                fs::remove_all(root, error);
++            }
++
++            fs::path at(const std::string& relative) const {
++                return root / relative;
++            }
++
++            std::string dir(const std::string& relative) const {
++                return (root / relative).string();
++            }
++
++            fs::path library(const std::string& relative, const Links& links = Links()) {
++                return buildLibrary(at(relative), links);
++            }
++
++            fs::path executable(const std::string& relative, const Links& links = Links()) {
++                return buildExecutable(at(relative), links);
++            }
++
++            Call inRoot() const {
++                return Call{root, std::nullopt, {}};
++            }
++
++            Call withLdLibraryPath(const std::string& value) const {
++                return Call{root, value, {}};
++            }
++
++            Call excluding(std::vector<std::string> patterns) const {
++                return Call{root, std::nullopt, std::move(patterns)};
++            }
++    };
++
++    TEST_F(NativeDependencyTracingTest, systemExecutablesMatchLdd) {
++        for (const auto* candidate : {"/usr/bin/patchelf", "/usr/bin/ls", "/usr/bin/bash", "/usr/bin/git", "/usr/bin/perl", "/usr/bin/make", "/usr/local/bin/python3.12"}) {
++            if (!lddListsDependenciesOf(candidate))
++                continue;
++
++            SCOPED_TRACE(candidate);
++            expectSameAsLdd(candidate, inRoot());
++        }
++    }
++
++    TEST_F(NativeDependencyTracingTest, systemLibrariesAreNotLoadedIntoTheProcess) {
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libz.so.1", "libselinux.so.1"})), inRoot());
++        expectListed(traced, requireSystemLibrary("libz.so.1"));
++        expectListed(traced, requireSystemLibrary("libselinux.so.1"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, systemLibrariesMatchLdd) {
++        for (const auto& name : {"libstdc++.so.6", "libz.so.1", "libc.so.6", "libfakeroot-0.so", "libselinux.so.1"}) {
++            SCOPED_TRACE(name);
++            expectSameAsLdd(requireSystemLibrary(name), inRoot());
++        }
++    }
++
++    TEST_F(NativeDependencyTracingTest, testBinaryItselfMatchesLdd) {
++        expectSameAsLdd(fs::canonical("/proc/self/exe"), inRoot());
++    }
++
++    TEST_F(NativeDependencyTracingTest, rpathOfTheExecutableIsSearched) {
++        const auto liba = library("a/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a"))), inRoot());
++        expectListed(traced, liba);
++    }
++
++    TEST_F(NativeDependencyTracingTest, runpathOfTheExecutableIsSearched) {
++        const auto liba = library("a/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRunpath(dir("a"))), inRoot());
++        expectListed(traced, liba);
++    }
++
++    TEST_F(NativeDependencyTracingTest, ldLibraryPathIsSearched) {
++        const auto liba = library("a/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"})), withLdLibraryPath(dir("a")));
++        expectListed(traced, liba);
++    }
++
++    TEST_F(NativeDependencyTracingTest, rpathComesBeforeLdLibraryPath) {
++        const auto first = library("a/liba.so");
++        const auto second = library("b/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a"))), withLdLibraryPath(dir("b")));
++        expectListed(traced, first);
++        expectNotListed(traced, second);
++    }
++
++    TEST_F(NativeDependencyTracingTest, ldLibraryPathComesBeforeRunpath) {
++        const auto first = library("a/liba.so");
++        const auto second = library("b/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRunpath(dir("a"))), withLdLibraryPath(dir("b")));
++        expectListed(traced, second);
++        expectNotListed(traced, first);
++    }
++
++    TEST_F(NativeDependencyTracingTest, runpathComesBeforeTheCache) {
++        const auto local = library("a/libz.so.1");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libz.so.1"}).withRunpath(dir("a"))), inRoot());
++        expectListed(traced, local);
++        expectNotListed(traced, requireSystemLibrary("libz.so.1"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, cacheProvidesLibrariesOutsideTheDefaultDirectories) {
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libfakeroot-0.so"})), inRoot());
++        expectListed(traced, requireSystemLibrary("libfakeroot-0.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, defaultDirectoriesProvideLibrariesMissingFromTheCache) {
++        const auto fileName = systemFileName("libz.so.1");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({fileName})), inRoot());
++        expectListed(traced, requireSystemLibrary("libz.so.1"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, searchPathDirectoriesAreTriedInOrder) {
++        const auto first = library("a/liba.so");
++        library("b/liba.so");
++        const auto libb = library("b/libb.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so", "libb.so"}).withRpath(dir("missing") + ":" + dir("a") + ":" + dir("b"))), inRoot());
++        expectListed(traced, first);
++        expectNotListed(traced, at("b/liba.so"));
++        expectListed(traced, libb);
++    }
++
++    TEST_F(NativeDependencyTracingTest, ldLibraryPathIsReadAtCallTime) {
++        const auto first = library("a/liba.so");
++        const auto second = library("b/liba.so");
++        const auto app = executable("bin/app", needs({"liba.so"}));
++
++        const auto traced = expectSequenceSameAsLdd(app, {withLdLibraryPath(dir("a")), withLdLibraryPath(dir("b")), inRoot()});
++        expectListed(traced[0], first);
++        expectListed(traced[1], second);
++        expectMissing(traced[2], "liba.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, workingDirectoryIsReadAtCallTime) {
++        const auto first = library("a/lib/liba.so");
++        const auto second = library("b/lib/liba.so");
++        const auto app = executable("bin/app", needs({"liba.so"}).withRpath("lib"));
++
++        const auto traced = expectSequenceSameAsLdd(app, {Call{at("a"), std::nullopt, {}}, Call{at("b"), std::nullopt, {}}});
++        expectListed(traced[0], first);
++        expectListed(traced[1], second);
++    }
++
++    TEST_F(NativeDependencyTracingTest, emptyLdLibraryPathIsIgnored) {
++        library("liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"})), withLdLibraryPath(""));
++        expectMissing(traced, "liba.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, emptyLdLibraryPathElementMeansWorkingDirectory) {
++        const auto liba = library("liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"})), withLdLibraryPath(dir("missing") + "::" + dir("other")));
++        expectListed(traced, liba);
++    }
++
++    TEST_F(NativeDependencyTracingTest, semicolonsSeparateLdLibraryPathElements) {
++        const auto liba = library("b/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"})), withLdLibraryPath(dir("a") + ";" + dir("b")));
++        expectListed(traced, liba);
++    }
++
++    TEST_F(NativeDependencyTracingTest, relativeLdLibraryPathElementsUseTheWorkingDirectory) {
++        const auto liba = library("sub/liba.so");
++        library("bin/sub/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"})), withLdLibraryPath("sub"));
++        expectListed(traced, liba);
++        expectNotListed(traced, at("bin/sub/liba.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, relativeRpathElementsUseTheWorkingDirectory) {
++        const auto liba = library("sub/liba.so");
++        library("bin/sub/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath("sub")), inRoot());
++        expectListed(traced, liba);
++        expectNotListed(traced, at("bin/sub/liba.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, emptyRpathElementMeansWorkingDirectory) {
++        const auto liba = library("liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRunpath(dir("missing") + ":")), inRoot());
++        expectListed(traced, liba);
++    }
++
++    TEST_F(NativeDependencyTracingTest, rpathOfTheExecutableAppliesToIndirectDependencies) {
++        library("a/liba.so", needs({"libb.so"}));
++        const auto libb = library("a/libb.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a"))), inRoot());
++        expectListed(traced, libb);
++    }
++
++    TEST_F(NativeDependencyTracingTest, runpathOfTheExecutableDoesNotApplyToIndirectDependencies) {
++        library("a/liba.so", needs({"libb.so"}));
++        library("a/libb.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRunpath(dir("a"))), inRoot());
++        expectMissing(traced, "libb.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, rpathsOfAllLoadingObjectsAreSearchedInOrder) {
++        library("a/liba.so", needs({"libb.so"}).withRpath(dir("la")));
++        library("a/libb.so", needs({"libc_.so"}));
++        const auto fromLiba = library("la/libc_.so");
++        library("le/libc_.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a") + ":" + dir("le"))), inRoot());
++        expectListed(traced, fromLiba);
++        expectNotListed(traced, at("le/libc_.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, runpathOfTheRequesterDisablesInheritedRpaths) {
++        library("a/liba.so", needs({"libb.so"}).withRunpath(dir("other")));
++        library("a/libb.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a"))), inRoot());
++        expectMissing(traced, "libb.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, libraryBelowOneWithRunpathStillInheritsRpaths) {
++        library("a/liba.so", needs({"libb.so"}).withRunpath(dir("b")));
++        library("b/libb.so", needs({"libc_.so"}));
++        const auto libc = library("e/libc_.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a") + ":" + dir("e"))), inRoot());
++        expectListed(traced, libc);
++    }
++
++    TEST_F(NativeDependencyTracingTest, loaderOfALibraryIsTheObjectThatLoadedItFirst) {
++        library("a/liba.so", needs({"libx.so"}).withRpath(dir("a")));
++        library("b/libb.so", needs({"libs.so"}).withRpath(dir("b")));
++        library("a/libx.so", needs({"libs.so"}));
++        library("a/libs.so", needs({"libt.so"}));
++        const auto libs = library("b/libs.so", needs({"libt.so"}));
++        library("a/libt.so");
++        const auto libt = library("b/libt.so");
++
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so", "libb.so"}).withRpath(dir("a") + ":" + dir("b"))), inRoot());
++        expectListed(traced, libs);
++        expectListed(traced, libt);
++        expectNotListed(traced, at("a/libs.so"));
++        expectNotListed(traced, at("a/libt.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, dependenciesAreLoadedBreadthFirst) {
++        const auto liba = library("lib/liba.so", needs({"libc_.so"}));
++        const auto libb = library("lib/libb.so", needs({"libd.so"}));
++        const auto libc = library("lib/libc_.so", needs({"libe.so"}));
++        const auto libd = library("lib/libd.so");
++        const auto libe = library("lib/libe.so");
++
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so", "libb.so"}).withRpath(dir("lib"))), inRoot());
++        expectInOrder(traced, {liba, libb, libc, libd, libe});
++    }
++
++    TEST_F(NativeDependencyTracingTest, originIsTheDirectoryOfTheObjectOwningTheSearchPath) {
++        const auto liba = library("lib/liba.so", needs({"libb.so"}).withRpath("$ORIGIN/sub"));
++        const auto libb = library("lib/sub/libb.so");
++        library("bin/sub/libb.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath("$ORIGIN/../lib")), inRoot());
++        expectListed(traced, liba);
++        expectListed(traced, libb);
++        expectNotListed(traced, at("bin/sub/libb.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, originInAnInheritedRpathIsTheDirectoryOfItsOwner) {
++        library("lib/sub/liba.so", needs({"libb.so"}));
++        const auto libb = library("deps/libb.so");
++        library("lib/deps/libb.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath("$ORIGIN/../lib/sub:$ORIGIN/../deps")), inRoot());
++        expectListed(traced, libb);
++        expectNotListed(traced, at("lib/deps/libb.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, bracedOriginIsExpanded) {
++        const auto liba = library("lib/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRunpath("${ORIGIN}/../lib")), inRoot());
++        expectListed(traced, liba);
++    }
++
++    TEST_F(NativeDependencyTracingTest, originOfTheInputIsItsCanonicalDirectory) {
++        const auto liba = library("real/lib/liba.so");
++        library("alias/lib/liba.so");
++        executable("real/bin/app", needs({"liba.so"}).withRpath("$ORIGIN/../lib"));
++        const auto link = makeSymlink(at("real/bin/app"), at("alias/bin/app"));
++
++        const auto traced = expectSameAsLdd(link, inRoot());
++        expectListed(traced, liba);
++        expectNotListed(traced, at("alias/lib/liba.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, originThroughASymlinkedDirectoryIsNotNormalizedLexically) {
++        library("r2/lib/libuse.so", needs({"libdd.so"}).withRpath("$ORIGIN/../dep"));
++        const auto physical = library("r2/dep/libdd.so");
++        library("l2/dep/libdd.so");
++        makeSymlink(at("r2/lib"), at("l2/lib"));
++
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libuse.so"}).withRpath(dir("l2/lib"))), inRoot());
++        expectListed(traced, physical);
++        expectNotListed(traced, at("l2/dep/libdd.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, dotDotAfterASymlinkedDirectoryIsResolvedPhysically) {
++        fs::create_directories(at("r2/lib"));
++        makeSymlink(at("r2/lib"), at("l2/lib"));
++        const auto libuse = library("r2/dep/libuse.so", needs({"libx.so"}).withRpath("$ORIGIN/sub"));
++        const auto libx = library("r2/dep/sub/libx.so");
++        library("l2/dep/libuse.so", needs({"libx.so"}).withRpath("$ORIGIN/sub"));
++        library("l2/dep/sub/libx.so");
++
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libuse.so"}).withRpath(dir("l2/lib") + "/../dep")), inRoot());
++        expectListed(traced, libuse);
++        expectListed(traced, libx);
++        expectNotListed(traced, at("l2/dep/libuse.so"));
++        expectNotListed(traced, at("l2/dep/sub/libx.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, originInLdLibraryPathIsTheDirectoryOfTheInput) {
++        const auto liba = library("lib/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"})), withLdLibraryPath("$ORIGIN/../lib"));
++        expectListed(traced, liba);
++    }
++
++    TEST_F(NativeDependencyTracingTest, originInADependencyNameIsExpanded) {
++        const auto liba = library("lib/liba.so", needs({"$ORIGIN/plugins/libp.so"}));
++        const auto libp = library("lib/plugins/libp.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRunpath("$ORIGIN/../lib")), inRoot());
++        expectListed(traced, liba);
++        expectListed(traced, libp);
++    }
++
++    TEST_F(NativeDependencyTracingTest, absoluteDependencyPathsAreUsedAsIs) {
++        const auto direct = library("abs/liba.so");
++        library("a/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({direct.string()}).withRpath(dir("a"))), inRoot());
++        expectListed(traced, direct);
++        expectNotListed(traced, at("a/liba.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, relativeDependencyPathsUseTheWorkingDirectory) {
++        const auto liba = library("sub/liba.so");
++        library("bin/sub/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"sub/liba.so"}).withRpath("$ORIGIN")), inRoot());
++        expectListed(traced, liba);
++        expectNotListed(traced, at("bin/sub/liba.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, missingDependencyPathIsReportedByItsName) {
++        library("a/libq.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({dir("nowhere") + "/libq.so"}).withRpath(dir("a"))), inRoot());
++        expectMissing(traced, dir("nowhere") + "/libq.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, nodeflibSkipsTheDefaultDirectories) {
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({systemFileName("libz.so.1")}).noDefaultLibraries()), inRoot());
++        expectMissing(traced, systemFileName("libz.so.1"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, nodeflibRejectsCachedLibrariesInTheDefaultDirectories) {
++        library("a/liba.so", needs({"libz.so.1"}).noDefaultLibraries());
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a"))), inRoot());
++        expectMissing(traced, "libz.so.1");
++    }
++
++    TEST_F(NativeDependencyTracingTest, nodeflibRejectsCachedLibrariesBelowTheDefaultDirectories) {
++        library("a/liba.so", needs({"libfakeroot-0.so"}).noDefaultLibraries());
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a"))), inRoot());
++        expectMissing(traced, "libfakeroot-0.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, nodeflibKeepsCachedLibrariesElsewhere) {
++        const auto cached = cachedLibraryOutsideTheDefaultDirectories();
++        if (!cached.has_value())
++            GTEST_SKIP() << "the loader cache lists no library outside the default directories";
++
++        library("a/liba.so", needs({cached->first}).noDefaultLibraries());
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a"))), inRoot());
++        expectListed(traced, cached->second);
++    }
++
++    TEST_F(NativeDependencyTracingTest, nodeflibOnlyAppliesToTheFlaggedObject) {
++        library("a/liba.so", needs({"libb.so"}).noDefaultLibraries());
++        library("a/libb.so", needs({"libfakeroot-0.so"}));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a"))), inRoot());
++        expectListed(traced, requireSystemLibrary("libfakeroot-0.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, nodeflibDoesNotAffectAlreadyLoadedLibraries) {
++        library("a/liba.so", needs({"libfakeroot-0.so"}).noDefaultLibraries());
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libfakeroot-0.so", "liba.so"}).withRpath(dir("a"))), inRoot());
++        expectListed(traced, requireSystemLibrary("libfakeroot-0.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, nodeflibStillUsesSearchPaths) {
++        const auto libb = library("b/libb.so");
++        library("a/liba.so", needs({"libb.so"}).withRpath(dir("b")).noDefaultLibraries());
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a"))), inRoot());
++        expectListed(traced, libb);
++    }
++
++    TEST_F(NativeDependencyTracingTest, nodeflibInputLibraryCannotUseSystemLibraries) {
++        const auto liba = library("a/liba.so", Links().noDefaultLibraries());
++        expectMissing(expectSameAsLdd(liba, inRoot()), "libc.so.6");
++    }
++
++    TEST_F(NativeDependencyTracingTest, sharedDependencyIsListedOnce) {
++        const auto libc = library("lib/libc_.so");
++        library("lib/liba.so", needs({"libc_.so"}));
++        library("lib/libb.so", needs({"libc_.so"}));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so", "libb.so", "libc_.so"}).withRpath(dir("lib"))), inRoot());
++        expectCount(traced, libc, 1);
++    }
++
++    TEST_F(NativeDependencyTracingTest, libraryReachedThroughASymlinkIsListedOnce) {
++        const auto liba = library("lib/liba.so");
++        makeSymlink("liba.so", at("lib/libalias.so"));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so", "libalias.so"}).withRpath(dir("lib"))), inRoot());
++        expectCount(traced, liba, 1);
++    }
++
++    TEST_F(NativeDependencyTracingTest, nameMatchingTheSonameOfALoadedLibraryIsNotLoadedAgain) {
++        const auto real = library("a/libreal.so", Links().withSoname("libnamed.so"));
++        library("b/libnamed.so");
++        library("b/libuser.so", needs({"libnamed.so"}));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libreal.so", "libuser.so"}).withRpath(dir("a") + ":" + dir("b"))), inRoot());
++        expectListed(traced, real);
++        expectNotListed(traced, at("b/libnamed.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, sonameOnlyMatchesOnceTheLibraryIsLoaded) {
++        const auto real = library("a/libreal.so", Links().withSoname("libnamed.so"));
++        const auto named = library("b/libnamed.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libnamed.so", "libreal.so"}).withRpath(dir("a") + ":" + dir("b"))), inRoot());
++        expectListed(traced, real);
++        expectListed(traced, named);
++    }
++
++    TEST_F(NativeDependencyTracingTest, dependencyOnTheInputLibraryIsNotListed) {
++        const auto input = library("lib/libmain.so", needs({"libhelper.so"}).withRpath("$ORIGIN"));
++        const auto helper = library("lib/libhelper.so", needs({"libmain.so"}).withRpath("$ORIGIN"));
++        const auto traced = expectSameAsLdd(input, inRoot());
++        expectListed(traced, helper);
++        expectNotListed(traced, input);
++    }
++
++    TEST_F(NativeDependencyTracingTest, inputLibraryNeededUnderAnotherNameIsListedAgain) {
++        const auto input = library("lib/libmain.so", needs({"libhelper.so"}).withRpath("$ORIGIN").withSoname("libmain.so.2"));
++        const auto helper = library("lib/libhelper.so", needs({"libmain.so"}).withRpath("$ORIGIN"));
++        const auto traced = expectSameAsLdd(input, inRoot());
++        expectListed(traced, helper);
++        expectListed(traced, input);
++    }
++
++    TEST_F(NativeDependencyTracingTest, inputLibraryNeededByItsOwnPathIsListedAgain) {
++        const auto input = library("lib/libmain.so", needs({"libhelper.so"}).withRpath("$ORIGIN"));
++        const auto helper = library("lib/libhelper.so", needs({input.string()}));
++        const auto traced = expectSameAsLdd(input, inRoot());
++        expectListed(traced, helper);
++        expectListed(traced, input);
++    }
++
++    TEST_F(NativeDependencyTracingTest, nameALibraryWasLoadedAsIsNotSearchedAgain) {
++        const auto first = library("a/libx.so", Links().withSoname("libx.so.1"));
++        library("b/libx.so");
++        library("a/liba.so", needs({"libx.so"}).withRunpath(dir("b")));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libx.so", "liba.so"}).withRpath(dir("a"))), inRoot());
++        expectListed(traced, first);
++        expectNotListed(traced, at("b/libx.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, cyclicDependenciesAreResolved) {
++        const auto liba = library("lib/liba.so", needs({"libb.so"}).withRpath("$ORIGIN"));
++        const auto libb = library("lib/libb.so", needs({"liba.so", "libb.so"}).withRpath("$ORIGIN"));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("lib"))), inRoot());
++        expectCount(traced, liba, 1);
++        expectCount(traced, libb, 1);
++    }
++
++    TEST_F(NativeDependencyTracingTest, filteeIsListedInFrontOfTheFilterAndHandledNext) {
++        const auto deep = library("lib/libdeep.so");
++        const auto filtee = library("lib/libimpl.so", needs({"libdeep.so"}));
++        const auto filter = library("lib/libfilt.so", Links().filter("libimpl.so"));
++        const auto other2 = library("lib/libother2.so");
++        const auto other = library("lib/libother.so", needs({"libother2.so"}));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libfilt.so", "libother.so"}).withRpath(dir("lib"))), inRoot());
++        expectInOrder(traced, {filtee, filter, other, deep, other2});
++    }
++
++    TEST_F(NativeDependencyTracingTest, auxiliaryObjectsAreListedInFrontOfTheirOwner) {
++        const auto deep = library("lib/libdeep.so");
++        const auto first = library("lib/libfirst.so");
++        const auto second = library("lib/libsecond.so", needs({"libdeep.so"}));
++        const auto owner = library("lib/libowner.so", Links().auxiliary("libfirst.so").auxiliary("libsecond.so"));
++        const auto other2 = library("lib/libother2.so");
++        const auto other = library("lib/libother.so", needs({"libother2.so"}));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libowner.so", "libother.so"}).withRpath(dir("lib"))), inRoot());
++        expectInOrder(traced, {first, second, owner, other, deep, other2});
++    }
++
++    TEST_F(NativeDependencyTracingTest, filteeNeededLaterMovesInFrontOfTheFilter) {
++        const auto libx = library("lib/libx.so");
++        const auto filter = library("lib/libf.so", Links().filter("libx.so"));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libf.so", "libx.so"}).withRpath(dir("lib"))), inRoot());
++        expectInOrder(traced, {libx, filter});
++    }
++
++    TEST_F(NativeDependencyTracingTest, filteeOfTheInputLibraryIsNotListed) {
++        const auto deep = library("lib/libdeep.so");
++        const auto filtee = library("lib/libimpl.so", needs({"libdeep.so"}));
++        const auto input = library("lib/libmain.so", Links().filter("libimpl.so").withRpath("$ORIGIN"));
++        const auto traced = expectSameAsLdd(input, inRoot());
++        expectListed(traced, deep);
++        expectNotListed(traced, filtee);
++    }
++
++    TEST_F(NativeDependencyTracingTest, missingFilteeIsReported) {
++        library("lib/libf.so", Links().filter("libgone.so"));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libf.so"}).withRpath(dir("lib"))), inRoot());
++        expectMissing(traced, "libgone.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, missingAuxiliaryObjectIsReported) {
++        library("lib/libowner.so", Links().auxiliary("libgone.so"));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libowner.so"}).withRpath(dir("lib"))), inRoot());
++        expectMissing(traced, "libgone.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, libraryMissingForOneObjectIsFoundForAnother) {
++        library("lib/liba.so", needs({"libm1.so"}).withRpath(dir("extra")));
++        const auto found = library("extra/libm1.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libm1.so", "liba.so"}).withRpath(dir("lib"))), excluding({"libm1.so"}));
++        expectListed(traced, found);
++    }
++
++    TEST_F(NativeDependencyTracingTest, librariesForAnotherMachineAreSkipped) {
++        const auto good = library("b/liba.so");
++        copyForOtherMachine(good, at("a/liba.so"));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a") + ":" + dir("b"))), inRoot());
++        expectListed(traced, good);
++        expectNotListed(traced, at("a/liba.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, librariesOfTheOtherElfClassAreSkipped) {
++        const auto good = library("b/liba.so");
++        copyForOtherClass(good, at("a/liba.so"));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"})), withLdLibraryPath(dir("a") + ":" + dir("b")));
++        expectListed(traced, good);
++        expectNotListed(traced, at("a/liba.so"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, onlyUnusableCandidatesMeansNotFound) {
++        copyForOtherMachine(library("build/liba.so"), at("a/liba.so"));
++        copyForOtherClass(at("build/liba.so"), at("b/liba.so"));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("a") + ":" + dir("b"))), inRoot());
++        expectMissing(traced, "liba.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, unopenableCandidateEndsTheSearchOfItsList) {
++        library("b/libx.so");
++        makeSymlink("libx.so", at("a/libx.so"));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libx.so"}).withRpath(dir("a") + ":" + dir("b"))), inRoot());
++        expectMissing(traced, "libx.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, unopenableCandidateOnlyEndsItsOwnList) {
++        const auto libx = library("b/libx.so");
++        makeSymlink("libx.so", at("a/libx.so"));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libx.so"}).withRpath(dir("a") + ":" + dir("b"))), withLdLibraryPath(dir("b")));
++        expectListed(traced, libx);
++    }
++
++    TEST_F(NativeDependencyTracingTest, danglingSymlinkCandidateIsSkipped) {
++        const auto libx = library("b/libx.so");
++        makeSymlink(at("nowhere/libx.so"), at("a/libx.so"));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libx.so"}).withRpath(dir("a") + ":" + dir("b"))), inRoot());
++        expectListed(traced, libx);
++    }
++
++    TEST_F(NativeDependencyTracingTest, missingLibraryThrowsDependencyNotFoundError) {
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libnothere.so"})), inRoot());
++        expectMissing(traced, "libnothere.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, firstMissingLibraryInLoadOrderIsReported) {
++        library("lib/liba.so", needs({"libdeepmissing.so"}));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so", "libtopmissing.so"}).withRpath(dir("lib"))), inRoot());
++        expectMissing(traced, "libtopmissing.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, missingLibraryIsNamedAsLddShowsIt) {
++        library("lib/liba.so", needs({"$ORIGIN/plugins/libgone.so"}));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("lib"))), inRoot());
++        expectMissing(traced, dir("lib") + "/plugins/libgone.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, excludedMissingLibrariesAreSkipped) {
++        const auto liba = library("lib/liba.so", needs({"libgone.so"}));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so", "libgone.so"}).withRpath(dir("lib"))), excluding({"libgone.so"}));
++        ASSERT_FALSE(traced.notFound) << traced.message;
++        expectListed(traced, liba);
++    }
++
++    TEST_F(NativeDependencyTracingTest, excludePatternsDoNotRemoveFoundLibraries) {
++        const auto liba = library("lib/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so"}).withRpath(dir("lib"))), excluding({"liba.so", "lib*"}));
++        expectListed(traced, liba);
++    }
++
++    TEST_F(NativeDependencyTracingTest, missingLibraryAfterAnExcludedOneIsReported) {
++        library("lib/liba.so", needs({"libsecond.so"}));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"libfirst.so", "liba.so"}).withRpath(dir("lib"))), excluding({"libfirst.so"}));
++        expectMissing(traced, "libsecond.so");
++    }
++
++    TEST_F(NativeDependencyTracingTest, excludePatternsAreGlobs) {
++        const auto liba = library("lib/liba.so", needs({"libplugin-gl.so"}));
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so", "libplugin-vk.so"}).withRpath(dir("lib"))), excluding({"libplugin-*.so"}));
++        expectListed(traced, liba);
++    }
++
++    TEST_F(NativeDependencyTracingTest, sharedLibraryInputIsTraced) {
++        const auto libb = library("lib/libb.so");
++        const auto liba = library("lib/liba.so", needs({"libb.so", "libz.so.1"}).withRunpath("$ORIGIN"));
++        const auto traced = expectSameAsLdd(liba, inRoot());
++        expectListed(traced, libb);
++        expectListed(traced, requireSystemLibrary("libz.so.1"));
++    }
++
++    TEST_F(NativeDependencyTracingTest, resultPathsAreAbsolute) {
++        library("sub/liba.so");
++        const auto traced = expectSameAsLdd(executable("bin/app", needs({"liba.so", "sub/liba.so"}).withRpath("sub")), inRoot());
++        ASSERT_FALSE(traced.paths.empty());
++
++        for (const auto& path : traced.paths)
++            EXPECT_TRUE(path.is_absolute()) << path.string();
++    }
++
++    TEST_F(NativeDependencyTracingTest, randomDependencyGraphsMatchLdd) {
++        expectRandomScenariosMatchLdd(root, 17u, 120, GraphOptions{});
++    }
++
++    TEST_F(NativeDependencyTracingTest, randomSearchPathsMatchLdd) {
++        GraphOptions options;
++        options.searchPathVariety = true;
++        expectRandomScenariosMatchLdd(root, 4242u, 120, options);
++    }
++
++    TEST_F(NativeDependencyTracingTest, randomSystemLibrariesAndMissingNamesMatchLdd) {
++        GraphOptions options;
++        options.systemLibraries = true;
++        options.missingLibraries = true;
++        expectRandomScenariosMatchLdd(root, 90210u, 120, options);
++    }
++}

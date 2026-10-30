@@ -1,0 +1,1480 @@
+diff --git a/docs/markdown/snippets/fortran_module_scanning.md b/docs/markdown/snippets/fortran_module_scanning.md
+new file mode 100644
+index 000000000..892043f35
+--- /dev/null
++++ b/docs/markdown/snippets/fortran_module_scanning.md
+@@ -0,0 +1,12 @@
++## Fortran module scanning follows gfortran
++
++The ninja backend's Fortran dependency scanner now reads sources the way
++gfortran does. Every module and submodule in a file is found, the `.smod`
++files of modules with separate module procedures are listed, continuation
++lines, `;`, fixed-form sources and `include` lines are understood, and sources
++that gfortran preprocesses are preprocessed with the target's `-D`, `-U` and
++`-I` arguments and gfortran's own `__GFORTRAN__` and `__GNUC__` macros before
++they are scanned. When several targets write a module file of the same name, a
++source depends on the one gfortran finds first on its module search path. When a
++file that a source includes changes, the sources are scanned again and the
++objects that include it are rebuilt.
+diff --git a/mesonbuild/backend/ninjabackend.py b/mesonbuild/backend/ninjabackend.py
+index 598635468..01662ae3d 100644
+--- a/mesonbuild/backend/ninjabackend.py
++++ b/mesonbuild/backend/ninjabackend.py
+@@ -133,16 +133,26 @@ class TargetDependencyScannerInfo:
+ 
+     """Information passed to the depscanner about a target.
+ 
++    The Fortran fields have defaults, so information pickled by an older Meson
++    still loads, compares unequal and is written again.
++
+     :param private_dir: The private scratch directory for the target.
+     :param source2object: A mapping of source file names to the objects that
+         will be created from them.
+     :param sources: a list of sources mapping them to the language rules to use
+         to scan them.
++    :param fortran_args: The arguments the Fortran sources are compiled with.
++    :param fortran_compiler: The id and version of the Fortran compiler.
++    :param include_stamps: Pairs of a Fortran source and the stamp file that
++        records the files it includes, which its object depends on.
+     """
+ 
+     private_dir: str
+     source2object: T.Dict[str, str]
+     sources: T.List[T.Tuple[str, Literal['cpp', 'fortran']]]
++    fortran_args: T.Tuple[str, ...] = ()
++    fortran_compiler: T.Tuple[str, str] = ('', '')
++    include_stamps: T.Tuple[T.Tuple[str, str], ...] = ()
+ 
+ 
+ @unique
+@@ -1185,7 +1195,8 @@ class NinjaBackend(backends.Backend):
+         else:
+             final_obj_list = obj_list
+ 
+-        self.generate_dependency_scan_target(target, compiled_sources, source2object, fortran_order_deps)
++        self.generate_dependency_scan_target(target, compiled_sources, source2object,
++                                             [*header_deps, *fortran_order_deps], fortran_inc_args)
+ 
+         if isinstance(target, build.SharedLibrary):
+             self.generate_shsym(target)
+@@ -1233,7 +1244,8 @@ class NinjaBackend(backends.Backend):
+     def generate_dependency_scan_target(self, target: build.BuildTarget,
+                                         compiled_sources: T.List[str],
+                                         source2object: T.Dict[str, str],
+-                                        object_deps: T.List[File]) -> None:
++                                        object_deps: T.List[FileOrString],
++                                        fortran_inc_args: T.List[str]) -> None:
+         if not self.should_use_dyndeps_for_target(target):
+             return
+         self._uses_dyndeps = True
+@@ -1244,8 +1256,19 @@ class NinjaBackend(backends.Backend):
+         rule_name = 'depscan'
+         scan_sources = list(self.select_sources_to_scan(compiled_sources))
+ 
++        fortran_args: T.Tuple[str, ...] = ()
++        fortran_compiler = ('', '')
++        include_stamps: T.Tuple[T.Tuple[str, str], ...] = ()
++        fc = target.compilers.get('fortran')
++        if fc is not None:
++            fortran_args = tuple(self.get_fortran_scan_args(target, fc, fortran_inc_args))
++            fortran_compiler = (fc.get_id(), fc.version)
++            include_stamps = tuple((s, self.get_fortran_include_stamp(source2object[s]))
++                                   for s, lang in scan_sources if lang == 'fortran')
++
+         scaninfo = TargetDependencyScannerInfo(
+-            self.get_target_private_dir(target), source2object, scan_sources)
++            self.get_target_private_dir(target), source2object, scan_sources,
++            fortran_args, fortran_compiler, include_stamps)
+ 
+         write = True
+         if os.path.exists(pickle_abs):
+@@ -1257,7 +1280,8 @@ class NinjaBackend(backends.Backend):
+             with open(pickle_abs, 'wb') as p:
+                 pickle.dump(scaninfo, p)
+ 
+-        elem = NinjaBuildElement(self.all_outputs, json_file, rule_name, pickle_file)
++        elem = NinjaBuildElement(self.all_outputs, json_file, rule_name, pickle_file,
++                                 implicit_outs=[stamp for _, stamp in include_stamps])
+         # A full dependency is required on all scanned sources, if any of them
+         # are updated we need to rescan, as they may have changed the modules
+         # they use or export.
+@@ -1277,6 +1301,20 @@ class NinjaBackend(backends.Backend):
+         elem.add_item('name', target.name)
+         self.add_build(elem)
+ 
++    def get_fortran_scan_args(self, target: build.BuildTarget, compiler: Compiler,
++                              extra_args: T.List[str]) -> T.List[str]:
++        # The scanner preprocesses and searches for included files with the
++        # arguments the sources are compiled with, put together the same way
++        # as in generate_single_compile.
++        commands = self._generate_single_compile(target, compiler)
++        commands = commands.compiler.compiler_args(commands)
++        commands.extend(extra_args)
++        return commands.to_native()
++
++    @staticmethod
++    def get_fortran_include_stamp(obj: str) -> str:
++        return obj + '.includes'
++
+     def select_sources_to_scan(self, compiled_sources: T.List[str],
+                                ) -> T.Iterable[T.Tuple[str, Literal['cpp', 'fortran']]]:
+         # in practice pick up C++ and Fortran files. If some other language
+@@ -2824,7 +2862,7 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
+             ['--internal', 'depscan']
+         args = ['$picklefile', '$out', '$in']
+         description = 'Scanning target $name for modules'
+-        rule = NinjaRule(rulename, command, args, description)
++        rule = NinjaRule(rulename, command, args, description, deps='gcc', depfile='$out.d', restat=True)
+         self.add_rule(rule)
+ 
+         rulename = 'depaccumulate'
+@@ -3484,6 +3522,10 @@ https://gcc.gnu.org/bugzilla/show_bug.cgi?id=47485'''))
+         dep_scan_file = self.get_dep_scan_file_for(target)[1]
+         element.add_item('dyndep', dep_scan_file)
+         element.add_orderdep(dep_scan_file)
++        if extension in compilers.lang_suffixes['fortran']:
++            # The scanner rewrites this stamp when a file the source includes
++            # changes, which the compiler does not report for Fortran.
++            element.add_dep(self.get_fortran_include_stamp(element.outfilenames[0]))
+ 
+     def get_dep_scan_file_for(self, target: build.BuildTarget) -> T.Tuple[str, str]:
+         priv = self.get_target_private_dir(target)
+diff --git a/mesonbuild/scripts/depaccumulate.py b/mesonbuild/scripts/depaccumulate.py
+index 7576390d4..5b60a765c 100644
+--- a/mesonbuild/scripts/depaccumulate.py
++++ b/mesonbuild/scripts/depaccumulate.py
+@@ -8,6 +8,7 @@ See: https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2022/p1689r5.html
+ 
+ from __future__ import annotations
+ import json
++import os
+ import re
+ import textwrap
+ import typing as T
+@@ -66,6 +67,47 @@ def get_provider(rules: T.List[Rule], name: str) -> T.Optional[str]:
+     return None
+ 
+ 
++def get_module_files(rules: T.List[Rule], extra_rules: T.List[Rule]) -> T.Dict[str, str]:
++    """Map the module files written by this Target and the Targets it links
++    with to what a user of each depends on: the module file itself when this
++    Target writes it, otherwise the object of the rule that writes it.
++
++    :param rules: the rules for this target
++    :param extra_rules: the rules for this target and all of the targets it links with
++    :return: The absolute path of each module file mapped to its dependency
++    """
++    own = {id(r) for r in rules}
++    files: T.Dict[str, str] = {}
++    for r in extra_rules:
++        for p in r.get('provides', []):
++            path = p.get('compiled-module-path')
++            if path is not None:
++                files[os.path.abspath(path)] = path if id(r) in own else r['primary-output']
++    return files
++
++
++def get_use_smods(rules: T.List[Rule], extra_rules: T.List[Rule]) -> T.Dict[str, T.Tuple[str, str, bool]]:
++    """Map the .smod file that gfortran writes beside a module file when the
++    module uses another one with separate module procedures, which the scanner
++    does not list, to what a submodule of it depends on, the object that
++    writes it and whether that object is in this Target.
++
++    :param rules: the rules for this target
++    :param extra_rules: the rules for this target and all of the targets it links with
++    :return: The absolute path of each such .smod file mapped to its dependency
++    """
++    own = {id(r) for r in rules}
++    files: T.Dict[str, T.Tuple[str, str, bool]] = {}
++    for r in extra_rules:
++        for p in r.get('provides', []):
++            path = p.get('compiled-module-path')
++            if path is not None and path.endswith('.mod'):
++                smod = path[:-len('.mod')] + '.smod'
++                mine = id(r) in own
++                files[os.path.abspath(smod)] = (smod if mine else r['primary-output'], r['primary-output'], mine)
++    return files
++
++
+ def process_rules(rules: T.List[Rule],
+                   extra_rules: T.List[Rule],
+                   ) -> T.Iterable[T.Tuple[str, T.Optional[T.List[str]], T.List[str]]]:
+@@ -75,6 +117,10 @@ def process_rules(rules: T.List[Rule],
+     :param extra_rules: the rules for all of the targets this one links with, to use their provides
+     :yield: A tuple of the output, the exported modules, and the consumed modules
+     """
++    module_files = get_module_files(rules, extra_rules)
++    use_smods = get_use_smods(rules, extra_rules)
++    results: T.List[T.Tuple[str, T.Optional[T.List[str]], T.List[str]]] = []
++    extra_provides: T.Dict[str, T.List[str]] = {}
+     for rule in rules:
+         prov: T.Optional[T.List[str]] = None
+         req: T.List[str] = []
+@@ -82,6 +128,25 @@ def process_rules(rules: T.List[Rule],
+             prov = [p['compiled-module-path'] for p in rule['provides']]
+         if 'requires' in rule:
+             for p in rule['requires']:
++                candidates = p.get('compiled-module-candidates')
++                if candidates is not None:
++                    # Like the compiler, use the first module file found along
++                    # the search path, even one that no target writes.
++                    for candidate in candidates:
++                        path = os.path.abspath(candidate)
++                        if path in module_files:
++                            req.append(module_files[path])
++                            break
++                        if path in use_smods:
++                            dep, writer, mine = use_smods[path]
++                            if writer != rule['primary-output']:
++                                req.append(dep)
++                                if mine:
++                                    extra_provides.setdefault(writer, []).append(dep)
++                            break
++                        if os.path.isfile(path):
++                            break
++                    continue
+                 modfile = p.get('compiled-module-path')
+                 if modfile is not None:
+                     req.append(modfile)
+@@ -91,7 +156,12 @@ def process_rules(rules: T.List[Rule],
+                     found = get_provider(extra_rules, p['logical-name'])
+                     if found:
+                         req.append(found)
+-        yield rule['primary-output'], prov, req
++        # Several modules of a linked target may come from the same object
++        results.append((rule['primary-output'], prov, list(dict.fromkeys(req))))
++    for obj, prov, req in results:
++        if obj in extra_provides:
++            prov = list(dict.fromkeys((prov or []) + extra_provides[obj]))
++        yield obj, prov, req
+ 
+ 
+ def formatter(files: T.Optional[T.List[str]]) -> str:
+diff --git a/mesonbuild/scripts/depscan.py b/mesonbuild/scripts/depscan.py
+index 25b557e40..51e56d112 100644
+--- a/mesonbuild/scripts/depscan.py
++++ b/mesonbuild/scripts/depscan.py
+@@ -12,6 +12,8 @@ import pickle
+ import re
+ import typing as T
+ 
++from . import fortranscan
++
+ if T.TYPE_CHECKING:
+     from typing_extensions import Literal, TypedDict, NotRequired
+     from ..backend.ninjabackend import TargetDependencyScannerInfo
+@@ -21,6 +23,7 @@ if T.TYPE_CHECKING:
+         {
+             'logical-name': str,
+             'compiled-module-path': NotRequired[str],
++            'compiled-module-candidates': NotRequired[T.List[str]],
+             'source-path': NotRequired[str],
+             'unique-on-source-path': NotRequired[bool],
+             'lookup-method': NotRequired[Literal['by-name', 'include-angle', 'include-quote']]
+@@ -58,14 +61,10 @@ if T.TYPE_CHECKING:
+ CPP_IMPORT_RE = re.compile(r'\w*import ([a-zA-Z0-9]+);')
+ CPP_EXPORT_RE = re.compile(r'\w*export module ([a-zA-Z0-9]+);')
+ 
+-FORTRAN_INCLUDE_PAT = r"^\s*include\s*['\"](\w+\.\w+)['\"]"
+-FORTRAN_MODULE_PAT = r"^\s*\bmodule\b\s+(\w+)\s*(?:!+.*)*$"
+-FORTRAN_SUBMOD_PAT = r"^\s*\bsubmodule\b\s*\((\w+:?\w+)\)\s*(\w+)"
+-FORTRAN_USE_PAT = r"^\s*use,?\s*(?:non_intrinsic)?\s*(?:::)?\s*(\w+)"
+ 
+-FORTRAN_MODULE_RE = re.compile(FORTRAN_MODULE_PAT, re.IGNORECASE)
+-FORTRAN_SUBMOD_RE = re.compile(FORTRAN_SUBMOD_PAT, re.IGNORECASE)
+-FORTRAN_USE_RE = re.compile(FORTRAN_USE_PAT, re.IGNORECASE)
++def depfile_quote(path: str) -> str:
++    return path.replace('$', '$$').replace('#', '\\#').replace(' ', '\\ ')
++
+ 
+ class DependencyScanner:
+     def __init__(self, pickle_file: str, outfile: str):
+@@ -74,9 +73,11 @@ class DependencyScanner:
+         self.outfile = outfile
+         self.sources = self.target_data.sources
+         self.provided_by: T.Dict[str, str] = {}
+-        self.exports: T.Dict[str, str] = {}
++        self.exports: T.Dict[str, T.List[str]] = {}
+         self.imports: collections.defaultdict[str, T.List[str]] = collections.defaultdict(list)
+         self.sources_with_exports: T.List[str] = []
++        self.included: T.List[str] = []
++        self.included_by: T.Dict[str, T.List[str]] = {}
+ 
+     def scan_file(self, fname: str, lang: Literal['cpp', 'fortran']) -> None:
+         if lang == 'fortran':
+@@ -85,49 +86,21 @@ class DependencyScanner:
+             self.scan_cpp_file(fname)
+ 
+     def scan_fortran_file(self, fname: str) -> None:
+-        fpath = pathlib.Path(fname)
+-        modules_in_this_file = set()
+-        for line in fpath.read_text(encoding='utf-8-sig', errors='ignore').split('\n'):
+-            import_match = FORTRAN_USE_RE.match(line)
+-            export_match = FORTRAN_MODULE_RE.match(line)
+-            submodule_export_match = FORTRAN_SUBMOD_RE.match(line)
+-            if import_match:
+-                needed = import_match.group(1).lower()
+-                # In Fortran you have an using declaration also for the module
+-                # you define in the same file. Prevent circular dependencies.
+-                if needed not in modules_in_this_file:
+-                    self.imports[fname].append(needed)
+-            if export_match:
+-                exported_module = export_match.group(1).lower()
+-                assert exported_module not in modules_in_this_file
+-                modules_in_this_file.add(exported_module)
+-                if exported_module in self.provided_by:
+-                    raise RuntimeError(f'Multiple files provide module {exported_module}.')
+-                self.sources_with_exports.append(fname)
+-                self.provided_by[exported_module] = fname
+-                self.exports[fname] = exported_module
+-            if submodule_export_match:
+-                # Store submodule "Foo" "Bar" as "foo:bar".
+-                # A submodule declaration can be both an import and an export declaration:
+-                #
+-                # submodule (a1:a2) a3
+-                #  - requires a1@a2.smod
+-                #  - produces a1@a3.smod
+-                parent_module_name_full = submodule_export_match.group(1).lower()
+-                parent_module_name = parent_module_name_full.split(':')[0]
+-                submodule_name = submodule_export_match.group(2).lower()
+-                concat_name = f'{parent_module_name}:{submodule_name}'
+-                self.sources_with_exports.append(fname)
+-                self.provided_by[concat_name] = fname
+-                self.exports[fname] = concat_name
+-                # Fortran requires that the immediate parent module must be built
+-                # before the current one. Thus:
+-                #
+-                # submodule (parent) parent   <- requires parent.mod (really parent.smod, but they are created at the same time)
+-                # submodule (a1:a2) a3        <- requires a1@a2.smod
+-                #
+-                # a3 does not depend on the a1 parent module directly, only transitively.
+-                self.imports[fname].append(parent_module_name_full)
++        # Fortran modules are tracked by the name of the file the compiler
++        # writes for them, such as foo.mod, foo.smod or foo@bar.smod.
++        compiler_id, version = self.target_data.fortran_compiler
++        result = fortranscan.scan(fname, self.target_data.fortran_args, compiler_id, version)
++        for modfile in result.writes:
++            if modfile in self.provided_by:
++                raise RuntimeError(f'Multiple files provide module {modfile}.')
++            self.provided_by[modfile] = fname
++        if result.writes:
++            self.sources_with_exports.append(fname)
++            self.exports[fname] = result.writes
++        # A module file the source writes itself is none of its dependencies.
++        self.imports[fname].extend(m for m in result.reads if m not in result.writes)
++        self.included.extend(result.included)
++        self.included_by[fname] = result.included
+ 
+     def scan_cpp_file(self, fname: str) -> None:
+         fpath = pathlib.Path(fname)
+@@ -143,20 +116,26 @@ class DependencyScanner:
+                     raise RuntimeError(f'Multiple files provide module {exported_module}.')
+                 self.sources_with_exports.append(fname)
+                 self.provided_by[exported_module] = fname
+-                self.exports[fname] = exported_module
++                self.exports[fname] = [exported_module]
+ 
+-    def module_name_for(self, src: str, lang: Literal['cpp', 'fortran']) -> str:
++    def module_path(self, modname: str, lang: Literal['cpp', 'fortran']) -> str:
+         if lang == 'fortran':
+-            exported = self.exports[src]
+-            # Module foo:bar goes to a file name foo@bar.smod
+-            # Module Foo goes to a file name foo.mod
+-            namebase = exported.replace(':', '@')
+-            if ':' in exported:
+-                extension = 'smod'
+-            else:
+-                extension = 'mod'
+-            return os.path.join(self.target_data.private_dir, f'{namebase}.{extension}')
+-        return '{}.ifc'.format(self.exports[src])
++            return os.path.join(self.target_data.private_dir, modname)
++        return f'{modname}.ifc'
++
++    def module_search_path(self) -> T.List[str]:
++        # gfortran looks for a module file in the directory it runs in, the
++        # build directory, then in the -I directories in the order they are
++        # given and last in the -J directory, the private directory.
++        dirs: T.List[str] = ['.']
++        args = iter(self.target_data.fortran_args)
++        for arg in args:
++            if arg == '-I':
++                dirs.append(next(args, ''))
++            elif arg.startswith('-I'):
++                dirs.append(arg[2:])
++        dirs.append(self.target_data.private_dir)
++        return list(dict.fromkeys(os.path.normpath(d) for d in dirs if d))
+ 
+     def scan(self) -> int:
+         for s, lang in self.sources:
+@@ -166,6 +145,7 @@ class DependencyScanner:
+             'revision': 0,
+             'rules': [],
+         }
++        search_path = self.module_search_path()
+         for src, lang in self.sources:
+             rule: Rule = {
+                 'primary-output': self.target_data.source2object[src],
+@@ -173,34 +153,64 @@ class DependencyScanner:
+                 'provides': [],
+             }
+             if src in self.sources_with_exports:
+-                rule['outputs'] = [self.module_name_for(src, lang)]
++                rule['outputs'] = [self.module_path(m, lang) for m in self.exports[src]]
+             if src in self.imports:
+                 for modname in self.imports[src]:
+                     provider_src = self.provided_by.get(modname)
+                     if provider_src == src:
+                         continue
++                    if lang == 'fortran':
++                        # A linked target can provide a module file of the same
++                        # name earlier on the search path than this target does.
++                        rule['requires'].append({
++                            'logical-name': modname,
++                            'compiled-module-candidates': [os.path.join(d, modname) for d in search_path],
++                        })
++                        continue
+                     rule['requires'].append({
+                         'logical-name': modname,
+                     })
+                     if provider_src:
+                         rule['requires'][-1].update({
+                             'source-path': provider_src,
+-                            'compiled-module-path': self.module_name_for(provider_src, lang),
++                            'compiled-module-path': self.module_path(modname, lang),
+                         })
+-            if src in self.exports:
+-                modname = self.exports[src]
++            for modname in self.exports.get(src, []):
+                 rule['provides'].append({
+                     'logical-name': modname,
+                     'source-path': src,
+-                    'compiled-module-path': self.module_name_for(src, lang),
++                    'compiled-module-path': self.module_path(modname, lang),
+                 })
+             description['rules'].append(rule)
+ 
+         with open(self.outfile, 'w', encoding='utf-8') as f:
+             json.dump(description, f)
+ 
++        # The included files decide the result as much as the sources do, so
++        # the scan reruns when one of them changes.
++        with open(self.outfile + '.d', 'w', encoding='utf-8') as f:
++            f.write(f'{depfile_quote(self.outfile)}: \\\n')
++            for path in dict.fromkeys(self.included):
++                f.write(f'  {depfile_quote(path)} \\\n')
++
++        for src, stamp in self.target_data.include_stamps:
++            self.write_include_stamp(stamp, self.included_by.get(src, []))
++
+         return 0
+ 
++    @staticmethod
++    def write_include_stamp(stamp: str, included: T.List[str]) -> None:
++        # Only a changed stamp makes the object stale, and the scan rule restats.
++        text = ''.join(f'{os.stat(path).st_mtime_ns} {path}\n' for path in included)
++        try:
++            with open(stamp, encoding='utf-8') as f:
++                if f.read() == text:
++                    return
++        except FileNotFoundError:
++            pass
++        with open(stamp, 'w', encoding='utf-8') as f:
++            f.write(text)
++
+ def run(args: T.List[str]) -> int:
+     assert len(args) == 2, 'got wrong number of arguments!'
+     outfile, pickle_file = args
+diff --git a/mesonbuild/scripts/fortranscan.py b/mesonbuild/scripts/fortranscan.py
+new file mode 100644
+index 000000000..c0c7b1c88
+--- /dev/null
++++ b/mesonbuild/scripts/fortranscan.py
+@@ -0,0 +1,988 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright 2026 The Meson development team
++
++"""Find the module files gfortran writes and reads when compiling a source.
++
++Nothing is run: the source is preprocessed when gfortran would preprocess
++it, Fortran include lines are expanded, and the statements are read in the
++source form gfortran picks from the file name.
++"""
++
++from __future__ import annotations
++
++import operator
++import os
++import re
++import typing as T
++from dataclasses import dataclass
++
++FREE_FORM_SUFFIXES = frozenset({'f90', 'f95', 'f03', 'f08'})
++
++_NAME = re.compile(r'[a-z][a-z0-9_]*')
++_PP_IDENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
++_PP_NUMBER = re.compile(r'\.?[0-9](?:[eEpP][+-]|[A-Za-z0-9_.])*')
++# Only the simple character constants are read in #if lines: gfortran 12 stops
++# with an internal compiler error on any character constant in one.
++_PP_EXPR_TOKEN = re.compile(r'\s*(?:(0[xX][0-9a-fA-F]+|0[bB][01]+|[0-9]+)([uUlL]*)|([A-Za-z_][A-Za-z0-9_]*)|'
++                            r"('(?:\\.|[^\\'])')|(<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%<>!~&|^?:(),]))")
++_FREE_TOKEN = re.compile(r"[a-z][a-z0-9_]*|[0-9]+|::|=>|==|/=|<=|>=|\S")
++_FREE_INCLUDE = re.compile(r'''\s*include\s*(['"])(.+?)\1\s*(?:!.*)?$''', re.IGNORECASE)
++_FIXED_INCLUDE = re.compile(r'''include(['"])(.+?)\1(?:!.*)?$''')
++
++# Words that can come before FUNCTION or SUBROUTINE in a procedure statement.
++_PREFIX_WORDS = ('non_recursive', 'recursive', 'elemental', 'impure', 'pure', 'module')
++_TYPE_WORDS = ('doubleprecision', 'doublecomplex', 'integer', 'real', 'complex',
++               'logical', 'character', 'type', 'class')
++
++# The END statements that close a program unit or a subprogram.
++_UNIT_KINDS = frozenset({'blockdata', 'function', 'module', 'procedure', 'program', 'submodule', 'subroutine'})
++# Arguments that turn preprocessing on or off: gfortran and flang, Intel, PGI.
++_PREPROCESS_ON = frozenset({'-cpp', '-fpp', '-Mpreprocess'})
++_PREPROCESS_OFF = frozenset({'-nocpp', '-nofpp', '-Mnopreprocess'})
++_INTRINSIC_MODULES = frozenset({
++    'iso_c_binding', 'iso_fortran_env', 'ieee_arithmetic', 'ieee_exceptions', 'ieee_features',
++    'omp_lib', 'omp_lib_kinds', 'openacc', 'openacc_kinds',
++})
++
++_BINARY_PRECEDENCE = {
++    '||': 1, '&&': 2, '|': 3, '^': 4, '&': 5, '==': 6, '!=': 6,
++    '<': 7, '>': 7, '<=': 7, '>=': 7, '<<': 8, '>>': 8,
++    '+': 9, '-': 9, '*': 10, '/': 10, '%': 10,
++}
++_ARITHMETIC: T.Dict[str, T.Callable[[int, int], int]] = {
++    '|': operator.or_, '^': operator.xor, '&': operator.and_,
++    '+': operator.add, '-': operator.sub, '*': operator.mul,
++}
++_COMPARISON: T.Dict[str, T.Callable[[int, int], bool]] = {
++    '==': operator.eq, '!=': operator.ne, '<': operator.lt,
++    '>': operator.gt, '<=': operator.le, '>=': operator.ge,
++}
++
++
++# A value in a #if expression and whether it is unsigned. The preprocessor
++# computes in 64 bits and wraps on overflow, and in the traditional mode
++# gfortran uses a constant without a U suffix stays signed however large it is.
++_Number = T.Tuple[int, bool]
++_MASK = (1 << 64) - 1
++
++
++class ScanResult(T.NamedTuple):
++
++    """Module file names, such as ``foo.mod`` or ``foo@bar.smod``, and the
++    included files the scan read."""
++
++    writes: T.List[str]
++    reads: T.List[str]
++    included: T.List[str]
++
++
++def predefined_macros(compiler_id: str, version: str) -> T.Dict[str, str]:
++    if compiler_id != 'gcc':
++        return {}
++    parts = (version.split('.') + ['0', '0', '0'])[:3]
++    return {
++        '__GFORTRAN__': '1',
++        '__GNUC__': parts[0],
++        '__GNUC_MINOR__': parts[1],
++        '__GNUC_PATCHLEVEL__': parts[2],
++    }
++
++
++def scan(fname: str, args: T.Sequence[str], compiler_id: str = 'gcc', version: str = '') -> ScanResult:
++    macros = predefined_macros(compiler_id, version)
++    include_dirs: T.List[str] = []
++    preprocess: T.Optional[bool] = None
++    it = iter(args)
++    for arg in it:
++        if arg in _PREPROCESS_ON:
++            preprocess = True
++            continue
++        if arg in _PREPROCESS_OFF:
++            preprocess = False
++            continue
++        if arg in {'-D', '-U', '-I'}:
++            opt, value = arg, next(it, '')
++        elif arg[:2] in {'-D', '-U', '-I'} and len(arg) > 2:
++            opt, value = arg[:2], arg[2:]
++        else:
++            continue
++        if opt == '-D':
++            name, sep, body = value.partition('=')
++            macros[name] = body if sep else '1'
++        elif opt == '-U':
++            macros.pop(value, None)
++        else:
++            include_dirs.append(value)
++
++    suffix = os.path.splitext(fname)[1][1:]
++    if preprocess is None:
++        preprocess = suffix != suffix.lower() or suffix.lower() == 'fpp'
++    free = suffix.lower() in FREE_FORM_SUFFIXES
++
++    included: T.List[str] = []
++    if preprocess:
++        preprocessor = Preprocessor(macros, include_dirs)
++        lines = preprocessor.run(fname)
++        included += preprocessor.included
++    else:
++        lines = _read_lines(fname)
++    source_dir = os.path.dirname(fname)
++    lines = _expand_includes(lines, free, source_dir, include_dirs, included, 0)
++    statements = _free_statements(lines) if free else _fixed_statements(lines)
++    writes, reads = _module_files(statements, free, compiler_id)
++    return ScanResult(writes, reads, list(dict.fromkeys(included)))
++
++
++def _read_lines(fname: str) -> T.List[str]:
++    with open(fname, encoding='utf-8-sig', errors='replace') as f:
++        return [line.rstrip('\r') for line in f.read().split('\n')]
++
++
++class Preprocessor:
++
++    """The parts of gfortran's traditional-mode preprocessor that decide
++    which lines are compiled and what object-like macros expand to."""
++
++    def __init__(self, macros: T.Dict[str, str], include_dirs: T.List[str]):
++        self.macros = dict(macros)
++        self.include_dirs = include_dirs
++        self.included: T.List[str] = []
++        self.once: T.Set[str] = set()
++        # The -I directory each header was found in, -1 for its includer's.
++        self.found_in: T.Dict[str, int] = {}
++
++    def run(self, fname: str) -> T.List[str]:
++        out: T.List[str] = []
++        self._process(fname, out, 0)
++        return out
++
++    def _process(self, fname: str, out: T.List[str], depth: int) -> None:
++        raw = _read_lines(fname)
++        lines: T.List[str] = []
++        pending = ''
++        for line in raw:
++            if line.endswith('\\'):
++                pending += line[:-1]
++                continue
++            lines.append(pending + line)
++            pending = ''
++        if pending:
++            lines.append(pending)
++        lines = _strip_comments(lines)
++
++        # Each frame is [enclosing branch active, a branch was taken, this branch active].
++        stack: T.List[T.List[bool]] = []
++        for line in lines:
++            active = not stack or stack[-1][2]
++            # In traditional mode only a '#' in column 1 starts a directive;
++            # gfortran passes an indented one on to the compiler.
++            if line.startswith('#'):
++                self._directive(line[1:], fname, out, depth, stack, active)
++            elif active:
++                out.append(self.expand(line))
++
++    def _directive(self, text: str, fname: str, out: T.List[str], depth: int,
++                   stack: T.List[T.List[bool]], active: bool) -> None:
++        m = re.match(r'\s*([A-Za-z_]\w*)(.*)$', text)
++        if not m:
++            return
++        name, rest = m.group(1), m.group(2).strip()
++        if name in {'if', 'ifdef', 'ifndef'}:
++            if not active:
++                stack.append([False, True, False])
++                return
++            cond = self._condition(name, rest)
++            stack.append([True, cond, cond])
++        elif name in {'elif', 'elifdef', 'elifndef'}:
++            if stack:
++                frame = stack[-1]
++                if frame[0] and not frame[1]:
++                    frame[2] = self._condition(name, rest)
++                    frame[1] = frame[2]
++                else:
++                    frame[2] = False
++        elif name == 'else':
++            if stack:
++                frame = stack[-1]
++                frame[2] = frame[0] and not frame[1]
++                frame[1] = True
++        elif name == 'endif':
++            if stack:
++                stack.pop()
++        elif not active:
++            return
++        elif name == 'define':
++            ident = _PP_IDENT.match(rest)
++            if ident is not None and rest[ident.end():ident.end() + 1] != '(':
++                self.macros[ident.group()] = rest[ident.end():].strip()
++        elif name == 'undef':
++            ident = _PP_IDENT.match(rest)
++            if ident is not None:
++                self.macros.pop(ident.group(), None)
++        elif name == 'pragma':
++            # Like cpp, a header with #pragma once is not read again; in the
++            # main file the pragma does nothing.
++            if rest.split()[:1] == ['once'] and depth > 0:
++                self.once.add(os.path.realpath(fname))
++        elif name in {'include', 'include_next'} and depth < 200:
++            if rest[:1] not in {'"', '<'}:
++                rest = self.expand(rest).strip()
++            # In a header, #include_next goes on searching after the directory
++            # the header was found in; in the source itself it is #include.
++            after = self.found_in.get(fname, -1) if name == 'include_next' and depth > 0 else None
++            path, index = self._find_header(rest, fname, after)
++            if path is not None:
++                self.found_in[path] = index
++                self.included.append(path)
++                if os.path.realpath(path) not in self.once:
++                    self._process(path, out, depth + 1)
++
++    def _condition(self, name: str, rest: str) -> bool:
++        if name in {'if', 'elif'}:
++            return self.evaluate(rest) != 0
++        ident = _PP_IDENT.match(rest)
++        defined = ident is not None and ident.group() in self.macros
++        return defined if name in {'ifdef', 'elifdef'} else not defined
++
++    def _find_header(self, spec: str, fname: str, after: T.Optional[int] = None) -> T.Tuple[T.Optional[str], int]:
++        if len(spec) < 2:
++            return None, -1
++        if spec[0] == '"' and '"' in spec[1:]:
++            header = spec[1:spec.index('"', 1)]
++            quoted = True
++        elif spec[0] == '<' and '>' in spec:
++            header = spec[1:spec.index('>')]
++            quoted = False
++        else:
++            return None, -1
++        dirs = list(enumerate(self.include_dirs))
++        if after is not None:
++            dirs = dirs[after + 1:]
++        elif quoted:
++            dirs.insert(0, (-1, os.path.dirname(fname)))
++        for index, d in dirs:
++            path = os.path.join(d, header)
++            if os.path.isfile(path):
++                return path, index
++        return None, -1
++
++    def expand(self, text: str, hidden: T.FrozenSet[str] = frozenset()) -> str:
++        out: T.List[str] = []
++        i = 0
++        while i < len(text):
++            c = text[i]
++            if c in {'"', "'"}:
++                end = _quoted_end(text, i)
++                out.append(text[i:end])
++                i = end
++            elif c.isdigit() or (c == '.' and text[i + 1:i + 2].isdigit()):
++                m = _PP_NUMBER.match(text, i)
++                assert m is not None
++                out.append(m.group())
++                i = m.end()
++            elif c.isalpha() or c == '_':
++                m = _PP_IDENT.match(text, i)
++                assert m is not None
++                name = m.group()
++                i = m.end()
++                if name in self.macros and name not in hidden:
++                    out.append(self.expand(self.macros[name], hidden | {name}))
++                else:
++                    out.append(name)
++            else:
++                out.append(c)
++                i += 1
++        return ''.join(out)
++
++    def evaluate(self, expr: str) -> int:
++        tokens = self._expression_tokens(expr, frozenset())
++        value, pos = self._parse_expression(tokens, 0)
++        return value[0]
++
++    def _expression_tokens(self, expr: str, hidden: T.FrozenSet[str]) -> T.List[T.Union[_Number, str]]:
++        raw: T.List[T.Tuple[str, str]] = []
++        pos = 0
++        while pos < len(expr):
++            m = _PP_EXPR_TOKEN.match(expr, pos)
++            if m is None or m.end() == pos:
++                break
++            pos = m.end()
++            if m.group(1) is not None:
++                raw.append(('num', m.group(1) + m.group(2)))
++            elif m.group(3) is not None:
++                raw.append(('id', m.group(3)))
++            elif m.group(4) is not None:
++                raw.append(('char', m.group(4)))
++            else:
++                raw.append(('op', m.group(5)))
++
++        tokens: T.List[T.Union[_Number, str]] = []
++        i = 0
++        while i < len(raw):
++            kind, text = raw[i]
++            if kind == 'id' and text == 'defined':
++                if i + 1 < len(raw) and raw[i + 1] == ('op', '('):
++                    name = raw[i + 2][1] if i + 2 < len(raw) else ''
++                    i += 4
++                else:
++                    name = raw[i + 1][1] if i + 1 < len(raw) else ''
++                    i += 2
++                tokens.append((int(name in self.macros), False))
++                continue
++            if kind == 'id':
++                if text in self.macros and text not in hidden:
++                    tokens.extend(self._expression_tokens(self.macros[text], hidden | {text}))
++                else:
++                    tokens.append((0, False))
++            elif kind == 'num':
++                tokens.append(_literal(text))
++            elif kind == 'char':
++                tokens.append((ord(text[1:-1].encode().decode('unicode_escape')[:1] or '\0'), False))
++            else:
++                tokens.append(text)
++            i += 1
++        return tokens
++
++    def _parse_expression(self, tokens: T.List[T.Union[_Number, str]], pos: int) -> T.Tuple[_Number, int]:
++        # The comma operator binds loosest and gives its right operand.
++        value, pos = self._parse_conditional(tokens, pos)
++        while pos < len(tokens) and tokens[pos] == ',':
++            value, pos = self._parse_conditional(tokens, pos + 1)
++        return value, pos
++
++    def _parse_conditional(self, tokens: T.List[T.Union[_Number, str]], pos: int) -> T.Tuple[_Number, int]:
++        value, pos = self._parse_binary(tokens, pos, 1)
++        if pos < len(tokens) and tokens[pos] == '?':
++            left, pos = self._parse_expression(tokens, pos + 1)
++            if pos < len(tokens) and tokens[pos] == ':':
++                pos += 1
++            right, pos = self._parse_conditional(tokens, pos)
++            value = _number((left if value[0] else right)[0], left[1] or right[1])
++        return value, pos
++
++    def _parse_binary(self, tokens: T.List[T.Union[_Number, str]], pos: int, min_prec: int) -> T.Tuple[_Number, int]:
++        left, pos = self._parse_unary(tokens, pos)
++        while pos < len(tokens):
++            op = tokens[pos]
++            if not isinstance(op, str):
++                break
++            prec = _BINARY_PRECEDENCE.get(op)
++            if prec is None or prec < min_prec:
++                break
++            right, pos = self._parse_binary(tokens, pos + 1, prec + 1)
++            left = _apply(op, left, right)
++        return left, pos
++
++    def _parse_unary(self, tokens: T.List[T.Union[_Number, str]], pos: int) -> T.Tuple[_Number, int]:
++        if pos >= len(tokens):
++            return (0, False), pos
++        tok = tokens[pos]
++        if isinstance(tok, tuple):
++            return tok, pos + 1
++        if tok in {'!', '~', '-', '+'}:
++            (value, unsigned), pos = self._parse_unary(tokens, pos + 1)
++            if tok == '!':
++                return (int(not value), False), pos
++            if tok == '~':
++                return _number(~value, unsigned), pos
++            return (_number(-value, unsigned) if tok == '-' else (value, unsigned)), pos
++        if tok == '(':
++            result, pos = self._parse_expression(tokens, pos + 1)
++            if pos < len(tokens) and tokens[pos] == ')':
++                pos += 1
++            return result, pos
++        return (0, False), pos + 1
++
++
++def _number(value: int, unsigned: bool) -> _Number:
++    value &= _MASK
++    if not unsigned and value >> 63:
++        value -= 1 << 64
++    return value, unsigned
++
++
++def _literal(text: str) -> _Number:
++    digits = text.rstrip('uUlL')
++    try:
++        if digits[:2].lower() == '0x':
++            value = int(digits, 16)
++        elif digits[:2].lower() == '0b':
++            value = int(digits[2:], 2)
++        elif len(digits) > 1 and digits[0] == '0':
++            value = int(digits, 8)
++        else:
++            value = int(digits)
++    except ValueError:
++        value = 0
++    return _number(value, 'u' in text[len(digits):].lower())
++
++
++def _apply(op: str, left: _Number, right: _Number) -> _Number:
++    if op == '||':
++        return int(bool(left[0]) or bool(right[0])), False
++    if op == '&&':
++        return int(bool(left[0]) and bool(right[0])), False
++    if op in {'<<', '>>'}:
++        return _shift(op, left, right)
++    # Either operand being unsigned makes both unsigned.
++    unsigned = left[1] or right[1]
++    a, b = _number(left[0], unsigned)[0], _number(right[0], unsigned)[0]
++    if op in _COMPARISON:
++        return int(_COMPARISON[op](a, b)), False
++    if op in {'/', '%'}:
++        if b == 0:
++            return 0, unsigned
++        quotient = abs(a) // abs(b) * (1 if (a >= 0) == (b >= 0) else -1)
++        return _number(quotient if op == '/' else a - quotient * b, unsigned)
++    return _number(_ARITHMETIC[op](a, b), unsigned)
++
++
++def _shift(op: str, left: _Number, right: _Number) -> _Number:
++    # The result has the type of the left operand; a negative count shifts
++    # the other way.
++    value, unsigned = left
++    count = right[0]
++    if count < 0:
++        op, count = ('>>' if op == '<<' else '<<'), -count
++    if op == '<<':
++        return _number(value << count if count < 64 else 0, unsigned)
++    if count >= 64:
++        return (-1 if value < 0 else 0), unsigned
++    return value >> count, unsigned
++
++
++def _quoted_end(text: str, i: int) -> int:
++    # The preprocessor ends a character constant at its closing quote, skips
++    # the character after a backslash, and ends an open one with the line.
++    quote = text[i]
++    i += 1
++    while i < len(text):
++        if text[i] == '\\':
++            i += 2
++        elif text[i] == quote:
++            return i + 1
++        else:
++            i += 1
++    return len(text)
++
++
++def _strip_comments(lines: T.List[str]) -> T.List[str]:
++    # Traditional-mode cpp drops /* */ comments without leaving a space, also
++    # inside Fortran comments, and joins the lines a comment spans.
++    out: T.List[str] = []
++    current: T.List[str] = []
++    in_comment = False
++    for line in lines:
++        i = 0
++        while i < len(line):
++            if in_comment:
++                end = line.find('*/', i)
++                if end == -1:
++                    break
++                in_comment = False
++                i = end + 2
++            elif line[i] in {'"', "'"}:
++                end = _quoted_end(line, i)
++                current.append(line[i:end])
++                i = end
++            elif line.startswith('/*', i):
++                in_comment = True
++                i += 2
++            else:
++                current.append(line[i])
++                i += 1
++        if not in_comment:
++            out.append(''.join(current))
++            current = []
++    if current:
++        out.append(''.join(current))
++    return out
++
++
++def _expand_includes(lines: T.List[str], free: bool, source_dir: str,
++                     include_dirs: T.List[str], included: T.List[str], depth: int) -> T.List[str]:
++    # gfortran reads lines that start with '#' as preprocessor leftovers and
++    # skips them. Included files are not preprocessed, keep the form of the
++    # source and are searched for from the source's directory, whichever
++    # file the include line is in.
++    out: T.List[str] = []
++    i = 0
++    while i < len(lines):
++        line = lines[i]
++        i += 1
++        if line.startswith('#'):
++            continue
++        name = _include_name(line, free)
++        if name is None:
++            name, i = _continued_include(lines, i - 1, free)
++        if name is None:
++            out.append(line)
++            continue
++        if depth >= 200:
++            continue
++        for d in [source_dir] + include_dirs:
++            path = os.path.join(d, name)
++            if os.path.isfile(path):
++                included.append(path)
++                out.extend(_expand_includes(_read_lines(path), free, source_dir, include_dirs, included, depth + 1))
++                break
++    return out
++
++
++def _continued_include(lines: T.List[str], start: int, free: bool) -> T.Tuple[T.Optional[str], int]:
++    # gfortran rejects an INCLUDE line that is continued onto the next line;
++    # reading it as written loses nothing.
++    end = start + 1
++    if free:
++        text = lines[start].rstrip()
++        if not text.endswith('&') or not re.match(r'\s*include\b', text, re.IGNORECASE):
++            return None, end
++        joined = text[:-1]
++        while end < len(lines):
++            part = lines[end].strip()
++            end += 1
++            part = part[1:] if part.startswith('&') else part
++            if not part.endswith('&'):
++                joined += part
++                break
++            joined += part[:-1]
++        m = _FREE_INCLUDE.match(joined)
++        return (m.group(2), end) if m else (None, start + 1)
++    first = _fixed_columns(lines[start])
++    if first is None or first[:6].strip() or not first[6:].replace(' ', '').lower().startswith('include'):
++        return None, end
++    text = first[6:]
++    while end < len(lines):
++        nxt = _fixed_columns(lines[end])
++        if nxt is None or nxt[5:6] in {'', ' ', '0'}:
++            break
++        text += nxt[6:]
++        end += 1
++    m = _FIXED_INCLUDE.match(text.replace(' ', '').lower())
++    if end == start + 1 or m is None:
++        return None, start + 1
++    quote = m.group(1)
++    begin = text.index(quote) + 1
++    return text[begin:text.index(quote, begin)], end
++
++
++def _include_name(line: str, free: bool) -> T.Optional[str]:
++    if free:
++        m = _FREE_INCLUDE.match(line)
++        return m.group(2) if m else None
++    line = _fixed_columns(line)
++    if line is None:
++        return None
++    # Like gfortran, read an INCLUDE line in any column, also the label field.
++    m = _FIXED_INCLUDE.match(line.replace(' ', '').lower())
++    if m is None:
++        return None
++    # Take the file name with its case from the original line.
++    quote = m.group(1)
++    start = line.index(quote) + 1
++    return line[start:line.index(quote, start)]
++
++
++def _fixed_columns(line: str) -> T.Optional[str]:
++    """Return a fixed-form line with tabs in the label field expanded and cut
++    at column 72, or None for a comment line."""
++    if line[:1] in {'C', 'c', '*', '!'}:
++        return None
++    tab = line.find('\t', 0, 6)
++    if tab != -1:
++        rest = line[tab + 1:]
++        if rest[:1] in set('123456789'):
++            line = line[:tab].ljust(5) + rest
++        else:
++            line = line[:tab].ljust(6) + rest
++    line = line.replace('\t', ' ')[:72]
++    text = line.lstrip(' ')
++    if not line.strip(' \f') or text.startswith('!') and len(line) - len(text) != 5:
++        return None
++    return line
++
++
++def _free_statements(lines: T.List[str]) -> T.List[str]:
++    statements: T.List[str] = []
++    buf: T.List[str] = []
++    quote = ''
++    continued = False
++    for line in lines:
++        i = 0
++        if continued:
++            stripped = line.lstrip(' \t\f')
++            if not stripped or (stripped.startswith('!') and not quote):
++                continue
++            if stripped.startswith('&'):
++                i = len(line) - len(stripped) + 1
++            elif not quote:
++                buf.append(' ')
++        continued = False
++        while i < len(line):
++            c = line[i]
++            if quote:
++                if c == quote:
++                    if line[i + 1:i + 2] == quote:
++                        i += 2
++                        continue
++                    quote = ''
++                    buf.append("'")
++                elif c == '&' and not line[i + 1:].strip():
++                    continued = True
++                    break
++                i += 1
++                continue
++            if c in {'"', "'"}:
++                quote = c
++                buf.append("'")
++            elif c == '!':
++                break
++            elif c == '&' and (not line[i + 1:].strip() or line[i + 1:].lstrip().startswith('!')):
++                continued = True
++                break
++            elif c == ';':
++                statements.append(''.join(buf))
++                buf = []
++            else:
++                buf.append(c)
++            i += 1
++        if not continued:
++            statements.append(''.join(buf))
++            buf = []
++            quote = ''
++    statements.append(''.join(buf))
++    result = []
++    for s in statements:
++        s = s.strip().lower()
++        s = re.sub(r'^[0-9]+\s+', '', s)
++        if s:
++            result.append(s)
++    return result
++
++
++def _fixed_statements(lines: T.List[str]) -> T.List[str]:
++    statements: T.List[str] = []
++    buf: T.List[str] = []
++    quote = ''
++    for raw in lines:
++        line = _fixed_columns(raw)
++        if line is None:
++            continue
++        if line[5:6] in {'', ' ', '0'}:
++            statements.append(''.join(buf))
++            buf = []
++            quote = ''
++        i = 6
++        while i < len(line):
++            c = line[i]
++            if quote:
++                if c == quote:
++                    if line[i + 1:i + 2] == quote:
++                        i += 2
++                        continue
++                    quote = ''
++                    buf.append("'")
++                i += 1
++                continue
++            if c in {'"', "'"}:
++                quote = c
++                buf.append("'")
++            elif c == '!':
++                break
++            elif c == ';':
++                statements.append(''.join(buf))
++                buf = []
++            elif c not in ' \f':
++                buf.append(c)
++            i += 1
++    statements.append(''.join(buf))
++    return [s.lower() for s in statements if s]
++
++
++def _assignment(statement: str) -> bool:
++    depth = 0
++    for i, c in enumerate(statement):
++        if c == '(':
++            depth += 1
++        elif c == ')':
++            depth -= 1
++        elif c == '=' and depth == 0:
++            before = statement[i - 1:i]
++            after = statement[i + 1:i + 2]
++            if after not in {'=', '>'} and before not in {'=', '/', '<', '>'}:
++                return True
++    return False
++
++
++def _submodule_file(ancestor: str, name: str, compiler_id: str) -> str:
++    # The same naming as FortranCompiler.module_name_to_filename.
++    if compiler_id in {'gcc', 'intel', 'intel-cl'}:
++        return f'{ancestor}@{name}.smod'
++    if compiler_id in {'pgi', 'flang'}:
++        return f'{ancestor}-{name}.mod'
++    return f'{ancestor}_{name}.mod'
++
++
++@dataclass
++class _Scope:
++
++    """An open program unit, subprogram, interface block or derived type."""
++
++    kind: str
++    module: T.Optional[str] = None
++    contains: bool = False
++
++
++def _module_files(statements: T.List[str], free: bool, compiler_id: str) -> T.Tuple[T.List[str], T.List[str]]:
++    # Only gfortran writes a .smod for a module with separate module
++    # procedures and has its submodules read that instead of the .mod.
++    gfortran = compiler_id == 'gcc'
++    writes: T.List[str] = []
++    reads: T.List[str] = []
++    scopes: T.List[_Scope] = []
++    parse = _free_statement if free else _fixed_statement
++    for statement in statements:
++        if _assignment(statement):
++            continue
++        kind, names = parse(statement, _context(scopes))
++        if kind in {'module', 'submodule', 'unit'}:
++            scopes = []
++        if kind in {'module', 'use'} and names and names[0] in _INTRINSIC_MODULES:
++            names = []
++        if kind == 'module':
++            scopes.append(_Scope('module', names[0] if names else None))
++            if names:
++                writes.append(f'{names[0]}.mod')
++        elif kind == 'submodule':
++            scopes.append(_Scope('submodule'))
++            if names:
++                ancestor, parent, name = names
++                writes.append(_submodule_file(ancestor, name, compiler_id))
++                if parent:
++                    reads.append(_submodule_file(ancestor, parent, compiler_id))
++                else:
++                    reads.append(f'{ancestor}.smod' if gfortran else f'{ancestor}.mod')
++        elif kind == 'use':
++            if names:
++                reads.append(f'{names[0]}.mod')
++        elif kind == 'separate':
++            if gfortran and scopes and scopes[0].module is not None:
++                writes.append(f'{scopes[0].module}.smod')
++            scopes.append(_Scope('procedure'))
++        elif kind in {'unit', 'procedure', 'interface', 'type'}:
++            scopes.append(_Scope('procedure' if kind == 'unit' else kind))
++        elif kind == 'contains':
++            if scopes:
++                scopes[-1].contains = True
++        elif kind == 'end':
++            _close(scopes, {'module', 'submodule', 'procedure'})
++        elif kind in {'end_interface', 'end_type'}:
++            _close(scopes, {kind[4:]})
++    return list(dict.fromkeys(writes)), list(dict.fromkeys(reads))
++
++
++def _context(scopes: T.List[_Scope]) -> str:
++    """Where the next statement is: 'top' outside any program unit,
++    'interface' directly in an interface block, 'contains' after a CONTAINS
++    statement, otherwise 'specification'."""
++    if not scopes:
++        return 'top'
++    if scopes[-1].kind == 'interface':
++        return 'interface'
++    return 'contains' if scopes[-1].contains else 'specification'
++
++
++def _close(scopes: T.List[_Scope], kinds: T.Collection[str]) -> None:
++    for i in range(len(scopes) - 1, -1, -1):
++        if scopes[i].kind in kinds:
++            del scopes[i:]
++            return
++
++
++def _free_statement(statement: str, context: str) -> T.Tuple[str, T.List[str]]:
++    tokens = _FREE_TOKEN.findall(statement)
++    if len(tokens) == 2 and tokens[0] == 'module' and _NAME.fullmatch(tokens[1]):
++        return 'module', [tokens[1]]
++    if tokens[:2] == ['submodule', '(']:
++        try:
++            close = tokens.index(')')
++        except ValueError:
++            return '', []
++        inside = [t for t in tokens[2:close] if t != ':']
++        if 1 <= len(inside) <= 2 and close + 1 < len(tokens):
++            return 'submodule', [inside[0], inside[1] if len(inside) == 2 else '', tokens[close + 1]]
++        return '', []
++    if tokens[:1] == ['use'] and len(tokens) > 1:
++        rest = tokens[1:]
++        intrinsic = False
++        if rest[0] == ',':
++            if len(rest) < 2:
++                return '', []
++            intrinsic = rest[1] == 'intrinsic'
++            rest = rest[2:]
++        if rest[:1] == ['::']:
++            rest = rest[1:]
++        if rest and _NAME.fullmatch(rest[0]) and not intrinsic:
++            return 'use', [rest[0]]
++        return '', []
++    if len(tokens) == 2 and tokens[0] == 'program' and _NAME.fullmatch(tokens[1]):
++        return 'unit', []
++    if tokens[:2] == ['block', 'data'] or tokens[:1] == ['blockdata']:
++        return 'unit', []
++    if tokens == ['contains']:
++        return 'contains', []
++    if tokens == ['abstract', 'interface'] or tokens[:1] == ['interface'] and (
++            len(tokens) == 1 or len(tokens) == 2 and _NAME.fullmatch(tokens[1])
++            or tokens[1] in {'operator', 'assignment', 'read', 'write'} and tokens[2:3] == ['(']):
++        return 'interface', []
++    if tokens[:1] == ['type'] and (tokens[1:2] in (['::'], [',']) or len(tokens) == 2 and _NAME.fullmatch(tokens[1])):
++        return 'type', []
++    end = _free_end(tokens)
++    if end:
++        return end, []
++    if tokens[:2] == ['module', 'procedure']:
++        return ('procedure' if context == 'contains' else ''), []
++    if context not in {'top', 'interface', 'contains'}:
++        return '', []
++    i = 0
++    seen_module = False
++    while i < len(tokens):
++        tok = tokens[i]
++        if tok in _PREFIX_WORDS:
++            seen_module = seen_module or tok == 'module'
++            i += 1
++        elif tok in _TYPE_WORDS or tok == 'double':
++            i += 2 if tok == 'double' else 1
++            if tokens[i:i + 1] == ['(']:
++                i = _skip_parens(tokens, i)
++            elif tokens[i:i + 1] == ['*']:
++                i = _skip_parens(tokens, i + 1) if tokens[i + 1:i + 2] == ['('] else i + 2
++        else:
++            break
++    named = i + 1 < len(tokens) and _NAME.fullmatch(tokens[i + 1]) is not None
++    if named and (tokens[i] == 'subroutine' or tokens[i] == 'function'
++                  and tokens[i + 2:i + 3] in (['('], ['result'], ['bind'], [])):
++        return ('separate' if seen_module else 'procedure'), []
++    return '', []
++
++
++def _free_end(tokens: T.List[str]) -> str:
++    words = list(tokens)
++    if words[:3] == ['end', 'block', 'data'] or words[:2] in (['endblock', 'data'], ['end', 'blockdata']):
++        words = ['endblockdata'] + words[3 if words[:3] == ['end', 'block', 'data'] else 2:]
++    elif words[:1] == ['end'] and len(words) > 1 and words[1] in _UNIT_KINDS | {'interface', 'type'}:
++        words = ['end' + words[1]] + words[2:]
++    if words == ['end']:
++        return 'end'
++    if words[0] in {'endinterface', 'endtype'}:
++        return 'end_' + words[0][3:]
++    if words[0][:3] == 'end' and words[0][3:] in _UNIT_KINDS and len(words) <= 2:
++        return 'end'
++    return ''
++
++
++def _skip_parens(tokens: T.List[str], i: int) -> int:
++    depth = 0
++    while i < len(tokens):
++        if tokens[i] == '(':
++            depth += 1
++        elif tokens[i] == ')':
++            depth -= 1
++            if depth == 0:
++                return i + 1
++        i += 1
++    return i
++
++
++_FIXED_INTERFACE = re.compile(r'(?:abstract)?interface(?:[a-z][a-z0-9_]*|(?:operator|assignment)\(.*\)'
++                              r'|(?:read|write)\((?:un)?formatted\))?')
++
++
++def _fixed_statement(statement: str, context: str) -> T.Tuple[str, T.List[str]]:
++    # Blanks mean nothing in fixed form, so MODULE PROCEDURE X and a module
++    # named PROCEDUREX look the same. Like gfortran, only a statement
++    # outside any program unit is read as a MODULE statement.
++    if context == 'top' and statement.startswith('module') and _NAME.fullmatch(statement[6:]):
++        return 'module', [statement[6:]]
++    if statement.startswith('submodule('):
++        m = re.fullmatch(r'submodule\(([a-z][a-z0-9_]*)(?::([a-z][a-z0-9_]*))?\)([a-z][a-z0-9_]*)', statement)
++        if m:
++            return 'submodule', [m.group(1), m.group(2) or '', m.group(3)]
++        return '', []
++    if statement.startswith('use'):
++        m = re.match(r'use(?:,(intrinsic|non_intrinsic)::|::)?([a-z][a-z0-9_]*)(?:,|$)', statement)
++        if m and m.group(1) != 'intrinsic':
++            return 'use', [m.group(2)]
++    if context == 'top' and (statement.startswith('program') and _NAME.fullmatch(statement[7:])
++                             or re.fullmatch(r'blockdata(?:[a-z][a-z0-9_]*)?', statement)):
++        return 'unit', []
++    if statement == 'contains':
++        return 'contains', []
++    if _FIXED_INTERFACE.fullmatch(statement):
++        return 'interface', []
++    if re.fullmatch(r'type(?:[,:].*|[a-z][a-z0-9_]*)', statement):
++        return 'type', []
++    if statement.startswith('end'):
++        rest = statement[3:]
++        if rest.startswith(('interface', 'type')):
++            return ('end_interface' if rest.startswith('interface') else 'end_type'), []
++        if not rest or any(rest.startswith(k) and (rest == k or _NAME.fullmatch(rest[len(k):])) for k in _UNIT_KINDS):
++            return 'end', []
++    if statement.startswith('moduleprocedure'):
++        return ('procedure' if context == 'contains' else ''), []
++    if context not in {'top', 'interface', 'contains'}:
++        return '', []
++    procedure = _fixed_procedure(statement)
++    if procedure is None:
++        return '', []
++    return ('separate' if procedure else 'procedure'), []
++
++
++def _fixed_procedure(statement: str) -> T.Optional[bool]:
++    """Whether a fixed-form FUNCTION or SUBROUTINE statement has the MODULE
++    prefix, or None for any other statement. Without blanks only the argument
++    list tells a FUNCTION statement from a declaration such as INTEGER
++    FUNCTIONX, and F RESULT(R) is the function FRESULT(R). A type can only
++    come before FUNCTION, so INTEGER SUBROUTINES declares a variable."""
++    pos = 0
++    seen_module = False
++    typed = False
++    while True:
++        for word in _PREFIX_WORDS:
++            if statement.startswith(word, pos):
++                seen_module = seen_module or word == 'module'
++                pos += len(word)
++                break
++        else:
++            for word in _TYPE_WORDS:
++                if statement.startswith(word, pos):
++                    typed = True
++                    pos += len(word)
++                    if statement.startswith('(', pos):
++                        pos = _skip_text_parens(statement, pos)
++                    elif statement.startswith('*', pos):
++                        m = re.match(r'\*(?:\([^)]*\)|[0-9]+)', statement[pos:])
++                        pos += m.end() if m else 1
++                    break
++            else:
++                break
++    if statement.startswith('subroutine', pos) and not typed:
++        m = re.fullmatch(r'[a-z][a-z0-9_]*(?:\(.*)?', statement[pos + 10:])
++    elif statement.startswith('function', pos):
++        m = re.fullmatch(r'[a-z][a-z0-9_]*\(.*', statement[pos + 8:])
++    else:
++        m = None
++    return seen_module if m else None
++
++
++def _skip_text_parens(text: str, i: int) -> int:
++    depth = 0
++    while i < len(text):
++        if text[i] == '(':
++            depth += 1
++        elif text[i] == ')':
++            depth -= 1
++            if depth == 0:
++                return i + 1
++        i += 1
++    return i

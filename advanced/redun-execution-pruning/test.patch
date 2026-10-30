@@ -1,0 +1,1573 @@
+diff --git a/redun/tests/test_db_prune_0e57d3.py b/redun/tests/test_db_prune_0e57d3.py
+new file mode 100644
+index 0000000..0a1b897
+--- /dev/null
++++ b/redun/tests/test_db_prune_0e57d3.py
+@@ -0,0 +1,1399 @@
++import os
++from typing import Any
++
++import pytest
++from sqlalchemy.orm import Session
++
++from redun import File, Handle, Scheduler, apply_tags, catch, get_context, task
++from redun.backends.base import TagEntity
++from redun.backends.db import (
++    Argument,
++    ArgumentResult,
++    CallEdge,
++    CallNode,
++    CallSubtreeTask,
++    Evaluation,
++    Execution,
++    HandleEdge,
++    Job,
++    RedunBackendDb,
++    Subvalue,
++    Tag,
++    TagEdit,
++    Value,
++)
++from redun.backends.db import File as FileRow
++from redun.backends.db import Handle as HandleRow
++from redun.backends.db import Task as TaskRow
++from redun.config import Config
++from redun.hashing import hash_eval
++
++redun_namespace = "redun.tests.test_db_prune_0e57d3"
++
++TABLES = [
++    Execution,
++    Job,
++    CallNode,
++    CallEdge,
++    Argument,
++    ArgumentResult,
++    CallSubtreeTask,
++    Evaluation,
++    Value,
++    Subvalue,
++    FileRow,
++    HandleRow,
++    HandleEdge,
++    TaskRow,
++    Tag,
++    TagEdit,
++]
++RECORD_TABLES = {
++    "Execution": Execution,
++    "Job": Job,
++    "CallNode": CallNode,
++    "Value": Value,
++    "Tag": Tag,
++}
++RECORD_KEYS = {
++    "Execution": "id",
++    "Job": "id",
++    "CallNode": "call_hash",
++    "Value": "value_hash",
++    "Tag": "tag_hash",
++}
++
++EXEC_A = "a1a1a1a1-0000-4000-8000-00000000000a"
++EXEC_B = "b2b2b2b2-0000-4000-8000-00000000000b"
++EXEC_C = "c3c3c3c3-0000-4000-8000-00000000000c"
++EXEC_D = "d4d4d4d4-0000-4000-8000-00000000000d"
++
++CALLS: list[str] = []
++RUNS: list[int] = []
++
++
++@pytest.fixture(autouse=True)
++def reset_calls():
++    CALLS.clear()
++    RUNS.clear()
++    yield
++    CALLS.clear()
++    RUNS.clear()
++
++
++@task()
++def inc(x: int) -> int:
++    CALLS.append("inc")
++    return x + 1
++
++
++@task()
++def double(x: int) -> int:
++    CALLS.append("double")
++    return 2 * x
++
++
++@task()
++def add(a: int, b: int) -> int:
++    CALLS.append("add")
++    return a + b
++
++
++@task()
++def pipeline(x: int) -> int:
++    CALLS.append("pipeline")
++    return add(inc(x), double(x))
++
++
++@task()
++def after_pipeline(x: int) -> int:
++    CALLS.append("after_pipeline")
++    return inc(pipeline(x))
++
++
++@task()
++def both(x: int, y: int) -> int:
++    CALLS.append("both")
++    return add(inc(x), double(y))
++
++
++@task()
++def five() -> int:
++    CALLS.append("five")
++    return 5
++
++
++@task()
++def changing(x: int) -> int:
++    CALLS.append("changing")
++    RUNS.append(x)
++    return x + len(RUNS)
++
++
++@task()
++def after_changing(x: int) -> int:
++    CALLS.append("after_changing")
++    return inc(changing(x))
++
++
++@task(check_valid="shallow")
++def outer(x: int) -> int:
++    CALLS.append("outer")
++    return inc(double(x))
++
++
++@task(check_valid="shallow")
++def spread(x: int) -> list[int]:
++    CALLS.append("spread")
++    return [inc(x), double(x)]
++
++
++@task(check_valid="shallow")
++def shallow_inc(x: int) -> int:
++    CALLS.append("shallow_inc")
++    return x + 1
++
++
++@task()
++def shallow_pipeline(x: int) -> int:
++    CALLS.append("shallow_pipeline")
++    return add(shallow_inc(x), 1)
++
++
++@task()
++def apply_task(func: Any, x: int) -> int:
++    CALLS.append("apply_task")
++    return func(x)
++
++
++@task()
++def fail(x: int) -> int:
++    CALLS.append("fail")
++    raise ValueError("boom")
++
++
++@task()
++def failing(x: int) -> int:
++    CALLS.append("failing")
++    return inc(fail(x))
++
++
++@task()
++def fail_beside(x: int) -> list[int]:
++    CALLS.append("fail_beside")
++    return [fail(x), inc(x)]
++
++
++@task()
++def recover(error: Any) -> int:
++    CALLS.append("recover")
++    return 0
++
++
++@task()
++def write_file(path: str, text: str) -> File:
++    CALLS.append("write_file")
++    file = File(path)
++    file.write(text)
++    return file
++
++
++@task()
++def read_files(files: list[File]) -> str:
++    CALLS.append("read_files")
++    return "".join(file.read() for file in files)
++
++
++@task()
++def file_flow(dirname: str, names: list[str]) -> str:
++    CALLS.append("file_flow")
++    return read_files([write_file(os.path.join(dirname, name), name) for name in names])
++
++
++@task()
++def read_file(file: File) -> str:
++    CALLS.append("read_file")
++    return file.read()
++
++
++class Conn(Handle):
++    def __init__(self, name: str, uri: str, namespace: str | None = None):
++        self.uri = uri
++
++
++@task()
++def use_conn(conn: Conn, x: int) -> Conn:
++    CALLS.append("use_conn")
++    return conn
++
++
++@task()
++def conn_flow(last: int) -> Conn:
++    CALLS.append("conn_flow")
++    conn = Conn("conn", "db://data")
++    return use_conn(use_conn(conn, 1), last)
++
++
++@task()
++def fork_flow(last: int) -> Conn:
++    CALLS.append("fork_flow")
++    conn = Conn("conn", "db://data")
++    return use_conn(conn.fork("a").fork("b"), last)
++
++
++@task()
++def numbered_fork_flow(last: int) -> list[Conn]:
++    CALLS.append("numbered_fork_flow")
++    conn = Conn("conn", "db://data")
++    return [use_conn(conn.fork(key), last) for key in ["7", "8"]]
++
++
++@task()
++def fork_in_child(conn: Conn) -> Conn:
++    CALLS.append("fork_in_child")
++    return use_conn(conn.fork("z"), 9)
++
++
++@task()
++def child_fork_flow() -> Conn:
++    CALLS.append("child_fork_flow")
++    conn = Conn("conn", "db://data")
++    return fork_in_child(conn)
++
++
++@task()
++def take_conn(conn: Conn) -> int:
++    CALLS.append("take_conn")
++    return 1
++
++
++@task()
++def pass_conn_on(conn: Conn) -> int:
++    CALLS.append("pass_conn_on")
++    return take_conn(conn)
++
++
++@task(tags=[("stage", "prep")])
++def tagged(x: int, owner: str) -> int:
++    CALLS.append("tagged")
++    return apply_tags(
++        x + 100,
++        [("quality", owner)],
++        job_tags=[("step", owner)],
++        execution_tags=[("owner", owner)],
++    )
++
++
++@task()
++def with_context(x: int, offset: int = get_context("offset", 0)) -> int:
++    CALLS.append("with_context")
++    return x + offset
++
++
++def execution_ids(session: Session) -> set[str]:
++    return {id for (id,) in session.query(Execution.id)}
++
++
++def table_sizes(session: Session) -> dict[str, int]:
++    return {table.__tablename__: session.query(table).count() for table in TABLES}
++
++
++def record_counts(session: Session) -> dict[str, int]:
++    return {name: session.query(table).count() for name, table in RECORD_TABLES.items()}
++
++
++def removed_counts(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
++    return {name: before[name] - after[name] for name in before}
++
++
++def empty_sizes() -> dict[str, int]:
++    return {table.__tablename__: 0 for table in TABLES}
++
++
++def table_rows(session: Session) -> dict[str, list[tuple]]:
++    return {
++        table.__tablename__: sorted(
++            tuple(repr(value) for value in row)
++            for row in session.execute(table.__table__.select())
++        )
++        for table in TABLES
++    }
++
++
++def record_ids(backend: RedunBackendDb, *execution_ids: str) -> set[str]:
++    return set(backend.iter_record_ids(list(execution_ids)))
++
++
++def records_of(backend: RedunBackendDb, *execution_ids: str) -> dict[str, dict]:
++    ids = sorted(record_ids(backend, *execution_ids))
++    return {record[RECORD_KEYS[record["_type"]]]: record for record in backend.get_records(ids)}
++
++
++def job_count(session: Session, execution_id: str) -> int:
++    return session.query(Job).filter(Job.execution_id == execution_id).count()
++
++
++def unfinished_tasks(session: Session, execution_id: str) -> list[str]:
++    jobs = session.query(Job).filter(Job.execution_id == execution_id, Job.call_hash.is_(None))
++    return sorted(job.task.name for job in jobs)
++
++
++def run_failing_serially(backend: RedunBackendDb, expr: Any, execution_id: str) -> None:
++    serial = Scheduler(
++        config=Config(
++            {
++                "scheduler": {"ignore_warnings": "namespace"},
++                "executors.default": {"type": "local", "max_workers": "1"},
++            }
++        ),
++        backend=backend,
++    )
++    with pytest.raises(ValueError):
++        serial.run(expr, execution_id=execution_id)
++
++
++def make_store_scheduler(root: str) -> Scheduler:
++    config = Config(
++        {
++            "scheduler": {"ignore_warnings": "namespace"},
++            "backend": {
++                "db_uri": "sqlite:///:memory:",
++                "value_store_path": root,
++                "value_store_min_size": "0",
++            },
++        }
++    )
++    scheduler = Scheduler(config=config)
++    scheduler.load()
++    return scheduler
++
++
++def stored_files(root: str) -> set[str]:
++    return {
++        os.path.join(dirname, filename)
++        for dirname, _, filenames in os.walk(root)
++        for filename in filenames
++    }
++
++
++def rows_where(session: Session, table: Any, column: str, ids: set[str]) -> list[tuple]:
++    query = table.__table__.select().where(table.__table__.c[column].in_(sorted(ids)))
++    return sorted(tuple(repr(value) for value in row) for row in session.execute(query))
++
++
++def rows_used_by(backend: RedunBackendDb, session: Session, execution_id: str) -> dict:
++    records = records_of(backend, execution_id)
++    call_hashes = {id for id, record in records.items() if record["_type"] == "CallNode"}
++    value_hashes = {id for id, record in records.items() if record["_type"] == "Value"}
++    calls = session.query(CallNode).filter(CallNode.call_hash.in_(sorted(call_hashes))).all()
++    task_hashes = {call.task_hash for call in calls}
++    keys = {(call.task_hash, call.args_hash) for call in calls}
++    arg_hashes = {
++        arg_hash
++        for (arg_hash,) in session.query(Argument.arg_hash).filter(
++            Argument.call_hash.in_(sorted(call_hashes))
++        )
++    }
++    evaluations = Evaluation.__table__.select().where(
++        Evaluation.__table__.c.task_hash.in_(sorted(task_hashes))
++    )
++    return {
++        "argument": rows_where(session, Argument, "call_hash", call_hashes),
++        "argument_result": rows_where(session, ArgumentResult, "arg_hash", arg_hashes),
++        "call_edge": rows_where(session, CallEdge, "parent_id", call_hashes),
++        "call_subtree_task": rows_where(session, CallSubtreeTask, "call_hash", call_hashes),
++        "evaluation": sorted(
++            tuple(repr(value) for value in row)
++            for row in session.execute(evaluations)
++            if (row.task_hash, row.args_hash) in keys
++        ),
++        "subvalue": rows_where(session, Subvalue, "parent_value_hash", value_hashes),
++        "task": rows_where(session, TaskRow, "hash", task_hashes),
++        "file": rows_where(session, FileRow, "value_hash", value_hashes),
++    }
++
++
++def test_prune_named_execution_removes_it_and_its_jobs(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(pipeline(1), execution_id=EXEC_A) == 4
++    assert scheduler.run(pipeline(10), execution_id=EXEC_B) == 31
++    jobs_a = job_count(session, EXEC_A)
++    jobs_b = job_count(session, EXEC_B)
++    assert jobs_a == 4
++
++    backend.prune([EXEC_A])
++
++    assert execution_ids(session) == {EXEC_B}
++    assert job_count(session, EXEC_A) == 0
++    assert job_count(session, EXEC_B) == jobs_b
++
++
++def test_prune_removes_records_only_the_execution_used(
++    scheduler: Scheduler, backend: RedunBackendDb
++) -> None:
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    scheduler.run(pipeline(10), execution_id=EXEC_B)
++    ids_a = record_ids(backend, EXEC_A)
++    ids_b = record_ids(backend, EXEC_B)
++    assert ids_a - ids_b
++    assert ids_a & ids_b
++
++    backend.prune([EXEC_A])
++
++    assert backend.has_records(sorted(ids_a - ids_b)) == []
++    assert set(backend.has_records(sorted(ids_b))) == ids_b
++
++
++def test_prune_leaves_remaining_execution_records_unchanged(
++    scheduler: Scheduler, backend: RedunBackendDb
++) -> None:
++    scheduler.run(pipeline(1), execution_id=EXEC_A, tags=[("project", "one")])
++    scheduler.run(both(1, 7), execution_id=EXEC_B, tags=[("project", "two")])
++    scheduler.run(pipeline(10), execution_id=EXEC_C)
++    records_b = records_of(backend, EXEC_B)
++    records_c = records_of(backend, EXEC_C)
++
++    backend.prune([EXEC_A])
++
++    assert records_of(backend, EXEC_B) == records_b
++    assert records_of(backend, EXEC_C) == records_c
++
++
++def test_pruned_call_is_computed_again(scheduler: Scheduler, backend: RedunBackendDb) -> None:
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert scheduler.run(pipeline(1)) == 4
++    assert sorted(CALLS) == ["add", "double", "inc", "pipeline"]
++
++
++def test_remaining_call_stays_cached(scheduler: Scheduler, backend: RedunBackendDb) -> None:
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    scheduler.run(pipeline(10), execution_id=EXEC_B)
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert scheduler.run(pipeline(10)) == 31
++    assert CALLS == []
++
++
++def test_call_shared_with_remaining_execution_stays_cached(
++    scheduler: Scheduler, backend: RedunBackendDb
++) -> None:
++    scheduler.run(both(1, 7), execution_id=EXEC_A)
++    scheduler.run(inc(1), execution_id=EXEC_B)
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert scheduler.run(inc(1)) == 2
++    assert CALLS == []
++    assert scheduler.run(double(7)) == 14
++    assert CALLS == ["double"]
++    CALLS.clear()
++    assert scheduler.run(both(1, 7)) == 16
++    assert sorted(CALLS) == ["add", "both"]
++
++
++def test_pruned_call_is_not_cached_through_a_shared_result_value(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(inc(4), execution_id=EXEC_A) == 5
++    assert scheduler.run(five(), execution_id=EXEC_B) == 5
++    records_b = records_of(backend, EXEC_B)
++    calls_before = session.query(CallNode).count()
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert session.query(CallNode).count() == calls_before - 1
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(five()) == 5
++    assert CALLS == []
++    assert scheduler.run(inc(4)) == 5
++    assert CALLS == ["inc"]
++
++
++def test_pruned_call_is_computed_again_when_its_result_fed_a_remaining_call(
++    scheduler: Scheduler, backend: RedunBackendDb
++) -> None:
++    assert scheduler.run(pipeline(1), execution_id=EXEC_A) == 4
++    assert scheduler.run(add(2, 2), execution_id=EXEC_B) == 4
++    assert CALLS.count("add") == 1
++    records_b = records_of(backend, EXEC_B)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(add(2, 2)) == 4
++    assert CALLS == []
++    assert scheduler.run(inc(1)) == 2
++    assert scheduler.run(double(1)) == 2
++    assert sorted(CALLS) == ["double", "inc"]
++
++
++def test_pruned_nested_call_is_computed_again_when_its_result_fed_a_remaining_call(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(after_pipeline(1), execution_id=EXEC_A) == 5
++    assert scheduler.run(inc(4), execution_id=EXEC_B) == 5
++    assert CALLS.count("inc") == 2
++    records_b = records_of(backend, EXEC_B)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(inc(4)) == 5
++    assert CALLS == []
++    assert scheduler.run(pipeline(1)) == 4
++    assert sorted(CALLS) == ["add", "double", "inc", "pipeline"]
++
++
++def test_pruned_shallow_call_is_computed_again_when_its_result_fed_a_remaining_call(
++    scheduler: Scheduler, backend: RedunBackendDb
++) -> None:
++    assert scheduler.run(shallow_pipeline(1), execution_id=EXEC_A) == 3
++    assert scheduler.run(add(2, 1), execution_id=EXEC_B) == 3
++    assert CALLS.count("add") == 1
++    records_b = records_of(backend, EXEC_B)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(add(2, 1)) == 3
++    assert CALLS == []
++    assert scheduler.run(shallow_inc(1)) == 2
++    assert CALLS == ["shallow_inc"]
++
++
++def test_passed_on_call_stays_cached_when_another_remaining_execution_made_it(
++    scheduler: Scheduler, backend: RedunBackendDb
++) -> None:
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    scheduler.run(add(2, 2), execution_id=EXEC_B)
++    scheduler.run(inc(1), execution_id=EXEC_C)
++    records_b = records_of(backend, EXEC_B)
++    records_c = records_of(backend, EXEC_C)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert records_of(backend, EXEC_B) == records_b
++    assert records_of(backend, EXEC_C) == records_c
++    assert scheduler.run(inc(1)) == 2
++    assert scheduler.run(add(2, 2)) == 4
++    assert CALLS == []
++    assert scheduler.run(double(1)) == 2
++    assert CALLS == ["double"]
++
++
++def test_remaining_call_keeps_its_argument_source_through_a_later_prune(
++    scheduler: Scheduler, backend: RedunBackendDb
++) -> None:
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    scheduler.run(add(2, 2), execution_id=EXEC_B)
++    records_b = records_of(backend, EXEC_B)
++    backend.prune([EXEC_A])
++    assert scheduler.run(inc(1), execution_id=EXEC_C) == 2
++
++    backend.prune([EXEC_C])
++    CALLS.clear()
++
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(add(2, 2)) == 4
++    assert CALLS == []
++    assert scheduler.run(inc(1)) == 2
++    assert CALLS == ["inc"]
++
++
++def test_prune_empties_repository_when_a_result_fed_a_remaining_call(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(after_pipeline(1), execution_id=EXEC_A)
++    scheduler.run(inc(4), execution_id=EXEC_B)
++
++    backend.prune([EXEC_A])
++    backend.prune([EXEC_B])
++
++    assert table_sizes(session) == empty_sizes()
++
++
++def test_execution_repeated_later_loses_only_its_own_records(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    scheduler.run(pipeline(1), execution_id=EXEC_B)
++    jobs_a = job_count(session, EXEC_A)
++    records_b = records_of(backend, EXEC_B)
++    before = record_counts(session)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    removed = removed_counts(before, record_counts(session))
++    assert removed["Execution"] == 1
++    assert removed["Job"] == jobs_a
++    assert removed["CallNode"] == 0
++    assert removed["Value"] == 0
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(pipeline(1)) == 4
++    assert CALLS == []
++
++
++def test_remaining_shallow_execution_keeps_child_calls(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(outer(3), execution_id=EXEC_A) == 7
++    assert scheduler.run(outer(3), execution_id=EXEC_B) == 7
++    assert job_count(session, EXEC_A) == 3
++    assert job_count(session, EXEC_B) == 1
++    records_b = records_of(backend, EXEC_B)
++    call_nodes = session.query(CallNode).count()
++    assert call_nodes == 3
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert session.query(CallNode).count() == call_nodes
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(outer(3)) == 7
++    assert CALLS == []
++
++
++def test_remaining_shallow_execution_survives_later_prunes(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(outer(3), execution_id=EXEC_A) == 7
++    assert scheduler.run(outer(3), execution_id=EXEC_B) == 7
++    assert scheduler.run(double(3), execution_id=EXEC_C) == 6
++    assert job_count(session, EXEC_B) == 1
++    records_b = records_of(backend, EXEC_B)
++
++    backend.prune([EXEC_A])
++    backend.prune([EXEC_C])
++    CALLS.clear()
++
++    assert execution_ids(session) == {EXEC_B}
++    assert session.query(CallNode).count() == 3
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(outer(3)) == 7
++    assert CALLS == []
++
++
++def test_remaining_shallow_execution_keeps_child_call_its_other_user_lost(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(spread(3), execution_id=EXEC_A) == [4, 6]
++    assert scheduler.run(spread(3), execution_id=EXEC_B) == [4, 6]
++    assert scheduler.run(double(3), execution_id=EXEC_C) == 6
++    assert job_count(session, EXEC_B) == 1
++    records_b = records_of(backend, EXEC_B)
++    call_nodes = session.query(CallNode).count()
++
++    backend.prune([EXEC_A])
++    backend.prune([EXEC_C])
++    CALLS.clear()
++
++    assert session.query(CallNode).count() == call_nodes
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(spread(3)) == [4, 6]
++    assert CALLS == []
++
++
++def test_call_run_again_by_remaining_execution_stays_cached(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(changing(10), execution_id=EXEC_A) == 11
++    assert scheduler.run(changing(10), execution_id=EXEC_B, cache=False) == 12
++    assert session.query(CallNode).count() == 2
++    records_b = records_of(backend, EXEC_B)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert session.query(CallNode).count() == 1
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(changing(10)) == 12
++    assert CALLS == []
++
++
++def test_remaining_call_keeps_cached_result_of_a_pruned_rerun(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(changing(10), execution_id=EXEC_A) == 11
++    assert scheduler.run(changing(10), execution_id=EXEC_B, cache=False) == 12
++    records_a = records_of(backend, EXEC_A)
++
++    backend.prune([EXEC_B])
++    CALLS.clear()
++
++    assert records_of(backend, EXEC_A) == records_a
++    assert scheduler.run(changing(10)) == 12
++    assert CALLS == []
++
++
++def test_pruned_rerun_of_a_call_kept_as_an_argument_source_is_computed_again(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(after_changing(10), execution_id=EXEC_A) == 12
++    assert scheduler.run(inc(11), execution_id=EXEC_B) == 12
++    records_b = records_of(backend, EXEC_B)
++    backend.prune([EXEC_A])
++    assert scheduler.run(changing(10), execution_id=EXEC_C, cache=False) == 12
++
++    backend.prune([EXEC_C])
++    CALLS.clear()
++
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(changing(10)) == 13
++    assert CALLS == ["changing"]
++    assert scheduler.run(inc(11)) == 12
++    assert CALLS == ["changing"]
++
++
++def test_prune_two_executions_that_share_work(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    scheduler.run(pipeline(1), execution_id=EXEC_B)
++    scheduler.run(pipeline(10), execution_id=EXEC_C)
++    ids_ab = record_ids(backend, EXEC_A, EXEC_B)
++    ids_c = record_ids(backend, EXEC_C)
++    records_c = records_of(backend, EXEC_C)
++    before = record_counts(session)
++
++    backend.prune([EXEC_A, EXEC_B])
++    CALLS.clear()
++
++    assert removed_counts(before, record_counts(session))["CallNode"] == 4
++    assert backend.has_records(sorted(ids_ab - ids_c)) == []
++    assert records_of(backend, EXEC_C) == records_c
++    assert scheduler.run(pipeline(1)) == 4
++    assert sorted(CALLS) == ["add", "double", "inc", "pipeline"]
++
++
++def test_prune_every_execution_empties_repository(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    scheduler.run(pipeline(1), execution_id=EXEC_B)
++    scheduler.run(both(1, 7), execution_id=EXEC_C)
++    assert all(table_sizes(session)[name] > 0 for name in ["evaluation", "call_edge", "task"])
++
++    backend.prune([EXEC_A, EXEC_B, EXEC_C])
++
++    assert table_sizes(session) == empty_sizes()
++
++
++def test_prune_every_execution_one_at_a_time_empties_repository(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    scheduler.run(pipeline(1), execution_id=EXEC_B)
++    scheduler.run(both(1, 7), execution_id=EXEC_C)
++
++    for execution_id in [EXEC_B, EXEC_C, EXEC_A]:
++        backend.prune([execution_id])
++
++    assert table_sizes(session) == empty_sizes()
++
++
++def test_prune_empties_repository_with_files(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session, tmp_path
++) -> None:
++    assert scheduler.run(file_flow(str(tmp_path), ["a", "b"]), execution_id=EXEC_A) == "ab"
++    sizes = table_sizes(session)
++    assert sizes["file"] == 2
++    assert sizes["subvalue"] > 0
++
++    backend.prune([EXEC_A])
++
++    assert table_sizes(session) == empty_sizes()
++
++
++def test_prune_keeps_file_used_by_remaining_execution(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session, tmp_path
++) -> None:
++    assert scheduler.run(file_flow(str(tmp_path), ["a", "b"]), execution_id=EXEC_A) == "ab"
++    path_a = os.path.join(str(tmp_path), "a")
++    path_b = os.path.join(str(tmp_path), "b")
++    assert scheduler.run(read_file(File(path_a)), execution_id=EXEC_B) == "a"
++    records_b = records_of(backend, EXEC_B)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert [row.path for row in session.query(FileRow)] == [path_a]
++    assert session.query(Subvalue).count() == 0
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(read_file(File(path_a))) == "a"
++    assert CALLS == []
++    assert scheduler.run(read_file(File(path_b))) == "b"
++    assert CALLS == ["read_file"]
++
++
++def test_prune_leaves_rows_used_by_remaining_execution_unchanged(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session, tmp_path
++) -> None:
++    assert scheduler.run(file_flow(str(tmp_path), ["a", "b"]), execution_id=EXEC_A) == "ab"
++    assert scheduler.run(file_flow(str(tmp_path), ["a"]), execution_id=EXEC_B) == "a"
++    rows_b = rows_used_by(backend, session, EXEC_B)
++    assert all(
++        rows_b[name] for name in ["argument", "call_edge", "evaluation", "subvalue", "task"]
++    )
++
++    backend.prune([EXEC_A])
++
++    assert rows_used_by(backend, session, EXEC_B) == rows_b
++
++
++def test_prune_leaves_rows_used_by_remaining_shallow_execution_unchanged(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(outer(3), execution_id=EXEC_A) == 7
++    assert scheduler.run(outer(3), execution_id=EXEC_B) == 7
++    assert job_count(session, EXEC_B) == 1
++    rows_b = rows_used_by(backend, session, EXEC_B)
++    assert len(rows_b["evaluation"]) == 3
++
++    backend.prune([EXEC_A])
++
++    assert rows_used_by(backend, session, EXEC_B) == rows_b
++
++
++def test_prune_every_execution_empties_value_store(tmp_path) -> None:
++    root = str(tmp_path / "values")
++    scheduler = make_store_scheduler(root)
++    backend = scheduler.backend
++    assert isinstance(backend, RedunBackendDb) and backend.session
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    scheduler.run(both(1, 7), execution_id=EXEC_B)
++    assert stored_files(root)
++
++    backend.prune([EXEC_A, EXEC_B])
++
++    assert table_sizes(backend.session) == empty_sizes()
++    assert stored_files(root) == set()
++
++
++def test_prune_removes_value_store_data_of_removed_values_only(tmp_path) -> None:
++    root = str(tmp_path / "values")
++    scheduler = make_store_scheduler(root)
++    backend = scheduler.backend
++    assert isinstance(backend, RedunBackendDb) and backend.session and backend.value_store
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    scheduler.run(pipeline(10), execution_id=EXEC_B)
++    before = {value_hash for (value_hash,) in backend.session.query(Value.value_hash)}
++    assert all(backend.value_store.has(value_hash) for value_hash in before)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    after = {value_hash for (value_hash,) in backend.session.query(Value.value_hash)}
++    assert after < before
++    assert not any(backend.value_store.has(value_hash) for value_hash in before - after)
++    assert all(backend.value_store.has(value_hash) for value_hash in after)
++    assert scheduler.run(pipeline(10)) == 31
++    assert CALLS == []
++    assert scheduler.run(pipeline(1)) == 4
++    assert sorted(CALLS) == ["add", "double", "inc", "pipeline"]
++
++
++def test_prune_keeps_value_store_data_of_values_outside_executions(tmp_path) -> None:
++    root = str(tmp_path / "values")
++    scheduler = make_store_scheduler(root)
++    backend = scheduler.backend
++    assert isinstance(backend, RedunBackendDb) and backend.session and backend.value_store
++    kept_hash = backend.record_value("recorded directly")
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    assert backend.value_store.has(kept_hash)
++    assert len(stored_files(root)) > 1
++
++    backend.prune([EXEC_A])
++
++    assert backend.get_value(kept_hash) == ("recorded directly", True)
++    assert backend.value_store.has(kept_hash)
++    assert len(stored_files(root)) == 1
++    assert table_sizes(backend.session)["value"] == 1
++
++
++def test_prune_empties_repository_with_handles(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(conn_flow(2), execution_id=EXEC_A)
++    sizes = table_sizes(session)
++    assert sizes["handle"] > 0
++    assert sizes["handle_edge"] > 0
++
++    backend.prune([EXEC_A])
++
++    assert table_sizes(session) == empty_sizes()
++
++
++def test_remaining_handle_workflow_stays_cached(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(conn_flow(2), execution_id=EXEC_A)
++    scheduler.run(conn_flow(3), execution_id=EXEC_B)
++    records_b = records_of(backend, EXEC_B)
++    handles = session.query(HandleRow).count()
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert session.query(HandleRow).count() < handles
++    assert records_of(backend, EXEC_B) == records_b
++    scheduler.run(conn_flow(3))
++    assert CALLS == []
++
++
++def test_prune_empties_repository_with_forked_handles(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(fork_flow(2), execution_id=EXEC_A)
++    assert table_sizes(session)["handle"] > 0
++
++    backend.prune([EXEC_A])
++
++    assert table_sizes(session) == empty_sizes()
++
++
++def test_remaining_execution_keeps_forked_handle_lineage(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(fork_flow(2), execution_id=EXEC_A)
++    scheduler.run(fork_flow(3), execution_id=EXEC_B)
++    records_b = records_of(backend, EXEC_B)
++    alone = Scheduler(config=Config({"scheduler": {"ignore_warnings": "namespace"}}))
++    alone.load()
++    alone.run(fork_flow(3), execution_id=EXEC_B)
++    assert isinstance(alone.backend, RedunBackendDb) and alone.backend.session
++    expected = table_rows(alone.backend.session)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    rows = table_rows(session)
++    assert rows["handle"] == expected["handle"]
++    assert rows["handle_edge"] == expected["handle_edge"]
++    assert records_of(backend, EXEC_B) == records_b
++    scheduler.run(fork_flow(3))
++    assert CALLS == []
++
++
++def test_prune_removes_forked_handles_of_a_state_a_remaining_execution_uses(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(fork_flow(2), execution_id=EXEC_A)
++    scheduler.run(conn_flow(3), execution_id=EXEC_B)
++    records_b = records_of(backend, EXEC_B)
++    alone = Scheduler(config=Config({"scheduler": {"ignore_warnings": "namespace"}}))
++    alone.load()
++    alone.run(conn_flow(3), execution_id=EXEC_B)
++    assert isinstance(alone.backend, RedunBackendDb) and alone.backend.session
++    expected = table_rows(alone.backend.session)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    rows = table_rows(session)
++    assert rows["handle"] == expected["handle"]
++    assert rows["handle_edge"] == expected["handle_edge"]
++    assert rows["value"] == expected["value"]
++    assert records_of(backend, EXEC_B) == records_b
++    scheduler.run(conn_flow(3))
++    assert CALLS == []
++
++
++def test_remaining_execution_keeps_forked_handles_of_a_state_the_pruned_one_used(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(conn_flow(3), execution_id=EXEC_A)
++    scheduler.run(fork_flow(2), execution_id=EXEC_B)
++    records_b = records_of(backend, EXEC_B)
++    alone = Scheduler(config=Config({"scheduler": {"ignore_warnings": "namespace"}}))
++    alone.load()
++    alone.run(fork_flow(2), execution_id=EXEC_B)
++    assert isinstance(alone.backend, RedunBackendDb) and alone.backend.session
++    expected = table_rows(alone.backend.session)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    rows = table_rows(session)
++    assert rows["handle"] == expected["handle"]
++    assert rows["handle_edge"] == expected["handle_edge"]
++    assert rows["value"] == expected["value"]
++    assert records_of(backend, EXEC_B) == records_b
++    scheduler.run(fork_flow(2))
++    assert CALLS == []
++
++
++def test_prune_removes_numbered_forks_of_a_state_a_remaining_execution_uses(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(numbered_fork_flow(2), execution_id=EXEC_A)
++    scheduler.run(conn_flow(3), execution_id=EXEC_B)
++    records_b = records_of(backend, EXEC_B)
++    alone = Scheduler(config=Config({"scheduler": {"ignore_warnings": "namespace"}}))
++    alone.load()
++    alone.run(conn_flow(3), execution_id=EXEC_B)
++    assert isinstance(alone.backend, RedunBackendDb) and alone.backend.session
++    expected = table_rows(alone.backend.session)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    rows = table_rows(session)
++    assert rows["handle"] == expected["handle"]
++    assert rows["handle_edge"] == expected["handle_edge"]
++    assert rows["value"] == expected["value"]
++    assert records_of(backend, EXEC_B) == records_b
++    scheduler.run(conn_flow(3))
++    assert CALLS == []
++
++
++def test_prune_removes_forks_a_child_task_made_from_a_state_a_remaining_execution_uses(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(child_fork_flow(), execution_id=EXEC_A)
++    scheduler.run(conn_flow(3), execution_id=EXEC_B)
++    records_b = records_of(backend, EXEC_B)
++    alone = Scheduler(config=Config({"scheduler": {"ignore_warnings": "namespace"}}))
++    alone.load()
++    alone.run(conn_flow(3), execution_id=EXEC_B)
++    assert isinstance(alone.backend, RedunBackendDb) and alone.backend.session
++    expected = table_rows(alone.backend.session)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    rows = table_rows(session)
++    assert rows["handle"] == expected["handle"]
++    assert rows["handle_edge"] == expected["handle_edge"]
++    assert rows["value"] == expected["value"]
++    assert records_of(backend, EXEC_B) == records_b
++    scheduler.run(conn_flow(3))
++    assert CALLS == []
++
++
++def test_remaining_execution_keeps_the_fork_it_passed_on_to_a_child_task(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(take_conn(Conn("conn", "db://data")), execution_id=EXEC_A)
++    scheduler.run(pass_conn_on(Conn("conn", "db://data")), execution_id=EXEC_B)
++    records_b = records_of(backend, EXEC_B)
++    alone = Scheduler(config=Config({"scheduler": {"ignore_warnings": "namespace"}}))
++    alone.load()
++    alone.run(pass_conn_on(Conn("conn", "db://data")), execution_id=EXEC_B)
++    assert isinstance(alone.backend, RedunBackendDb) and alone.backend.session
++    expected = table_rows(alone.backend.session)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    rows = table_rows(session)
++    assert rows["handle"] == expected["handle"]
++    assert rows["handle_edge"] == expected["handle_edge"]
++    assert rows["value"] == expected["value"]
++    assert records_of(backend, EXEC_B) == records_b
++    scheduler.run(pass_conn_on(Conn("conn", "db://data")))
++    assert CALLS == []
++
++
++def test_prune_leaves_remaining_handle_states_a_pruned_run_rolled_back_unchanged(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(conn_flow(3), execution_id=EXEC_B)
++    scheduler.run(conn_flow(4), execution_id=EXEC_A)
++    rolled_back = rows_where(session, HandleRow, "is_valid", {False})
++    assert rolled_back
++    handles = table_rows(session)["handle"]
++
++    backend.prune([EXEC_A])
++
++    assert rows_where(session, HandleRow, "is_valid", {False}) == rolled_back
++    assert set(table_rows(session)["handle"]) < set(handles)
++
++
++def test_prune_empties_repository_with_tags(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(tagged(1, "ann"), execution_id=EXEC_A, tags=[("project", "one")])
++    backend.update_tags(TagEntity.Execution, EXEC_A, ["project"], [("project", "two")])
++    backend.delete_tags(EXEC_A, [("owner", "ann")])
++    sizes = table_sizes(session)
++    assert sizes["tag"] >= 6
++    assert sizes["tag_edit"] == 2
++
++    backend.prune([EXEC_A])
++
++    assert table_sizes(session) == empty_sizes()
++
++
++def test_prune_removes_tags_of_removed_records_only(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(tagged(1, "ann"), execution_id=EXEC_A, tags=[("project", "one")])
++    scheduler.run(tagged(2, "bob"), execution_id=EXEC_B, tags=[("project", "two")])
++    backend.update_tags(TagEntity.Execution, EXEC_A, ["project"], [("project", "three")])
++    backend.delete_tags(EXEC_A, [("owner", "ann")])
++    backend.update_tags(TagEntity.Execution, EXEC_B, ["project"], [("project", "four")])
++    job_a = session.get(Execution, EXEC_A).job_id
++    job_b = session.get(Execution, EXEC_B).job_id
++    task_hash = session.get(Job, job_b).task_hash
++    tags_b = backend.get_tags([EXEC_B, job_b, task_hash])
++    records_b = records_of(backend, EXEC_B)
++    assert backend.get_tags([EXEC_A, job_a])
++
++    backend.prune([EXEC_A])
++
++    assert backend.get_tags([EXEC_A, job_a]) == {}
++    assert backend.get_tags([EXEC_B, job_b, task_hash]) == tags_b
++    assert tags_b[task_hash]["stage"] == ["prep"]
++    assert records_of(backend, EXEC_B) == records_b
++    assert {tag.value for tag in session.query(Tag).filter(Tag.key == "quality")} == {"bob"}
++    assert {tag.value for tag in session.query(Tag).filter(Tag.key == "project")} == {
++        "two",
++        "four",
++    }
++    assert session.query(Tag).filter(Tag.entity_id == "").count() == 0
++    assert session.query(TagEdit).count() == 1
++
++
++def test_prune_removes_tag_added_to_removed_value(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(inc(4), execution_id=EXEC_A)
++    scheduler.run(inc(40), execution_id=EXEC_B)
++    hash_5 = session.get(Execution, EXEC_A).job.call_node.value_hash
++    hash_41 = session.get(Execution, EXEC_B).job.call_node.value_hash
++    assert backend.get_value(hash_5) == (5, True)
++    backend.record_tags(TagEntity.Value, hash_5, [("note", "five")])
++    backend.record_tags(TagEntity.Value, hash_41, [("note", "forty-one")])
++
++    backend.prune([EXEC_A])
++
++    assert backend.get_value(hash_5) == (None, False)
++    assert backend.get_tags([hash_5, hash_41]) == {hash_41: {"note": ["forty-one"]}}
++    assert [tag.value for tag in session.query(Tag).filter(Tag.key == "note")] == ["forty-one"]
++
++
++def test_prune_keeps_tags_of_value_a_remaining_execution_uses(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(tagged(1, "ann"), execution_id=EXEC_A)
++    scheduler.run(tagged(1, "bob"), execution_id=EXEC_B)
++    value_hash = session.get(Execution, EXEC_B).job.call_node.value_hash
++    assert session.get(Execution, EXEC_A).job.call_node.value_hash == value_hash
++    tags = backend.get_tags([value_hash])
++    assert sorted(tags[value_hash]["quality"]) == ["ann", "bob"]
++
++    backend.prune([EXEC_A])
++
++    assert backend.get_value(value_hash) == (101, True)
++    assert backend.get_tags([value_hash]) == tags
++
++
++def test_prune_removes_task_only_the_execution_used(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(apply_task(double, 3), execution_id=EXEC_A) == 6
++    assert scheduler.run(apply_task(inc, 3), execution_id=EXEC_B) == 4
++    records_b = records_of(backend, EXEC_B)
++    assert {row.name for row in session.query(TaskRow)} == {"apply_task", "double", "inc"}
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert {row.name for row in session.query(TaskRow)} == {"apply_task", "inc"}
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(apply_task(inc, 3)) == 4
++    assert CALLS == []
++
++
++def test_prune_empties_repository_with_task_arguments(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(apply_task(double, 3), execution_id=EXEC_A)
++    scheduler.run(apply_task(inc, 3), execution_id=EXEC_B)
++
++    backend.prune([EXEC_A, EXEC_B])
++
++    assert table_sizes(session) == empty_sizes()
++
++
++def test_prune_empties_repository_with_failed_execution(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    with pytest.raises(ValueError):
++        scheduler.run(failing(1), execution_id=EXEC_A)
++    assert session.get(Execution, EXEC_A).status == "FAILED"
++    assert table_sizes(session)["call_node"] > 0
++
++    backend.prune([EXEC_A])
++
++    assert table_sizes(session) == empty_sizes()
++
++
++def test_remaining_failed_execution_is_unchanged(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    with pytest.raises(ValueError):
++        scheduler.run(failing(1), execution_id=EXEC_A)
++    scheduler.run(pipeline(1), execution_id=EXEC_B)
++    records_a = records_of(backend, EXEC_A)
++    unpruned = Scheduler(config=Config({"scheduler": {"ignore_warnings": "namespace"}}))
++    unpruned.load()
++    with pytest.raises(ValueError):
++        unpruned.run(failing(1), execution_id=EXEC_A)
++    unpruned.run(pipeline(1), execution_id=EXEC_B)
++    CALLS.clear()
++    with pytest.raises(ValueError):
++        unpruned.run(failing(1))
++    calls_without_prune = sorted(CALLS)
++
++    backend.prune([EXEC_B])
++    CALLS.clear()
++
++    assert records_of(backend, EXEC_A) == records_a
++    with pytest.raises(ValueError):
++        scheduler.run(failing(1))
++    assert sorted(CALLS) == calls_without_prune
++
++
++def test_pruned_call_is_computed_again_when_a_remaining_execution_left_its_task_unfinished(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    run_failing_serially(backend, fail_beside(1), EXEC_A)
++    assert unfinished_tasks(session, EXEC_A) == ["inc"]
++    assert scheduler.run(inc(5), execution_id=EXEC_B) == 6
++    jobs_a = rows_where(session, Job, "execution_id", {EXEC_A})
++
++    backend.prune([EXEC_B])
++    CALLS.clear()
++
++    assert rows_where(session, Job, "execution_id", {EXEC_A}) == jobs_a
++    assert scheduler.run(inc(5)) == 6
++    assert CALLS == ["inc"]
++
++
++def test_prune_empties_repository_with_context(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(with_context(1), execution_id=EXEC_A, context={"offset": 10}) == 11
++    assert session.query(Tag).filter(Tag.key == "redun.context").count() > 0
++
++    backend.prune([EXEC_A])
++
++    assert table_sizes(session) == empty_sizes()
++
++
++def test_remaining_context_execution_stays_cached(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(with_context(1), execution_id=EXEC_A, context={"offset": 10}) == 11
++    assert scheduler.run(with_context(2), execution_id=EXEC_B, context={"offset": 10}) == 12
++    records_b = records_of(backend, EXEC_B)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert records_of(backend, EXEC_B) == records_b
++    assert scheduler.run(with_context(2), context={"offset": 10}) == 12
++    assert CALLS == []
++    assert scheduler.run(with_context(1), context={"offset": 10}) == 11
++    assert CALLS == ["with_context"]
++
++
++def test_prune_leaves_catch_cache_entry_alone(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    assert scheduler.run(catch(fail(1), ValueError, recover), execution_id=EXEC_A) == 0
++    entries = (
++        session.query(Evaluation.eval_hash, Evaluation.value_hash)
++        .join(TaskRow, TaskRow.hash == Evaluation.task_hash)
++        .filter(TaskRow.name == "catch")
++    )
++    cached = sorted(entries.all())
++    assert cached
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert execution_ids(session) == set()
++    assert sorted(entries.all()) == cached
++    assert scheduler.run(catch(fail(1), ValueError, recover)) == 0
++    assert CALLS == ["recover"]
++
++
++def test_prune_leaves_cache_entry_recorded_outside_executions_alone(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++    run_failing_serially(backend, fail_beside(2), EXEC_B)
++    assert unfinished_tasks(session, EXEC_B) == ["inc"]
++    eval_hash, args_hash = hash_eval(scheduler.type_registry, inc.hash, (7,), {})
++    backend.set_eval_cache(eval_hash, inc.hash, args_hash, 8)
++
++    backend.prune([EXEC_A, EXEC_B])
++    CALLS.clear()
++
++    assert execution_ids(session) == set()
++    assert scheduler.run(inc(7)) == 8
++    assert CALLS == []
++
++
++def test_pruned_execution_can_be_run_again(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    scheduler.run(both(1, 7), execution_id=EXEC_A)
++    scheduler.run(pipeline(1), execution_id=EXEC_B)
++    records_a = records_of(backend, EXEC_A)
++    hashes = {id for id, record in records_a.items() if record["_type"] in ("CallNode", "Value")}
++    sizes = table_sizes(session)
++
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert scheduler.run(both(1, 7), execution_id=EXEC_A) == 16
++    assert sorted(CALLS) == ["add", "both", "double"]
++    assert job_count(session, EXEC_A) == 4
++    assert {
++        id
++        for id, record in records_of(backend, EXEC_A).items()
++        if record["_type"] in ("CallNode", "Value")
++    } == hashes
++    assert table_sizes(session) == sizes
++
++
++def test_pruned_file_workflow_can_be_run_again(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session, tmp_path
++) -> None:
++    scheduler.run(file_flow(str(tmp_path), ["a", "b"]), execution_id=EXEC_A)
++    backend.prune([EXEC_A])
++    CALLS.clear()
++
++    assert scheduler.run(file_flow(str(tmp_path), ["a", "b"]), execution_id=EXEC_A) == "ab"
++    assert sorted(CALLS) == ["file_flow", "read_files", "write_file", "write_file"]
++    assert job_count(session, EXEC_A) == 4
++    assert session.query(FileRow).count() == 2
++
++
++def test_prune_leaves_values_outside_executions_alone(
++    scheduler: Scheduler, backend: RedunBackendDb, session: Session
++) -> None:
++    kept_hash = backend.record_value("recorded directly")
++    backend.record_tags(TagEntity.Value, kept_hash, [("note", "mine")])
++    scheduler.run(pipeline(1), execution_id=EXEC_A)
++
++    backend.prune([EXEC_A])
++
++    assert backend.get_value(kept_hash) == ("recorded directly", True)
++    assert backend.get_tags([kept_hash]) == {kept_hash: {"note": ["mine"]}}
++    assert session.query(Value).count() == 1
++    assert session.query(CallNode).count() == 0
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..2cdbd94
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,162 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      if [ $# -lt 1 ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 1
++
++NEW_TESTS="redun/tests/test_db_prune_0e57d3.py"
++WORK_DIR="$(mktemp -d -p /var/tmp 2>/dev/null || mktemp -d)"
++LOG="$WORK_DIR/pytest.log"
++
++# Temporary files go to a directory of this run only. pytest's default base, /tmp/pytest-of-<user>,
++# is shared by every uid that sets the same user name and is refused when another uid created it.
++# redun looks for a .redun directory in every parent of the working directory, so a repository
++# left in /tmp would also be picked up by tests that run in a temporary directory.
++mkdir -p "$WORK_DIR/tmp"
++export TMPDIR="$WORK_DIR/tmp"
++if [ -z "$OUTPUT_PATH" ]; then
++  OUTPUT_PATH="$WORK_DIR/junit.xml"
++fi
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++rm -f "$OUTPUT_PATH"
++
++PYTEST=(python -m pytest -p no:cacheprovider -o addopts= -v --basetemp="$WORK_DIR/pytest" --junitxml="$OUTPUT_PATH")
++
++# Base mode runs the whole suite of the repository except redun/experimental, which the
++# repository's own tox command ignores as well, and the tests named below.
++# - Three tests only work when the uid running them has an account entry, which the uid in this
++#   environment may not have: test_explicit_config_dir_env_var_still_auto_creates clears the
++#   environment and then asks for the user name, and the two Spark tests start a JVM whose login
++#   looks the uid up (they also need a Java runtime, which the image does not carry).
++# - test_readonly_file_error is skipped when it runs as root and runs otherwise, so its outcome
++#   depends on the uid the tests run as.
++# - The rest depend on how fast the machine is. test_cse_scopes and test_common_expression assert
++#   whether a duplicate call is served by a job that is still pending or by the backend, which
++#   depends on which of two threads gets there first. The others wait for a background thread
++#   through redun.tests.utils.wait_until, which gives up after two seconds. They pass on an idle
++#   machine and fail now and then on a loaded one. test_code_packaging and
++#   test_inflight_join_only_on_first_submission submit a second job while the executor's job
++#   arrayer thread scans its pending jobs without taking its lock, and the repository's pytest
++#   settings turn an exception in a background thread into a test error.
++# - test_docstrings generates one case per function in the package, so its cases change with the
++#   code under test: a change that adds functions adds cases that have no counterpart before it.
++BASE_SKIPS=(
++  redun/tests/test_static_analysis.py::test_docstrings
++  redun/tests/test_cli.py::test_explicit_config_dir_env_var_still_auto_creates
++  redun/tests/test_glue_helpers.py::test_sql_query
++  redun/tests/test_glue_helpers.py::test_udf_with_spark
++  redun/tests/test_file.py::test_readonly_file_error
++  redun/tests/test_scheduler.py::test_cse_scopes
++  redun/tests/test_scheduler.py::test_common_expression
++  redun/tests/test_scheduler.py::test_thread
++  redun/tests/test_scheduler.py::test_thread_join_multiple
++  redun/tests/test_scheduler.py::test_thread_catch
++  redun/tests/test_scheduler.py::test_thread_cache
++  redun/tests/test_context.py::test_context_cse2
++  redun/tests/test_context.py::test_context_check_valid
++  redun/tests/test_federated_tasks.py::test_lambda_federated_task
++  redun/tests/test_federated_tasks.py::test_rest_federated_task
++  redun/tests/test_aws_glue.py::test_glue_submission_retry
++  redun/tests/test_aws_batch.py::test_executor
++  redun/tests/test_aws_batch.py::test_executor_multinode
++  redun/tests/test_aws_batch.py::test_executor_docker
++  redun/tests/test_aws_batch.py::test_executor_job_debug
++  redun/tests/test_aws_batch.py::test_executor_error_override
++  redun/tests/test_aws_batch.py::test_interactive
++  redun/tests/test_aws_batch.py::test_job_staleness
++  redun/tests/test_aws_batch.py::test_jobs_are_arrayed
++  redun/tests/test_aws_batch.py::test_code_packaging
++  redun/tests/test_aws_batch.py::test_inflight_join_only_on_first_submission
++  redun/tests/test_gcp_batch.py::test_executor
++  redun/tests/test_gcp_batch.py::test_executor_array
++  redun/tests/test_gcp_batch.py::test_executor_script
++  redun/tests/test_k8s.py::test_executor
++  redun/tests/test_k8s.py::test_jobs_are_arrayed
++  redun/tests/test_k8s.py::test_executor_with_config_timeout
++  redun/tests/test_k8s.py::test_executor_with_node_affinity
++  redun/tests/test_k8s.py::test_executor_node_affinity_override
++  redun/tests/test_k8s.py::test_executor_with_env
++  redun/tests/test_k8s.py::test_executor_env_merge
++  redun/tests/test_k8s.py::test_executor_with_volumes
++  redun/tests/test_k8s.py::test_code_packaging
++  redun/tests/test_k8s.py::test_inflight_join_only_on_first_submission
++)
++
++if [ "$MODE" = "base" ]; then
++  # pytest's own --deselect matches by prefix and would also drop tests such as
++  # test_executor_config, so the names above are matched exactly.
++  cat > "$WORK_DIR/base_skips.py" <<'PYEOF'
++import os
++
++SKIPS = set(os.environ["REDUN_BASE_SKIPS"].split())
++
++
++def pytest_collection_modifyitems(config, items):
++    skipped = [item for item in items if item.nodeid.split("[")[0] in SKIPS]
++    config.hook.pytest_deselected(items=skipped)
++    items[:] = [item for item in items if item.nodeid.split("[")[0] not in SKIPS]
++PYEOF
++  REDUN_BASE_SKIPS="${BASE_SKIPS[*]}" PYTHONPATH="$WORK_DIR${PYTHONPATH:+:$PYTHONPATH}" \
++    timeout 1700 "${PYTEST[@]}" -p base_skips \
++    --ignore=redun/experimental --ignore="$NEW_TESTS" redun 2>&1 | tee "$LOG"
++  STATUS=${PIPESTATUS[0]}
++else
++  timeout 1700 "${PYTEST[@]}" "$NEW_TESTS" 2>&1 | tee "$LOG"
++  STATUS=${PIPESTATUS[0]}
++fi
++
++if [ "$STATUS" -ne 0 ] && ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  python - "$OUTPUT_PATH" "$LOG" "$MODE" "$STATUS" <<'PYEOF'
++import sys
++from xml.sax.saxutils import escape, quoteattr
++
++output_path, log_path, mode, status = sys.argv[1:5]
++with open(log_path, errors="replace") as infile:
++    log = infile.read()[-20000:]
++log = "".join(char for char in log if char in "\t\n\r" or ord(char) >= 32)
++message = f"pytest exited with status {status} before reporting any test"
++with open(output_path, "w") as out:
++    out.write('<?xml version="1.0" encoding="utf-8"?>\n')
++    out.write('<testsuites><testsuite name="pytest" tests="1" failures="1" errors="0">\n')
++    out.write(f'<testcase classname="test.sh" name={quoteattr(mode + " run")}>\n')
++    out.write(f"<failure message={quoteattr(message)}>{escape(log)}</failure>\n")
++    out.write("</testcase>\n</testsuite></testsuites>\n")
++PYEOF
++fi
++
++exit "$STATUS"

@@ -1,0 +1,1219 @@
+diff --git a/SCons/Tool/gccSideEffects069e76Tests.py b/SCons/Tool/gccSideEffects069e76Tests.py
+new file mode 100644
+index 000000000..36780465c
+--- /dev/null
++++ b/SCons/Tool/gccSideEffects069e76Tests.py
+@@ -0,0 +1,998 @@
++# MIT License
++#
++# Copyright The SCons Foundation
++#
++# Permission is hereby granted, free of charge, to any person obtaining
++# a copy of this software and associated documentation files (the
++# "Software"), to deal in the Software without restriction, including
++# without limitation the rights to use, copy, modify, merge, publish,
++# distribute, sublicense, and/or sell copies of the Software, and to
++# permit persons to whom the Software is furnished to do so, subject to
++# the following conditions:
++#
++# The above copyright notice and this permission notice shall be included
++# in all copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
++# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
++# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import textwrap
++import unittest
++
++REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++SCONS = os.path.join(REPO, 'scripts', 'scons.py')
++
++SOURCES = {
++    'src/a.c': 'int a(int x) { return x + 1; }\n',
++    'src/b.cpp': 'int b(int x) { return x * 2; }\n',
++    'src/c.S': '\t.text\n\t.globl c\nc:\n\tret\n',
++    'src/d.sx': '\t.text\n\t.globl d\nd:\n\tret\n',
++    'src/e.cc': 'int e() { return 3; }\n',
++    'src/f.cxx': 'int f() { return 4; }\n',
++    'src/g.C': 'int g() { return 5; }\n',
++    'src/h.c++': 'int h() { return 6; }\n',
++    'src/main.c': 'int main(void) { return 0; }\n',
++}
++
++TOOLS = "env = Environment(tools=['gcc', 'g++', 'gnulink', 'gas', 'ar'])"
++
++PROLOG = '''\
++import contextlib
++import json
++import os
++import subprocess
++from unittest import mock
++
++_launched = []
++_real_popen = subprocess.Popen
++
++
++class _RecordingPopen(_real_popen):
++    def __init__(self, args, *a, **k):
++        _launched.append(args if isinstance(args, str) else ' '.join(str(x) for x in args))
++        super().__init__(args, *a, **k)
++
++
++subprocess.Popen = _RecordingPopen
++{environment}
++subprocess.Popen = _real_popen
++
++_reports = []
++_started = []
++
++
++def report(name, nodes):
++    _reports.append((name, list(nodes)))
++
++
++def _refuse(*args, **kwargs):
++    _started.append(repr(args)[:200])
++    raise OSError('no program may be started while targets are declared')
++
++
++_launchers = [(subprocess, 'Popen'), (os, 'system'), (os, 'popen')]
++for _name in ('fork', 'forkpty', 'posix_spawn', 'posix_spawnp', 'spawnv', 'spawnve',
++              'spawnvp', 'spawnvpe', 'execv', 'execve', 'execvp', 'execvpe'):
++    if hasattr(os, _name):
++        _launchers.append((os, _name))
++try:
++    import _posixsubprocess
++    _launchers.append((_posixsubprocess, 'fork_exec'))
++except ImportError:
++    pass
++
++Export('env', 'report')
++_guard = contextlib.ExitStack()
++for _module, _name in _launchers:
++    _guard.enter_context(mock.patch.object(_module, _name, _refuse))
++'''
++
++EPILOG = '''
++_guard.close()
++_top = Dir('#').get_abspath()
++_declared = {}
++for _name, _nodes in _reports:
++    _files = set()
++    for _node in _nodes:
++        _files.update(os.path.relpath(s.get_abspath(), _top) for s in _node.side_effects)
++    _declared[_name] = sorted(_files)
++print('SIDE-EFFECTS ' + json.dumps({'declared': _declared, 'started': _started, 'launched': _launched}))
++'''
++
++
++class SideEffectsTestCase(unittest.TestCase):
++    def setUp(self) -> None:
++        self.top = os.path.realpath(tempfile.mkdtemp(prefix='gccse'))
++        self.addCleanup(shutil.rmtree, self.top, True)
++
++    def write(self, files) -> None:
++        for path, text in files.items():
++            full = os.path.join(self.top, path)
++            os.makedirs(os.path.dirname(full), exist_ok=True)
++            with open(full, 'w') as f:
++                f.write(text)
++
++    def scons(self, *args):
++        environ = dict(os.environ)
++        environ.pop('SCONSFLAGS', None)
++        environ['PYTHONDONTWRITEBYTECODE'] = '1'
++        return subprocess.run(
++            [sys.executable, SCONS] + list(args),
++            cwd=self.top,
++            env=environ,
++            capture_output=True,
++            text=True,
++            timeout=600,
++        )
++
++    def project(self, body, files=None, dirs=(), environment=TOOLS) -> None:
++        self.write(SOURCES)
++        self.write(files or {})
++        for d in dirs:
++            os.makedirs(os.path.join(self.top, d), exist_ok=True)
++        sconstruct = PROLOG.format(environment=environment) + textwrap.dedent(body) + EPILOG
++        self.write({'SConstruct': sconstruct})
++
++    def result(self, run):
++        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
++        lines = [l for l in run.stdout.splitlines() if l.startswith('SIDE-EFFECTS ')]
++        self.assertEqual(len(lines), 1, run.stdout + run.stderr)
++        data = json.loads(lines[0][len('SIDE-EFFECTS '):])
++        self.assertEqual(data['started'], [], 'a program was started while targets were declared')
++        return data
++
++    def declare(self, body, files=None, dirs=(), environment=TOOLS):
++        self.project(body, files, dirs, environment)
++        data = self.result(self.scons('-Q', '-n'))
++        if environment == TOOLS:
++            for command in data['launched']:
++                self.assertIn('--version', command, 'only the compiler version checks may run')
++        return data['declared']
++
++
++class DependencyFileTestCase(SideEffectsTestCase):
++    def test_md_and_mmd_write_beside_the_object(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-MD']))
++            report('b', env.StaticObject('obj/b.o', 'src/b.cpp', CXXFLAGS=['-MMD']))
++            report('e', env.Object('e.o', 'src/e.cc', CCFLAGS=['-MMD']))
++        ''')
++        self.assertEqual(declared, {'a': ['obj/a.d'], 'b': ['obj/b.d'], 'e': ['e.d']})
++
++    def test_named_from_the_object_without_its_last_suffix(self) -> None:
++        declared = self.declare('''
++            report('x', env.Object('obj/a.x.o', 'src/a.c', CCFLAGS=['-MD']))
++            report('obj', env.Object('obj/b.obj', 'src/b.cpp', CCFLAGS=['-MD']))
++            report('plain', env.Object('out/plain', 'src/f.cxx', CCFLAGS=['-MMD']))
++        ''')
++        self.assertEqual(declared, {'x': ['obj/a.x.d'], 'obj': ['obj/b.d'], 'plain': ['out/plain.d']})
++
++    def test_mf_names_the_file(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-MD', '-MF', 'deps/a.dep']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-MMD', '-MFdeps/b.d']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-MF', 'deps/e.d', '-MMD']))
++            report('g', env.Object('obj/g.o', 'src/g.C', CCFLAGS=['-MD', '-MF', 'deps/${SOURCE.filebase}.dep']))
++        ''')
++        self.assertEqual(
++            declared,
++            {'a': ['deps/a.dep'], 'b': ['deps/b.d'], 'e': ['deps/e.d'], 'g': ['deps/g.dep']},
++        )
++
++    def test_ccdepflags_names_the_file_after_the_target(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['$CCDEPFLAGS']))
++            report('b', env.SharedObject('obj/b', 'src/b.cpp', CXXFLAGS=['$CCDEPFLAGS']))
++        ''')
++        self.assertEqual(declared, {'a': ['obj/a.o.d'], 'b': ['obj/b.os.d']})
++
++    def test_preprocessor_options_override_the_driver(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-MD', '-Wp,-MD,deps/a.wp']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-MMD', '-MF', 'deps/b.d', '-Wp,-MMD,deps/b.wp']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-Wp,-MD,deps/e.wp', '-MF', 'deps/e.d']))
++            report('f', env.Object('obj/f.o', 'src/f.cxx', CCFLAGS=['-MD', '-Wp,-MF,deps/f.wp']))
++            report('g', env.Object('obj/g.o', 'src/g.C', CCFLAGS=['-Wp,-MD,deps/g1.wp,-MF,deps/g2.wp']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['deps/a.wp'],
++                'b': ['deps/b.wp'],
++                'e': ['deps/e.wp'],
++                'f': ['deps/f.wp'],
++                'g': ['deps/g2.wp'],
++            },
++        )
++
++    def test_preprocessed_assembler_sources(self) -> None:
++        declared = self.declare('''
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-MD']))
++            report('d', env.Object('obj/d.o', 'src/d.sx', CPPFLAGS=['-MMD', '-MF', 'deps/d.d']))
++            report('cs', env.SharedObject('obj/cs', 'src/c.S', ASPPFLAGS=['$CCDEPFLAGS']))
++        ''')
++        self.assertEqual(declared, {'c': ['obj/c.d'], 'd': ['deps/d.d'], 'cs': ['obj/cs.os.d']})
++
++    def test_options_passed_to_the_preprocessor(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-Xpreprocessor', '-MD', '-Xpreprocessor', 'deps/a.d']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-MMD', '-Xpreprocessor', '-MF', '-Xpreprocessor', 'deps/b.d']))
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-Xpreprocessor', '-MMD', '-Xpreprocessor', 'deps/c.d']))
++        ''')
++        self.assertEqual(declared, {'a': ['deps/a.d'], 'b': ['deps/b.d'], 'c': ['deps/c.d']})
++
++    def test_dependencies_on_standard_output(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-MD', '-MF', '-']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-MMD', '-MF-', '-fstack-usage']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-Wp,-MD,-']))
++        ''')
++        self.assertEqual(declared, {'a': [], 'b': ['obj/b.su'], 'e': []})
++
++    def test_not_moved_by_dumpdir_dumpbase_or_save_temps_cwd(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-MD', '-dumpdir', 'aux/']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-MD', '-dumpbase', 'aux/bb']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-MMD', '-save-temps=cwd']))
++        ''')
++        self.assertEqual(declared, {'a': ['obj/a.d'], 'b': ['obj/b.d'], 'e': ['e.ii', 'e.s', 'obj/e.d']})
++
++
++class CoverageNotesTestCase(SideEffectsTestCase):
++    def test_written_beside_the_object(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['--coverage']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-ftest-coverage']))
++            report('x', env.Object('obj/a.x.o', 'src/a.c', CCFLAGS=['--coverage']))
++            report('s', env.SharedObject('obj/s', 'src/e.cc', CCFLAGS=['--coverage']))
++        ''')
++        self.assertEqual(
++            declared,
++            {'a': ['obj/a.gcno'], 'b': ['obj/b.gcno'], 'x': ['obj/a.x.gcno'], 's': ['obj/s.gcno']},
++        )
++
++    def test_profile_arcs_and_profile_generate_write_none(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-fprofile-arcs']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-fprofile-generate']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-fprofile-arcs', '-ftest-coverage']))
++        ''')
++        self.assertEqual(declared, {'a': [], 'b': [], 'e': ['obj/e.gcno']})
++
++    def test_last_test_coverage_option_wins_unless_coverage_is_given(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-ftest-coverage', '-fno-test-coverage']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-fno-test-coverage', '-ftest-coverage']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['--coverage', '-fno-test-coverage']))
++        ''')
++        self.assertEqual(declared, {'a': [], 'b': ['obj/b.gcno'], 'e': ['obj/e.gcno']})
++
++    def test_profile_note_names_the_file(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['--coverage', '-fprofile-note=deps/a.notes']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-fprofile-note=deps/b.gcno']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-ftest-coverage', '-fprofile-note=deps/e.gcno', '-dumpdir', 'aux/']))
++        ''')
++        self.assertEqual(declared, {'a': ['deps/a.notes'], 'b': [], 'e': ['deps/e.gcno']})
++
++    def test_profile_directories_do_not_move_the_notes(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['--coverage', '-fprofile-dir=pd']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-ftest-coverage', '-fprofile-generate=pd']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-fprofile-dir=pd', '-fprofile-arcs']))
++        ''')
++        self.assertEqual(declared, {'a': ['obj/a.gcno'], 'b': ['obj/b.gcno'], 'e': []})
++
++    def test_assembler_sources_write_none(self) -> None:
++        declared = self.declare('''
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['--coverage', '-MD']))
++            report('d', env.Object('obj/d.o', 'src/d.sx', ASPPFLAGS=['-ftest-coverage']))
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-ftest-coverage']))
++        ''')
++        self.assertEqual(declared, {'c': ['obj/c.d'], 'd': [], 'a': ['obj/a.gcno']})
++
++
++class StackUsageTestCase(SideEffectsTestCase):
++    def test_written_beside_the_object(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-fstack-usage']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-fstack-usage']))
++            report('x', env.Object('obj/a.x.o', 'src/a.c', CFLAGS=['-fstack-usage']))
++            report('top', env.Object('a.o', 'src/a.c', CCFLAGS=['-fstack-usage']))
++        ''')
++        self.assertEqual(declared, {'a': ['obj/a.su'], 'b': ['obj/b.su'], 'x': ['obj/a.x.su'], 'top': ['a.su']})
++
++    def test_link_time_optimization_suppresses_it(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-fstack-usage', '-flto']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-flto=auto', '-ffat-lto-objects', '-fstack-usage']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-flto', '-fno-lto', '-fstack-usage']))
++            report('f', env.Object('obj/f.o', 'src/f.cxx', CCFLAGS=['-fno-lto', '-flto=4', '-fstack-usage']))
++        ''')
++        self.assertEqual(declared, {'a': [], 'b': [], 'e': ['obj/e.su'], 'f': []})
++
++    def test_assembler_sources_write_none(self) -> None:
++        declared = self.declare('''
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-fstack-usage']))
++            report('d', env.Object('obj/d.o', 'src/d.sx', ASPPFLAGS=['-fstack-usage', '-MMD']))
++        ''')
++        self.assertEqual(declared, {'c': [], 'd': ['obj/d.d']})
++
++
++class SplitDwarfTestCase(SideEffectsTestCase):
++    def test_written_beside_the_object(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-g', '-gsplit-dwarf']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-gsplit-dwarf']))
++            report('s', env.SharedObject('obj/s', 'src/e.cc', CCFLAGS=['-gsplit-dwarf']))
++        ''')
++        self.assertEqual(declared, {'a': ['obj/a.dwo'], 'b': ['obj/b.dwo'], 's': ['obj/s.dwo']})
++
++    def test_written_without_debug_info_and_with_lto(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-gsplit-dwarf', '-g0']))
++            report('f', env.Object('obj/f.o', 'src/f.cxx', CCFLAGS=['-flto', '-gsplit-dwarf']))
++        ''')
++        self.assertEqual(declared, {'a': ['obj/a.dwo'], 'f': ['obj/f.dwo']})
++
++    def test_assembler_sources(self) -> None:
++        declared = self.declare('''
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-gsplit-dwarf']))
++            report('d', env.Object('obj/d.o', 'src/d.sx', CPPFLAGS=['-g', '-gsplit-dwarf']))
++        ''')
++        self.assertEqual(declared, {'c': ['obj/c.dwo'], 'd': ['obj/d.dwo']})
++
++    def test_last_option_wins(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-gsplit-dwarf', '-gno-split-dwarf']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-gno-split-dwarf', '-gsplit-dwarf']))
++        ''')
++        self.assertEqual(declared, {'a': [], 'b': ['obj/b.dwo']})
++
++
++class SaveTempsTestCase(SideEffectsTestCase):
++    def test_written_beside_the_object(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-save-temps']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-save-temps']))
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-save-temps']))
++            report('d', env.Object('obj/d.o', 'src/d.sx', ASPPFLAGS=['-save-temps=obj']))
++            report('g', env.Object('obj/g.o', 'src/g.C', CCFLAGS=['-save-temps=obj']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['obj/a.i', 'obj/a.s'],
++                'b': ['obj/b.ii', 'obj/b.s'],
++                'c': ['obj/c.s'],
++                'd': ['obj/d.s'],
++                'g': ['obj/g.ii', 'obj/g.s'],
++            },
++        )
++
++    def test_cwd_writes_every_auxiliary_file_in_the_top_directory(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-save-temps=cwd']))
++            report('b', env.Object('obj/deep/bb.o', 'src/b.cpp', CXXFLAGS=['-save-temps=cwd']))
++            report('x', env.Object('obj/a.x.o', 'src/a.c', CCFLAGS=[
++                '-save-temps=cwd', '-fstack-usage', '--coverage', '-gsplit-dwarf', '-fsave-optimization-record',
++            ]))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['a.i', 'a.s'],
++                'b': ['bb.ii', 'bb.s'],
++                'x': ['a.x.c.opt-record.json.gz', 'a.x.dwo', 'a.x.gcno', 'a.x.i', 'a.x.s', 'a.x.su'],
++            },
++        )
++
++    def test_later_options(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-save-temps=cwd', '-save-temps=obj']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-save-temps=obj', '-save-temps=cwd']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-save-temps=cwd', '-save-temps']))
++            report('f', env.Object('obj/f.o', 'src/f.cxx', CCFLAGS=['-save-temps', '-save-temps=cwd']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['obj/a.i', 'obj/a.s'],
++                'b': ['b.ii', 'b.s'],
++                'e': ['e.ii', 'e.s'],
++                'f': ['f.ii', 'f.s'],
++            },
++        )
++
++    def test_written_with_link_time_optimization(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-flto', '-save-temps']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-flto', '-ffat-lto-objects', '-save-temps=cwd']))
++        ''')
++        self.assertEqual(declared, {'a': ['obj/a.i', 'obj/a.s'], 'b': ['b.ii', 'b.s']})
++
++    def test_follow_the_language_option(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-x', 'c++', '-save-temps']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-xc', '-save-temps']))
++            report('n', env.Object('obj/n.o', 'src/a.c', CCFLAGS=['-x', 'c++', '-x', 'none', '-save-temps']))
++        ''')
++        self.assertEqual(
++            declared,
++            {'a': ['obj/a.ii', 'obj/a.s'], 'b': ['obj/b.i', 'obj/b.s'], 'n': ['obj/n.i', 'obj/n.s']},
++        )
++
++
++class OptimizationRecordTestCase(SideEffectsTestCase):
++    def test_named_with_the_source_suffix(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-fsave-optimization-record']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-fsave-optimization-record']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-fsave-optimization-record']))
++            report('g', env.Object('obj/g.o', 'src/g.C', CCFLAGS=['-fsave-optimization-record']))
++            report('h', env.Object('obj/h.o', 'src/h.c++', CCFLAGS=['-fsave-optimization-record']))
++            report('x', env.Object('obj/a.x.o', 'src/a.c', CCFLAGS=['-fsave-optimization-record']))
++            report('s', env.SharedObject('obj/s', 'src/b.cpp', CCFLAGS=['-fsave-optimization-record']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['obj/a.c.opt-record.json.gz'],
++                'b': ['obj/b.cpp.opt-record.json.gz'],
++                'e': ['obj/e.cc.opt-record.json.gz'],
++                'g': ['obj/g.C.opt-record.json.gz'],
++                'h': ['obj/h.c++.opt-record.json.gz'],
++                'x': ['obj/a.x.c.opt-record.json.gz'],
++                's': ['obj/s.cpp.opt-record.json.gz'],
++            },
++        )
++
++    def test_last_option_wins_and_language_option_keeps_the_name(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-fsave-optimization-record', '-fno-save-optimization-record']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-fno-save-optimization-record', '-fsave-optimization-record']))
++            report('k', env.Object('obj/k.o', 'src/a.c', CCFLAGS=['-x', 'c++', '-fsave-optimization-record']))
++        ''')
++        self.assertEqual(
++            declared,
++            {'a': [], 'b': ['obj/b.cpp.opt-record.json.gz'], 'k': ['obj/k.c.opt-record.json.gz']},
++        )
++
++    def test_written_with_link_time_optimization_or_without_optimizing(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-flto', '-fsave-optimization-record']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-O0', '-fsave-optimization-record']))
++        ''')
++        self.assertEqual(
++            declared,
++            {'a': ['obj/a.c.opt-record.json.gz'], 'b': ['obj/b.cpp.opt-record.json.gz']},
++        )
++
++    def test_assembler_sources_write_none(self) -> None:
++        declared = self.declare('''
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-fsave-optimization-record', '-save-temps']))
++        ''')
++        self.assertEqual(declared, {'c': ['obj/c.s']})
++
++
++class AssemblerListingTestCase(SideEffectsTestCase):
++    def test_named_by_the_assembler_option(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-g', '-Wa,-adhln=lst/a.lst']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-Wa,-al=lst/b1.lst', '-Wa,-ah=lst/b2.lst']))
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-Wa,-a=lst/c.lst']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-Xassembler', '-al=lst/e.lst']))
++            report('f', env.Object('obj/f.o', 'src/f.cxx', CCFLAGS=['-Wa,-al=lst/f.lst,-ah']))
++            report('g', env.Object('obj/g.o', 'src/g.C', CCFLAGS=['-Wa,-a']))
++            report('h', env.Object('obj/h.o', 'src/h.c++', CCFLAGS=['-Wa,-ah', '-Wa,-anl=lst/h.lst']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['lst/a.lst'],
++                'b': ['lst/b2.lst'],
++                'c': ['lst/c.lst'],
++                'e': ['lst/e.lst'],
++                'f': ['lst/f.lst'],
++                'g': [],
++                'h': ['lst/h.lst'],
++            },
++        )
++
++    def test_not_moved_by_lto_or_auxiliary_options(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-flto', '-fstack-usage', '-Wa,-al=lst/a.lst']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-save-temps=cwd', '-Wa,-a=b.lst', '-dumpdir', 'aux/']))
++            report('d', env.Object('obj/d.o', 'src/d.sx', ASPPFLAGS=['-save-temps', '-Wa,-am=lst/d.lst', '-dumpbase', 'dd']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['lst/a.lst'],
++                'b': ['aux/b.ii', 'aux/b.s', 'b.lst'],
++                'd': ['lst/d.lst', 'obj/dd.s'],
++            },
++        )
++
++
++class DumpOptionsTestCase(SideEffectsTestCase):
++    def test_dumpdir_is_a_prefix(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-fstack-usage', '-dumpdir', 'aux/']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-fstack-usage', '-dumpdir', 'aux/p-']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-dumpdir', 'pre', '-fstack-usage']))
++            report('f', env.Object('obj/f.o', 'src/f.cxx', CCFLAGS=['-dumpdir', 'aux/', '-fsave-optimization-record', '--coverage']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['aux/a.su'],
++                'b': ['aux/p-b.su'],
++                'e': ['pree.su'],
++                'f': ['aux/f.cxx.opt-record.json.gz', 'aux/f.gcno'],
++            },
++        )
++
++    def test_dumpbase_names_the_files(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-dumpbase', 'base', '-fstack-usage']))
++            report('b', env.Object('obj/b.o', 'src/a.c', CCFLAGS=['-dumpbase', 'base.c', '-fstack-usage']))
++            report('e', env.Object('obj/e.o', 'src/a.c', CCFLAGS=['-dumpbase', 'x.c', '-dumpbase-ext', '.c', '-fstack-usage', '-save-temps']))
++            report('f', env.Object('obj/f.o', 'src/f.cxx', CCFLAGS=['-dumpbase', 'aux/y', '-gsplit-dwarf']))
++            report('g', env.Object('obj/g.o', 'src/g.C', CXXFLAGS=['-dumpbase', 'z.cc', '-dumpbase-ext', '.cc', '-fsave-optimization-record', '--coverage']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['obj/base.su'],
++                'b': ['obj/base.c.su'],
++                'e': ['obj/x.i', 'obj/x.s', 'obj/x.su'],
++                'f': ['aux/y.dwo'],
++                'g': ['obj/z.cc.opt-record.json.gz', 'obj/z.gcno'],
++            },
++        )
++
++    def test_dumpbase_ext_needs_dumpbase(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-dumpbase-ext', '.c', '-fstack-usage']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-dumpbase-ext', '.o', '-save-temps', '-fstack-usage']))
++        ''')
++        self.assertEqual(declared, {'a': ['obj/a.su'], 'b': ['obj/b.ii', 'obj/b.s', 'obj/b.su']})
++
++    def test_save_temps_cwd_and_obj_drop_an_earlier_dumpdir(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-dumpdir', 'aux/', '-save-temps=cwd', '-fstack-usage']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-save-temps=cwd', '-dumpdir', 'aux/', '-fstack-usage']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-dumpdir', 'aux/', '-save-temps=obj']))
++            report('f', env.Object('obj/f.o', 'src/f.cxx', CCFLAGS=['-dumpdir', 'aux/', '-save-temps', '-fstack-usage']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['a.i', 'a.s', 'a.su'],
++                'b': ['aux/b.ii', 'aux/b.s', 'aux/b.su'],
++                'e': ['obj/e.ii', 'obj/e.s'],
++                'f': ['aux/f.ii', 'aux/f.s', 'aux/f.su'],
++            },
++        )
++
++    def test_absolute_paths(self) -> None:
++        declared = self.declare('''
++            top = Dir('#').get_abspath()
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-MD', '-MF', top + '/deps/a.d']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-dumpdir', top + '/aux/', '-fstack-usage']))
++            report('p', env.Program('bin/p', env.Object('obj/main.o', 'src/main.c'), LINKFLAGS=['-Wl,-Map=' + top + '/maps/p.map']))
++        ''')
++        self.assertEqual(declared, {'a': ['deps/a.d'], 'b': ['aux/b.su'], 'p': ['maps/p.map']})
++
++
++class LinkerMapTestCase(SideEffectsTestCase):
++    def test_option_forms(self) -> None:
++        declared = self.declare('''
++            main = env.Object('obj/main.o', 'src/main.c')
++            report('p1', env.Program('bin/p1', main, LINKFLAGS=['-Wl,-Map=maps/p1.map']))
++            report('p2', env.Program('bin/p2', main, LINKFLAGS=['-Wl,-Map,maps/p2.txt']))
++            report('p3', env.Program('bin/p3', main, LINKFLAGS=['-Xlinker', '-Map', '-Xlinker', 'maps/p3.map']))
++            report('p4', env.Program('bin/p4', main, LINKFLAGS=['-Wl,--Map=maps/p4.map']))
++            report('p5', env.Program('bin/p5', main, LINKFLAGS=['-Xlinker', '-Map=maps/p5.map']))
++            report('p6', env.Program('bin/p6', main, LINKFLAGS=['-Wl,--cref,-Map=maps/p6.map,--gc-sections']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'p1': ['maps/p1.map'],
++                'p2': ['maps/p2.txt'],
++                'p3': ['maps/p3.map'],
++                'p4': ['maps/p4.map'],
++                'p5': ['maps/p5.map'],
++                'p6': ['maps/p6.map'],
++            },
++        )
++
++    def test_standard_output_and_last_option(self) -> None:
++        declared = self.declare('''
++            main = env.Object('obj/main.o', 'src/main.c')
++            report('p1', env.Program('bin/p1', main, LINKFLAGS=['-Wl,-Map=-']))
++            report('p2', env.Program('bin/p2', main, LINKFLAGS=['-Wl,-Map=maps/a.map', '-Wl,-Map=maps/b.map']))
++            report('p3', env.Program('bin/p3', main, LINKFLAGS=['-Wl,-Map=maps/c.map', '-Wl,-Map=-']))
++            report('p4', env.Program('bin/p4', main))
++            report('p5', env.Program('bin/p5', main, LINKFLAGS=['-Xlinker', '-Map', '-Xlinker', 'maps/e.map', '-Wl,-Map,maps/f.map']))
++        ''')
++        self.assertEqual(declared, {'p1': [], 'p2': ['maps/b.map'], 'p3': [], 'p4': [], 'p5': ['maps/f.map']})
++
++    def test_shared_library_and_loadable_module(self) -> None:
++        declared = self.declare('''
++            report('lib', env.SharedLibrary('lib/foo', 'src/a.c', LINKFLAGS=['-Wl,-Map=${TARGET}.map']))
++            report('mod', env.LoadableModule('mod/plug', 'src/b.cpp', LINKFLAGS=['-Wl,-Map=maps/${TARGET.file}.map']))
++            report('lib2', env.SharedLibrary('lib/bar', 'src/e.cc', SHLINKFLAGS=['-shared', '-Wl,-Map,maps/bar.map']))
++        ''')
++        self.assertEqual(
++            declared,
++            {'lib': ['lib/libfoo.so.map'], 'mod': ['maps/libplug.so.map'], 'lib2': ['maps/bar.map']},
++        )
++
++
++    def test_output_given_to_the_linker(self) -> None:
++        declared = self.declare('''
++            env2 = env.Clone(
++                LINKCOM='$LINK $SOURCES -Wl,-o,$TARGET,-Map=maps/program.map',
++                SHLINKCOM='$SHLINK $SHLINKFLAGS $SOURCES -Wl,-o,$TARGET,-Map=maps/library.map',
++                LDMODULECOM='$LDMODULE $LDMODULEFLAGS $SOURCES -Wl,-o,$TARGET,-Map=maps/module.map',
++            )
++            report('program', env2.Program('bin/program', env2.Object('obj/main.o', 'src/main.c')))
++            report('library', env2.SharedLibrary('lib/x', env2.SharedObject('obj/a', 'src/a.c')))
++            report('module', env2.LoadableModule('mod/y', env2.SharedObject('obj/b', 'src/b.cpp')))
++        ''')
++        self.assertEqual(
++            declared,
++            {'program': ['maps/program.map'], 'library': ['maps/library.map'], 'module': ['maps/module.map']},
++        )
++
++class IntegrationTestCase(SideEffectsTestCase):
++    def test_options_from_any_construction_variable(self) -> None:
++        declared = self.declare('''
++            env2 = env.Clone()
++            env2.Append(CFLAGS=['-fstack-usage'], CXXFLAGS=['-gsplit-dwarf'], CPPFLAGS=['-MMD'])
++            report('a', env2.Object('obj/a.o', 'src/a.c'))
++            report('b', env2.Object('obj/b.o', 'src/b.cpp'))
++            report('c', env2.Object('obj/c.o', 'src/c.S'))
++            report('s', env2.SharedObject('obj/s', 'src/a.c', SHCCFLAGS=['-fPIC', '--coverage']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['obj/a.d', 'obj/a.su'],
++                'b': ['obj/b.d', 'obj/b.dwo'],
++                'c': ['obj/c.d'],
++                's': ['obj/s.d', 'obj/s.gcno', 'obj/s.su'],
++            },
++        )
++
++    def test_replaced_commands(self) -> None:
++        declared = self.declare('''
++            env2 = env.Clone(
++                CCCOM='$CC -c -MD -o$TARGET $SOURCES',
++                SHCXXCOM='$SHCXX $SHCXXFLAGS -save-temps=cwd -c $SOURCES -o $TARGET',
++                LINKCOM='$LINK $SOURCES -o $TARGET -Wl,-Map=${TARGET}.txt',
++            )
++            report('a', env2.Object('obj/a.o', 'src/a.c'))
++            report('b', env2.SharedObject('obj/b', 'src/b.cpp'))
++            report('p', env2.Program('bin/p', env2.Object('obj/main.o', 'src/main.c')))
++        ''')
++        self.assertEqual(
++            declared,
++            {'a': ['obj/a.d'], 'b': ['b.ii', 'b.s'], 'p': ['bin/p.txt']},
++        )
++
++    def test_compiler_launchers(self) -> None:
++        declared = self.declare('''
++            env2 = env.Clone(CC='env CCACHE_DISABLE=1 gcc', CXX='nice g++')
++            report('a', env2.Object('obj/a.o', 'src/a.c', CCFLAGS=['-MD', '-fstack-usage']))
++            report('b', env2.SharedObject('obj/b', 'src/b.cpp', CXXFLAGS=['-save-temps']))
++            report('c', env2.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-MD']))
++            report('p', env2.Program('bin/p', env2.Object('obj/main.o', 'src/main.c'), LINKFLAGS=['-Wl,-Map=${TARGET}.map']))
++        ''')
++        self.assertEqual(
++            declared,
++            {'a': ['obj/a.d', 'obj/a.su'], 'b': ['obj/b.ii', 'obj/b.s'], 'c': ['obj/c.d'], 'p': ['bin/p.map']},
++        )
++
++    def test_compile_command_without_an_output_option(self) -> None:
++        declared = self.declare('''
++            env2 = env.Clone(CCCOM='$CC -c -MD -fstack-usage -save-temps $CCFLAGS $SOURCES')
++            report('a', env2.Object('a.o', 'src/a.c', CCFLAGS=['-fsave-optimization-record']))
++        ''')
++        self.assertEqual(declared, {'a': ['a.c.opt-record.json.gz', 'a.d', 'a.i', 'a.s', 'a.su']})
++
++    def test_every_kind_for_each_source_and_object_type(self) -> None:
++        declared = self.declare('''
++            flags = ['-MD', '--coverage', '-fstack-usage', '-gsplit-dwarf', '-save-temps',
++                     '-fsave-optimization-record', '-Wa,-al=lst/${TARGET.filebase}.lst']
++            for name, source, variable in [('c', 'src/a.c', 'CCFLAGS'), ('cxx', 'src/b.cpp', 'CCFLAGS'),
++                                           ('S', 'src/c.S', 'ASPPFLAGS'), ('sx', 'src/d.sx', 'ASPPFLAGS')]:
++                report(name, env.StaticObject('m/' + name, source, **{variable: flags}))
++                report(name + '_sh', env.SharedObject('m/' + name + '_sh', source, **{variable: flags}))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'c': ['lst/c.lst', 'm/c.c.opt-record.json.gz', 'm/c.d', 'm/c.dwo', 'm/c.gcno', 'm/c.i', 'm/c.s', 'm/c.su'],
++                'c_sh': [
++                    'lst/c_sh.lst', 'm/c_sh.c.opt-record.json.gz', 'm/c_sh.d', 'm/c_sh.dwo', 'm/c_sh.gcno',
++                    'm/c_sh.i', 'm/c_sh.s', 'm/c_sh.su',
++                ],
++                'cxx': [
++                    'lst/cxx.lst', 'm/cxx.cpp.opt-record.json.gz', 'm/cxx.d', 'm/cxx.dwo', 'm/cxx.gcno',
++                    'm/cxx.ii', 'm/cxx.s', 'm/cxx.su',
++                ],
++                'cxx_sh': [
++                    'lst/cxx_sh.lst', 'm/cxx_sh.cpp.opt-record.json.gz', 'm/cxx_sh.d', 'm/cxx_sh.dwo',
++                    'm/cxx_sh.gcno', 'm/cxx_sh.ii', 'm/cxx_sh.s', 'm/cxx_sh.su',
++                ],
++                'S': ['lst/S.lst', 'm/S.d', 'm/S.dwo', 'm/S.s'],
++                'S_sh': ['lst/S_sh.lst', 'm/S_sh.d', 'm/S_sh.dwo', 'm/S_sh.s'],
++                'sx': ['lst/sx.lst', 'm/sx.d', 'm/sx.dwo', 'm/sx.s'],
++                'sx_sh': ['lst/sx_sh.lst', 'm/sx_sh.d', 'm/sx_sh.dwo', 'm/sx_sh.s'],
++            },
++        )
++
++    def test_command_lists_and_paths_with_spaces(self) -> None:
++        declared = self.declare('''
++            env2 = env.Clone(CCCOM=['echo compiling $SOURCE', '$CC -o $TARGET -c $CCFLAGS $SOURCES'])
++            report('a', env2.Object('obj dir/a.o', 'src/a.c', CCFLAGS=['-MD', '-fstack-usage']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-MD', '-MF', 'deps/my deps.d', '-Wa,-al=lst/b list.lst']))
++            report('p', env.Program('bin dir/p', env.Object('obj/main.o', 'src/main.c'), LINKFLAGS=['-Wl,-Map=${TARGET}.map']))
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'a': ['obj dir/a.d', 'obj dir/a.su'],
++                'b': ['deps/my deps.d', 'lst/b list.lst'],
++                'p': ['bin dir/p.map'],
++            },
++        )
++
++    def test_objects_built_for_programs_and_libraries(self) -> None:
++        declared = self.declare('''
++            prog = env.Program('bin/prog', ['src/main.c', 'src/b.cpp'], CCFLAGS=['-MD'], LINKFLAGS=['-Wl,-Map=maps/prog.map'])
++            report('prog', prog)
++            report('prog_objects', prog[0].sources)
++            lib = env.StaticLibrary('lib/s', ['src/a.c', 'src/c.S'], CCFLAGS=['-fstack-usage'], ASPPFLAGS=['-MD'])
++            report('lib_objects', lib[0].sources)
++        ''')
++        self.assertEqual(
++            declared,
++            {
++                'prog': ['maps/prog.map'],
++                'prog_objects': ['src/b.d', 'src/main.d'],
++                'lib_objects': ['src/a.su', 'src/c.d'],
++            },
++        )
++
++    def test_paths_start_at_the_top_directory(self) -> None:
++        declared = self.declare(
++            '''
++            SConscript('sub/SConscript')
++            ''',
++            files={
++                'sub/SConscript': textwrap.dedent('''\
++                    Import('env', 'report')
++                    report('a', env.Object('a.o', 'a.c', CCFLAGS=['-MD', '-fstack-usage']))
++                    report('b', env.Object('b.o', 'b.c', CCFLAGS=['-MD', '-MF', 'deps/b.d', '-save-temps=cwd']))
++                    report('e', env.Object('e.o', 'e.cc', CCFLAGS=['-dumpdir', 'aux/', '--coverage']))
++                    report('p', env.Program('prog', 'm.c', LINKFLAGS=['-Wl,-Map=maps/sub.map']))
++                    report('q', env.Program('prog2', 'm2.c', LINKFLAGS=['-Wl,-Map=${TARGET}.map']))
++                '''),
++                'sub/a.c': SOURCES['src/a.c'],
++                'sub/b.c': SOURCES['src/a.c'].replace('a(', 'b('),
++                'sub/e.cc': SOURCES['src/e.cc'],
++                'sub/m.c': SOURCES['src/main.c'],
++                'sub/m2.c': SOURCES['src/main.c'],
++            },
++        )
++        self.assertEqual(
++            declared,
++            {
++                'a': ['sub/a.d', 'sub/a.su'],
++                'b': ['b.i', 'b.s', 'deps/b.d'],
++                'e': ['aux/e.gcno'],
++                'p': ['maps/sub.map'],
++                'q': ['sub/prog2.map'],
++            },
++        )
++
++    def test_variant_directory(self) -> None:
++        declared = self.declare(
++            '''
++            SConscript('src/SConscript', variant_dir='build', duplicate=False)
++            ''',
++            files={
++                'src/SConscript': textwrap.dedent('''\
++                    Import('env', 'report')
++                    report('a', env.Object('a.c', CCFLAGS=['-MD', '-save-temps', '-gsplit-dwarf']))
++                    report('b', env.Object('b.cpp', CXXFLAGS=['-fsave-optimization-record', '-save-temps=cwd']))
++                '''),
++            },
++        )
++        self.assertEqual(
++            declared,
++            {
++                'a': ['build/a.d', 'build/a.dwo', 'build/a.i', 'build/a.s'],
++                'b': ['b.cpp.opt-record.json.gz', 'b.ii', 'b.s'],
++            },
++        )
++
++    def test_static_and_shared_objects_share_a_side_effect(self) -> None:
++        declared = self.declare('''
++            report('static', env.StaticObject('obj/a.o', 'src/a.c', CCFLAGS=['-save-temps=cwd']))
++            report('shared', env.SharedObject('obj/a', 'src/a.c', CCFLAGS=['-save-temps=cwd']))
++        ''')
++        self.assertEqual(declared, {'static': ['a.i', 'a.s'], 'shared': ['a.i', 'a.s']})
++
++    def test_default_tools(self) -> None:
++        declared = self.declare(
++            '''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-MD']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-fstack-usage']))
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-gsplit-dwarf']))
++            report('p', env.Program('bin/p', env.Object('obj/main.o', 'src/main.c'), LINKFLAGS=['-Wl,-Map=${TARGET}.map']))
++            ''',
++            environment='env = Environment()',
++        )
++        self.assertEqual(
++            declared,
++            {'a': ['obj/a.d'], 'b': ['obj/b.su'], 'c': ['obj/c.dwo'], 'p': ['bin/p.map']},
++        )
++
++    def test_commands_without_extra_files(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=[
++                '-O2', '-Wall', '-g', '-flto', '-fprofile-arcs', '-dumpdir', 'aux/', '-dumpbase', 'x',
++            ]))
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-O2', '-g']))
++            report('p', env.Program('bin/p', env.Object('obj/main.o', 'src/main.c'), LINKFLAGS=['-Wl,--gc-sections']))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-MD']))
++        ''')
++        self.assertEqual(declared, {'a': [], 'c': [], 'p': [], 'e': ['obj/e.d']})
++
++
++class ExcludedFilesTestCase(SideEffectsTestCase):
++    def test_call_graph_aux_info_dump_and_tool_dependency_files_are_left_out(self) -> None:
++        declared = self.declare('''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-fcallgraph-info', '-MD']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['-aux-info', 'deps/b.aux', '-fstack-usage']))
++            report('e', env.Object('obj/e.o', 'src/a.c', CCFLAGS=['-fdump-tree-original', '-fdump-rtl-expand', '-gsplit-dwarf']))
++            report('f', env.Object('obj/f.o', 'src/a.c', CCFLAGS=['-Wa,--MD,deps/f.gas.d', '-MMD']))
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-Wa,--MD,deps/c.gas.d', '-save-temps']))
++            report('p', env.Program('bin/p', env.Object('obj/main.o', 'src/main.c'), LINKFLAGS=['-Wl,--dependency-file=deps/p.d,-Map=maps/p.map']))
++        ''', dirs=['deps'])
++        self.assertEqual(
++            declared,
++            {
++                'a': ['obj/a.d'],
++                'b': ['obj/b.su'],
++                'e': ['obj/e.dwo'],
++                'f': ['obj/f.d'],
++                'c': ['obj/c.s'],
++                'p': ['maps/p.map'],
++            },
++        )
++
++    def test_commands_that_fail_declare_nothing(self) -> None:
++        declared = self.declare('''
++            env2 = env.Clone(
++                CCCOM='$CC -c -MD -o $TARGET $SOURCES src/e.cc',
++                SHCXXCOM='$SHCXX -c -MD -save-temps -o $TARGET $SOURCES src/f.cxx',
++                ASPPCOM='$CC -c -MD -fstack-usage -o $TARGET $SOURCES src/d.sx',
++            )
++            report('a', env2.Object('obj/a.o', 'src/a.c'))
++            report('b', env2.SharedObject('obj/b', 'src/b.cpp'))
++            report('c', env2.Object('obj/c.o', 'src/c.S'))
++            report('n', env.Clone(CCCOM='$CC -c -MD -o $TARGET').Object('obj/n.o', 'src/a.c'))
++            report('e', env.Object('obj/e.o', 'src/e.cc', CCFLAGS=['-MD']))
++        ''')
++        self.assertEqual(declared, {'a': [], 'b': [], 'c': [], 'n': [], 'e': ['obj/e.d']})
++
++    def test_files_written_when_linking_with_lto_are_left_out(self) -> None:
++        declared = self.declare('''
++            lto = env.Object('obj/lo.o', 'src/main.c', CCFLAGS=['-flto', '-MD'])
++            report('lo', lto)
++            report('l', env.Program('bin/l', lto, LINKFLAGS=[
++                '-flto', '-save-temps', '-fstack-usage', '-fsave-optimization-record', '-Wl,-Map=maps/l.map',
++            ]))
++        ''')
++        self.assertEqual(declared, {'lo': ['obj/lo.d'], 'l': ['maps/l.map']})
++
++
++class BuildTestCase(SideEffectsTestCase):
++    def files(self):
++        found = set()
++        for dirpath, dirnames, filenames in os.walk(self.top):
++            for name in filenames:
++                path = os.path.relpath(os.path.join(dirpath, name), self.top)
++                if not path.startswith('.sconsign'):
++                    found.add(path)
++        return found
++
++    def build_and_clean(self, body, files=None, targets=()):
++        self.project(body, files)
++        before = self.files()
++        data = self.result(self.scons('-Q'))
++        written = self.files() - before
++        declared = set()
++        for paths in data['declared'].values():
++            declared.update(paths)
++        self.assertEqual(written - set(targets), declared)
++        cleaned = self.scons('-Q', '-c')
++        self.assertEqual(cleaned.returncode, 0, cleaned.stdout + cleaned.stderr)
++        self.assertEqual(sorted(p for p in declared if os.path.exists(os.path.join(self.top, p))), [])
++        return data['declared']
++
++    def test_build_writes_the_declared_files_and_clean_removes_them(self) -> None:
++        declared = self.build_and_clean(
++            '''
++            report('a', env.Object('obj/a.o', 'src/a.c', CCFLAGS=['-MD', '--coverage', '-fstack-usage', '-save-temps', '-gsplit-dwarf']))
++            report('b', env.Object('obj/b.o', 'src/b.cpp', CXXFLAGS=['$CCDEPFLAGS', '-fsave-optimization-record', '-dumpdir', 'aux/', '-fstack-usage']))
++            report('c', env.Object('obj/c.o', 'src/c.S', ASPPFLAGS=['-MMD', '-MF', 'deps/c.d', '-save-temps=cwd', '-Wa,-al=lst/c.lst']))
++            report('s', env.SharedObject('obj/s', 'src/e.cc', CCFLAGS=['-dumpbase', 'aux/es', '-gsplit-dwarf', '-ftest-coverage']))
++            main = env.Object('obj/main.o', 'src/main.c')
++            report('p', env.Program('bin/p', main, LINKFLAGS=['-Wl,-Map=maps/p.map']))
++            report('q', env.Program('bin/q', main, LINKFLAGS=['-Wl,-Map=maps/q.map', '-Wl,-Map=${TARGET}.map']))
++            report('t', env.Program('bin/t', main, LINKFLAGS=['-o', 'bin/other', '-Wl,-Map=maps/t.map']))
++            ''',
++            targets=['obj/a.o', 'obj/b.o', 'obj/c.o', 'obj/s.os', 'obj/main.o', 'bin/p', 'bin/q', 'bin/other'],
++        )
++        self.assertEqual(
++            declared,
++            {
++                'a': ['obj/a.d', 'obj/a.dwo', 'obj/a.gcno', 'obj/a.i', 'obj/a.s', 'obj/a.su'],
++                'b': ['aux/b.cpp.opt-record.json.gz', 'aux/b.su', 'obj/b.o.d'],
++                'c': ['c.s', 'deps/c.d', 'lst/c.lst'],
++                's': ['aux/es.dwo', 'aux/es.gcno'],
++                'p': ['maps/p.map'],
++                'q': ['bin/q.map'],
++                't': ['maps/t.map'],
++            },
++        )
++
++    def test_build_from_a_subdirectory_sconscript(self) -> None:
++        declared = self.build_and_clean(
++            '''
++            SConscript('sub/SConscript')
++            ''',
++            files={
++                'sub/SConscript': textwrap.dedent('''\
++                    Import('env', 'report')
++                    report('a', env.Object('a.o', 'a.c', CCFLAGS=['-MD', '-MF', 'deps/a.d', '-save-temps=cwd', '-fstack-usage']))
++                    report('b', env.SharedObject('b', 'b.cpp', CXXFLAGS=['-save-temps', '-fsave-optimization-record']))
++                    report('p', env.Program('prog', 'm.c', LINKFLAGS=['-Wl,-Map=${TARGET}.map']))
++                '''),
++                'sub/a.c': SOURCES['src/a.c'],
++                'sub/b.cpp': SOURCES['src/b.cpp'],
++                'sub/m.c': SOURCES['src/main.c'],
++            },
++            targets=['sub/a.o', 'sub/b.os', 'sub/m.o', 'sub/prog'],
++        )
++        self.assertEqual(
++            declared,
++            {
++                'a': ['a.i', 'a.s', 'a.su', 'deps/a.d'],
++                'b': ['sub/b.cpp.opt-record.json.gz', 'sub/b.ii', 'sub/b.s'],
++                'p': ['sub/prog.map'],
++            },
++        )
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..b0a1e9a52
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,209 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() { echo "usage: $0 [--output_path <path>] base|new" >&2; exit 2; }
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new) MODE="$1"; MODE_COUNT=$((MODE_COUNT + 1)); shift ;;
++    --output_path) shift; [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }; OUTPUT_PATH="$1"; shift ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    *) echo "unknown argument: $1" >&2; usage ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++[ -n "$OUTPUT_PATH" ] || OUTPUT_PATH="test-results-$MODE.xml"
++mkdir -p "$(dirname "$OUTPUT_PATH")" || exit 2
++OUTPUT_PATH="$(cd "$(dirname "$OUTPUT_PATH")" && pwd)/$(basename "$OUTPUT_PATH")"
++
++cd "$(dirname "$0")" || exit 1
++export PYTHONPATH="$PWD/testing/framework:$PWD"
++export PYTHONDONTWRITEBYTECODE=1
++unset SCONSFLAGS
++
++WORK="$(mktemp -d)"
++trap 'rm -rf "$WORK"' EXIT
++STATUS=0
++GROUP=0
++
++# Runs one group of unit tests in its own pytest process.  When a group
++# yields no test cases at all (a collection crash or a hang), every test
++# named in its files is recorded as failed, with pytest's exit status and
++# the end of its output.
++run_group() {
++  GROUP=$((GROUP + 1))
++  local xml="$WORK/group$GROUP.xml"
++  local log="$WORK/group$GROUP.log"
++  timeout 1800 python -m pytest -p no:cacheprovider -o addopts= -q \
++    --junitxml="$xml" "$@" 2>&1 | tee "$log"
++  local rc=${PIPESTATUS[0]}
++  if [ "$rc" -ne 0 ]; then
++    STATUS=1
++  fi
++  if [ "$rc" -ne 0 ] && ! grep -q '<testcase' "$xml" 2>/dev/null; then
++    python - "$xml" "$rc" "$log" "$@" <<'PY'
++import re
++import sys
++from xml.sax.saxutils import escape, quoteattr
++
++xml, rc, log, args = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
++reason = 'it timed out after 1800 seconds' if rc == '124' else f'pytest exited with status {rc}'
++with open(log, errors='replace') as f:
++    output = ''.join(f.readlines()[-60:])
++output = escape(re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', output))
++targets = []
++skip = False
++for arg in args:
++    if skip or arg.startswith('-'):
++        skip = arg == '--deselect'
++        continue
++    targets.append(arg)
++cases = []
++for target in targets:
++    path, _, wanted = target.partition('::')
++    module = path[:-3].replace('/', '.')
++    with open(path) as f:
++        source = f.read()
++    for cls, body in re.findall(r'^class (\w+)\(.*?\):\n((?:(?:[ \t]+.*)?\n)*)', source, re.M):
++        if wanted and cls != wanted:
++            continue
++        for name in re.findall(r'^    def (test\w*)\(', body, re.M):
++            cases.append((f'{module}.{cls}', name))
++lines = ['<?xml version="1.0" encoding="utf-8"?>',
++         f'<testsuites><testsuite name="pytest" tests="{len(cases)}" failures="{len(cases)}" errors="0">']
++for classname, name in cases:
++    lines.append(f'<testcase classname={quoteattr(classname)} name={quoteattr(name)}>'
++                 f'<failure message={quoteattr("the test module could not be run: " + reason)}>'
++                 f'{output}</failure></testcase>')
++lines.append('</testsuite></testsuites>')
++with open(xml, 'w') as f:
++    f.write('\n'.join(lines) + '\n')
++PY
++  fi
++}
++
++# Runs SCons end-to-end test scripts the way runtest.py does, a few at a
++# time, and records each one as a test case: exit status 0 passes, any
++# other status (2 is "no result") fails with the script's output.
++run_e2e() {
++  GROUP=$((GROUP + 1))
++  python - "$WORK/group$GROUP.xml" "$@" <<'PY'
++import concurrent.futures
++import os
++import re
++import subprocess
++import sys
++import time
++from xml.sax.saxutils import escape, quoteattr
++
++xml, tests = sys.argv[1], sys.argv[2:]
++root = os.getcwd()
++env = dict(os.environ)
++env.update({
++    'SCONS_RUNTEST_DIR': root,
++    'SCONS_TOOLS_DIR': os.path.join(root, 'bin'),
++    'SCONS_SCRIPT_DIR': os.path.join(root, 'scripts'),
++    'SCONS_CWD': root,
++    'SCONS_LIB_DIR': root,
++    'PYTHONPATH': os.pathsep.join([root, os.path.join(root, 'testing', 'framework')]),
++    'python_executable': sys.executable,
++})
++
++
++def run(test):
++    start = time.time()
++    fixtures = [os.path.dirname(os.path.abspath(test)), os.path.join(root, 'test', 'fixture')]
++    test_env = dict(env, FIXTURE_DIRS=os.pathsep.join(fixtures))
++    try:
++        done = subprocess.run([sys.executable, test], cwd=root, env=test_env, stdin=subprocess.DEVNULL,
++                              capture_output=True, text=True, errors='replace', timeout=900)
++        status, output = done.returncode, done.stdout + done.stderr
++    except subprocess.TimeoutExpired:
++        status, output = 124, 'timed out after 900 seconds'
++    return test, status, output, time.time() - start
++
++
++workers = max(1, min(8, os.cpu_count() or 1))
++with concurrent.futures.ThreadPoolExecutor(workers) as pool:
++    results = list(pool.map(run, tests))
++
++failed = 0
++lines = []
++for test, status, output, seconds in results:
++    directory, name = os.path.split(test)
++    head = f'<testcase classname={quoteattr(directory.replace("/", "."))} name={quoteattr(name)} time="{seconds:.1f}">'
++    print(('PASSED ' if status == 0 else 'FAILED ') + test, flush=True)
++    if status == 0:
++        lines.append(head + '</testcase>')
++        continue
++    failed += 1
++    text = escape(re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', output[-6000:]))
++    message = 'no result' if status == 2 else f'exit status {status}'
++    lines.append(head + f'<failure message={quoteattr(message)}>{text}</failure></testcase>')
++with open(xml, 'w') as f:
++    f.write('<?xml version="1.0" encoding="utf-8"?>\n')
++    f.write(f'<testsuites><testsuite name="e2e" tests="{len(results)}" failures="{failed}" errors="0">\n')
++    f.write('\n'.join(lines) + '\n</testsuite></testsuites>\n')
++sys.exit(1 if failed else 0)
++PY
++  [ $? -eq 0 ] || STATUS=1
++}
++
++if [ "$MODE" = "base" ]; then
++  run_group SCons/BuilderTests.py
++  run_group SCons/DefaultsTests.py
++  # test_tool is a helper that takes an environment, not a test.
++  run_group SCons/EnvironmentTests.py --deselect SCons/EnvironmentTests.py::test_tool
++  # test_remove_fail skips itself when run as root, and a skipped test
++  # does not count as passed.
++  run_group SCons/Node/FSTests.py --deselect SCons/Node/FSTests.py::FSTestCase::test_remove_fail
++  run_group SCons/Tool/ToolTests.py
++  # ml.py and nasm.py need assemblers this image does not have, and
++  # VariantDir/errors.py skips itself when run as root, which does not count
++  # as passed.
++  E2E=$(ls test/CC/*.py test/CXX/*.py test/AS/*.py test/LINK/*.py test/SideEffect/*.py \
++          test/SideEffect/Issues/3013/*.py test/MinGW/mingw_uses_comstr_issue_2799.py \
++          test/LoadableModule.py test/Object.py test/Program.py test/gnutools.py \
++          test/Configure/*.py test/Clean/*.py test/CompilationDatabase/*.py test/VariantDir/*.py \
++          test/Depends/*.py \
++        | grep -v -e '^test/AS/ml\.py$' -e '^test/AS/nasm\.py$' -e '^test/VariantDir/errors\.py$')
++  run_e2e $E2E
++else
++  run_group SCons/Tool/gccSideEffects069e76Tests.py
++fi
++
++# Merges the group reports into the one at --output_path.  A group report
++# that cannot be read becomes a failed test case, and a merge that cannot
++# write the report fails the run.
++python - "$OUTPUT_PATH" "$WORK"/group*.xml <<'PY'
++import os
++import sys
++import xml.etree.ElementTree as ET
++
++out, parts = sys.argv[1], sys.argv[2:]
++root = ET.Element('testsuites')
++unreadable = 0
++for part in parts:
++    try:
++        tree = ET.parse(part).getroot()
++    except (ET.ParseError, OSError) as error:
++        unreadable += 1
++        suite = ET.SubElement(root, 'testsuite', name='harness', tests='1', failures='1', errors='0')
++        case = ET.SubElement(suite, 'testcase', classname='harness', name=os.path.basename(part))
++        failure = ET.SubElement(case, 'failure', message='the group report could not be read')
++        failure.text = str(error)
++        continue
++    suites = [tree] if tree.tag == 'testsuite' else tree.findall('testsuite')
++    root.extend(suites)
++ET.ElementTree(root).write(out, encoding='utf-8', xml_declaration=True)
++sys.exit(1 if unreadable else 0)
++PY
++if [ $? -ne 0 ]; then
++  echo "the JUnit report at $OUTPUT_PATH is incomplete or could not be written" >&2
++  STATUS=1
++fi
++
++exit "$STATUS"

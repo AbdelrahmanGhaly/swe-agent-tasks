@@ -1,0 +1,5430 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..ffdfd66d
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,80 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() { echo "usage: $0 [--output_path <path>] base|new" >&2; exit 2; }
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new) MODE="$1"; MODE_COUNT=$((MODE_COUNT + 1)); shift ;;
++    --output_path) shift; [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }; OUTPUT_PATH="$1"; shift ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    *) echo "unknown argument: $1" >&2; usage ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++ROOT="$(cd "$(dirname "$0")" && pwd)"
++WORK="$(mktemp -d)"
++BUILD="$WORK/build"
++if [ -n "$OUTPUT_PATH" ]; then mkdir -p "$(dirname "$OUTPUT_PATH")"; fi
++JOBS="$(nproc 2>/dev/null || echo 4)"
++[ "$JOBS" -gt 8 ] && JOBS=8
++
++write_failure() {
++  [ -n "$OUTPUT_PATH" ] || return 0
++  cat > "$OUTPUT_PATH" <<EOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites tests="1" failures="1" errors="0" name="AllTests">
++  <testsuite name="TestHarness" tests="1" failures="1" errors="0">
++    <testcase name="$1" classname="TestHarness">
++      <failure message="$2"><![CDATA[$(tail -n 60 "$3" 2>/dev/null | sed 's/]]>/]] >/g')]]></failure>
++    </testcase>
++  </testsuite>
++</testsuites>
++EOF
++}
++
++cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release > "$WORK/build.log" 2>&1 \
++  && cmake --build "$BUILD" -j"$JOBS" >> "$WORK/build.log" 2>&1
++BUILD_STATUS=$?
++if [ "$BUILD_STATUS" -ne 0 ]; then
++  echo "cmake build failed with status $BUILD_STATUS" >&2
++  tail -n 40 "$WORK/build.log" >&2
++fi
++
++if [ "$MODE" = "base" ]; then
++  FILTER='Keep/*:Repo/*'
++  for program in test_bits test_ranges streams stest lazytest; do
++    g++ -std=gnu++11 -O2 -I"$ROOT/include" -o "$BUILD/$program" "$ROOT/tests/$program.cpp" "$BUILD/libreflex.a" >> "$WORK/programs.log" 2>&1 &
++  done
++  wait
++else
++  FILTER='Buffers/*:Lines/*'
++fi
++
++HARNESS="$WORK/buffers_8e9584_test"
++if ! g++ -std=c++17 -O1 -pthread -o "$HARNESS" "$ROOT/tests/buffers_8e9584/buffers_8e9584_test.cpp" -lgtest -lgtest_main > "$WORK/harness.log" 2>&1; then
++  write_failure "harness_build" "the test harness does not compile" "$WORK/harness.log"
++  rm -rf "$WORK"
++  exit 1
++fi
++
++XML_FLAG=()
++if [ -n "$OUTPUT_PATH" ]; then
++  rm -f "$OUTPUT_PATH"
++  XML_FLAG=(--gtest_output="xml:$OUTPUT_PATH")
++fi
++REFLEX_ROOT="$ROOT" REFLEX_BUILD="$BUILD" BUFFERS_WORK="$WORK/scanners" BUFFERS_JOBS="$JOBS" \
++  "$HARNESS" --gtest_filter="$FILTER" ${XML_FLAG[@]+"${XML_FLAG[@]}"} 2>&1 | tee "$WORK/run.log"
++STATUS=${PIPESTATUS[0]}
++
++if [ -n "$OUTPUT_PATH" ] && [ ! -s "$OUTPUT_PATH" ]; then
++  write_failure "harness_run" "the test harness exited with status $STATUS without results" "$WORK/run.log"
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++rm -rf "$WORK"
++exit "$STATUS"
+diff --git a/tests/buffers_8e9584/buffers_8e9584_test.cpp b/tests/buffers_8e9584/buffers_8e9584_test.cpp
+new file mode 100644
+index 00000000..447f36b8
+--- /dev/null
++++ b/tests/buffers_8e9584/buffers_8e9584_test.cpp
+@@ -0,0 +1,397 @@
++#include <gtest/gtest.h>
++
++#include <sys/wait.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <map>
++#include <sstream>
++#include <string>
++#include <vector>
++
++namespace {
++
++const char *const buffer_cases[] = {
++  "scan_first",
++  "scan_parts",
++  "scan_bytes",
++  "scan_copy",
++  "scan_handles",
++  "scan_inplace",
++  "scan_docs",
++  "switch_saved",
++  "switch_bol",
++  "switch_states",
++  "switch_action",
++  "switch_include_files",
++  "push_include",
++  "push_include_tokens",
++  "push_first",
++  "files_loop",
++  "files_tokens",
++  "restart_between",
++  "yyin_follows",
++  "file_first",
++  "wrap_files",
++  "wrap_strings",
++  "wrap_restart",
++  "wrap_switch",
++  "wrap_push",
++  "wrap_tokens",
++  "wrap_eof",
++  "flush_current",
++  "flush_action",
++  "init_once",
++  "delete_rescan",
++  "eof_files",
++  "eof_new_file",
++  "eof_strings",
++  "string_then_yyin",
++  "flush_bol",
++  "scan_buffer_check",
++  "init_yyin",
++  "init_buffer",
++  "init_string",
++  "restart_first",
++  "yyin_switch",
++  "yyin_action",
++};
++
++const int corpus_size = 36;
++
++const char *const line_cases[] = {
++  "lineno_per_buffer",
++  "lineno_mixed",
++};
++
++const char *const keep_cases[] = {
++  "keep_stdin",
++  "keep_files",
++  "restart_action",
++  "lineno_eof",
++};
++
++const char *const modes[] = { "default", "fast" };
++
++const char *const repo_programs[] = { "rtest", "test_bits", "test_ranges", "streams", "stest", "lazytest" };
++
++struct Param {
++  std::string name;
++  std::string mode;
++};
++
++std::string key(const Param& param)
++{
++  return param.name + "_" + param.mode;
++}
++
++void PrintTo(const Param& param, std::ostream *os)
++{
++  *os << key(param);
++}
++
++std::map<std::string,Param>& registry()
++{
++  static std::map<std::string,Param> params;
++  return params;
++}
++
++void add(const std::string& name, const std::string& mode, std::vector<Param>& params)
++{
++  Param param = { name, mode };
++  registry()[key(param)] = param;
++  params.push_back(param);
++}
++
++std::vector<Param> buffer_params()
++{
++  std::vector<Param> params;
++  for (size_t i = 0; i < sizeof(buffer_cases)/sizeof(*buffer_cases); ++i)
++    for (size_t j = 0; j < sizeof(modes)/sizeof(*modes); ++j)
++      add(buffer_cases[i], modes[j], params);
++  for (int i = 1; i <= corpus_size; ++i)
++  {
++    char name[16];
++    snprintf(name, sizeof(name), "corpus_%02d", i);
++    add(name, "default", params);
++  }
++  return params;
++}
++
++std::vector<Param> line_params()
++{
++  std::vector<Param> params;
++  for (size_t i = 0; i < sizeof(line_cases)/sizeof(*line_cases); ++i)
++    for (size_t j = 0; j < sizeof(modes)/sizeof(*modes); ++j)
++      add(line_cases[i], modes[j], params);
++  return params;
++}
++
++std::vector<Param> keep_params()
++{
++  std::vector<Param> params;
++  for (size_t i = 0; i < sizeof(keep_cases)/sizeof(*keep_cases); ++i)
++    for (size_t j = 0; j < sizeof(modes)/sizeof(*modes); ++j)
++      add(keep_cases[i], modes[j], params);
++  return params;
++}
++
++std::string env(const char *name, const char *fallback)
++{
++  const char *value = getenv(name);
++  return value != NULL && *value != '\0' ? value : fallback;
++}
++
++const std::string root = env("REFLEX_ROOT", "/app");
++const std::string build_dir = env("REFLEX_BUILD", (root + "/build").c_str());
++const std::string work = env("BUFFERS_WORK", "/tmp/buffers_8e9584");
++const std::string suite_dir = root + "/tests/buffers_8e9584";
++const std::string cases_dir = suite_dir + "/cases";
++const std::string reflex = build_dir + "/reflex";
++const std::string library = build_dir + "/libreflex.a";
++
++std::string quote(const std::string& s)
++{
++  return "'" + s + "'";
++}
++
++struct Outcome {
++  int         status;
++  std::string output;
++};
++
++Outcome run(const std::string& command)
++{
++  Outcome result = { -1, "" };
++  FILE *pipe = popen(command.c_str(), "r");
++  if (pipe == NULL)
++    return result;
++  char buffer[4096];
++  size_t n;
++  while ((n = fread(buffer, 1, sizeof(buffer), pipe)) > 0)
++    result.output.append(buffer, n);
++  int status = pclose(pipe);
++  if (WIFEXITED(status))
++    result.status = WEXITSTATUS(status);
++  return result;
++}
++
++bool read_file(const std::string& path, std::string& text)
++{
++  std::ifstream file(path.c_str(), std::ios::binary);
++  if (!file)
++    return false;
++  std::stringstream buffer;
++  buffer << file.rdbuf();
++  text = buffer.str();
++  return true;
++}
++
++bool exists(const std::string& path)
++{
++  std::ifstream file(path.c_str());
++  return file.good();
++}
++
++std::string head(const std::string& text, size_t lines)
++{
++  size_t pos = 0;
++  while (lines-- > 0 && pos != std::string::npos)
++  {
++    pos = text.find('\n', pos);
++    if (pos != std::string::npos)
++      ++pos;
++  }
++  return pos == std::string::npos ? text : text.substr(0, pos);
++}
++
++std::string visible(const std::string& text)
++{
++  std::string s;
++  for (size_t i = 0; i < text.size(); ++i)
++  {
++    if (text[i] == '\n')
++      s.append("\\n");
++    else if (text[i] == '\t')
++      s.append("\\t");
++    else
++      s.push_back(text[i]);
++  }
++  return s;
++}
++
++::testing::AssertionResult same_output(const char *reference, const std::string& expected, const std::string& actual)
++{
++  if (expected == actual)
++    return ::testing::AssertionSuccess();
++  size_t i = 0;
++  while (i < expected.size() && i < actual.size() && expected[i] == actual[i])
++    ++i;
++  size_t from = i > 60 ? i - 60 : 0;
++  return ::testing::AssertionFailure()
++    << "output differs from the " << reference << " output at byte " << i
++    << " (expected " << expected.size() << " bytes, got " << actual.size() << " bytes)\n"
++    << "expected: ..." << visible(expected.substr(from, 160)) << "\n"
++    << "actual:   ..." << visible(actual.substr(from, 160));
++}
++
++struct Build {
++  bool        done;
++  std::string log;
++  std::string exe;
++};
++
++std::map<std::string,Build>& builds()
++{
++  static std::map<std::string,Build> table;
++  return table;
++}
++
++std::string mode_flags(const std::string& mode)
++{
++  return mode == "default" ? "" : "--" + mode + " ";
++}
++
++const char *const build_script =
++  "flags=--yy\n"
++  "if [ \"$3\" != default ]; then flags=\"--yy --$3\"; fi\n"
++  "if ! \"$REFLEX\" $flags -o \"$WORK/$1.cpp\" \"$CASES/$2.l\" > \"$WORK/$1.gen\" 2>&1; then\n"
++  "  echo generate > \"$WORK/$1.fail\"\n"
++  "elif ! g++ -w -I\"$INCLUDE\" -o \"$WORK/$1\" \"$WORK/$1.cpp\" \"$LIBRARY\" > \"$WORK/$1.cc\" 2>&1; then\n"
++  "  echo compile > \"$WORK/$1.fail\"\n"
++  "fi\n";
++
++void check_build(const Param& param, Build& build)
++{
++  std::string base = work + "/" + key(param);
++  build.exe = base;
++  std::string failure, output;
++  if (!read_file(base + ".fail", failure))
++  {
++    build.done = true;
++    return;
++  }
++  if (failure.compare(0, 8, "generate") == 0)
++  {
++    read_file(base + ".gen", output);
++    build.log = "reflex --yy " + mode_flags(param.mode) + param.name + ".l failed:\n" + head(output, 20);
++  }
++  else
++  {
++    read_file(base + ".cc", output);
++    build.log = "the scanner generated by reflex --yy " + mode_flags(param.mode) + param.name + ".l does not compile:\n" + head(output, 30);
++  }
++}
++
++class Builds : public ::testing::Environment {
++ public:
++  void SetUp() override
++  {
++    run("mkdir -p " + quote(work));
++    std::vector<const Param*> params;
++    const ::testing::UnitTest *unit = ::testing::UnitTest::GetInstance();
++    for (int i = 0; i < unit->total_test_suite_count(); ++i)
++    {
++      const ::testing::TestSuite *suite = unit->GetTestSuite(i);
++      for (int j = 0; j < suite->total_test_count(); ++j)
++      {
++        const ::testing::TestInfo *info = suite->GetTestInfo(j);
++        if (!info->should_run() || info->value_param() == NULL)
++          continue;
++        std::map<std::string,Param>::const_iterator param = registry().find(info->value_param());
++        if (param != registry().end())
++          params.push_back(&param->second);
++      }
++    }
++    if (params.empty())
++      return;
++    std::ofstream script((work + "/build.sh").c_str(), std::ios::binary);
++    script << build_script;
++    script.close();
++    std::ofstream jobs((work + "/jobs.txt").c_str(), std::ios::binary);
++    for (size_t i = 0; i < params.size(); ++i)
++      jobs << key(*params[i]) << ' ' << params[i]->name << ' ' << params[i]->mode << '\n';
++    jobs.close();
++    run("cd " + quote(work) +
++        " && REFLEX=" + quote(reflex) +
++        " INCLUDE=" + quote(root + "/include") +
++        " LIBRARY=" + quote(library) +
++        " CASES=" + quote(cases_dir) +
++        " WORK=" + quote(work) +
++        " xargs -P " + env("BUFFERS_JOBS", "4") + " -L 1 sh build.sh < jobs.txt 2>&1");
++    for (size_t i = 0; i < params.size(); ++i)
++      check_build(*params[i], builds()[key(*params[i])]);
++  }
++};
++
++::testing::Environment *const builds_environment = ::testing::AddGlobalTestEnvironment(new Builds);
++
++void expect_output(const Param& param, const char *reference)
++{
++  const Build& build = builds()[key(param)];
++  ASSERT_TRUE(build.done) << build.log;
++  std::string expected;
++  ASSERT_TRUE(read_file(cases_dir + "/" + param.name + ".out", expected)) << "missing " << param.name << ".out";
++  std::string input = cases_dir + "/" + param.name + ".in";
++  if (!exists(input))
++    input = "/dev/null";
++  std::string output = work + "/" + key(param) + ".txt";
++  std::string errors = work + "/" + key(param) + ".err";
++  Outcome scan = run("cd " + quote(cases_dir) + " && timeout 60 " + quote(build.exe) + " < " + quote(input) + " > " + quote(output) + " 2> " + quote(errors));
++  std::string actual, stderr_text;
++  read_file(output, actual);
++  read_file(errors, stderr_text);
++  EXPECT_EQ(0, scan.status) << "the program exited with status " << scan.status << (scan.status == 124 ? " (timed out)" : "") << "\n" << head(stderr_text, 10);
++  EXPECT_TRUE(same_output(reference, expected, actual));
++}
++
++std::string param_name(const ::testing::TestParamInfo<Param>& info)
++{
++  return key(info.param);
++}
++
++class BufferScanner : public ::testing::TestWithParam<Param> { };
++
++TEST_P(BufferScanner, MatchesFlex)
++{
++  expect_output(GetParam(), "flex 2.6.4");
++}
++
++INSTANTIATE_TEST_SUITE_P(Buffers, BufferScanner, ::testing::ValuesIn(buffer_params()), param_name);
++
++class LineScanner : public ::testing::TestWithParam<Param> { };
++
++TEST_P(LineScanner, CountsPerBuffer)
++{
++  expect_output(GetParam(), "per-buffer yylineno");
++}
++
++INSTANTIATE_TEST_SUITE_P(Lines, LineScanner, ::testing::ValuesIn(line_params()), param_name);
++
++class KeepScanner : public ::testing::TestWithParam<Param> { };
++
++TEST_P(KeepScanner, MatchesFlex)
++{
++  expect_output(GetParam(), "flex 2.6.4");
++}
++
++INSTANTIATE_TEST_SUITE_P(Keep, KeepScanner, ::testing::ValuesIn(keep_params()), param_name);
++
++class RepoProgram : public ::testing::TestWithParam<const char*> { };
++
++TEST_P(RepoProgram, Passes)
++{
++  std::string program = build_dir + "/" + GetParam();
++  Outcome test = run("cd " + quote(root + "/tests") + " && timeout 600 " + quote(program) + " 2>&1");
++  EXPECT_EQ(0, test.status) << GetParam() << " exited with status " << test.status << ":\n" << head(test.output, 40);
++}
++
++std::string program_name(const ::testing::TestParamInfo<const char*>& info)
++{
++  return info.param;
++}
++
++INSTANTIATE_TEST_SUITE_P(Repo, RepoProgram, ::testing::ValuesIn(repo_programs), program_name);
++
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_01.in b/tests/buffers_8e9584/cases/corpus_01.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_01.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_01.l b/tests/buffers_8e9584/cases/corpus_01.l
+new file mode 100644
+index 00000000..0126574f
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_01.l
+@@ -0,0 +1,35 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++%%
++int main() {
++  bufs[0] = yy_scan_bytes("caa  abcc", 7);
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_01.out b/tests/buffers_8e9584/cases/corpus_01.out
+new file mode 100644
+index 00000000..22dbe1e1
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_01.out
+@@ -0,0 +1 @@
++{init} B(caa) W(ab)<0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_02.in b/tests/buffers_8e9584/cases/corpus_02.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_02.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_02.l b/tests/buffers_8e9584/cases/corpus_02.l
+new file mode 100644
+index 00000000..2b609699
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_02.l
+@@ -0,0 +1,32 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++.	{ }
++%%
++int main() {
++  bufs[0] = yy_scan_string("\n  ");
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[1] = yy_scan_string("\n\n\" \nbcb \na");
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_02.out b/tests/buffers_8e9584/cases/corpus_02.out
+new file mode 100644
+index 00000000..f7977aa5
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_02.out
+@@ -0,0 +1 @@
++ N(^)<0> | N(^) N(^) N(^) B(bcb) N(^) B(a)<0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_03.in b/tests/buffers_8e9584/cases/corpus_03.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_03.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_03.l b/tests/buffers_8e9584/cases/corpus_03.l
+new file mode 100644
+index 00000000..106ff2b6
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_03.l
+@@ -0,0 +1,34 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++\n	{ show("N", yytext, yyleng); return 4; }
++.	{ }
++%%
++int main() {
++  yyin = fopen("d2.txt", "r");
++  for (k = 0; k < 2; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[0] = yy_scan_string("ac\nca\na aaa");
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[1] = yy_create_buffer(fopen("d2.txt", "r"), YY_BUF_SIZE); yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_03.out b/tests/buffers_8e9584/cases/corpus_03.out
+new file mode 100644
+index 00000000..bd49bee1
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_03.out
+@@ -0,0 +1 @@
++ B(cc)<1> W(a)<2> | B(ac)<1> | B(cc)<1> W(a)<2> N(^)<4> |
+diff --git a/tests/buffers_8e9584/cases/corpus_04.in b/tests/buffers_8e9584/cases/corpus_04.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_04.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_04.l b/tests/buffers_8e9584/cases/corpus_04.l
+new file mode 100644
+index 00000000..659c9392
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_04.l
+@@ -0,0 +1,43 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++%%
++int main() {
++  bufs[0] = yy_scan_bytes("\n bbc  ", 2);
++  bufs[1] = yy_scan_bytes("\ncb bc abb\nb", 4);
++  bufs[2] = yy_scan_string(" ab\nabbaca");
++  yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yy_flush_buffer(YY_CURRENT_BUFFER);
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_04.out b/tests/buffers_8e9584/cases/corpus_04.out
+new file mode 100644
+index 00000000..288da0ac
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_04.out
+@@ -0,0 +1 @@
++{init} N(^) B(cb)<0> |<0> |<0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_05.in b/tests/buffers_8e9584/cases/corpus_05.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_05.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_05.l b/tests/buffers_8e9584/cases/corpus_05.l
+new file mode 100644
+index 00000000..281def2f
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_05.l
+@@ -0,0 +1,34 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); return 3; }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); return 4; }
++<*>.	{ }
++%%
++int main() {
++  bufs[0] = yy_scan_string("c ");
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_05.out b/tests/buffers_8e9584/cases/corpus_05.out
+new file mode 100644
+index 00000000..3709e3ca
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_05.out
+@@ -0,0 +1 @@
++ B(c)<1> |
+diff --git a/tests/buffers_8e9584/cases/corpus_06.in b/tests/buffers_8e9584/cases/corpus_06.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_06.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_06.l b/tests/buffers_8e9584/cases/corpus_06.l
+new file mode 100644
+index 00000000..04aa3b28
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_06.l
+@@ -0,0 +1,37 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); return 3; }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++%%
++int main() {
++  bufs[0] = yy_create_buffer(fopen("d2.txt", "r"), YY_BUF_SIZE);
++  bufs[1] = yy_scan_bytes("b b", 2);
++  bufs[2] = yy_scan_string(" cccccbaba b");
++  yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_06.out b/tests/buffers_8e9584/cases/corpus_06.out
+new file mode 100644
+index 00000000..dbcf5790
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_06.out
+@@ -0,0 +1 @@
++{init} B(b)<1><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_07.in b/tests/buffers_8e9584/cases/corpus_07.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_07.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_07.l b/tests/buffers_8e9584/cases/corpus_07.l
+new file mode 100644
+index 00000000..eab38ded
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_07.l
+@@ -0,0 +1,41 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int k = 0;
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d1.txt", "r"), YY_BUF_SIZE)); break; case '1': kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d3.txt", "r"), YY_BUF_SIZE)); break; default: saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("a "); break; } ++depth; } }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int main() {
++  yyrestart(fopen("d1.txt", "r"));
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yyrestart(fopen("d3.txt", "r"));
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_07.out b/tests/buffers_8e9584/cases/corpus_07.out
+new file mode 100644
+index 00000000..7282e7b2
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_07.out
+@@ -0,0 +1 @@
++{init} B(ab) W(ca) N(^) B(bb) N(^) <eof0><0> | B(ba) N(^) Q(") S(cab c) E(") N(^) B(ab) <eof0><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_08.in b/tests/buffers_8e9584/cases/corpus_08.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_08.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_08.l b/tests/buffers_8e9584/cases/corpus_08.l
+new file mode 100644
+index 00000000..615cf0e3
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_08.l
+@@ -0,0 +1,40 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d1.txt", "r"), YY_BUF_SIZE)); break; case '1': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("\n   "); break; default: kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d2.txt", "r"), YY_BUF_SIZE)); break; } ++depth; } }
++\n	{ show("N", yytext, yyleng); }
++.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int main() {
++  bufs[0] = yy_scan_string("\n \nbcb \n");
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("[%d]", YY_CURRENT_BUFFER != NULL);
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[1] = yy_create_buffer(fopen("d3.txt", "r"), YY_BUF_SIZE); if (depth == 0) yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_08.out b/tests/buffers_8e9584/cases/corpus_08.out
+new file mode 100644
+index 00000000..e634ddf3
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_08.out
+@@ -0,0 +1 @@
++ N(^) N(^) B(bcb) N(^) <eof0><0> |[1] <eof0><0> | B(ba) N(^) W(cab) W(c) N(^) B(ab) <eof0><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_09.in b/tests/buffers_8e9584/cases/corpus_09.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_09.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_09.l b/tests/buffers_8e9584/cases/corpus_09.l
+new file mode 100644
+index 00000000..68699861
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_09.l
+@@ -0,0 +1,36 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("bc"); break; case '1': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("c\n"); break; default: kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d3.txt", "r"), YY_BUF_SIZE)); break; } ++depth; } }
++\n	{ show("N", yytext, yyleng); }
++.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int main() {
++  bufs[0] = yy_scan_string("");
++  bufs[1] = yy_scan_string("bcb\n  \ncc ");
++  bufs[2] = yy_scan_string("cb\n\n\nc bbac");
++  yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_09.out b/tests/buffers_8e9584/cases/corpus_09.out
+new file mode 100644
+index 00000000..67f1110a
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_09.out
+@@ -0,0 +1 @@
++ B(bcb)<1> N(^) N(^) B(cc)<1> <eof0><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_10.in b/tests/buffers_8e9584/cases/corpus_10.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_10.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_10.l b/tests/buffers_8e9584/cases/corpus_10.l
+new file mode 100644
+index 00000000..64fba6b6
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_10.l
+@@ -0,0 +1,51 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("\n \n bbc "); break; case '1': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("\nc"); break; default: saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("ab\"b\nbb"); break; } ++depth; } }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int main() {
++  bufs[0] = yy_scan_bytes("b\n", 1);
++  bufs[1] = yy_create_buffer(fopen("d2.txt", "r"), YY_BUF_SIZE);
++  bufs[2] = yy_scan_string("cabbc\n\n");
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 2; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (YY_CURRENT_BUFFER == NULL || k < 2) yyrestart(fopen("d1.txt", "r"));
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yyrestart(fopen("d3.txt", "r"));
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (depth == 0) yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_10.out b/tests/buffers_8e9584/cases/corpus_10.out
+new file mode 100644
+index 00000000..7da2f8c6
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_10.out
+@@ -0,0 +1 @@
++{init} B(b) <eof0><0> | B(ab) W(ca) N(^) B(bb) N(^) <eof0><0> | B(ba) N(^) Q(") S(cab c) E(") N(^) B(ab) <eof0><0> | <eof0><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_11.in b/tests/buffers_8e9584/cases/corpus_11.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_11.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_11.l b/tests/buffers_8e9584/cases/corpus_11.l
+new file mode 100644
+index 00000000..0e24b465
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_11.l
+@@ -0,0 +1,38 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int k = 0;
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("ba"); break; case '1': kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d2.txt", "r"), YY_BUF_SIZE)); break; default: saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("bb\n c"); break; } ++depth; } }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); return 3; }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int main() {
++  yyrestart(fopen("d2.txt", "r"));
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_11.out b/tests/buffers_8e9584/cases/corpus_11.out
+new file mode 100644
+index 00000000..a59d0d8b
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_11.out
+@@ -0,0 +1 @@
++{init} B(cc)<1> W(a)<2> N(^) <eof0><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_12.in b/tests/buffers_8e9584/cases/corpus_12.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_12.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_12.l b/tests/buffers_8e9584/cases/corpus_12.l
+new file mode 100644
+index 00000000..a19ac7cb
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_12.l
+@@ -0,0 +1,42 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("bc\n"); break; case '1': kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d2.txt", "r"), YY_BUF_SIZE)); break; default: saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string(" a cba"); break; } ++depth; } }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int main() {
++  bufs[0] = yy_scan_string(" \"acb\" \"\n c");
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (YY_CURRENT_BUFFER == NULL || k < 5) yyrestart(fopen("d3.txt", "r"));
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_12.out b/tests/buffers_8e9584/cases/corpus_12.out
+new file mode 100644
+index 00000000..f9c0b74b
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_12.out
+@@ -0,0 +1 @@
++ Q(") S(acb) E(") Q(") n(^) S( c) <eof0><0> | S(ba) n(^) E(") W(cab) W(c) Q(") n(^) S(ab) <eof0><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_13.in b/tests/buffers_8e9584/cases/corpus_13.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_13.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_13.l b/tests/buffers_8e9584/cases/corpus_13.l
+new file mode 100644
+index 00000000..e95ee0fd
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_13.l
+@@ -0,0 +1,38 @@
++%option yywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int wraps = 0;
++static int k = 0;
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yy_switch_to_buffer(yy_scan_bytes(" \ncaa ", 6)); break; case 1: yy_switch_to_buffer(yy_scan_bytes("b", 1)); break; case 2: yyin = fopen("d3.txt", "r"); break; default: return 1; } return 0; }
++int main() {
++  yyrestart(fopen("d4.txt", "r"));
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (YY_CURRENT_BUFFER == NULL || k < 5) yyrestart(fopen("d1.txt", "r"));
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_13.out b/tests/buffers_8e9584/cases/corpus_13.out
+new file mode 100644
+index 00000000..c9577332
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_13.out
+@@ -0,0 +1 @@
++{init} N(^) N(^) B(ca) W(bc) N(^) {w0} N(^) B(caa) {w1} B(b) {w2} B(ba) N(^) Q(") S(cab c) E(") N(^) B(ab) {w3}<0> | B(ab) W(ca) N(^) B(bb) N(^) {w4}<0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_14.in b/tests/buffers_8e9584/cases/corpus_14.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_14.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_14.l b/tests/buffers_8e9584/cases/corpus_14.l
+new file mode 100644
+index 00000000..bf6a49fd
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_14.l
+@@ -0,0 +1,39 @@
++%option yywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int wraps = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++.	{ }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) {  default: return 1; } return 0; }
++int main() {
++  bufs[0] = yy_scan_bytes(" b  a \n\n", 7);
++  bufs[1] = yy_scan_bytes(" \na", 2);
++  bufs[2] = yy_create_buffer(fopen("d3.txt", "r"), YY_BUF_SIZE);
++  yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("[%d]", YY_CURRENT_BUFFER != NULL);
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yy_switch_to_buffer(bufs[2]);
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_14.out b/tests/buffers_8e9584/cases/corpus_14.out
+new file mode 100644
+index 00000000..9d9b2f86
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_14.out
+@@ -0,0 +1 @@
++ N(^) {w0}<0> |[1] {w1}<0> | B(ba) N(^) W(cab) W(c) N(^) B(ab) {w2}<0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_15.in b/tests/buffers_8e9584/cases/corpus_15.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_15.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_15.l b/tests/buffers_8e9584/cases/corpus_15.l
+new file mode 100644
+index 00000000..1499ab17
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_15.l
+@@ -0,0 +1,39 @@
++%option yywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int wraps = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yyin = fopen("d4.txt", "r"); break; case 1: yyin = fopen("d4.txt", "r"); break; case 2: yy_scan_string("  b\n"); break; default: return 1; } return 0; }
++int main() {
++  yyin = fopen("d3.txt", "r");
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[0] = yy_scan_string("");
++  for (k = 0; k < 2; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_15.out b/tests/buffers_8e9584/cases/corpus_15.out
+new file mode 100644
+index 00000000..8298ec24
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_15.out
+@@ -0,0 +1 @@
++{init} B(ba) N(^) Q(") S(cab c) E(") N(^) B(ab) {w0} N(^) N(^) B(ca) W(bc) N(^) {w1} N(^) N(^) B(ca) W(bc) N(^) {w2} W(b) N(^) {w3}<0> | {w4}<0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_16.in b/tests/buffers_8e9584/cases/corpus_16.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_16.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_16.l b/tests/buffers_8e9584/cases/corpus_16.l
+new file mode 100644
+index 00000000..72ccd6a5
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_16.l
+@@ -0,0 +1,36 @@
++%option yywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int wraps = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); return 3; }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); return 4; }
++<*>.	{ }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) {  default: return 1; } return 0; }
++int main() {
++  bufs[0] = yy_scan_string("c ");
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_16.out b/tests/buffers_8e9584/cases/corpus_16.out
+new file mode 100644
+index 00000000..3709e3ca
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_16.out
+@@ -0,0 +1 @@
++ B(c)<1> |
+diff --git a/tests/buffers_8e9584/cases/corpus_17.in b/tests/buffers_8e9584/cases/corpus_17.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_17.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_17.l b/tests/buffers_8e9584/cases/corpus_17.l
+new file mode 100644
+index 00000000..61a367a1
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_17.l
+@@ -0,0 +1,38 @@
++%option yywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int wraps = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); return 3; }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) {  default: return 1; } return 0; }
++int main() {
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[0] = yy_scan_string(" b");
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_17.out b/tests/buffers_8e9584/cases/corpus_17.out
+new file mode 100644
+index 00000000..7168c60a
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_17.out
+@@ -0,0 +1 @@
++{init} B(aa)<1> W(b)<2> N(^) B(c)<1> {w0}<0> | W(b)<2> {w1}<0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_18.in b/tests/buffers_8e9584/cases/corpus_18.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_18.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_18.l b/tests/buffers_8e9584/cases/corpus_18.l
+new file mode 100644
+index 00000000..ad465d92
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_18.l
+@@ -0,0 +1,37 @@
++%option yywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int wraps = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yy_scan_string("bc"); break; default: return 1; } return 0; }
++int main() {
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[0] = yy_scan_string(" a cb");
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_18.out b/tests/buffers_8e9584/cases/corpus_18.out
+new file mode 100644
+index 00000000..38817828
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_18.out
+@@ -0,0 +1 @@
++ B(aa) W(b) N(^) B(c) {w0} B(bc) {w1}<0> | W(a) W(cb) {w2}<0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_19.in b/tests/buffers_8e9584/cases/corpus_19.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_19.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_19.l b/tests/buffers_8e9584/cases/corpus_19.l
+new file mode 100644
+index 00000000..08f1d8e8
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_19.l
+@@ -0,0 +1,39 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof>"); yyterminate(); }
++%%
++int main() {
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[0] = yy_create_buffer(fopen("d1.txt", "r"), YY_BUF_SIZE); yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("[%d]", YY_CURRENT_BUFFER != NULL);
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_19.out b/tests/buffers_8e9584/cases/corpus_19.out
+new file mode 100644
+index 00000000..f5709d00
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_19.out
+@@ -0,0 +1 @@
++ B(aa) W(b) N(^) B(c) <eof><0> | B(ab) W(ca) N(^) B(bb) N(^) <eof><0> |[1] <eof><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_20.in b/tests/buffers_8e9584/cases/corpus_20.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_20.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_20.l b/tests/buffers_8e9584/cases/corpus_20.l
+new file mode 100644
+index 00000000..a7203f8f
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_20.l
+@@ -0,0 +1,32 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++.	{ }
++%%
++int main() {
++  bufs[0] = yy_scan_bytes("  b  a ", 6);
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_20.out b/tests/buffers_8e9584/cases/corpus_20.out
+new file mode 100644
+index 00000000..f752aba4
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_20.out
+@@ -0,0 +1 @@
++ W(b) W(a)<0> |<0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_21.in b/tests/buffers_8e9584/cases/corpus_21.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_21.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_21.l b/tests/buffers_8e9584/cases/corpus_21.l
+new file mode 100644
+index 00000000..4345d6a1
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_21.l
+@@ -0,0 +1,30 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++\n	{ show("N", yytext, yyleng); }
++.	{ }
++%%
++int main() {
++  bufs[0] = yy_scan_string("ac\nc");
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_21.out b/tests/buffers_8e9584/cases/corpus_21.out
+new file mode 100644
+index 00000000..8dce96c6
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_21.out
+@@ -0,0 +1 @@
++{init} B(ac)<1> N(^) B(c)<1><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_22.in b/tests/buffers_8e9584/cases/corpus_22.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_22.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_22.l b/tests/buffers_8e9584/cases/corpus_22.l
+new file mode 100644
+index 00000000..34c1b45c
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_22.l
+@@ -0,0 +1,43 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof>"); yyterminate(); }
++%%
++int main() {
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[0] = yy_scan_string("c  b\na\ncb b");
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("[%d]", YY_CURRENT_BUFFER != NULL);
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (YY_CURRENT_BUFFER == NULL || k < 1) yyrestart(fopen("d2.txt", "r"));
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_22.out b/tests/buffers_8e9584/cases/corpus_22.out
+new file mode 100644
+index 00000000..14ea021f
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_22.out
+@@ -0,0 +1 @@
++{init} B(aa) W(b) N(^) B(c) <eof><0> | B(c) W(b) N(^) B(a) N(^) B(cb) W(b) <eof><0> |[1] <eof><0> | B(cc) W(a) N(^) <eof><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_23.in b/tests/buffers_8e9584/cases/corpus_23.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_23.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_23.l b/tests/buffers_8e9584/cases/corpus_23.l
+new file mode 100644
+index 00000000..980c52b6
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_23.l
+@@ -0,0 +1,37 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); return 3; }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); return 4; }
++<*>.	{ }
++%%
++int main() {
++  yyin = fopen("d4.txt", "r");
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[0] = yy_scan_string("baaccabab");
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_23.out b/tests/buffers_8e9584/cases/corpus_23.out
+new file mode 100644
+index 00000000..ecf4a9c5
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_23.out
+@@ -0,0 +1 @@
++{init} N(^)<4> N(^)<4> B(ca)<1> W(bc)<2> N(^)<4><0> | B(baaccabab)<1><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_24.in b/tests/buffers_8e9584/cases/corpus_24.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_24.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_24.l b/tests/buffers_8e9584/cases/corpus_24.l
+new file mode 100644
+index 00000000..50ff2c5f
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_24.l
+@@ -0,0 +1,35 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); return 4; }
++<*>.	{ }
++%%
++int main() {
++  bufs[0] = yy_scan_bytes("abcb bbc cca", 3);
++  bufs[1] = yy_create_buffer(fopen("d4.txt", "r"), YY_BUF_SIZE);
++  yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_24.out b/tests/buffers_8e9584/cases/corpus_24.out
+new file mode 100644
+index 00000000..b2032b77
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_24.out
+@@ -0,0 +1 @@
++ N(^)<4> N(^)<4> B(ca)<1> W(bc)<2> |
+diff --git a/tests/buffers_8e9584/cases/corpus_25.in b/tests/buffers_8e9584/cases/corpus_25.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_25.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_25.l b/tests/buffers_8e9584/cases/corpus_25.l
+new file mode 100644
+index 00000000..088a0ccc
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_25.l
+@@ -0,0 +1,43 @@
++%option yywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int wraps = 0;
++static int k = 0;
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d1.txt", "r"), YY_BUF_SIZE)); break; case '1': kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d3.txt", "r"), YY_BUF_SIZE)); break; default: saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("a "); break; } ++depth; } }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yyin = fopen("d1.txt", "r"); break; case 1: yyin = fopen("d2.txt", "r"); break; case 2: yyin = fopen("d3.txt", "r"); break; default: return 1; } return 0; }
++int main() {
++  yyrestart(fopen("d4.txt", "r"));
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (YY_CURRENT_BUFFER == NULL || k < 5) yyrestart(fopen("d1.txt", "r"));
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_25.out b/tests/buffers_8e9584/cases/corpus_25.out
+new file mode 100644
+index 00000000..1a1ea5af
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_25.out
+@@ -0,0 +1 @@
++{init} N(^) N(^) B(ca) W(bc) N(^) {w0} B(ab) W(ca) N(^) B(bb) N(^) {w1} B(cc) W(a) N(^) {w2} B(ba) N(^) Q(") S(cab c) E(") N(^) B(ab) {w3} <eof0><0> | B(ab) W(ca) N(^) B(bb) N(^) {w4} <eof0><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_26.in b/tests/buffers_8e9584/cases/corpus_26.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_26.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_26.l b/tests/buffers_8e9584/cases/corpus_26.l
+new file mode 100644
+index 00000000..d6486a08
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_26.l
+@@ -0,0 +1,43 @@
++%option yywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int wraps = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d1.txt", "r"), YY_BUF_SIZE)); break; case '1': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("\n   "); break; default: kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d2.txt", "r"), YY_BUF_SIZE)); break; } ++depth; } }
++\n	{ show("N", yytext, yyleng); }
++.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yyrestart(fopen("d1.txt", "r")); break; case 1: yyrestart(fopen("d4.txt", "r")); break; case 2: yyin = fopen("d2.txt", "r"); break; default: return 1; } return 0; }
++int main() {
++  bufs[0] = yy_scan_bytes(" c \ncac\nb abc", 2);
++  bufs[1] = yy_scan_bytes("cc babc", 3);
++  yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (depth == 0) yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (depth == 0) yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_26.out b/tests/buffers_8e9584/cases/corpus_26.out
+new file mode 100644
+index 00000000..266f9aee
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_26.out
+@@ -0,0 +1 @@
++ B(cc) {w0} B(ab) W(ca) N(^) B(bb) N(^) {w1} N(^) N(^) B(ca) W(bc) N(^) {w2} B(cc) W(a) N(^) {w3} <eof0><0> | {w4} <eof0><0> | {w5} <eof0><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_27.in b/tests/buffers_8e9584/cases/corpus_27.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_27.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_27.l b/tests/buffers_8e9584/cases/corpus_27.l
+new file mode 100644
+index 00000000..ec2710c2
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_27.l
+@@ -0,0 +1,48 @@
++%option yywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int wraps = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("\n \n bbc "); break; case '1': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("\nc"); break; default: saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("ab\"b\nbb"); break; } ++depth; } }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yy_switch_to_buffer(yy_scan_bytes("ab\nabbac", 8)); break; case 1: yy_switch_to_buffer(yy_scan_bytes("abbc\n\n", 6)); break; default: return 1; } return 0; }
++int main() {
++  bufs[0] = yy_create_buffer(fopen("d1.txt", "r"), YY_BUF_SIZE);
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (depth == 0) yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yyrestart(fopen("d3.txt", "r"));
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_27.out b/tests/buffers_8e9584/cases/corpus_27.out
+new file mode 100644
+index 00000000..cc5fb87e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_27.out
+@@ -0,0 +1 @@
++{init} B(ab) W(ca) N(^) B(bb) N(^) {w0} B(ab) N(^) B(abbac) {w1} B(abbc) N(^) N(^) {w2} <eof0><0> | {w3} <eof0><0> | B(ba) N(^) Q(") S(cab c) E(") N(^) B(ab) {w4} <eof0><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_28.in b/tests/buffers_8e9584/cases/corpus_28.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_28.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_28.l b/tests/buffers_8e9584/cases/corpus_28.l
+new file mode 100644
+index 00000000..23ca09e1
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_28.l
+@@ -0,0 +1,45 @@
++%option yywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int wraps = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("ab"); break; case '1': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("c b"); break; default: kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d1.txt", "r"), YY_BUF_SIZE)); break; } ++depth; } }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); return 3; }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); return 4; }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yy_scan_string("aabc bbb"); break; default: return 1; } return 0; }
++int main() {
++  bufs[0] = yy_scan_string("ccaca caaab");
++  bufs[1] = yy_scan_bytes("ccb cc  ", 8);
++  yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 2; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (YY_CURRENT_BUFFER == NULL || k < 2) yyrestart(fopen("d3.txt", "r"));
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_28.out b/tests/buffers_8e9584/cases/corpus_28.out
+new file mode 100644
+index 00000000..71e6a631
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_28.out
+@@ -0,0 +1 @@
++ B(ccb)<1> W(cc)<2> | {w0} B(aabc)<1> W(bbb)<2> {w1} <eof0><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_29.in b/tests/buffers_8e9584/cases/corpus_29.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_29.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_29.l b/tests/buffers_8e9584/cases/corpus_29.l
+new file mode 100644
+index 00000000..aab9d8de
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_29.l
+@@ -0,0 +1,53 @@
++%option yywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int wraps = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("ba"); break; case '1': kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d2.txt", "r"), YY_BUF_SIZE)); break; default: saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("bb\n c"); break; } ++depth; } }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); return 3; }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yyrestart(fopen("d2.txt", "r")); break; case 1: yy_switch_to_buffer(yy_scan_bytes("ba", 2)); break; default: return 1; } return 0; }
++int main() {
++  bufs[0] = yy_scan_bytes("acbbbb acc \ncb", 2);
++  bufs[1] = yy_scan_string("cbb");
++  bufs[2] = yy_create_buffer(fopen("d1.txt", "r"), YY_BUF_SIZE);
++  yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 2; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("[%d]", YY_CURRENT_BUFFER != NULL);
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (depth == 0) bufs[3] = yy_scan_string("c");
++  for (k = 0; k < 2; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yyrestart(fopen("d3.txt", "r"));
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_29.out b/tests/buffers_8e9584/cases/corpus_29.out
+new file mode 100644
+index 00000000..f6af7e23
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_29.out
+@@ -0,0 +1 @@
++{init} B(cbb)<1> {w0} B(cc)<1> |[1] W(a)<2> N(^) {w1} B(ba)<1> {w2} <eof0><0> | B(c)<1> {w3} <eof0><0> | B(ba)<1> |
+diff --git a/tests/buffers_8e9584/cases/corpus_30.in b/tests/buffers_8e9584/cases/corpus_30.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_30.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_30.l b/tests/buffers_8e9584/cases/corpus_30.l
+new file mode 100644
+index 00000000..783f4ec7
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_30.l
+@@ -0,0 +1,49 @@
++%option yywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int depth = 0;
++static int wraps = 0;
++static int k = 0;
++static YY_BUFFER_STATE bufs[6];
++static YY_BUFFER_STATE saved[4];
++static int kind[4];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++"@"[0-2]	{ show("I", yytext, yyleng); if (depth < 3) { switch (yytext[1]) { case '0': saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string("bc\n"); break; case '1': kind[depth] = 1; yypush_buffer_state(yy_create_buffer(fopen("d2.txt", "r"), YY_BUF_SIZE)); break; default: saved[depth] = YY_CURRENT_BUFFER; kind[depth] = 0; yy_scan_string(" a cba"); break; } ++depth; } }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof%d>", depth); if (depth == 0) yyterminate(); --depth; if (kind[depth]) yypop_buffer_state(); else { yy_delete_buffer(YY_CURRENT_BUFFER); yy_switch_to_buffer(saved[depth]); } }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yy_scan_string("ab acb "); break; case 1: yyin = fopen("d4.txt", "r"); break; default: return 1; } return 0; }
++int main() {
++  yyin = fopen("d3.txt", "r");
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (depth == 0) bufs[0] = yy_scan_string("a ab a \na cc");
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (depth == 0) bufs[1] = yy_scan_string("bc\n b  \n\nc \ncc");
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (depth == 0) bufs[2] = yy_scan_string("a\n cc");
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_30.out b/tests/buffers_8e9584/cases/corpus_30.out
+new file mode 100644
+index 00000000..5ca7afe1
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_30.out
+@@ -0,0 +1 @@
++ B(ba) N(^) Q(") S(cab c) E(") N(^) B(ab) {w0} B(ab) W(acb) {w1} N(^) N(^) B(ca) W(bc) N(^) {w2} <eof0><0> | B(a) W(ab) W(a) N(^) B(a) W(cc) {w3} <eof0><0> | B(bc) N(^) W(b) N(^) N(^) B(c) N(^) B(cc) {w4} <eof0><0> | B(a) N(^) W(cc) {w5} <eof0><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_31.in b/tests/buffers_8e9584/cases/corpus_31.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_31.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_31.l b/tests/buffers_8e9584/cases/corpus_31.l
+new file mode 100644
+index 00000000..55ea0150
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_31.l
+@@ -0,0 +1,48 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static int eofs = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof%d>", eofs); if (eofs >= 2) yyterminate(); yyin = fopen(eofs ? "d1.txt" : "d4.txt", "r"); ++eofs; }
++%%
++int main() {
++  bufs[0] = yy_scan_string(" \"a\"bcc");
++  bufs[1] = yy_create_buffer(fopen("d2.txt", "r"), YY_BUF_SIZE);
++  bufs[2] = yy_scan_bytes("aabcbbba aacbc", 11);
++  yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yy_switch_to_buffer(bufs[0]);
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yy_switch_to_buffer(bufs[2]);
++  for (k = 0; k < 1; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[3] = yy_scan_string("a\n  \n");
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_31.out b/tests/buffers_8e9584/cases/corpus_31.out
+new file mode 100644
+index 00000000..f189922a
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_31.out
+@@ -0,0 +1 @@
++{init} B(cc) W(a) N(^) <eof0> N(^) N(^) B(ca) W(bc) N(^) <eof1> B(ab) W(ca) N(^) B(bb) N(^) <eof2><0> | Q(") S(a) E(") W(bcc) <eof2><0> | B(aabcbbba) W(aa) <eof2><0> | B(a) N(^) N(^) <eof2><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_32.in b/tests/buffers_8e9584/cases/corpus_32.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_32.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_32.l b/tests/buffers_8e9584/cases/corpus_32.l
+new file mode 100644
+index 00000000..d3033211
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_32.l
+@@ -0,0 +1,41 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static int eofs = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++\n	{ show("N", yytext, yyleng); return 4; }
++.	{ }
++<<EOF>>	{ printf(" <eof%d>", eofs); if (eofs >= 2) yyterminate(); yyin = fopen(eofs ? "d1.txt" : "d3.txt", "r"); ++eofs; }
++%%
++int main() {
++  bufs[0] = yy_scan_string("c");
++  bufs[1] = yy_scan_bytes("ca\na aaaa  bcb", 9);
++  yy_switch_to_buffer(bufs[1]);
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[2] = yy_create_buffer(fopen("d3.txt", "r"), YY_BUF_SIZE); yy_switch_to_buffer(bufs[2]);
++  for (k = 0; k < 3; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[3] = yy_create_buffer(fopen("d3.txt", "r"), YY_BUF_SIZE); yy_switch_to_buffer(bufs[3]);
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("[%d]", YY_CURRENT_BUFFER != NULL);
++  for (k = 0; k < 2; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_32.out b/tests/buffers_8e9584/cases/corpus_32.out
+new file mode 100644
+index 00000000..63b29d8f
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_32.out
+@@ -0,0 +1 @@
++ B(ca)<1> N(^)<4> B(a)<1> W(aaaa)<2> <eof0> <eof1> <eof2><0> | B(ba)<1> N(^)<4> W(cab)<2> | B(ba)<1> N(^)<4> W(cab)<2> W(c)<2> N(^)<4> B(ab)<1> |[1] <eof2><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_33.in b/tests/buffers_8e9584/cases/corpus_33.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_33.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_33.l b/tests/buffers_8e9584/cases/corpus_33.l
+new file mode 100644
+index 00000000..1ded970d
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_33.l
+@@ -0,0 +1,36 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int k = 0;
++static int eofs = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++.	{ }
++<<EOF>>	{ printf(" <eof%d>", eofs); if (eofs >= 2) yyterminate(); yyin = fopen(eofs ? "d1.txt" : "d1.txt", "r"); YY_NEW_FILE; ++eofs; }
++%%
++int main() {
++  bufs[0] = yy_scan_string("b  a \n\n \nbc");
++  bufs[1] = yy_scan_string(" c \nc");
++  bufs[2] = yy_scan_string(" a");
++  yy_switch_to_buffer(bufs[2]);
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[3] = yy_scan_string(" cc ");
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_33.out b/tests/buffers_8e9584/cases/corpus_33.out
+new file mode 100644
+index 00000000..baf3825d
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_33.out
+@@ -0,0 +1 @@
++ W(a) <eof0> B(ab) W(ca) N(^) B(bb) N(^) <eof1> B(ab) W(ca) N(^) B(bb) N(^) <eof2><0> | W(cc) <eof2><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_34.in b/tests/buffers_8e9584/cases/corpus_34.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_34.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_34.l b/tests/buffers_8e9584/cases/corpus_34.l
+new file mode 100644
+index 00000000..07391e0f
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_34.l
+@@ -0,0 +1,45 @@
++%option yywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++#define YY_USER_INIT printf("{init}");
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int wraps = 0;
++static int k = 0;
++static int eofs = 0;
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\"	{ show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+	{ show("S", yytext, yyleng); }
++<STR>\"	{ show("E", yytext, yyleng); BEGIN INITIAL; }
++<STR>\n	{ show("n", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++<*>.	{ }
++<<EOF>>	{ printf(" <eof%d>", eofs); if (eofs >= 2) yyterminate(); yyin = fopen(eofs ? "d1.txt" : "d4.txt", "r"); ++eofs; }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yyrestart(fopen("d3.txt", "r")); break; case 1: yyin = fopen("d1.txt", "r"); break; default: return 1; } return 0; }
++int main() {
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  if (YY_CURRENT_BUFFER == NULL || k < 5) yyrestart(fopen("d2.txt", "r"));
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yyrestart(fopen("d3.txt", "r"));
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  yyrestart(fopen("d1.txt", "r"));
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_34.out b/tests/buffers_8e9584/cases/corpus_34.out
+new file mode 100644
+index 00000000..9f25ea99
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_34.out
+@@ -0,0 +1 @@
++{init} B(aa) W(b) N(^) B(c) {w0} B(ba) N(^) Q(") S(cab c) E(") N(^) B(ab) {w1} B(ab) W(ca) N(^) B(bb) N(^) {w2} <eof0> N(^) N(^) B(ca) W(bc) N(^) {w3} <eof1> B(ab) W(ca) N(^) B(bb) N(^) {w4} <eof2><0> | B(cc) W(a) N(^) {w5} <eof2><0> | B(ba) N(^) Q(") S(cab c) E(") N(^) B(ab) {w6} <eof2><0> | B(ab) W(ca) N(^) B(bb) N(^) {w7} <eof2><0> |
+diff --git a/tests/buffers_8e9584/cases/corpus_35.in b/tests/buffers_8e9584/cases/corpus_35.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_35.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_35.l b/tests/buffers_8e9584/cases/corpus_35.l
+new file mode 100644
+index 00000000..0a81d3e3
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_35.l
+@@ -0,0 +1,30 @@
++%option yywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int wraps = 0;
++static int k = 0;
++static int eofs = 0;
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); return 1; }
++[a-c]+	{ show("W", yytext, yyleng); return 2; }
++\n	{ show("N", yytext, yyleng); return 4; }
++.	{ }
++<<EOF>>	{ printf(" <eof%d>", eofs); if (eofs >= 2) yyterminate(); yyin = fopen(eofs ? "d1.txt" : "d3.txt", "r"); ++eofs; }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yy_scan_string("c"); break; case 1: yyin = fopen("d3.txt", "r"); break; default: return 1; } return 0; }
++int main() {
++  for (k = 0; k < 4; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_35.out b/tests/buffers_8e9584/cases/corpus_35.out
+new file mode 100644
+index 00000000..ce48db98
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_35.out
+@@ -0,0 +1 @@
++ B(aa)<1> W(b)<2> N(^)<4> B(c)<1> |
+diff --git a/tests/buffers_8e9584/cases/corpus_36.in b/tests/buffers_8e9584/cases/corpus_36.in
+new file mode 100644
+index 00000000..16051f7e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_36.in
+@@ -0,0 +1,2 @@
++aa b
++c
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/corpus_36.l b/tests/buffers_8e9584/cases/corpus_36.l
+new file mode 100644
+index 00000000..1c95008d
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_36.l
+@@ -0,0 +1,38 @@
++%option yywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int wraps = 0;
++static int k = 0;
++static int eofs = 0;
++static YY_BUFFER_STATE bufs[6];
++%}
++%%
++^[a-c]+	{ show("B", yytext, yyleng); }
++[a-c]+	{ show("W", yytext, yyleng); }
++\n	{ show("N", yytext, yyleng); }
++.	{ }
++<<EOF>>	{ printf(" <eof%d>", eofs); if (eofs >= 2) yyterminate(); yyin = fopen(eofs ? "d1.txt" : "d1.txt", "r"); YY_NEW_FILE; ++eofs; }
++%%
++int yywrap(void) { printf(" {w%d}", wraps); switch (wraps++) { case 0: yyin = fopen("d4.txt", "r"); break; default: return 1; } return 0; }
++int main() {
++  bufs[0] = yy_scan_string("");
++  bufs[1] = yy_scan_string("\n \nbcb \n");
++  bufs[2] = yy_scan_string("c \ncac");
++  yy_switch_to_buffer(bufs[2]);
++  for (k = 0; k < 6; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  bufs[3] = yy_create_buffer(fopen("d2.txt", "r"), YY_BUF_SIZE); yy_switch_to_buffer(bufs[3]);
++  for (k = 0; k < 5; ++k) { int t = yylex(); printf("<%d>", t); if (t == 0) break; }
++  printf(" |");
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/corpus_36.out b/tests/buffers_8e9584/cases/corpus_36.out
+new file mode 100644
+index 00000000..b0e5be09
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/corpus_36.out
+@@ -0,0 +1 @@
++ B(c) N(^) B(cac) {w0} N(^) N(^) B(ca) W(bc) N(^) {w1} <eof0> B(ab) W(ca) N(^) B(bb) N(^) {w2} <eof1> B(ab) W(ca) N(^) B(bb) N(^) {w3} <eof2><0> | B(cc) W(a) N(^) {w4} <eof2><0> |
+diff --git a/tests/buffers_8e9584/cases/d1.txt b/tests/buffers_8e9584/cases/d1.txt
+new file mode 100644
+index 00000000..c056d777
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/d1.txt
+@@ -0,0 +1,2 @@
++ab ca
++bb
+diff --git a/tests/buffers_8e9584/cases/d2.txt b/tests/buffers_8e9584/cases/d2.txt
+new file mode 100644
+index 00000000..7bbcd724
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/d2.txt
+@@ -0,0 +1 @@
++cc a
+diff --git a/tests/buffers_8e9584/cases/d3.txt b/tests/buffers_8e9584/cases/d3.txt
+new file mode 100644
+index 00000000..f28cfaa4
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/d3.txt
+@@ -0,0 +1,3 @@
++ba
++"cab c"
++ab
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/d4.txt b/tests/buffers_8e9584/cases/d4.txt
+new file mode 100644
+index 00000000..2da0fa55
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/d4.txt
+@@ -0,0 +1,3 @@
++
++
++ca bc
+diff --git a/tests/buffers_8e9584/cases/delete_rescan.l b/tests/buffers_8e9584/cases/delete_rescan.l
+new file mode 100644
+index 00000000..5e6468ef
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/delete_rescan.l
+@@ -0,0 +1,36 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++[0-9]+          { show("N", yytext, yyleng); return 3; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yy_scan_string("aa bb");
++  yylex();
++  yy_delete_buffer(YY_CURRENT_BUFFER);
++  printf(" [%d]", YY_CURRENT_BUFFER == NULL);
++  yy_scan_string("cc dd");
++  while (yylex() != 0)
++    ;
++  yy_delete_buffer(YY_CURRENT_BUFFER);
++  yy_scan_bytes("ee ff gg", 5);
++  while (yylex() != 0)
++    ;
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/delete_rescan.out b/tests/buffers_8e9584/cases/delete_rescan.out
+new file mode 100644
+index 00000000..9c2aff01
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/delete_rescan.out
+@@ -0,0 +1 @@
++ B(aa) [1] B(cc) W(dd) B(ee) W(ff)
+diff --git a/tests/buffers_8e9584/cases/eof_files.l b/tests/buffers_8e9584/cases/eof_files.l
+new file mode 100644
+index 00000000..c0d38dc7
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/eof_files.l
+@@ -0,0 +1,36 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static const char *names[] = { "f1.txt", "f3.txt", "f4.txt", NULL };
++static int next = 0;
++%}
++%%
++<<EOF>>         {
++                  printf(" <eof %d>", next);
++                  fclose(yyin);
++                  if (names[next] == NULL)
++                    yyterminate();
++                  yyin = fopen(names[next++], "r");
++                }
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yyin = fopen("f2.txt", "r");
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/eof_files.out b/tests/buffers_8e9584/cases/eof_files.out
+new file mode 100644
+index 00000000..95e04086
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/eof_files.out
+@@ -0,0 +1 @@
++ B(delta) L(^) B(epsilon) W(zeta) L(^) <eof 0> B(alpha) W(beta) L(^) B(gamma) <eof 1> B(eta) W(theta) <eof 2> N(7) W(iota) L(^) B(kappa) N(8) L(^) <eof 3>
+diff --git a/tests/buffers_8e9584/cases/eof_new_file.in b/tests/buffers_8e9584/cases/eof_new_file.in
+new file mode 100644
+index 00000000..41d82569
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/eof_new_file.in
+@@ -0,0 +1 @@
++stdin line
+diff --git a/tests/buffers_8e9584/cases/eof_new_file.l b/tests/buffers_8e9584/cases/eof_new_file.l
+new file mode 100644
+index 00000000..35521ca8
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/eof_new_file.l
+@@ -0,0 +1,35 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static const char *names[] = { "f3.txt", "f1.txt", NULL };
++static int next = 0;
++%}
++%%
++<<EOF>>         {
++                  printf(" <eof %d>", next);
++                  if (names[next] == NULL)
++                    yyterminate();
++                  yyin = fopen(names[next++], "r");
++                  YY_NEW_FILE;
++                }
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/eof_new_file.out b/tests/buffers_8e9584/cases/eof_new_file.out
+new file mode 100644
+index 00000000..627b426a
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/eof_new_file.out
+@@ -0,0 +1 @@
++ B(stdin) W(line) L(^) <eof 0> B(eta) W(theta) <eof 1> B(alpha) W(beta) L(^) B(gamma) <eof 2>
+diff --git a/tests/buffers_8e9584/cases/eof_strings.l b/tests/buffers_8e9584/cases/eof_strings.l
+new file mode 100644
+index 00000000..5a3ccd32
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/eof_strings.l
+@@ -0,0 +1,38 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int count = 0;
++%}
++%%
++<<EOF>>         {
++                  printf(" <eof %d>", count);
++                  if (count++ >= 2)
++                    yyterminate();
++                  yyin = fopen("f1.txt", "r");
++                }
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yy_scan_string("aa bb");
++  yylex();
++  printf(" |");
++  yyrestart(fopen("f3.txt", "r"));
++  count = 0;
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/eof_strings.out b/tests/buffers_8e9584/cases/eof_strings.out
+new file mode 100644
+index 00000000..8a6469f5
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/eof_strings.out
+@@ -0,0 +1 @@
++ B(aa) W(bb) <eof 0> <eof 1> <eof 2> | B(eta) W(theta) <eof 0> B(alpha) W(beta) L(^) B(gamma) <eof 1> B(alpha) W(beta) L(^) B(gamma) <eof 2>
+diff --git a/tests/buffers_8e9584/cases/f1.txt b/tests/buffers_8e9584/cases/f1.txt
+new file mode 100644
+index 00000000..2e971fce
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/f1.txt
+@@ -0,0 +1,2 @@
++alpha beta
++gamma
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/f2.txt b/tests/buffers_8e9584/cases/f2.txt
+new file mode 100644
+index 00000000..e4e9123b
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/f2.txt
+@@ -0,0 +1,2 @@
++delta
++epsilon zeta
+diff --git a/tests/buffers_8e9584/cases/f3.txt b/tests/buffers_8e9584/cases/f3.txt
+new file mode 100644
+index 00000000..c4fadff5
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/f3.txt
+@@ -0,0 +1 @@
++eta theta
+\ No newline at end of file
+diff --git a/tests/buffers_8e9584/cases/f4.txt b/tests/buffers_8e9584/cases/f4.txt
+new file mode 100644
+index 00000000..d9da6d5c
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/f4.txt
+@@ -0,0 +1,2 @@
++7 iota
++kappa 8
+diff --git a/tests/buffers_8e9584/cases/file_first.in b/tests/buffers_8e9584/cases/file_first.in
+new file mode 100644
+index 00000000..9d2e2d58
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/file_first.in
+@@ -0,0 +1 @@
++stdin should stay unread
+diff --git a/tests/buffers_8e9584/cases/file_first.l b/tests/buffers_8e9584/cases/file_first.l
+new file mode 100644
+index 00000000..bcb0bc98
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/file_first.l
+@@ -0,0 +1,32 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++#define YY_USER_INIT printf("{init}");
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  FILE *file = fopen("f4.txt", "r");
++  YY_BUFFER_STATE buffer = yy_create_buffer(file, YY_BUF_SIZE);
++  yy_switch_to_buffer(buffer);
++  yylex();
++  yy_delete_buffer(buffer);
++  fclose(file);
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/file_first.out b/tests/buffers_8e9584/cases/file_first.out
+new file mode 100644
+index 00000000..c7597f4b
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/file_first.out
+@@ -0,0 +1 @@
++{init} N(7) W(iota) L(^) B(kappa) N(8) L(^)
+diff --git a/tests/buffers_8e9584/cases/files_loop.l b/tests/buffers_8e9584/cases/files_loop.l
+new file mode 100644
+index 00000000..d670bb92
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/files_loop.l
+@@ -0,0 +1,34 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  const char *names[] = { "f1.txt", "f2.txt", "f3.txt", "f4.txt" };
++  int i;
++  for (i = 0; i < 4; ++i)
++  {
++    yyin = fopen(names[i], "r");
++    yylex();
++    fclose(yyin);
++    printf(" |");
++  }
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/files_loop.out b/tests/buffers_8e9584/cases/files_loop.out
+new file mode 100644
+index 00000000..88a0a523
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/files_loop.out
+@@ -0,0 +1 @@
++ B(alpha) W(beta) L(^) B(gamma) | B(delta) L(^) B(epsilon) W(zeta) L(^) | B(eta) W(theta) | N(7) W(iota) L(^) B(kappa) N(8) L(^) |
+diff --git a/tests/buffers_8e9584/cases/files_tokens.l b/tests/buffers_8e9584/cases/files_tokens.l
+new file mode 100644
+index 00000000..0c845601
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/files_tokens.l
+@@ -0,0 +1,36 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++[0-9]+          { show("N", yytext, yyleng); return 3; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  const char *names[] = { "f3.txt", "f1.txt", "f4.txt" };
++  int i, count;
++  for (i = 0; i < 3; ++i)
++  {
++    yyin = fopen(names[i], "r");
++    count = 0;
++    while (yylex() != 0)
++      ++count;
++    fclose(yyin);
++    printf(" |%d", count);
++  }
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/files_tokens.out b/tests/buffers_8e9584/cases/files_tokens.out
+new file mode 100644
+index 00000000..d97e6e09
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/files_tokens.out
+@@ -0,0 +1 @@
++ B(eta) W(theta) |2 B(alpha) W(beta) L(^) B(gamma) |3 N(7) W(iota) L(^) B(kappa) N(8) L(^) |4
+diff --git a/tests/buffers_8e9584/cases/flush_action.l b/tests/buffers_8e9584/cases/flush_action.l
+new file mode 100644
+index 00000000..643562c1
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/flush_action.l
+@@ -0,0 +1,37 @@
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static const char *more[] = { "after # skipped", "last part", NULL };
++static int next = 0;
++%}
++%%
++"#"             { show("H", yytext, yyleng); yy_flush_buffer(YY_CURRENT_BUFFER); }
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int yywrap(void)
++{
++  printf(" {wrap %d}", next);
++  if (more[next] == NULL)
++    return 1;
++  yy_scan_string(more[next++]);
++  return 0;
++}
++int main()
++{
++  yy_scan_string("start # not scanned\nhidden");
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/flush_action.out b/tests/buffers_8e9584/cases/flush_action.out
+new file mode 100644
+index 00000000..93700eda
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/flush_action.out
+@@ -0,0 +1 @@
++ B(start) H(#) {wrap 0} B(after) H(#) {wrap 1} B(last) W(part) {wrap 2}
+diff --git a/tests/buffers_8e9584/cases/flush_bol.l b/tests/buffers_8e9584/cases/flush_bol.l
+new file mode 100644
+index 00000000..9822e153
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/flush_bol.l
+@@ -0,0 +1,43 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  YY_BUFFER_STATE text = yy_scan_string("aa bb cc");
++  YY_BUFFER_STATE file = yy_create_buffer(fopen("f1.txt", "r"), YY_BUF_SIZE);
++  printf(" [%d]", YY_AT_BOL());
++  yylex();
++  printf(" [%d]", YY_AT_BOL());
++  yy_flush_buffer(text);
++  printf(" [%d]", YY_AT_BOL());
++  yy_switch_to_buffer(file);
++  yylex();
++  yylex();
++  printf(" [%d]", YY_AT_BOL());
++  yy_flush_buffer(YY_CURRENT_BUFFER);
++  printf(" [%d]", YY_AT_BOL());
++  while (yylex() != 0)
++    ;
++  yy_switch_to_buffer(text);
++  printf(" [%d]", YY_AT_BOL());
++  while (yylex() != 0)
++    ;
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/flush_bol.out b/tests/buffers_8e9584/cases/flush_bol.out
+new file mode 100644
+index 00000000..60c1d5c2
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/flush_bol.out
+@@ -0,0 +1 @@
++ [1] B(aa) [0] [1] B(alpha) W(beta) [0] [1] [1]
+diff --git a/tests/buffers_8e9584/cases/flush_current.l b/tests/buffers_8e9584/cases/flush_current.l
+new file mode 100644
+index 00000000..e8d02a5c
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/flush_current.l
+@@ -0,0 +1,38 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++#define YY_USER_INIT printf("{init}");
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++[0-9]+          { show("N", yytext, yyleng); return 3; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  YY_BUFFER_STATE other = yy_scan_string("other buffer");
++  yy_scan_string("aa bb cc dd");
++  yylex();
++  yy_flush_buffer(YY_CURRENT_BUFFER);
++  printf(" |");
++  while (yylex() != 0)
++    ;
++  printf(" |");
++  yy_flush_buffer(other);
++  yy_switch_to_buffer(other);
++  while (yylex() != 0)
++    ;
++  printf(" |\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/flush_current.out b/tests/buffers_8e9584/cases/flush_current.out
+new file mode 100644
+index 00000000..076bc385
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/flush_current.out
+@@ -0,0 +1 @@
++{init} B(aa) | | |
+diff --git a/tests/buffers_8e9584/cases/inc1.txt b/tests/buffers_8e9584/cases/inc1.txt
+new file mode 100644
+index 00000000..08d590de
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/inc1.txt
+@@ -0,0 +1,3 @@
++in one
++include inc2.txt
++in two
+diff --git a/tests/buffers_8e9584/cases/inc2.txt b/tests/buffers_8e9584/cases/inc2.txt
+new file mode 100644
+index 00000000..c22b585a
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/inc2.txt
+@@ -0,0 +1 @@
++deep 42 deeper
+diff --git a/tests/buffers_8e9584/cases/init_buffer.in b/tests/buffers_8e9584/cases/init_buffer.in
+new file mode 100644
+index 00000000..36b22162
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_buffer.in
+@@ -0,0 +1 @@
++stdin words
+diff --git a/tests/buffers_8e9584/cases/init_buffer.l b/tests/buffers_8e9584/cases/init_buffer.l
+new file mode 100644
+index 00000000..c2677122
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_buffer.l
+@@ -0,0 +1,33 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static FILE *file;
++#define YY_USER_INIT { printf("{init}"); yyin = fopen("f3.txt", "r"); }
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  file = fopen("f1.txt", "r");
++  yy_switch_to_buffer(yy_create_buffer(file, YY_BUF_SIZE));
++  yylex();
++  printf(" [%d]", yyin == file);
++  yy_scan_string("aa bb");
++  yylex();
++  printf(" [%d]\n", yyin == NULL);
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/init_buffer.out b/tests/buffers_8e9584/cases/init_buffer.out
+new file mode 100644
+index 00000000..ed1415e7
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_buffer.out
+@@ -0,0 +1 @@
++{init} B(alpha) W(beta) L(^) B(gamma) [1] B(aa) W(bb) [1]
+diff --git a/tests/buffers_8e9584/cases/init_once.in b/tests/buffers_8e9584/cases/init_once.in
+new file mode 100644
+index 00000000..36b22162
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_once.in
+@@ -0,0 +1 @@
++stdin words
+diff --git a/tests/buffers_8e9584/cases/init_once.l b/tests/buffers_8e9584/cases/init_once.l
+new file mode 100644
+index 00000000..64108fa6
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_once.l
+@@ -0,0 +1,44 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++#define YY_USER_INIT printf("{init}");
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++[0-9]+          { show("N", yytext, yyleng); return 3; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  YY_BUFFER_STATE a = yy_scan_string("aa bb");
++  YY_BUFFER_STATE b = yy_scan_string("cc dd");
++  YY_BUFFER_STATE c = yy_create_buffer(fopen("f3.txt", "r"), YY_BUF_SIZE);
++  yy_switch_to_buffer(a);
++  yylex();
++  yy_switch_to_buffer(b);
++  yylex();
++  yy_switch_to_buffer(c);
++  yylex();
++  yy_switch_to_buffer(a);
++  while (yylex() != 0)
++    ;
++  yy_switch_to_buffer(c);
++  while (yylex() != 0)
++    ;
++  yy_switch_to_buffer(b);
++  while (yylex() != 0)
++    ;
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/init_once.out b/tests/buffers_8e9584/cases/init_once.out
+new file mode 100644
+index 00000000..56f97152
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_once.out
+@@ -0,0 +1 @@
++{init} B(aa) B(cc) B(eta) W(bb) W(theta) W(dd)
+diff --git a/tests/buffers_8e9584/cases/init_string.in b/tests/buffers_8e9584/cases/init_string.in
+new file mode 100644
+index 00000000..36b22162
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_string.in
+@@ -0,0 +1 @@
++stdin words
+diff --git a/tests/buffers_8e9584/cases/init_string.l b/tests/buffers_8e9584/cases/init_string.l
+new file mode 100644
+index 00000000..e3a878d8
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_string.l
+@@ -0,0 +1,31 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++#define YY_USER_INIT { printf("{init}"); yyin = fopen("f3.txt", "r"); }
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yy_scan_string("aa bb");
++  yylex();
++  printf(" [%d]", yyin == NULL);
++  yyrestart(fopen("f2.txt", "r"));
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/init_string.out b/tests/buffers_8e9584/cases/init_string.out
+new file mode 100644
+index 00000000..fd1120fd
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_string.out
+@@ -0,0 +1 @@
++{init} B(aa) W(bb) [1] B(delta) L(^) B(epsilon) W(zeta) L(^)
+diff --git a/tests/buffers_8e9584/cases/init_yyin.in b/tests/buffers_8e9584/cases/init_yyin.in
+new file mode 100644
+index 00000000..d47c7692
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_yyin.in
+@@ -0,0 +1,2 @@
++stdin line one
++stdin line two
+diff --git a/tests/buffers_8e9584/cases/init_yyin.l b/tests/buffers_8e9584/cases/init_yyin.l
+new file mode 100644
+index 00000000..806ad05f
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_yyin.l
+@@ -0,0 +1,31 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++#define YY_USER_INIT { printf("{init}"); yyin = fopen("f3.txt", "r"); }
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  char line[64];
++  yylex();
++  printf(" |");
++  if (fgets(line, sizeof(line), stdin) != NULL)
++    printf(" [%s]", strtok(line, "\n"));
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/init_yyin.out b/tests/buffers_8e9584/cases/init_yyin.out
+new file mode 100644
+index 00000000..6b550310
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/init_yyin.out
+@@ -0,0 +1 @@
++{init} B(eta) W(theta) | [stdin line one]
+diff --git a/tests/buffers_8e9584/cases/keep_files.in b/tests/buffers_8e9584/cases/keep_files.in
+new file mode 100644
+index 00000000..4e9bcfae
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/keep_files.in
+@@ -0,0 +1 @@
++stdin first
+diff --git a/tests/buffers_8e9584/cases/keep_files.l b/tests/buffers_8e9584/cases/keep_files.l
+new file mode 100644
+index 00000000..291a8cde
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/keep_files.l
+@@ -0,0 +1,32 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yylex();
++  printf(" |");
++  yyin = fopen("f2.txt", "r");
++  yylex();
++  printf(" |");
++  yyin = fopen("f4.txt", "r");
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/keep_files.out b/tests/buffers_8e9584/cases/keep_files.out
+new file mode 100644
+index 00000000..6c47a644
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/keep_files.out
+@@ -0,0 +1 @@
++ B(stdin) W(first) L(^) | B(delta) L(^) B(epsilon) W(zeta) L(^) | N(7) W(iota) L(^) B(kappa) N(8) L(^)
+diff --git a/tests/buffers_8e9584/cases/keep_stdin.in b/tests/buffers_8e9584/cases/keep_stdin.in
+new file mode 100644
+index 00000000..4f640856
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/keep_stdin.in
+@@ -0,0 +1,3 @@
++one two 3
++four
++5 six
+diff --git a/tests/buffers_8e9584/cases/keep_stdin.l b/tests/buffers_8e9584/cases/keep_stdin.l
+new file mode 100644
+index 00000000..6ca92424
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/keep_stdin.l
+@@ -0,0 +1,28 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++[0-9]+          { show("N", yytext, yyleng); return 3; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  int token, count = 0;
++  while ((token = yylex()) != 0)
++    count += token;
++  printf(" |%d\n", count);
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/keep_stdin.out b/tests/buffers_8e9584/cases/keep_stdin.out
+new file mode 100644
+index 00000000..8003a29f
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/keep_stdin.out
+@@ -0,0 +1 @@
++ B(one) W(two) N(3) L(^) B(four) L(^) N(5) W(six) L(^) |12
+diff --git a/tests/buffers_8e9584/cases/lineno_eof.l b/tests/buffers_8e9584/cases/lineno_eof.l
+new file mode 100644
+index 00000000..19527f00
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/lineno_eof.l
+@@ -0,0 +1,18 @@
++%option noyywrap yylineno
++%{
++#include <stdio.h>
++%}
++%%
++[a-z]+          { printf(" %s@%d", yytext, yylineno); return 1; }
++<<EOF>>         { printf(" <eof@%d>", yylineno); yyterminate(); }
++\n              { }
++.               { }
++%%
++int main()
++{
++  yyin = fopen("f1.txt", "r");
++  while (yylex() != 0)
++    ;
++  printf(" [%d]\n", yylineno);
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/lineno_eof.out b/tests/buffers_8e9584/cases/lineno_eof.out
+new file mode 100644
+index 00000000..2df59a6e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/lineno_eof.out
+@@ -0,0 +1 @@
++ alpha@1 beta@1 gamma@2 <eof@2> [2]
+diff --git a/tests/buffers_8e9584/cases/lineno_mixed.l b/tests/buffers_8e9584/cases/lineno_mixed.l
+new file mode 100644
+index 00000000..f43533e1
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/lineno_mixed.l
+@@ -0,0 +1,34 @@
++%option noyywrap yylineno
++%{
++#include <stdio.h>
++%}
++%%
++[a-z]+          { printf(" %s@%d", yytext, yylineno); return 1; }
++\n              { }
++.               { }
++%%
++int main()
++{
++  const char *text = "one\ntwo\n\nthree\nfour five\nsix";
++  YY_BUFFER_STATE bytes = yy_scan_bytes(text, 25);
++  YY_BUFFER_STATE other = yy_scan_string("x\n\ny\nz");
++  yy_switch_to_buffer(bytes);
++  yylex();
++  yylex();
++  yypush_buffer_state(yy_create_buffer(fopen("f4.txt", "r"), YY_BUF_SIZE));
++  yylex();
++  yylex();
++  yypop_buffer_state();
++  yylex();
++  yy_switch_to_buffer(other);
++  yylex();
++  yylex();
++  yy_switch_to_buffer(bytes);
++  while (yylex() != 0)
++    ;
++  yy_switch_to_buffer(other);
++  while (yylex() != 0)
++    ;
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/lineno_mixed.out b/tests/buffers_8e9584/cases/lineno_mixed.out
+new file mode 100644
+index 00000000..f6f18124
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/lineno_mixed.out
+@@ -0,0 +1 @@
++ one@1 two@2 iota@1 kappa@2 three@4 x@1 y@3 four@5 five@5 z@4
+diff --git a/tests/buffers_8e9584/cases/lineno_per_buffer.l b/tests/buffers_8e9584/cases/lineno_per_buffer.l
+new file mode 100644
+index 00000000..933abce7
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/lineno_per_buffer.l
+@@ -0,0 +1,28 @@
++%option noyywrap yylineno
++%{
++#include <stdio.h>
++%}
++%%
++[a-z]+          { printf(" %s@%d", yytext, yylineno); return 1; }
++\n              { }
++.               { }
++%%
++int main()
++{
++  YY_BUFFER_STATE text = yy_scan_string("one\ntwo\nthree four\nfive");
++  YY_BUFFER_STATE file = yy_create_buffer(fopen("f2.txt", "r"), YY_BUF_SIZE);
++  yy_switch_to_buffer(text);
++  yylex();
++  yylex();
++  yy_switch_to_buffer(file);
++  yylex();
++  yylex();
++  yy_switch_to_buffer(text);
++  while (yylex() != 0)
++    ;
++  yy_switch_to_buffer(file);
++  while (yylex() != 0)
++    ;
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/lineno_per_buffer.out b/tests/buffers_8e9584/cases/lineno_per_buffer.out
+new file mode 100644
+index 00000000..7267599e
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/lineno_per_buffer.out
+@@ -0,0 +1 @@
++ one@1 two@2 delta@1 epsilon@2 three@3 four@3 five@4 zeta@2
+diff --git a/tests/buffers_8e9584/cases/main.txt b/tests/buffers_8e9584/cases/main.txt
+new file mode 100644
+index 00000000..97820d1b
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/main.txt
+@@ -0,0 +1,4 @@
++top one
++include inc1.txt
++top two include inc2.txt top three
++top four
+diff --git a/tests/buffers_8e9584/cases/push_first.in b/tests/buffers_8e9584/cases/push_first.in
+new file mode 100644
+index 00000000..b7d949ac
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/push_first.in
+@@ -0,0 +1,2 @@
++stdin one
++stdin two
+diff --git a/tests/buffers_8e9584/cases/push_first.l b/tests/buffers_8e9584/cases/push_first.l
+new file mode 100644
+index 00000000..931f718b
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/push_first.l
+@@ -0,0 +1,41 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++<<EOF>>             {
++                      printf(" <pop>");
++                      yypop_buffer_state();
++                      if (!YY_CURRENT_BUFFER)
++                        yyterminate();
++                    }
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  FILE *first = fopen("f1.txt", "r");
++  FILE *second = fopen("f3.txt", "r");
++  FILE *third = fopen("f4.txt", "r");
++  yypush_buffer_state(yy_create_buffer(first, YY_BUF_SIZE));
++  yypush_buffer_state(yy_create_buffer(second, YY_BUF_SIZE));
++  yypush_buffer_state(yy_create_buffer(third, YY_BUF_SIZE));
++  yylex();
++  printf(" [%d]\n", YY_CURRENT_BUFFER == NULL);
++  fclose(first);
++  fclose(second);
++  fclose(third);
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/push_first.out b/tests/buffers_8e9584/cases/push_first.out
+new file mode 100644
+index 00000000..84615612
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/push_first.out
+@@ -0,0 +1 @@
++ N(7) W(iota) L(^) B(kappa) N(8) L(^) <pop> B(eta) W(theta) <pop> B(alpha) W(beta) L(^) B(gamma) <pop> [1]
+diff --git a/tests/buffers_8e9584/cases/push_include.in b/tests/buffers_8e9584/cases/push_include.in
+new file mode 100644
+index 00000000..97820d1b
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/push_include.in
+@@ -0,0 +1,4 @@
++top one
++include inc1.txt
++top two include inc2.txt top three
++top four
+diff --git a/tests/buffers_8e9584/cases/push_include.l b/tests/buffers_8e9584/cases/push_include.l
+new file mode 100644
+index 00000000..3132b903
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/push_include.l
+@@ -0,0 +1,43 @@
++%option noyywrap
++%x incl
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++include             BEGIN(incl);
++[a-z0-9]+           { show("W", yytext, yyleng); }
++\n                  { show("L", yytext, yyleng); }
++.                   ;
++<incl>[ \t]*        ;
++<incl>[^ \t\n]+     {
++                      printf(" <in %s>", yytext);
++                      yyin = fopen(yytext, "r");
++                      if (yyin == NULL)
++                        yyterminate();
++                      yypush_buffer_state(yy_create_buffer(yyin, YY_BUF_SIZE));
++                      BEGIN(INITIAL);
++                    }
++<<EOF>>             {
++                      printf(" <out %d>", yyin == stdin);
++                      if (yyin != stdin)
++                        fclose(yyin);
++                      yypop_buffer_state();
++                      if (!YY_CURRENT_BUFFER)
++                        yyterminate();
++                    }
++%%
++int main()
++{
++  yylex();
++  printf(" [%d]\n", YY_CURRENT_BUFFER == NULL);
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/push_include.out b/tests/buffers_8e9584/cases/push_include.out
+new file mode 100644
+index 00000000..e1fa8bde
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/push_include.out
+@@ -0,0 +1 @@
++ W(top) W(one) L(^) <in inc1.txt> W(in) W(one) L(^) <in inc2.txt> W(deep) W(42) W(deeper) L(^) <out 0> L(^) W(in) W(two) L(^) <out 0> L(^) W(top) W(two) <in inc2.txt> W(deep) W(42) W(deeper) L(^) <out 0> W(top) W(three) L(^) W(top) W(four) L(^) <out 1> [1]
+diff --git a/tests/buffers_8e9584/cases/push_include_tokens.in b/tests/buffers_8e9584/cases/push_include_tokens.in
+new file mode 100644
+index 00000000..97820d1b
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/push_include_tokens.in
+@@ -0,0 +1,4 @@
++top one
++include inc1.txt
++top two include inc2.txt top three
++top four
+diff --git a/tests/buffers_8e9584/cases/push_include_tokens.l b/tests/buffers_8e9584/cases/push_include_tokens.l
+new file mode 100644
+index 00000000..fe313707
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/push_include_tokens.l
+@@ -0,0 +1,49 @@
++%option noyywrap
++%x incl
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++include             BEGIN(incl);
++[a-z]+              { show("W", yytext, yyleng); return 1; }
++[0-9]+              { show("N", yytext, yyleng); return 2; }
++\n                  ;
++.                   ;
++<incl>[ \t]*        ;
++<incl>[^ \t\n]+     {
++                      yyin = fopen(yytext, "r");
++                      if (yyin == NULL)
++                        yyterminate();
++                      yypush_buffer_state(yy_create_buffer(yyin, YY_BUF_SIZE));
++                      BEGIN(INITIAL);
++                    }
++<<EOF>>             {
++                      if (yyin != stdin)
++                        fclose(yyin);
++                      yypop_buffer_state();
++                      if (!YY_CURRENT_BUFFER)
++                        yyterminate();
++                    }
++%%
++int main()
++{
++  int token, words = 0, numbers = 0;
++  while ((token = yylex()) != 0)
++  {
++    if (token == 1)
++      ++words;
++    else
++      ++numbers;
++  }
++  printf(" |%d %d\n", words, numbers);
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/push_include_tokens.out b/tests/buffers_8e9584/cases/push_include_tokens.out
+new file mode 100644
+index 00000000..6ca7bb35
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/push_include_tokens.out
+@@ -0,0 +1 @@
++ W(top) W(one) W(in) W(one) W(deep) N(42) W(deeper) W(in) W(two) W(top) W(two) W(deep) N(42) W(deeper) W(top) W(three) W(top) W(four) |16 2
+diff --git a/tests/buffers_8e9584/cases/restart_action.in b/tests/buffers_8e9584/cases/restart_action.in
+new file mode 100644
+index 00000000..1a7b7e99
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/restart_action.in
+@@ -0,0 +1,3 @@
++first line
++@reset here
++never seen
+diff --git a/tests/buffers_8e9584/cases/restart_action.l b/tests/buffers_8e9584/cases/restart_action.l
+new file mode 100644
+index 00000000..a1e9cde1
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/restart_action.l
+@@ -0,0 +1,27 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++"@reset"        { show("R", yytext, yyleng); yyrestart(fopen("f2.txt", "r")); }
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/restart_action.out b/tests/buffers_8e9584/cases/restart_action.out
+new file mode 100644
+index 00000000..0641acff
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/restart_action.out
+@@ -0,0 +1 @@
++ B(first) W(line) L(^) R(@reset) B(delta) L(^) B(epsilon) W(zeta) L(^)
+diff --git a/tests/buffers_8e9584/cases/restart_between.in b/tests/buffers_8e9584/cases/restart_between.in
+new file mode 100644
+index 00000000..7e6e08d5
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/restart_between.in
+@@ -0,0 +1,2 @@
++one two
++three
+diff --git a/tests/buffers_8e9584/cases/restart_between.l b/tests/buffers_8e9584/cases/restart_between.l
+new file mode 100644
+index 00000000..44769c12
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/restart_between.l
+@@ -0,0 +1,35 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  FILE *file;
++  yylex();
++  printf(" |");
++  file = fopen("f1.txt", "r");
++  yyrestart(file);
++  yylex();
++  fclose(file);
++  printf(" |");
++  yyrestart(fopen("f4.txt", "r"));
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/restart_between.out b/tests/buffers_8e9584/cases/restart_between.out
+new file mode 100644
+index 00000000..843be1e5
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/restart_between.out
+@@ -0,0 +1 @@
++ B(one) W(two) L(^) B(three) L(^) | B(alpha) W(beta) L(^) B(gamma) | N(7) W(iota) L(^) B(kappa) N(8) L(^)
+diff --git a/tests/buffers_8e9584/cases/restart_first.in b/tests/buffers_8e9584/cases/restart_first.in
+new file mode 100644
+index 00000000..36b22162
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/restart_first.in
+@@ -0,0 +1 @@
++stdin words
+diff --git a/tests/buffers_8e9584/cases/restart_first.l b/tests/buffers_8e9584/cases/restart_first.l
+new file mode 100644
+index 00000000..5614e784
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/restart_first.l
+@@ -0,0 +1,36 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static FILE *file;
++#define YY_USER_INIT { printf(" {init %d %d}", YY_CURRENT_BUFFER != NULL, yyin == file); yyin = fopen("f3.txt", "r"); }
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  YY_BUFFER_STATE buffer;
++  file = fopen("f1.txt", "r");
++  yyrestart(file);
++  buffer = YY_CURRENT_BUFFER;
++  printf("[%d %d]", buffer != NULL, yyin == file);
++  yylex();
++  printf(" [%d %d]", yyin == file, YY_CURRENT_BUFFER == buffer);
++  yyrestart(fopen("f4.txt", "r"));
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/restart_first.out b/tests/buffers_8e9584/cases/restart_first.out
+new file mode 100644
+index 00000000..b432c3f4
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/restart_first.out
+@@ -0,0 +1 @@
++[1 1] {init 1 1} B(alpha) W(beta) L(^) B(gamma) [1 1] N(7) W(iota) L(^) B(kappa) N(8) L(^)
+diff --git a/tests/buffers_8e9584/cases/scan_buffer_check.l b/tests/buffers_8e9584/cases/scan_buffer_check.l
+new file mode 100644
+index 00000000..e320682d
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_buffer_check.l
+@@ -0,0 +1,40 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  char bad[4] = { 'a', 'b', 'x', 'y' };
++  char half[4] = { 'c', 'd', 'e', '\0' };
++  char tiny[1] = { '\0' };
++  char good[6] = { 'g', 'h', ' ', 'i', '\0', '\0' };
++  YY_BUFFER_STATE text = yy_scan_string("text buffer");
++  YY_BUFFER_STATE b1 = yy_scan_buffer(bad, 4);
++  YY_BUFFER_STATE b2 = yy_scan_buffer(half, 4);
++  YY_BUFFER_STATE b3 = yy_scan_buffer(tiny, 1);
++  YY_BUFFER_STATE b4;
++  printf("[%d %d %d %d]", b1 == NULL, b2 == NULL, b3 == NULL, YY_CURRENT_BUFFER == text);
++  yylex();
++  printf(" |");
++  b4 = yy_scan_buffer(good, 6);
++  printf("[%d %d]", b4 != NULL, YY_CURRENT_BUFFER == b4);
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/scan_buffer_check.out b/tests/buffers_8e9584/cases/scan_buffer_check.out
+new file mode 100644
+index 00000000..ca6c5ab4
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_buffer_check.out
+@@ -0,0 +1 @@
++[1 1 1 1] B(text) W(buffer) |[1 1] B(gh) W(i)
+diff --git a/tests/buffers_8e9584/cases/scan_bytes.in b/tests/buffers_8e9584/cases/scan_bytes.in
+new file mode 100644
+index 00000000..9be64a1d
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_bytes.in
+@@ -0,0 +1 @@
++stdin text
+diff --git a/tests/buffers_8e9584/cases/scan_bytes.l b/tests/buffers_8e9584/cases/scan_bytes.l
+new file mode 100644
+index 00000000..1812524c
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_bytes.l
+@@ -0,0 +1,34 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  const char *text = "abc def\nghi 99 jkl";
++  int n;
++  for (n = 2; n <= 18; n += 4)
++  {
++    yy_scan_bytes(text, n);
++    yylex();
++    yy_delete_buffer(YY_CURRENT_BUFFER);
++    printf(" |%d", n);
++  }
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/scan_bytes.out b/tests/buffers_8e9584/cases/scan_bytes.out
+new file mode 100644
+index 00000000..81a59b37
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_bytes.out
+@@ -0,0 +1 @@
++ B(ab) |2 B(abc) W(de) |6 B(abc) W(def) L(^) B(gh) |10 B(abc) W(def) L(^) B(ghi) N(99) |14 B(abc) W(def) L(^) B(ghi) N(99) W(jkl) |18
+diff --git a/tests/buffers_8e9584/cases/scan_copy.l b/tests/buffers_8e9584/cases/scan_copy.l
+new file mode 100644
+index 00000000..3591f5cc
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_copy.l
+@@ -0,0 +1,41 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  char text[32];
++  YY_BUFFER_STATE first, second;
++  strcpy(text, "red green\nblue");
++  first = yy_scan_string(text);
++  strcpy(text, "cyan magenta yellow");
++  second = yy_scan_bytes(text, 12);
++  memset(text, 'x', sizeof(text) - 1);
++  text[sizeof(text) - 1] = '\0';
++  yy_switch_to_buffer(first);
++  yylex();
++  printf(" |");
++  yy_switch_to_buffer(second);
++  yylex();
++  printf(" |");
++  yy_delete_buffer(first);
++  yy_delete_buffer(second);
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/scan_copy.out b/tests/buffers_8e9584/cases/scan_copy.out
+new file mode 100644
+index 00000000..654bcb2c
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_copy.out
+@@ -0,0 +1 @@
++ B(red) W(green) L(^) B(blue) | B(cyan) W(magenta) |
+diff --git a/tests/buffers_8e9584/cases/scan_docs.l b/tests/buffers_8e9584/cases/scan_docs.l
+new file mode 100644
+index 00000000..203042b0
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_docs.l
+@@ -0,0 +1,40 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  const char *bytes = "memory segment 5 more";
++  FILE *file = fopen("f2.txt", "r");
++  yyin = file;
++  yylex();
++  printf(" |");
++  yy_delete_buffer(YY_CURRENT_BUFFER);
++  yy_scan_string("How now brown cow.");
++  yylex();
++  printf(" |");
++  yy_delete_buffer(YY_CURRENT_BUFFER);
++  yy_scan_bytes(bytes, 16);
++  yylex();
++  printf(" |");
++  yy_delete_buffer(YY_CURRENT_BUFFER);
++  fclose(file);
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/scan_docs.out b/tests/buffers_8e9584/cases/scan_docs.out
+new file mode 100644
+index 00000000..8ee47793
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_docs.out
+@@ -0,0 +1 @@
++ B(delta) L(^) B(epsilon) W(zeta) L(^) | W(ow) W(now) W(brown) W(cow) | B(memory) W(segment) N(5) |
+diff --git a/tests/buffers_8e9584/cases/scan_first.l b/tests/buffers_8e9584/cases/scan_first.l
+new file mode 100644
+index 00000000..b9c23560
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_first.l
+@@ -0,0 +1,28 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++#define YY_USER_INIT printf("{init}");
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yy_scan_string("ab cd\nef 12 gh");
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/scan_first.out b/tests/buffers_8e9584/cases/scan_first.out
+new file mode 100644
+index 00000000..addfb44c
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_first.out
+@@ -0,0 +1 @@
++{init} B(ab) W(cd) L(^) B(ef) N(12) W(gh)
+diff --git a/tests/buffers_8e9584/cases/scan_handles.l b/tests/buffers_8e9584/cases/scan_handles.l
+new file mode 100644
+index 00000000..a62b8e10
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_handles.l
+@@ -0,0 +1,41 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  YY_BUFFER_STATE a, b, c;
++  printf("[%d]", YY_CURRENT_BUFFER == NULL);
++  a = yy_scan_string("one two");
++  printf("[%d %d]", a != NULL, YY_CURRENT_BUFFER == a);
++  b = yy_scan_bytes("three four five", 10);
++  printf("[%d %d]", b != a, YY_CURRENT_BUFFER == b);
++  c = yy_create_buffer(stdin, YY_BUF_SIZE);
++  printf("[%d %d]", c != b, YY_CURRENT_BUFFER == b);
++  yylex();
++  yy_switch_to_buffer(a);
++  printf("[%d]", YY_CURRENT_BUFFER == a);
++  yylex();
++  yy_delete_buffer(a);
++  printf("[%d]", YY_CURRENT_BUFFER == NULL);
++  yy_delete_buffer(b);
++  yy_delete_buffer(c);
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/scan_handles.out b/tests/buffers_8e9584/cases/scan_handles.out
+new file mode 100644
+index 00000000..0256a04d
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_handles.out
+@@ -0,0 +1 @@
++[1][1 1][1 1][1 1] B(three) W(four)[1] B(one) W(two)[1]
+diff --git a/tests/buffers_8e9584/cases/scan_inplace.l b/tests/buffers_8e9584/cases/scan_inplace.l
+new file mode 100644
+index 00000000..e90439b5
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_inplace.l
+@@ -0,0 +1,40 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  char place[24];
++  YY_BUFFER_STATE text, mem;
++  memcpy(place, "inplace 77\nscan", 15);
++  place[15] = '\0';
++  place[16] = '\0';
++  text = yy_scan_string("before after");
++  mem = yy_scan_buffer(place, 17);
++  printf("[%d %d]", mem != NULL, YY_CURRENT_BUFFER == mem);
++  yylex();
++  printf(" |");
++  yy_switch_to_buffer(text);
++  yylex();
++  printf(" |");
++  yy_delete_buffer(mem);
++  yy_delete_buffer(text);
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/scan_inplace.out b/tests/buffers_8e9584/cases/scan_inplace.out
+new file mode 100644
+index 00000000..c04f169f
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_inplace.out
+@@ -0,0 +1 @@
++[1 1] B(inplace) N(77) L(^) B(scan) | B(before) W(after) |
+diff --git a/tests/buffers_8e9584/cases/scan_parts.in b/tests/buffers_8e9584/cases/scan_parts.in
+new file mode 100644
+index 00000000..e5761048
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_parts.in
+@@ -0,0 +1,2 @@
++first part|second
++line|third 33
+diff --git a/tests/buffers_8e9584/cases/scan_parts.l b/tests/buffers_8e9584/cases/scan_parts.l
+new file mode 100644
+index 00000000..aea26377
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_parts.l
+@@ -0,0 +1,43 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++[0-9]+          { show("N", yytext, yyleng); return 3; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  static char text[256];
++  size_t n = fread(text, 1, sizeof(text) - 1, stdin);
++  char *part = text, *bar;
++  int count = 0;
++  text[n] = '\0';
++  while (part != NULL)
++  {
++    YY_BUFFER_STATE buffer;
++    bar = strchr(part, '|');
++    if (bar != NULL)
++      *bar = '\0';
++    buffer = yy_scan_string(part);
++    while (yylex() != 0)
++      ++count;
++    yy_delete_buffer(buffer);
++    printf(" |");
++    part = bar != NULL ? bar + 1 : NULL;
++  }
++  printf(" %d\n", count);
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/scan_parts.out b/tests/buffers_8e9584/cases/scan_parts.out
+new file mode 100644
+index 00000000..8c0443df
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/scan_parts.out
+@@ -0,0 +1 @@
++ B(first) W(part) | B(second) L(^) B(line) | B(third) N(33) L(^) | 6
+diff --git a/tests/buffers_8e9584/cases/string_then_yyin.l b/tests/buffers_8e9584/cases/string_then_yyin.l
+new file mode 100644
+index 00000000..90cad157
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/string_then_yyin.l
+@@ -0,0 +1,33 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yy_scan_string("aa bb");
++  yylex();
++  printf(" |");
++  yyin = fopen("f1.txt", "r");
++  yylex();
++  printf(" |");
++  yyrestart(yyin);
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/string_then_yyin.out b/tests/buffers_8e9584/cases/string_then_yyin.out
+new file mode 100644
+index 00000000..4b4f70df
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/string_then_yyin.out
+@@ -0,0 +1 @@
++ B(aa) W(bb) | | B(alpha) W(beta) L(^) B(gamma)
+diff --git a/tests/buffers_8e9584/cases/switch_action.in b/tests/buffers_8e9584/cases/switch_action.in
+new file mode 100644
+index 00000000..3a3a6c80
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_action.in
+@@ -0,0 +1,2 @@
++top @1 middle @2 bottom
++end @1
+diff --git a/tests/buffers_8e9584/cases/switch_action.l b/tests/buffers_8e9584/cases/switch_action.l
+new file mode 100644
+index 00000000..f9c08637
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_action.l
+@@ -0,0 +1,44 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static YY_BUFFER_STATE saved[8];
++static int depth = 0;
++static const char *macro[] = { "", "one 1\nuno", "two @1 dos" };
++%}
++%%
++"@"[1-2]        {
++                  show("M", yytext, yyleng);
++                  if (depth < 8)
++                  {
++                    saved[depth++] = YY_CURRENT_BUFFER;
++                    yy_scan_string(macro[yytext[1] - '0']);
++                  }
++                }
++<<EOF>>         {
++                  printf(" <eof %d>", depth);
++                  if (depth == 0)
++                    yyterminate();
++                  yy_delete_buffer(YY_CURRENT_BUFFER);
++                  yy_switch_to_buffer(saved[--depth]);
++                }
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/switch_action.out b/tests/buffers_8e9584/cases/switch_action.out
+new file mode 100644
+index 00000000..44a720aa
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_action.out
+@@ -0,0 +1 @@
++ B(top) M(@1) B(one) N(1) L(^) B(uno) <eof 1> W(middle) M(@2) B(two) M(@1) B(one) N(1) L(^) B(uno) <eof 2> W(dos) <eof 1> W(bottom) L(^) B(end) M(@1) B(one) N(1) L(^) B(uno) <eof 1> L(^) <eof 0>
+diff --git a/tests/buffers_8e9584/cases/switch_bol.l b/tests/buffers_8e9584/cases/switch_bol.l
+new file mode 100644
+index 00000000..886eb995
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_bol.l
+@@ -0,0 +1,38 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++[0-9]+          { show("N", yytext, yyleng); return 3; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  YY_BUFFER_STATE a = yy_scan_string("aa bb\ncc dd");
++  YY_BUFFER_STATE b = yy_create_buffer(fopen("f2.txt", "r"), YY_BUF_SIZE);
++  yy_switch_to_buffer(a);
++  yylex();
++  yy_switch_to_buffer(b);
++  yylex();
++  yylex();
++  yy_switch_to_buffer(a);
++  while (yylex() != 0)
++    ;
++  yy_switch_to_buffer(b);
++  while (yylex() != 0)
++    ;
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/switch_bol.out b/tests/buffers_8e9584/cases/switch_bol.out
+new file mode 100644
+index 00000000..187d2afa
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_bol.out
+@@ -0,0 +1 @@
++ B(aa) B(delta) L(^) B(epsilon) W(bb) L(^) B(cc) W(dd) W(zeta) L(^)
+diff --git a/tests/buffers_8e9584/cases/switch_include_files.in b/tests/buffers_8e9584/cases/switch_include_files.in
+new file mode 100644
+index 00000000..97820d1b
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_include_files.in
+@@ -0,0 +1,4 @@
++top one
++include inc1.txt
++top two include inc2.txt top three
++top four
+diff --git a/tests/buffers_8e9584/cases/switch_include_files.l b/tests/buffers_8e9584/cases/switch_include_files.l
+new file mode 100644
+index 00000000..f9b63656
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_include_files.l
+@@ -0,0 +1,53 @@
++%option noyywrap
++%x incl
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++#define MAX_INCLUDE_DEPTH 10
++YY_BUFFER_STATE include_stack[MAX_INCLUDE_DEPTH];
++int include_stack_ptr = 0;
++%}
++%%
++include             BEGIN(incl);
++[a-z0-9]+           { show("W", yytext, yyleng); }
++\n                  { show("L", yytext, yyleng); }
++.                   ;
++<incl>[ \t]*        ;
++<incl>[^ \t\n]+     {
++                      if (include_stack_ptr >= MAX_INCLUDE_DEPTH)
++                        yyterminate();
++                      include_stack[include_stack_ptr++] = YY_CURRENT_BUFFER;
++                      yyin = fopen(yytext, "r");
++                      if (yyin == NULL)
++                        yyterminate();
++                      yy_switch_to_buffer(yy_create_buffer(yyin, YY_BUF_SIZE));
++                      BEGIN(INITIAL);
++                    }
++<<EOF>>             {
++                      if (--include_stack_ptr < 0)
++                      {
++                        yyterminate();
++                      }
++                      else
++                      {
++                        fclose(yyin);
++                        yy_delete_buffer(YY_CURRENT_BUFFER);
++                        yy_switch_to_buffer(include_stack[include_stack_ptr]);
++                        printf(" <back %d>", yyin == stdin);
++                      }
++                    }
++%%
++int main()
++{
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/switch_include_files.out b/tests/buffers_8e9584/cases/switch_include_files.out
+new file mode 100644
+index 00000000..342a3ba3
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_include_files.out
+@@ -0,0 +1 @@
++ W(top) W(one) L(^) W(in) W(one) L(^) W(deep) W(42) W(deeper) L(^) <back 0> L(^) W(in) W(two) L(^) <back 1> L(^) W(top) W(two) W(deep) W(42) W(deeper) L(^) <back 1> W(top) W(three) L(^) W(top) W(four) L(^)
+diff --git a/tests/buffers_8e9584/cases/switch_saved.l b/tests/buffers_8e9584/cases/switch_saved.l
+new file mode 100644
+index 00000000..37b4d667
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_saved.l
+@@ -0,0 +1,45 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++[0-9]+          { show("N", yytext, yyleng); return 3; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  YY_BUFFER_STATE buffers[3];
++  int i, done = 0, active[3] = { 1, 1, 1 };
++  buffers[0] = yy_scan_string("one two\nthree four");
++  buffers[1] = yy_create_buffer(fopen("f4.txt", "r"), YY_BUF_SIZE);
++  buffers[2] = yy_scan_string("five\n6 seven eight");
++  while (done < 3)
++  {
++    for (i = 0; i < 3; ++i)
++    {
++      if (!active[i])
++        continue;
++      yy_switch_to_buffer(buffers[i]);
++      if (yylex() == 0)
++      {
++        active[i] = 0;
++        ++done;
++        printf(" <end %d>", i);
++      }
++    }
++  }
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/switch_saved.out b/tests/buffers_8e9584/cases/switch_saved.out
+new file mode 100644
+index 00000000..eb002bca
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_saved.out
+@@ -0,0 +1 @@
++ B(one) N(7) B(five) W(two) W(iota) L(^) N(6) L(^) B(three) L(^) B(kappa) W(seven) W(four) N(8) W(eight) <end 0> L(^) <end 1> <end 2>
+diff --git a/tests/buffers_8e9584/cases/switch_states.l b/tests/buffers_8e9584/cases/switch_states.l
+new file mode 100644
+index 00000000..27125600
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_states.l
+@@ -0,0 +1,37 @@
++%option noyywrap
++%x STR
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++[a-z]+          { show("W", yytext, yyleng); }
++\"              { show("Q", yytext, yyleng); BEGIN STR; }
++<STR>[^"\n]+    { show("S", yytext, yyleng); }
++<STR>\"         { show("E", yytext, yyleng); BEGIN INITIAL; }
++<*>\n           { show("L", yytext, yyleng); }
++<*>.            { }
++%%
++int main()
++{
++  YY_BUFFER_STATE a = yy_scan_string("aa \"open string");
++  YY_BUFFER_STATE b = yy_scan_string("still open\" back \"again");
++  yy_switch_to_buffer(a);
++  yylex();
++  printf(" [%d]", YY_START == STR);
++  yy_switch_to_buffer(b);
++  yylex();
++  printf(" [%d]", YY_START == STR);
++  yy_delete_buffer(a);
++  yy_delete_buffer(b);
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/switch_states.out b/tests/buffers_8e9584/cases/switch_states.out
+new file mode 100644
+index 00000000..bdced0e9
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/switch_states.out
+@@ -0,0 +1 @@
++ W(aa) Q(") S(open string) [1] S(still open) E(") W(back) Q(") S(again) [1]
+diff --git a/tests/buffers_8e9584/cases/wrap_eof.in b/tests/buffers_8e9584/cases/wrap_eof.in
+new file mode 100644
+index 00000000..0ddf1bf3
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_eof.in
+@@ -0,0 +1 @@
++first input
+diff --git a/tests/buffers_8e9584/cases/wrap_eof.l b/tests/buffers_8e9584/cases/wrap_eof.l
+new file mode 100644
+index 00000000..801bc7b1
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_eof.l
+@@ -0,0 +1,37 @@
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static const char *more[] = { "second input", "third", NULL };
++static int next = 0;
++%}
++%%
++<<EOF>>         { printf(" <eof %d>", next); yyterminate(); }
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int yywrap(void)
++{
++  printf(" {wrap %d}", next);
++  if (more[next] == NULL)
++    return 1;
++  yy_scan_string(more[next++]);
++  return 0;
++}
++int main()
++{
++  int first = yylex();
++  int again = yylex();
++  printf(" |%d %d\n", first, again);
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/wrap_eof.out b/tests/buffers_8e9584/cases/wrap_eof.out
+new file mode 100644
+index 00000000..6e3b2dd1
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_eof.out
+@@ -0,0 +1 @@
++ B(first) W(input) L(^) {wrap 0} B(second) W(input) {wrap 1} B(third) {wrap 2} <eof 2> {wrap 2} <eof 2> |0 0
+diff --git a/tests/buffers_8e9584/cases/wrap_files.l b/tests/buffers_8e9584/cases/wrap_files.l
+new file mode 100644
+index 00000000..a6190141
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_files.l
+@@ -0,0 +1,37 @@
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static const char *names[] = { "f1.txt", "f3.txt", "f2.txt", NULL };
++static int next = 0;
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int yywrap(void)
++{
++  printf(" {wrap %d}", next);
++  fclose(yyin);
++  if (names[next] == NULL)
++    return 1;
++  yyin = fopen(names[next++], "r");
++  return 0;
++}
++int main()
++{
++  yyin = fopen("f3.txt", "r");
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/wrap_files.out b/tests/buffers_8e9584/cases/wrap_files.out
+new file mode 100644
+index 00000000..3170f453
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_files.out
+@@ -0,0 +1 @@
++ B(eta) W(theta) {wrap 0} B(alpha) W(beta) L(^) B(gamma) {wrap 1} B(eta) W(theta) {wrap 2} B(delta) L(^) B(epsilon) W(zeta) L(^) {wrap 3}
+diff --git a/tests/buffers_8e9584/cases/wrap_push.l b/tests/buffers_8e9584/cases/wrap_push.l
+new file mode 100644
+index 00000000..0a12607c
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_push.l
+@@ -0,0 +1,37 @@
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int next = 0;
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int yywrap(void)
++{
++  printf(" {wrap %d}", next);
++  if (next++ < 2)
++  {
++    yypush_buffer_state(yy_create_buffer(fopen(next == 1 ? "f3.txt" : "f1.txt", "r"), YY_BUF_SIZE));
++    return 0;
++  }
++  return 1;
++}
++int main()
++{
++  yyin = fopen("f2.txt", "r");
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/wrap_push.out b/tests/buffers_8e9584/cases/wrap_push.out
+new file mode 100644
+index 00000000..d6d75d50
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_push.out
+@@ -0,0 +1 @@
++ B(delta) L(^) B(epsilon) W(zeta) L(^) {wrap 0} B(eta) W(theta) {wrap 1} B(alpha) W(beta) L(^) B(gamma) {wrap 2}
+diff --git a/tests/buffers_8e9584/cases/wrap_restart.l b/tests/buffers_8e9584/cases/wrap_restart.l
+new file mode 100644
+index 00000000..d1d32027
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_restart.l
+@@ -0,0 +1,36 @@
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static const char *names[] = { "f1.txt", "f4.txt", NULL };
++static int next = 0;
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int yywrap(void)
++{
++  printf(" {wrap %d}", next);
++  if (names[next] == NULL)
++    return 1;
++  yyrestart(fopen(names[next++], "r"));
++  return 0;
++}
++int main()
++{
++  yyin = fopen("f3.txt", "r");
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/wrap_restart.out b/tests/buffers_8e9584/cases/wrap_restart.out
+new file mode 100644
+index 00000000..cbf5478d
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_restart.out
+@@ -0,0 +1 @@
++ B(eta) W(theta) {wrap 0} B(alpha) W(beta) L(^) B(gamma) {wrap 1} N(7) W(iota) L(^) B(kappa) N(8) L(^) {wrap 2}
+diff --git a/tests/buffers_8e9584/cases/wrap_strings.l b/tests/buffers_8e9584/cases/wrap_strings.l
+new file mode 100644
+index 00000000..508d2d78
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_strings.l
+@@ -0,0 +1,36 @@
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static const char *more[] = { "pq rs", "\nuv 12", "", "wx", NULL };
++static int next = 0;
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int yywrap(void)
++{
++  printf(" {wrap %d}", next);
++  if (more[next] == NULL)
++    return 1;
++  yy_scan_string(more[next++]);
++  return 0;
++}
++int main()
++{
++  yy_scan_string("ab cd");
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/wrap_strings.out b/tests/buffers_8e9584/cases/wrap_strings.out
+new file mode 100644
+index 00000000..336f3d01
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_strings.out
+@@ -0,0 +1 @@
++ B(ab) W(cd) {wrap 0} B(pq) W(rs) {wrap 1} L(^) B(uv) N(12) {wrap 2} {wrap 3} B(wx) {wrap 4}
+diff --git a/tests/buffers_8e9584/cases/wrap_switch.l b/tests/buffers_8e9584/cases/wrap_switch.l
+new file mode 100644
+index 00000000..31d03403
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_switch.l
+@@ -0,0 +1,40 @@
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static YY_BUFFER_STATE pending[4];
++static int next = 0;
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int yywrap(void)
++{
++  printf(" {wrap %d}", next);
++  if (pending[next] == NULL)
++    return 1;
++  yy_switch_to_buffer(pending[next++]);
++  return 0;
++}
++int main()
++{
++  YY_BUFFER_STATE start = yy_scan_string("ab cd");
++  pending[0] = yy_create_buffer(fopen("f1.txt", "r"), YY_BUF_SIZE);
++  pending[1] = yy_scan_bytes("xy\nzw", 4);
++  pending[2] = yy_create_buffer(fopen("f3.txt", "r"), YY_BUF_SIZE);
++  yy_switch_to_buffer(start);
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/wrap_switch.out b/tests/buffers_8e9584/cases/wrap_switch.out
+new file mode 100644
+index 00000000..79caf970
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_switch.out
+@@ -0,0 +1 @@
++ B(ab) W(cd) {wrap 0} B(alpha) W(beta) L(^) B(gamma) {wrap 1} B(xy) L(^) B(z) {wrap 2} B(eta) W(theta) {wrap 3}
+diff --git a/tests/buffers_8e9584/cases/wrap_tokens.l b/tests/buffers_8e9584/cases/wrap_tokens.l
+new file mode 100644
+index 00000000..1384e1d4
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_tokens.l
+@@ -0,0 +1,42 @@
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static const char *names[] = { "f3.txt", "f1.txt", NULL };
++static int next = 0;
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++[0-9]+          { show("N", yytext, yyleng); return 3; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int yywrap(void)
++{
++  printf(" {wrap %d}", next);
++  fclose(yyin);
++  if (names[next] == NULL)
++    return 1;
++  yyin = fopen(names[next++], "r");
++  return 0;
++}
++int main()
++{
++  int token, count = 0;
++  yyin = fopen("f1.txt", "r");
++  while ((token = yylex()) != 0)
++  {
++    ++count;
++    printf("<%d>", token);
++  }
++  printf(" |%d\n", count);
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/wrap_tokens.out b/tests/buffers_8e9584/cases/wrap_tokens.out
+new file mode 100644
+index 00000000..1e9776eb
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/wrap_tokens.out
+@@ -0,0 +1 @@
++ B(alpha)<1> W(beta)<2> L(^) B(gamma)<1> {wrap 0} B(eta)<1> W(theta)<2> {wrap 1} B(alpha)<1> W(beta)<2> L(^) B(gamma)<1> {wrap 2} |8
+diff --git a/tests/buffers_8e9584/cases/yyin_action.in b/tests/buffers_8e9584/cases/yyin_action.in
+new file mode 100644
+index 00000000..692f9432
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/yyin_action.in
+@@ -0,0 +1,2 @@
++aa @next bb
++cc
+diff --git a/tests/buffers_8e9584/cases/yyin_action.l b/tests/buffers_8e9584/cases/yyin_action.l
+new file mode 100644
+index 00000000..e01a4817
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/yyin_action.l
+@@ -0,0 +1,28 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++static int next = 0;
++%}
++%%
++"@next"         { show("S", yytext, yyleng); if (next++ == 0) yyin = fopen("f3.txt", "r"); }
++^[a-z]+         { show("B", yytext, yyleng); }
++[a-z]+          { show("W", yytext, yyleng); }
++[0-9]+          { show("N", yytext, yyleng); }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yylex();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/yyin_action.out b/tests/buffers_8e9584/cases/yyin_action.out
+new file mode 100644
+index 00000000..73f5312f
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/yyin_action.out
+@@ -0,0 +1 @@
++ B(aa) S(@next) W(bb) L(^) B(cc) L(^) B(eta) W(theta)
+diff --git a/tests/buffers_8e9584/cases/yyin_follows.in b/tests/buffers_8e9584/cases/yyin_follows.in
+new file mode 100644
+index 00000000..36b22162
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/yyin_follows.in
+@@ -0,0 +1 @@
++stdin words
+diff --git a/tests/buffers_8e9584/cases/yyin_follows.l b/tests/buffers_8e9584/cases/yyin_follows.l
+new file mode 100644
+index 00000000..f51c96d2
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/yyin_follows.l
+@@ -0,0 +1,65 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++[0-9]+          { show("N", yytext, yyleng); return 3; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++static FILE *files[2];
++static void which(void)
++{
++  if (yyin == NULL)
++    printf(" {none}");
++  else if (yyin == stdin)
++    printf(" {stdin}");
++  else if (yyin == files[0])
++    printf(" {f2}");
++  else if (yyin == files[1])
++    printf(" {f4}");
++  else
++    printf(" {other}");
++}
++int main()
++{
++  YY_BUFFER_STATE text, f2, f4;
++  files[0] = fopen("f2.txt", "r");
++  files[1] = fopen("f4.txt", "r");
++  f2 = yy_create_buffer(files[0], YY_BUF_SIZE);
++  yy_switch_to_buffer(f2);
++  which();
++  yylex();
++  which();
++  text = yy_scan_string("from memory");
++  which();
++  yylex();
++  which();
++  f4 = yy_create_buffer(files[1], YY_BUF_SIZE);
++  yypush_buffer_state(f4);
++  which();
++  yylex();
++  which();
++  yypop_buffer_state();
++  which();
++  yy_switch_to_buffer(f2);
++  which();
++  yylex();
++  yyrestart(stdin);
++  which();
++  yylex();
++  which();
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/yyin_follows.out b/tests/buffers_8e9584/cases/yyin_follows.out
+new file mode 100644
+index 00000000..7eeee6fc
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/yyin_follows.out
+@@ -0,0 +1 @@
++ {f2} B(delta) {f2} {none} B(from) {none} {f4} N(7) {f4} {none} {f2} L(^) B(epsilon) {stdin} B(stdin) {stdin}
+diff --git a/tests/buffers_8e9584/cases/yyin_switch.l b/tests/buffers_8e9584/cases/yyin_switch.l
+new file mode 100644
+index 00000000..90198547
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/yyin_switch.l
+@@ -0,0 +1,38 @@
++%option noyywrap
++%{
++#include <stdio.h>
++#include <string.h>
++static void show(const char *kind, const char *text, int len)
++{
++  int i;
++  printf(" %s(", kind);
++  for (i = 0; i < len; ++i)
++    putchar(text[i] == '\n' ? '^' : text[i]);
++  printf(")");
++}
++%}
++%%
++^[a-z]+         { show("B", yytext, yyleng); return 1; }
++[a-z]+          { show("W", yytext, yyleng); return 2; }
++[0-9]+          { show("N", yytext, yyleng); return 3; }
++\n              { show("L", yytext, yyleng); }
++.               { }
++%%
++int main()
++{
++  yyin = fopen("f1.txt", "r");
++  yylex();
++  yyin = fopen("f4.txt", "r");
++  while (yylex() != 0)
++    ;
++  printf(" |");
++  yyin = fopen("f3.txt", "r");
++  yylex();
++  yylex();
++  yyin = fopen("f2.txt", "r");
++  printf(" [%d]", yylex());
++  while (yylex() != 0)
++    ;
++  printf("\n");
++  return 0;
++}
+diff --git a/tests/buffers_8e9584/cases/yyin_switch.out b/tests/buffers_8e9584/cases/yyin_switch.out
+new file mode 100644
+index 00000000..00c62260
+--- /dev/null
++++ b/tests/buffers_8e9584/cases/yyin_switch.out
+@@ -0,0 +1 @@
++ B(alpha) W(beta) L(^) B(gamma) N(7) W(iota) L(^) B(kappa) N(8) L(^) | B(eta) W(theta) [0] B(delta) L(^) B(epsilon) W(zeta) L(^)

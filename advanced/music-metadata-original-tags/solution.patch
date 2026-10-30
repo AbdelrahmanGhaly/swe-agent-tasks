@@ -1,0 +1,939 @@
+diff --git a/README.md b/README.md
+index 6eaab164..f4220cce 100644
+--- a/README.md
++++ b/README.md
+@@ -615,6 +615,17 @@ Returns a list of supported MIME-types. This may include some MIME-types which a
+   Files, buffers, and Blobs support chapters whether `moov` appears before or after `mdat`.
+   For forward-only streams, `moov` must appear before the chapter data.
+ 
++- `includeOriginalTags`: `boolean` (default: `false`)
++
++  When `true`, the tags of the original file kept in a WavPack file, or in a FLAC file encoded with
++  `flac --keep-foreign-metadata`, are included, as parsing the restored original gives them with the same options.
++  They are added after the tags of the file itself. Only `format.tagTypes` changes in `format`.
++  The metadata of the restored original is returned as `original`.
++  WavPack keeps WAV, AIFF, CAF, DSDIFF, DSF, W64 and RF64 originals; FLAC keeps WAV, AIFF, W64 and RF64 originals,
++  restored as `flac --decode --keep-foreign-metadata` writes them.
++  An original that cannot be parsed, or a W64 or RF64 original, adds nothing.
++  The parts of the original kept together count toward `maxMemoryAllocation`; past it the original adds nothing.
++
+ - `maxChapterCount`: `number` (default: `1000`)
+ 
+   Maximum chapters returned from QuickTime/Nero MP4 and ID3v2 chapter lists.
+diff --git a/lib/ParserFactory.ts b/lib/ParserFactory.ts
+index 0fd9cb4b..4423cd66 100644
+--- a/lib/ParserFactory.ts
++++ b/lib/ParserFactory.ts
+@@ -9,7 +9,7 @@ import { asfParserLoader } from './asf/AsfLoader.js';
+ import { cafParserLoader } from './caf/CafLoader.js';
+ import { getMaxChapterCount, getMaxMemoryAllocation, getMaxMetadataEntries } from './common/Allocation.js';
+ import { type INativeMetadataCollector, MetadataCollector } from './common/MetadataCollector.js';
+-import { createAudioTrackInfo, finalizeContainerInfo } from './common/TrackInfo.js';
++import { finalizeFormat } from './common/TrackInfo.js';
+ import { scanAppendingHeaders } from './core.js';
+ import { dsdiffParserLoader } from './dsdiff/DsdiffLoader.js';
+ import { dsfParserLoader } from './dsf/DsfLoader.js';
+@@ -20,7 +20,7 @@ import { mpegParserLoader } from './mpeg/MpegLoader.js';
+ import { musepackParserLoader } from './musepack/MusepackLoader.js';
+ import { oggParserLoader } from './ogg/OggLoader.js';
+ import { CouldNotDetermineFileTypeError, UnsupportedFileTypeError } from './ParseError.js';
+-import { type IAudioMetadata, type IOptions, type ParserType, TrackType } from './type.js';
++import type { IAudioMetadata, IOptions, ParserType } from './type.js';
+ import { riffParserLoader } from './wav/WaveLoader.js';
+ import { wavpackParserLoader } from './wavpack/WavPackLoader.js';
+ 
+@@ -140,20 +140,7 @@ export class ParserFactory {
+     const parser = new ParserImpl(metadata, tokenizer, opts);
+     debug(`Parser ${parserLoader.parserType} loaded`);
+     await parser.parse();
+-    // Audio-only parsers describe their single stream through the format fields.
+-    // Container parsers supply their own tracks; never copy aggregate fields to them.
+-    if (metadata.format.trackInfo.length === 0 && metadata.format.hasAudio === true) {
+-      metadata.addStreamInfo(createAudioTrackInfo(metadata.format));
+-    }
+-    if (metadata.format.trackInfo) {
+-      if (metadata.format.hasAudio === undefined) {
+-        metadata.setFormat('hasAudio', !!metadata.format.trackInfo.find(track => track.type === TrackType.audio));
+-      }
+-      if (metadata.format.hasVideo === undefined) {
+-        metadata.setFormat('hasVideo', !!metadata.format.trackInfo.find(track => track.type === TrackType.video));
+-      }
+-    }
+-    finalizeContainerInfo(metadata, tokenizer.fileInfo.size);
++    finalizeFormat(metadata, tokenizer.fileInfo.size);
+     return metadata.toCommonMetadata();
+   }
+ 
+diff --git a/lib/common/MetadataCollector.ts b/lib/common/MetadataCollector.ts
+index 8aed8508..a4db30ac 100644
+--- a/lib/common/MetadataCollector.ts
++++ b/lib/common/MetadataCollector.ts
+@@ -80,6 +80,11 @@ export interface INativeMetadataCollector extends IWarningCollector {
+   addStreamInfo(streamInfo: ITrackInfo): void;
+ 
+   setAudioOnly(): void;
++
++  /**
++   * Set the metadata of the original file a lossless encoder kept
++   */
++  setOriginal(original: IAudioMetadata): void;
+ }
+ 
+ /**
+@@ -122,6 +127,8 @@ export class MetadataCollector implements INativeMetadataCollector {
+ 
+   private opts?: IOptions;
+ 
++  private originalMetadata?: IAudioMetadata;
++
+   public constructor(opts?: IOptions) {
+     this.opts = opts;
+     let priority = 1;
+@@ -168,6 +175,10 @@ export class MetadataCollector implements INativeMetadataCollector {
+     this.setFormat('hasVideo', false);
+   }
+ 
++  public setOriginal(original: IAudioMetadata): void {
++    this.originalMetadata = original;
++  }
++
+   public registerTagType(tagType: TagType): void {
+     if (!this.format.tagTypes.includes(tagType)) {
+       this.format.tagTypes.push(tagType);
+@@ -329,12 +340,16 @@ export class MetadataCollector implements INativeMetadataCollector {
+    * @returns {IAudioMetadata} Native + common tags
+    */
+   public toCommonMetadata(): IAudioMetadata {
+-    return {
++    const metadata: IAudioMetadata = {
+       format: this.format,
+       native: this.native,
+       quality: this.quality,
+       common: this.common
+     };
++    if (this.originalMetadata) {
++      metadata.original = this.originalMetadata;
++    }
++    return metadata;
+   }
+ 
+   /**
+diff --git a/lib/common/OriginalFile.ts b/lib/common/OriginalFile.ts
+new file mode 100644
+index 00000000..e0182741
+--- /dev/null
++++ b/lib/common/OriginalFile.ts
+@@ -0,0 +1,412 @@
++import { textDecode } from '@borewit/text-codec';
++import initDebug from 'debug';
++import {
++  AbstractTokenizer,
++  EndOfStreamError,
++  type IRandomAccessFileInfo,
++  type IReadChunkOptions,
++  type ITokenizerOptions
++} from 'strtok3';
++import { concatUint8Arrays } from 'uint8array-extras';
++
++import { scanAppendingHeaders } from '../core.js';
++import { ParserFactory } from '../ParserFactory.js';
++import type { AnyTagValue, IAudioMetadata, IFormat, IPrivateOptions, ITrackInfo } from '../type.js';
++import { getMaxMemoryAllocation, getTokenizerOptions, validateAllocation } from './Allocation.js';
++import type { IGenericTag, TagType } from './GenericTagTypes.js';
++import { type INativeMetadataCollector, MetadataCollector } from './MetadataCollector.js';
++import { finalizeFormat } from './TrackInfo.js';
++
++const debug = initDebug('music-metadata:original-file');
++
++/**
++ * Layout of the chunks of a container, up to the chunk holding the audio
++ */
++interface IChunkLayout {
++  mimeType: string;
++  /**
++   * Offset of the first chunk
++   */
++  start: number;
++  /**
++   * Byte length of the chunk size
++   */
++  sizeLength: 4 | 8;
++  littleEndian: boolean;
++  /**
++   * The chunk size includes the chunk ID and size
++   */
++  sizeIncludesHeader: boolean;
++  /**
++   * Chunks are padded to an even length
++   */
++  padded: boolean;
++  audioChunks: string[];
++  /**
++   * Chunk giving the byte length of an audio frame
++   */
++  frameChunk?: { id: string; length: number; getFrameSize: (view: DataView, offset: number) => number };
++}
++
++/**
++ * Chunk layouts of every original WavPack or `flac --keep-foreign-metadata` keeps, by container ID:
++ * WAV, AIFF, CAF, DSDIFF and DSF, as W64 and RF64 originals are not parsed
++ */
++const chunkLayouts: { [id: string]: IChunkLayout } = {
++  RIFF: {
++    mimeType: 'audio/wav',
++    start: 12,
++    sizeLength: 4,
++    littleEndian: true,
++    sizeIncludesHeader: false,
++    padded: true,
++    audioChunks: ['data'],
++    frameChunk: { id: 'fmt ', length: 14, getFrameSize: (view, offset) => view.getUint16(offset + 12, true) }
++  },
++  FORM: {
++    mimeType: 'audio/aiff',
++    start: 12,
++    sizeLength: 4,
++    littleEndian: false,
++    sizeIncludesHeader: false,
++    padded: true,
++    audioChunks: ['SSND'],
++    frameChunk: {
++      id: 'COMM',
++      length: 8,
++      getFrameSize: (view, offset) => view.getInt16(offset) * Math.ceil(view.getInt16(offset + 6) / 8)
++    }
++  },
++  caff: {
++    mimeType: 'audio/caf',
++    start: 8,
++    sizeLength: 8,
++    littleEndian: false,
++    sizeIncludesHeader: false,
++    padded: false,
++    audioChunks: ['data'],
++    frameChunk: {
++      id: 'desc',
++      length: 24,
++      getFrameSize: (view, offset) => view.getUint32(offset + 16) / view.getUint32(offset + 20)
++    }
++  },
++  FRM8: {
++    mimeType: 'audio/dff',
++    start: 16,
++    sizeLength: 8,
++    littleEndian: false,
++    sizeIncludesHeader: false,
++    padded: true,
++    audioChunks: ['DSD ', 'DST ']
++  },
++  'DSD ': {
++    mimeType: 'audio/dsf',
++    start: 0,
++    sizeLength: 8,
++    littleEndian: true,
++    sizeIncludesHeader: true,
++    padded: false,
++    audioChunks: ['data']
++  }
++};
++
++/**
++ * Length of the audio between the header and the trailer of the original file: the rest of the chunk the header ends in,
++ * or, given the number of samples, the whole audio frames, as the encoder keeps any bytes left in the chunk in the trailer
++ * @param header Original file up to its audio
++ * @param layout Chunk layout of the original file
++ * @param numberOfSamples Number of samples of the file holding the original
++ * @returns Audio length, 0 if it cannot be told, undefined if the audio chunk is not found
++ */
++function getAudioLength(header: Uint8Array, layout: IChunkLayout, numberOfSamples?: number): number | undefined {
++  const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
++  const chunkHeaderLength = 4 + layout.sizeLength;
++  let frameSize: number | undefined;
++  for (let offset = layout.start; offset + chunkHeaderLength <= header.length; ) {
++    const id = textDecode(header.subarray(offset, offset + 4), 'latin1');
++    const size =
++      layout.sizeLength === 4
++        ? view.getUint32(offset + 4, layout.littleEndian)
++        : Number(view.getBigInt64(offset + 4, layout.littleEndian));
++    const dataSize = layout.sizeIncludesHeader ? size - chunkHeaderLength : size;
++    const dataOffset = offset + chunkHeaderLength;
++    if (layout.audioChunks.includes(id)) {
++      const unknownSize = dataSize < 0 || (layout.sizeLength === 4 && size === 0xffffffff);
++      if (numberOfSamples !== undefined && frameSize !== undefined) {
++        const audioLength = numberOfSamples * frameSize;
++        const chunkSize = unknownSize ? header.length - dataOffset + audioLength : dataSize;
++        const padding = layout.padded && chunkSize === header.length - dataOffset + audioLength ? chunkSize % 2 : 0;
++        return Number.isSafeInteger(audioLength) ? audioLength + padding : undefined;
++      }
++      if (unknownSize) {
++        return 0;
++      }
++      const end = dataOffset + dataSize + (layout.padded ? dataSize % 2 : 0);
++      return end < header.length ? undefined : end - header.length;
++    }
++    if (dataSize < 0) {
++      return;
++    }
++    const { frameChunk } = layout;
++    if (id === frameChunk?.id && dataOffset + frameChunk.length <= header.length) {
++      frameSize = frameChunk.getFrameSize(view, dataOffset);
++    }
++    offset = dataOffset + dataSize + (layout.padded ? dataSize % 2 : 0);
++  }
++}
++
++/**
++ * Random access tokenizer over the original file, reading its audio, which was not kept, as zeros
++ */
++class OriginalFileTokenizer extends AbstractTokenizer {
++  public fileInfo: IRandomAccessFileInfo;
++
++  private readonly trailerOffset: number;
++
++  public constructor(
++    private readonly header: Uint8Array,
++    audioLength: number,
++    private readonly trailer: Uint8Array,
++    options: ITokenizerOptions
++  ) {
++    super(options);
++    this.trailerOffset = header.length + audioLength;
++    this.fileInfo = { ...options.fileInfo, size: this.trailerOffset + trailer.length };
++  }
++
++  public async readBuffer(uint8Array: Uint8Array, options?: IReadChunkOptions): Promise<number> {
++    const normOptions = this.normalizeOptions(uint8Array, options);
++    const bytesRead = await this.peekBuffer(uint8Array, normOptions);
++    this.position = normOptions.position + bytesRead;
++    return bytesRead;
++  }
++
++  public async peekBuffer(uint8Array: Uint8Array, options?: IReadChunkOptions): Promise<number> {
++    const normOptions = this.normalizeOptions(uint8Array, options);
++    const bytes2read = Math.max(0, Math.min(this.fileInfo.size - normOptions.position, normOptions.length));
++    if (!normOptions.mayBeLess && bytes2read < normOptions.length) {
++      throw new EndOfStreamError();
++    }
++    const start = normOptions.position;
++    const end = start + bytes2read;
++    uint8Array.fill(0, 0, bytes2read);
++    if (start < this.header.length) {
++      uint8Array.set(this.header.subarray(start, Math.min(end, this.header.length)));
++    }
++    if (end > this.trailerOffset) {
++      const from = Math.max(start, this.trailerOffset);
++      uint8Array.set(this.trailer.subarray(from - this.trailerOffset, end - this.trailerOffset), from - start);
++    }
++    return bytes2read;
++  }
++
++  public supportsRandomAccess(): boolean {
++    return true;
++  }
++
++  public setPosition(position: number): void {
++    this.position = position;
++  }
++}
++
++type TagOperation = (metadata: INativeMetadataCollector) => Promise<void> | void;
++
++/**
++ * Keeps the metadata of the original file apart, while recording its tags for the file holding the original
++ */
++class OriginalFileMetadata implements INativeMetadataCollector {
++  private readonly original: MetadataCollector;
++
++  private readonly tagOperations: TagOperation[] = [];
++
++  public constructor(options: IPrivateOptions) {
++    this.original = new MetadataCollector(options);
++  }
++
++  public get format(): IFormat {
++    return this.original.format;
++  }
++
++  public get native() {
++    return this.original.native;
++  }
++
++  public get quality() {
++    return this.original.quality;
++  }
++
++  public hasAny(): boolean {
++    return this.original.hasAny();
++  }
++
++  public setFormat<K extends keyof IFormat>(key: K, value: IFormat[K]): void {
++    this.original.setFormat(key, value);
++  }
++
++  public registerTagType(tagType: TagType): void {
++    this.original.registerTagType(tagType);
++    this.tagOperations.push(metadata => metadata.registerTagType(tagType));
++  }
++
++  public async addTag(tagType: TagType, tagId: string, value: AnyTagValue): Promise<void> {
++    await this.original.addTag(tagType, tagId, value);
++    this.tagOperations.push(metadata => metadata.addTag(tagType, tagId, value));
++  }
++
++  public async postMap(tagType: TagType, tag: IGenericTag): Promise<void> {
++    const recorded = { ...tag };
++    this.tagOperations.push(metadata => metadata.postMap(tagType, recorded));
++    await this.original.postMap(tagType, tag);
++  }
++
++  /**
++   * Add the recorded tags to the file holding the original, in the order the original gave them
++   * @param metadata Metadata of the file holding the original
++   */
++  public async addTagsTo(metadata: INativeMetadataCollector): Promise<void> {
++    for (const operation of this.tagOperations) {
++      await operation(metadata);
++    }
++  }
++
++  public addStreamInfo(streamInfo: ITrackInfo): void {
++    this.original.addStreamInfo(streamInfo);
++  }
++
++  public setAudioOnly(): void {
++    this.original.setAudioOnly();
++  }
++
++  public addWarning(warning: string): void {
++    this.original.addWarning(warning);
++  }
++
++  public setOriginal(original: IAudioMetadata): void {
++    this.original.setOriginal(original);
++  }
++
++  /**
++   * Metadata of the original file, as parsing the restored original gives it
++   */
++  public toCommonMetadata(): IAudioMetadata {
++    return this.original.toCommonMetadata();
++  }
++}
++
++/**
++ * Parts of the original file a lossless encoder kept, buffered within the allocation limit
++ */
++export class OriginalFile {
++  private readonly header: Uint8Array[] = [];
++
++  private readonly trailer: Uint8Array[] = [];
++
++  /**
++   * Byte length of the parts found, including the parts dropped once over the allocation limit
++   */
++  private length = 0;
++
++  public constructor(private readonly options: IPrivateOptions) {}
++
++  /**
++   * Whether nothing of the original file was found
++   */
++  public isEmpty(): boolean {
++    return this.length === 0;
++  }
++
++  /**
++   * Keep the next part of the original file up to its audio
++   */
++  public addHeader(part: Uint8Array): void {
++    this.keep(this.header, part);
++  }
++
++  /**
++   * Keep the next part of the original file after its audio
++   */
++  public addTrailer(part: Uint8Array): void {
++    this.keep(this.trailer, part);
++  }
++
++  /**
++   * Whether a part of this length fits the allocation limit, together with the parts found before it
++   */
++  public fits(length: number): boolean {
++    return this.length + length <= getMaxMemoryAllocation(this.options);
++  }
++
++  /**
++   * Count a part of the original file left unread, past the allocation limit none of the parts are kept
++   */
++  public skip(length: number): void {
++    this.length += length;
++    this.header.length = 0;
++    this.trailer.length = 0;
++  }
++
++  /**
++   * Replace the parts kept up to the audio by the parts the decoder of the file holding the original writes in their place
++   * @param restore Gives those parts from the parts kept up to the audio and the byte length of the parts after it,
++   * undefined if the decoder does not restore the original
++   */
++  public restoreHeader(restore: (header: Uint8Array[], trailerLength: number) => Uint8Array[] | undefined): void {
++    const trailerLength = this.trailer.reduce((length, part) => length + part.length, 0);
++    this.header.splice(0, this.header.length, ...(restore(this.header, trailerLength) ?? []));
++  }
++
++  /**
++   * Add the tags and the metadata of the original file, as parsing the restored original gives them
++   * @param metadata Metadata of the file holding the original
++   * @param numberOfSamples Number of samples of the file holding the original
++   */
++  public async addTagsTo(metadata: INativeMetadataCollector, numberOfSamples?: number): Promise<void> {
++    const originalOptions: IPrivateOptions = { ...this.options, observer: undefined };
++    const originalMetadata = new OriginalFileMetadata(originalOptions);
++    let size: number;
++    try {
++      validateAllocation(this.length, this.options);
++      const header = concatUint8Arrays(this.header);
++      const trailer = concatUint8Arrays(this.trailer);
++      const layout = chunkLayouts[textDecode(header.subarray(0, 4), 'latin1')];
++      const audioLength = layout ? getAudioLength(header, layout, numberOfSamples) : undefined;
++      const loader = layout && new ParserFactory().findLoaderForContentType(layout.mimeType);
++      if (!layout || audioLength === undefined || !loader) {
++        debug('Original file not supported');
++        return;
++      }
++      const tokenizer = new OriginalFileTokenizer(
++        header,
++        audioLength,
++        trailer,
++        getTokenizerOptions(originalOptions, { mimeType: layout.mimeType })
++      );
++      await scanAppendingHeaders(tokenizer, originalOptions);
++      const ParserImpl = await loader.load();
++      await new ParserImpl(originalMetadata, tokenizer, originalOptions).parse();
++      size = tokenizer.fileInfo.size;
++    } catch (error) {
++      if (!(error instanceof Error)) {
++        throw error;
++      }
++      debug(`Failed to read the original file: ${error.message}`);
++      return;
++    }
++    finalizeFormat(originalMetadata, size);
++    metadata.setOriginal(originalMetadata.toCommonMetadata());
++    await originalMetadata.addTagsTo(metadata);
++  }
++
++  /**
++   * Keep a part while all the parts found fit the allocation limit, past it none of them are kept
++   */
++  private keep(parts: Uint8Array[], part: Uint8Array): void {
++    if (this.fits(part.length)) {
++      this.length += part.length;
++      parts.push(part);
++    } else {
++      this.skip(part.length);
++    }
++  }
++}
+diff --git a/lib/common/TrackInfo.ts b/lib/common/TrackInfo.ts
+index ff8b8a5c..855f52c9 100644
+--- a/lib/common/TrackInfo.ts
++++ b/lib/common/TrackInfo.ts
+@@ -73,3 +73,21 @@ export function finalizeContainerInfo(metadata: INativeMetadataCollector, fileSi
+     }
+   }
+ }
++
++/** Complete the format of a parsed file from its tracks and its size. */
++export function finalizeFormat(metadata: INativeMetadataCollector, fileSize?: number): void {
++  // Audio-only parsers describe their single stream through the format fields.
++  // Container parsers supply their own tracks; never copy aggregate fields to them.
++  if (metadata.format.trackInfo.length === 0 && metadata.format.hasAudio === true) {
++    metadata.addStreamInfo(createAudioTrackInfo(metadata.format));
++  }
++  if (metadata.format.trackInfo) {
++    if (metadata.format.hasAudio === undefined) {
++      metadata.setFormat('hasAudio', !!metadata.format.trackInfo.find(track => track.type === TrackType.audio));
++    }
++    if (metadata.format.hasVideo === undefined) {
++      metadata.setFormat('hasVideo', !!metadata.format.trackInfo.find(track => track.type === TrackType.video));
++    }
++  }
++  finalizeContainerInfo(metadata, fileSize);
++}
+diff --git a/lib/flac/FlacForeignChunks.ts b/lib/flac/FlacForeignChunks.ts
+new file mode 100644
+index 00000000..b2cb58c0
+--- /dev/null
++++ b/lib/flac/FlacForeignChunks.ts
+@@ -0,0 +1,134 @@
++import { textDecode } from '@borewit/text-codec';
++import { UINT16_BE, UINT16_LE, UINT32_BE, UINT32_LE } from 'token-types';
++import { FourCcToken } from '../common/FourCC.js';
++import type { IBlockStreamInfo } from './FlacToken.js';
++
++/**
++ * Channel mask the FLAC decoder writes for a number of channels, when the FLAC file gives none
++ */
++const defaultChannelMasks = [0, 0x4, 0x3, 0x7, 0x33, 0x607, 0x60f, 0x70f, 0x63f];
++
++/**
++ * WAVE_FORMAT_EXTENSIBLE sub format KSDATAFORMAT_SUBTYPE_PCM
++ */
++const pcmSubFormat = Uint8Array.of(0x01, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71);
++
++function getChunkId(chunk: Uint8Array): string {
++  return textDecode(chunk.subarray(0, 4), 'latin1');
++}
++
++function makeChunk(id: string, size: number, littleEndian: boolean, length: number): Uint8Array {
++  const chunk = new Uint8Array(length);
++  FourCcToken.put(chunk, 0, id);
++  (littleEndian ? UINT32_LE : UINT32_BE).put(chunk, 4, size);
++  return chunk;
++}
++
++/**
++ * fmt chunk the FLAC decoder writes: WAVE_FORMAT_PCM for 8 or 16-bit mono or stereo with the usual channel mask,
++ * WAVE_FORMAT_EXTENSIBLE otherwise
++ */
++function makeWaveFormatChunk(streamInfo: IBlockStreamInfo, channelMask: number): Uint8Array {
++  const { channels, sampleRate, bitsPerSample } = streamInfo;
++  const sampleLength = Math.ceil(bitsPerSample / 8);
++  const extensible =
++    (channelMask !== 0 && channelMask !== 0x4 && channelMask !== 0x3) ||
++    (bitsPerSample !== 8 && bitsPerSample !== 16) ||
++    channels > 2;
++  const size = extensible ? 40 : 16;
++  const chunk = makeChunk('fmt ', size, true, 8 + size);
++  UINT16_LE.put(chunk, 8, extensible ? 0xfffe : 1);
++  UINT16_LE.put(chunk, 10, channels);
++  UINT32_LE.put(chunk, 12, sampleRate);
++  UINT32_LE.put(chunk, 16, sampleRate * channels * sampleLength);
++  UINT16_LE.put(chunk, 20, channels * sampleLength);
++  UINT16_LE.put(chunk, 22, 8 * sampleLength);
++  if (extensible) {
++    UINT16_LE.put(chunk, 24, 22);
++    UINT16_LE.put(chunk, 26, bitsPerSample);
++    UINT32_LE.put(chunk, 28, channelMask);
++    chunk.set(pcmSubFormat, 32);
++  }
++  return chunk;
++}
++
++/**
++ * COMM chunk the FLAC decoder writes, with the sample rate as an 80-bit extended precision number
++ */
++function makeAiffCommonChunk(streamInfo: IBlockStreamInfo, numberOfFrames: number): Uint8Array {
++  const chunk = makeChunk('COMM', 18, false, 26);
++  UINT16_BE.put(chunk, 8, streamInfo.channels);
++  UINT32_BE.put(chunk, 10, numberOfFrames);
++  UINT16_BE.put(chunk, 14, streamInfo.bitsPerSample);
++  const shift = Math.clz32(streamInfo.sampleRate);
++  UINT16_BE.put(chunk, 16, 0x3fff + 31 - shift);
++  UINT32_BE.put(chunk, 18, (streamInfo.sampleRate << shift) >>> 0);
++  return chunk;
++}
++
++/**
++ * Length of the audio the kept sound data chunk header gives, for a FLAC file not giving its number of samples
++ */
++function getKeptAudioLength(chunk: Uint8Array, riff: boolean): number {
++  if (riff) {
++    return chunk.length >= 8 ? UINT32_LE.get(chunk, 4) : 0;
++  }
++  return chunk.length >= 16 ? Math.max(0, UINT32_BE.get(chunk, 4) - 8 - UINT32_BE.get(chunk, 8)) : 0;
++}
++
++/**
++ * Value of a WAVEFORMATEXTENSIBLE_CHANNEL_MASK comment, as the FLAC decoder reads it
++ * @returns Channel mask, 0 if the value does not give one
++ */
++export function parseChannelMask(value: string): number {
++  const mask = /^0x([\da-f]+)/i.exec(value);
++  return mask ? Number.parseInt(mask[1], 16) : 0;
++}
++
++/**
++ * Restore the chunks `flac --keep-foreign-metadata` keeps up to the audio, as `flac --decode` writes them:
++ * the decoder writes its own container header, format chunk and sound data chunk header from STREAMINFO,
++ * an AIFF-C original as AIFF, and copies the other chunks as kept
++ * @param chunks Chunks kept up to the audio, starting with the container header
++ * @param trailerLength Byte length of the chunks kept after the audio
++ * @param streamInfo STREAMINFO of the FLAC file
++ * @param channelMask Channel mask of the FLAC file, 0 if it gives none
++ * @returns Chunks up to the audio, undefined if the decoder does not restore the original
++ */
++export function restoreForeignChunks(
++  chunks: Uint8Array[],
++  trailerLength: number,
++  streamInfo: IBlockStreamInfo,
++  channelMask: number
++): Uint8Array[] | undefined {
++  const containerId = chunks.length > 0 && chunks[0].length >= 12 ? getChunkId(chunks[0]) : undefined;
++  const riff = containerId === 'RIFF';
++  if ((!riff && containerId !== 'FORM') || streamInfo.sampleRate === 0) {
++    return;
++  }
++  const ids = chunks.map(getChunkId);
++  const formatIndex = ids.indexOf(riff ? 'fmt ' : 'COMM', 1);
++  const audioIndex = chunks.length - 1;
++  if (formatIndex === -1 || ids[audioIndex] !== (riff ? 'data' : 'SSND')) {
++    return;
++  }
++  const frameLength = streamInfo.channels * Math.ceil(streamInfo.bitsPerSample / 8);
++  const audioLength =
++    streamInfo.totalSamples > 0 ? streamInfo.totalSamples * frameLength : getKeptAudioLength(chunks[audioIndex], riff);
++  const restored = [
++    ...chunks.slice(1, formatIndex),
++    riff
++      ? makeWaveFormatChunk(streamInfo, channelMask || defaultChannelMasks[streamInfo.channels])
++      : makeAiffCommonChunk(streamInfo, Math.floor(audioLength / frameLength)),
++    ...chunks.slice(formatIndex + 1, audioIndex),
++    riff ? makeChunk('data', audioLength, true, 8) : makeChunk('SSND', 8 + audioLength, false, 16)
++  ];
++  const containerSize =
++    4 + restored.reduce((length, chunk) => length + chunk.length, 0) + audioLength + (audioLength % 2) + trailerLength;
++  if (containerSize >= 0xfffffff4) {
++    return;
++  }
++  const container = makeChunk(riff ? 'RIFF' : 'FORM', containerSize, riff, 12);
++  FourCcToken.put(container, 8, riff ? 'WAVE' : 'AIFF');
++  return [container, ...restored];
++}
+diff --git a/lib/flac/FlacParser.ts b/lib/flac/FlacParser.ts
+index 312948c2..8983924c 100644
+--- a/lib/flac/FlacParser.ts
++++ b/lib/flac/FlacParser.ts
+@@ -1,12 +1,14 @@
+ import initDebug from 'debug';
+-import { Uint8ArrayType } from 'token-types';
++import { StringType, Uint8ArrayType } from 'token-types';
+ import { getMaxMetadataEntries } from '../common/Allocation.js';
+ import { FourCcToken } from '../common/FourCC.js';
++import { OriginalFile } from '../common/OriginalFile.js';
+ import { AbstractID3Parser } from '../id3v2/AbstractID3Parser.js';
+ import { type IVorbisPicture, VorbisPictureToken } from '../ogg/vorbis/Vorbis.js';
+ import { VorbisDecoder } from '../ogg/vorbis/VorbisDecoder.js';
+ import { VorbisStream } from '../ogg/vorbis/VorbisStream.js';
+ import { makeUnexpectedFileContentError } from '../ParseError.js';
++import { parseChannelMask, restoreForeignChunks } from './FlacForeignChunks.js';
+ import type { IBlockStreamInfo } from './FlacToken.js';
+ import * as Flac from './FlacToken.js';
+ 
+@@ -16,6 +18,24 @@ class FlacContentError extends makeUnexpectedFileContentError('FLAC') {}
+ 
+ export class FlacParser extends AbstractID3Parser {
+   private vorbisParser = new VorbisStream(this.metadata, this.options);
++  private readonly originalFile = new OriginalFile(this.options);
++  private originalAudioFound = false;
++  private streamInfo?: IBlockStreamInfo;
++  private channelMask?: number;
++
++  public async parse(): Promise<void> {
++    await super.parse();
++    const { streamInfo } = this;
++    if (!this.originalFile.isEmpty() && streamInfo) {
++      this.originalFile.restoreHeader((header, trailerLength) =>
++        restoreForeignChunks(header, trailerLength, streamInfo, this.channelMask ?? 0)
++      );
++      await this.originalFile.addTagsTo(
++        this.metadata,
++        streamInfo.totalSamples > 0 ? streamInfo.totalSamples : undefined
++      );
++    }
++  }
+ 
+   public async postId3v2Parse(): Promise<void> {
+     const fourCC = await this.readToken<string>(FourCcToken);
+@@ -45,6 +65,9 @@ export class FlacParser extends AbstractID3Parser {
+       case Flac.BlockType.PADDING:
+         break;
+       case Flac.BlockType.APPLICATION:
++        if (this.options.includeOriginalTags) {
++          return this.readApplication(blockHeader.length);
++        }
+         break;
+       case Flac.BlockType.SEEKTABLE:
+         break;
+@@ -73,6 +96,7 @@ export class FlacParser extends AbstractID3Parser {
+     const streamInfo = await this.readToken(Flac.BlockStreamInfo);
+     this.metadata.setFormat('container', 'FLAC');
+     this.processsStreamInfo(streamInfo);
++    this.streamInfo = streamInfo;
+   }
+ 
+   /**
+@@ -116,10 +140,38 @@ export class FlacParser extends AbstractID3Parser {
+       if (tag.key === 'ENCODER') {
+         this.metadata.setFormat('tool', tag.value);
+       }
++      if (tag.key === 'WAVEFORMATEXTENSIBLE_CHANNEL_MASK' && this.channelMask === undefined) {
++        this.channelMask = parseChannelMask(tag.value);
++      }
+       await this.addTag(tag.key, tag.value);
+     }
+   }
+ 
++  /**
++   * Read APPLICATION block, `flac --keep-foreign-metadata` keeps each chunk of a WAV or AIFF file in a `riff` or `aiff` block,
++   * in file order: the chunks up to the sound data chunk precede the audio, the rest follow it.
++   * A chunk past the allocation limit is skipped unread.
++   * `flac --decode` restores the original from these chunks and STREAMINFO.
++   */
++  private async readApplication(dataLen: number): Promise<void> {
++    const applicationId = dataLen >= 4 ? await this.readToken(new StringType(4, 'latin1')) : '';
++    const chunkLen = Math.max(0, dataLen - 4);
++    if (applicationId !== 'riff' && applicationId !== 'aiff') {
++      await this.tokenizer.ignore(dataLen - applicationId.length);
++    } else if (this.originalFile.fits(chunkLen)) {
++      const chunk = await this.readToken(new Uint8ArrayType(chunkLen));
++      if (this.originalAudioFound) {
++        this.originalFile.addTrailer(chunk);
++      } else {
++        this.originalFile.addHeader(chunk);
++        this.originalAudioFound = ['data', 'SSND'].includes(new StringType(4, 'latin1').get(chunk, 0));
++      }
++    } else {
++      this.originalFile.skip(chunkLen);
++      await this.tokenizer.ignore(chunkLen);
++    }
++  }
++
+   private async parsePicture(dataLen: number) {
+     if (this.options.skipCovers) {
+       return this.tokenizer.ignore(dataLen);
+diff --git a/lib/type.ts b/lib/type.ts
+index b4c5f03b..f71bb120 100644
+--- a/lib/type.ts
++++ b/lib/type.ts
+@@ -660,6 +660,11 @@ export interface IAudioMetadata extends INativeAudioMetadata {
+    * Metadata, form independent interface
+    */
+   common: ICommonTagsResult;
++
++  /**
++   * Metadata of the original file a lossless encoder kept, set when parsing with `includeOriginalTags`
++   */
++  original?: IAudioMetadata;
+ }
+ 
+ /**
+@@ -720,6 +725,13 @@ export interface IOptions {
+    */
+   includeChapters?: boolean;
+ 
++  /**
++   * default: `false`, if set to `true`, it will include the tags of the original file kept in a WavPack file,
++   * or in a FLAC file encoded with `--keep-foreign-metadata`, after the tags of the file itself,
++   * and return the metadata of the original as `original`.
++   */
++  includeOriginalTags?: boolean;
++
+   /**
+    * Maximum chapters returned for QuickTime/Nero MP4 and ID3v2 chapter lists.
+    * Defaults to 1000. Must be a positive safe integer.
+diff --git a/lib/wavpack/WavPackParser.ts b/lib/wavpack/WavPackParser.ts
+index 160af477..e1b2b310 100644
+--- a/lib/wavpack/WavPackParser.ts
++++ b/lib/wavpack/WavPackParser.ts
+@@ -4,6 +4,7 @@ import { uint8ArrayToHex } from 'uint8array-extras';
+ import { tryParseApeHeader } from '../apev2/APEv2Parser.js';
+ import { BasicParser } from '../common/BasicParser.js';
+ import { FourCcToken } from '../common/FourCC.js';
++import { OriginalFile } from '../common/OriginalFile.js';
+ import { makeUnexpectedFileContentError } from '../ParseError.js';
+ import { BlockHeaderToken, type IBlockHeader, type IMetadataId, MetadataIdToken } from './WavPackToken.js';
+ 
+@@ -16,6 +17,9 @@ export class WavPackContentError extends makeUnexpectedFileContentError('WavPack
+  */
+ export class WavPackParser extends BasicParser {
+   private audioDataSize = 0;
++  private decodedSamples = 0;
++  private isDSD?: boolean;
++  private readonly originalFile = new OriginalFile(this.options);
+ 
+   public async parse(): Promise<void> {
+     this.metadata.setAudioOnly();
+@@ -25,8 +29,11 @@ export class WavPackParser extends BasicParser {
+     // First parse all WavPack blocks
+     await this.parseWavPackBlocks();
+     // try to parse APEv2 header
++    await tryParseApeHeader(this.metadata, this.tokenizer, this.options);
+ 
+-    return tryParseApeHeader(this.metadata, this.tokenizer, this.options);
++    if (!this.originalFile.isEmpty()) {
++      await this.originalFile.addTagsTo(this.metadata, this.isDSD ? undefined : this.decodedSamples);
++    }
+   }
+ 
+   public async parseWavPackBlocks(): Promise<void> {
+@@ -65,6 +72,8 @@ export class WavPackParser extends BasicParser {
+         : this.tokenizer.ignore(ignoreBytes));
+       if (header.blockSamples > 0) {
+         this.audioDataSize += header.blockSize; // Count audio data for bit-rate calculation
++        this.decodedSamples = Math.max(this.decodedSamples, header.blockIndex + header.blockSamples);
++        this.isDSD ??= header.flags.isDSD;
+       }
+     } while (
+       !this.tokenizer.fileInfo.size ||
+@@ -89,7 +98,20 @@ export class WavPackParser extends BasicParser {
+       if (dataSizeInWords * 2 > remaining - headerSize) {
+         throw new WavPackContentError('Metadata sub-block exceeds its enclosing block');
+       }
+-      const data = await this.readToken(new Token.Uint8ArrayType(dataSizeInWords * 2 - (id.isOddSize ? 1 : 0)));
++      const dataLength = dataSizeInWords * 2 - (id.isOddSize ? 1 : 0);
++      // ID_RIFF_HEADER to ID_ALT_TRAILER: a part of the original file past the allocation limit is skipped unread
++      if (
++        this.options.includeOriginalTags &&
++        id.functionId >= 0x21 &&
++        id.functionId <= 0x24 &&
++        !this.originalFile.fits(dataLength)
++      ) {
++        this.originalFile.skip(dataLength);
++        await this.tokenizer.ignore(dataSizeInWords * 2);
++        remaining -= headerSize + dataSizeInWords * 2;
++        continue;
++      }
++      const data = await this.readToken(new Token.Uint8ArrayType(dataLength));
+       debug(
+         `Metadata Sub-Blocks functionId=0x${id.functionId.toString(16)}, id.largeBlock=${id.largeBlock},data-size=${data.length}`
+       );
+@@ -111,8 +133,18 @@ export class WavPackParser extends BasicParser {
+           break;
+         }
+ 
+-        case 0x24: // ID_ALT_TRAILER: maybe used to embed original ID3 tag header
+-          debug('ID_ALT_TRAILER: trailer for non-wav files');
++        case 0x21: // ID_RIFF_HEADER
++        case 0x23: // ID_ALT_HEADER: header of a non-wav original file
++          if (this.options.includeOriginalTags) {
++            this.originalFile.addHeader(data);
++          }
++          break;
++
++        case 0x22: // ID_RIFF_TRAILER
++        case 0x24: // ID_ALT_TRAILER: trailer of a non-wav original file
++          if (this.options.includeOriginalTags) {
++            this.originalFile.addTrailer(data);
++          }
+           break;
+ 
+         case 0x26: // ID_MD5_CHECKSUM
+diff --git a/lib/wavpack/WavPackToken.ts b/lib/wavpack/WavPackToken.ts
+index 98c35b11..99c49b8e 100644
+--- a/lib/wavpack/WavPackToken.ts
++++ b/lib/wavpack/WavPackToken.ts
+@@ -94,10 +94,7 @@ export const BlockHeaderToken: IGetToken<IBlockHeader> = {
+         off + 12
+       ),
+       // 40-bit block_index
+-      blockIndex: /* replace with bigint? (Token.UINT8.get(buf, off + 10) << 32) + */ Token.UINT32_LE.get(
+-        buf,
+-        off + 16
+-      ),
++      blockIndex: Token.UINT8.get(buf, off + 10) * 2 ** 32 + Token.UINT32_LE.get(buf, off + 16),
+       // 40-bit total samples for entire file (if block_index == 0 and a value of -1 indicates an unknown length)
+       blockSamples: Token.UINT32_LE.get(buf, off + 20),
+       // various flags for id and decoding

@@ -1,0 +1,1352 @@
+diff --git a/README.md b/README.md
+index 3650f7de..6481e30b 100644
+--- a/README.md
++++ b/README.md
+@@ -602,6 +602,19 @@ import { parseFile, selectCover } from 'music-metadata';
+ Returns a list of supported MIME-types. This may include some MIME-types which are not formally recognized.
+ 
+ ### `IOptions` Interface
++- `decodedDuration`: `boolean` (default: `false`)
++
++  When `true`, `format.numberOfSamples` of an MP4 file (including M4A, M4B and QuickTime MOV) is the number of
++  sample frames ffmpeg 5.1 decodes from the first audio track, which excludes the encoder delay an edit list or an
++  iTunes `iTunSMPB` tag marks, and `format.duration` is `format.numberOfSamples / format.sampleRate`.
++  It applies to AAC-LC, MP3, MP2, AC-3, E-AC-3, ALAC, FLAC, Opus and PCM tracks. It does not support fragmented files,
++  forward-only input (`parseStream`, `parseWebStream`) with the media data before `moov`, AAC encoded with libfaac,
++  tracks with more than one sample description or with a QuickTime version 2 sound description, E-AC-3 frames of
++  fewer than 6 audio blocks, edit lists with more than one non-empty edit, with only empty edits or with an edit of
++  duration 0, sample rates above 65535 Hz, an Opus track of a single packet, or files ffmpeg reports errors for.
++  AAC and PCM are counted from the sample tables; MP3, MP2, AC-3, E-AC-3, ALAC, FLAC and Opus from their packet headers.
++  Like ffmpeg 5.1, it ignores the media rate of an edit.
++
+ - `duration`: `boolean` (default: `false`)
+ 
+   When `true`, the parser will read the entire media file _if necessary_ to determine the duration.
+diff --git a/lib/mp4/Atom.ts b/lib/mp4/Atom.ts
+index f707fb6b..943dcfb8 100644
+--- a/lib/mp4/Atom.ts
++++ b/lib/mp4/Atom.ts
+@@ -41,7 +41,7 @@ export class Atom {
+       throw new Mp4ContentError(`Atom size exceeds remaining bytes: ${header.length} > ${remaining}`);
+     }
+     const payloadLength = length - headerLength;
+-    const atomBean = new Atom(header, extended, parent, payloadLength);
++    const atomBean = new Atom(header, extended, parent, payloadLength, offset);
+     debug(
+       `parse atom name=${atomBean.atomPath}, extended=${atomBean.extended}, offset=${offset}, len=${atomBean.header.length}`
+     ); //  buf.toString('ascii')
+@@ -60,7 +60,8 @@ export class Atom {
+     header: AtomToken.IAtomHeader,
+     extended: boolean,
+     parent: Atom | null,
+-    private readonly payloadLength: number
++    private readonly payloadLength: number,
++    public readonly offset = 0
+   ) {
+     this.header = header;
+     this.extended = extended;
+@@ -103,6 +104,7 @@ export class Atom {
+       case 'mdia': // Media atom
+       case 'minf': // Media Information Atom
+       case 'stbl': // The Sample Table Atom
++      case 'edts': // Edit Atom
+       case '<id>':
+       case 'ilst':
+       case 'tref':
+diff --git a/lib/mp4/AtomToken.ts b/lib/mp4/AtomToken.ts
+index a87696a9..873f82a4 100644
+--- a/lib/mp4/AtomToken.ts
++++ b/lib/mp4/AtomToken.ts
+@@ -842,6 +842,136 @@ export class StcoAtom extends SimpleTableAtom<number> {
+   }
+ }
+ 
++/**
++ * Edit list ('elst') entry
++ */
++export interface IEditListEntry {
++  /**
++   * Duration of the edit, in movie time-scale units
++   */
++  segmentDuration: number;
++  /**
++   * Start of the edit within the media, in media time-scale units; -1 for an empty edit
++   */
++  mediaTime: number;
++}
++
++/**
++ * Edit list ('elst') atom, without the media rate of each edit, which ffmpeg 5.1 ignores as well
++ * Ref: https://developer.apple.com/documentation/quicktime-file-format/edit_list_atom
++ */
++export class ElstAtom implements IGetToken<IEditListEntry[]> {
++  public constructor(public len: number) {}
++
++  public get(buf: Uint8Array, off: number): IEditListEntry[] {
++    const version = Token.UINT8.get(buf, off);
++    const entrySize = version === 1 ? 20 : 12;
++    const entries: IEditListEntry[] = [];
++    let pos = off + 8;
++    for (let n = Token.UINT32_BE.get(buf, off + 4); n > 0 && pos + entrySize <= off + this.len; --n) {
++      entries.push(
++        version === 1
++          ? {
++              segmentDuration: Number(Token.UINT64_BE.get(buf, pos)),
++              mediaTime: Number(Token.INT64_BE.get(buf, pos + 8))
++            }
++          : { segmentDuration: Token.UINT32_BE.get(buf, pos), mediaTime: Token.INT32_BE.get(buf, pos + 4) }
++      );
++      pos += entrySize;
++    }
++    return entries;
++  }
++}
++
++/**
++ * Decoder configuration from an elementary stream descriptor ('esds')
++ */
++export interface IDecoderConfig {
++  /**
++   * MPEG-4 object type indication, e.g. 0x40 for MPEG-4 audio, 0x6B for MPEG-1 audio
++   */
++  objectTypeIndication: number;
++  /**
++   * Audio object type from the AudioSpecificConfig, for MPEG-4 audio and MPEG-2 AAC
++   */
++  audioObjectType?: number;
++  /**
++   * Samples per AAC frame: 960 or 1024
++   */
++  frameLength?: number;
++}
++
++function readDescriptor(
++  buf: Uint8Array,
++  off: number,
++  end: number
++): { tag: number; start: number; end: number } | undefined {
++  if (off >= end) {
++    return undefined;
++  }
++  const tag = buf[off++];
++  let length = 0;
++  for (let n = 0; n < 4 && off < end; ++n) {
++    const byte = buf[off++];
++    length = (length << 7) | (byte & 0x7f);
++    if ((byte & 0x80) === 0) {
++      break;
++    }
++  }
++  return { tag, start: off, end: Math.min(off + length, end) };
++}
++
++/**
++ * Read the decoder configuration of an 'esds' atom payload
++ * Ref: ISO/IEC 14496-1 ES_Descriptor and ISO/IEC 14496-3 AudioSpecificConfig
++ */
++export function readDecoderConfig(buf: Uint8Array): IDecoderConfig | undefined {
++  const es = readDescriptor(buf, 4, buf.length);
++  if (es?.tag !== 0x03 || es.end - es.start < 3) {
++    return undefined;
++  }
++  const esFlags = buf[es.start + 2];
++  let off = es.start + 3;
++  if (esFlags & 0x80) {
++    off += 2;
++  }
++  if (esFlags & 0x40) {
++    off += 1 + (buf[off] ?? 0);
++  }
++  if (esFlags & 0x20) {
++    off += 2;
++  }
++  const dc = readDescriptor(buf, off, es.end);
++  if (dc?.tag !== 0x04 || dc.end - dc.start < 13) {
++    return undefined;
++  }
++  const config: IDecoderConfig = { objectTypeIndication: buf[dc.start] };
++  const dsi = readDescriptor(buf, dc.start + 13, dc.end);
++  if (![0x40, 0x66, 0x67, 0x68].includes(config.objectTypeIndication) || !dsi || dsi.tag !== 0x05) {
++    return config;
++  }
++  const asc = buf.subarray(dsi.start, dsi.end);
++  let bit = 0;
++  const read = (len: number): number => {
++    const value = util.getBitAllignedNumber(asc, 0, bit, len);
++    bit += len;
++    return value;
++  };
++  let audioObjectType = read(5);
++  if (audioObjectType === 31) {
++    audioObjectType = 32 + read(6);
++  }
++  if (read(4) === 0x0f) {
++    read(24);
++  }
++  read(4);
++  config.audioObjectType = audioObjectType;
++  if ([1, 2, 3, 4, 6, 7, 17, 19, 20, 21, 22, 23].includes(audioObjectType)) {
++    config.frameLength = read(1) ? 960 : 1024;
++  }
++  return config;
++}
++
+ /** 64-bit chunk offsets (co64), constrained to exact JavaScript positions. */
+ export class Co64Atom extends SimpleTableAtom<number> {
+   public constructor(len: number) {
+@@ -1088,7 +1218,8 @@ export class TrackRunBox implements IGetToken<ITrackRunBox> {
+     let dynOffset = off + 8;
+ 
+     if (trun.flags.dataOffsetPresent) {
+-      trun.dataOffset = Token.UINT32_BE.get(buf, dynOffset);
++      // Signed, relative to the base data offset of the track fragment
++      trun.dataOffset = Token.INT32_BE.get(buf, dynOffset);
+       dynOffset += 4;
+     }
+     if (trun.flags.firstSampleFlagsPresent) {
+diff --git a/lib/mp4/DecodedDuration.ts b/lib/mp4/DecodedDuration.ts
+new file mode 100644
+index 00000000..38e171de
+--- /dev/null
++++ b/lib/mp4/DecodedDuration.ts
+@@ -0,0 +1,328 @@
++import type { IEditListEntry } from './AtomToken.js';
++
++/**
++ * Consecutive packets of a track with the same duration and the same decoded length
++ */
++export interface IPacketRun {
++  count: number;
++  /**
++   * Duration of each packet, in media time-scale units
++   */
++  ticks: number;
++  /**
++   * Sample frames the decoder outputs for each packet
++   */
++  samples: number;
++  /**
++   * Sample frames of the last frame the frame parser splits each packet into, when it is not the whole packet
++   */
++  lastFrameSamples?: number;
++}
++
++/**
++ * How the demuxer and decoder of ffmpeg 5.1 trim the decoded audio of a track
++ */
++export interface IDecoderTrim {
++  mediaTimeScale: number;
++  movieTimeScale: number;
++  editList: IEditListEntry[];
++  /**
++   * Encoder delay from an iTunSMPB tag following the track box, which replaces the samples the edit list skips (AAC)
++   */
++  encoderDelay?: number;
++  /**
++   * Samples the decoder drops itself when the container skips none (Opus pre-skip)
++   */
++  decoderDelay: number;
++  /**
++   * The frame parser hands every frame the discard flag of the frame after it (AC-3, E-AC-3)
++   */
++  delayedDiscard: boolean;
++}
++
++interface IEditedFrames {
++  /**
++   * Media time-scale units an applied edit skips, which ffmpeg drops as that many decoded samples
++   */
++  skip: number;
++  kept: number;
++  discarded: number;
++  lastDiscarded?: number;
++}
++
++export function appendPacketRun(
++  runs: IPacketRun[],
++  count: number,
++  ticks: number,
++  samples: number,
++  lastFrameSamples?: number
++): void {
++  if (count <= 0) {
++    return;
++  }
++  const last = runs[runs.length - 1];
++  if (last && last.ticks === ticks && last.samples === samples && last.lastFrameSamples === lastFrameSamples) {
++    last.count += count;
++  } else {
++    runs.push(lastFrameSamples === undefined ? { count, ticks, samples } : { count, ticks, samples, lastFrameSamples });
++  }
++}
++
++function totalSamples(runs: IPacketRun[]): number {
++  return runs.reduce((sum, run) => sum + run.count * run.samples, 0);
++}
++
++/**
++ * Locate the packet decoding starts from: ffmpeg decodes from one second before the edit, starting at the first of
++ * the packets sharing the start time of the last packet that starts at or before that point
++ */
++function findDecodeStart(runs: IPacketRun[], target: number): { run: number; index: number; start: number } {
++  let startTime = 0;
++  let time = 0;
++  for (const { count, ticks } of runs) {
++    if (time > target) {
++      break;
++    }
++    startTime = ticks > 0 ? time + Math.min(count - 1, Math.floor((target - time) / ticks)) * ticks : time;
++    time += count * ticks;
++  }
++  time = 0;
++  for (const [run, { count, ticks }] of runs.entries()) {
++    if (ticks === 0 ? time === startTime : startTime >= time && startTime < time + count * ticks) {
++      const index = ticks === 0 ? 0 : (startTime - time) / ticks;
++      return { run, index, start: time + index * ticks };
++    }
++    time += count * ticks;
++  }
++  return { run: 0, index: 0, start: 0 };
++}
++
++/**
++ * Sort the packets around an edit into decoded and discarded frames, the way ffmpeg rebuilds its index: packets ending
++ * before the edit are decoded and discarded, the packet holding the edit start is kept and partly skipped, and
++ * decoding stops after the first packet reaching the end of the edit. The last packet of a track spans the edit's
++ * whole duration.
++ */
++function applyEdit(runs: IPacketRun[], mediaTime: number, duration: number, timeScale: number): IEditedFrames {
++  const end = mediaTime + duration;
++  const frames: IEditedFrames = { skip: 0, kept: 0, discarded: 0 };
++  let started = false;
++  const discard = (count: number, span: number, { samples, lastFrameSamples }: IPacketRun) => {
++    if (!started) {
++      frames.skip += count * span;
++    }
++    frames.discarded += count * samples;
++    frames.lastDiscarded = lastFrameSamples ?? samples;
++  };
++  const decodeStart = findDecodeStart(runs, Math.max(mediaTime - timeScale, 0));
++  let time = decodeStart.start - decodeStart.index * runs[decodeStart.run].ticks;
++  for (let run = decodeStart.run, index = decodeStart.index; run < runs.length; ++run, index = 0) {
++    const packetRun = runs[run];
++    const { count, ticks, samples } = packetRun;
++    const regular = run === runs.length - 1 ? count - 1 : count;
++    while (index < regular) {
++      const start = time + index * ticks;
++      if (start < mediaTime && start + ticks > mediaTime) {
++        frames.skip += mediaTime - start;
++        frames.kept += samples;
++        started = true;
++        ++index;
++        if (start + ticks >= end) {
++          return frames;
++        }
++      } else if (start < mediaTime || start >= end) {
++        const stop =
++          start < mediaTime
++            ? ticks > 0
++              ? Math.min(regular, Math.floor((mediaTime - time) / ticks))
++              : regular
++            : index + 1;
++        discard(stop - index, ticks, packetRun);
++        index = stop;
++        if (time + index * ticks >= end) {
++          return frames;
++        }
++      } else {
++        started = true;
++        const last = ticks > 0 ? Math.max(index, Math.ceil((end - time) / ticks) - 1) : regular;
++        if (last < regular) {
++          frames.kept += (last - index + 1) * samples;
++          return frames;
++        }
++        frames.kept += (regular - index) * samples;
++        index = regular;
++      }
++    }
++    if (run === runs.length - 1 && index === count - 1) {
++      const start = time + index * ticks;
++      if (start < mediaTime && start + duration > mediaTime) {
++        frames.skip += mediaTime - start;
++        frames.kept += samples;
++      } else if (start < mediaTime || start >= end) {
++        discard(1, duration, packetRun);
++      } else {
++        frames.kept += samples;
++      }
++      return frames;
++    }
++    time += count * ticks;
++  }
++  return frames;
++}
++
++/**
++ * Number of sample frames ffmpeg 5.1 decodes from an audio track
++ * @param runs Packets indexed by the movie box, which the edit list applies to
++ * @param trim Edit list and delays
++ * @param appendedSamples Decoded samples of movie fragments, which follow the edited packets untrimmed
++ */
++export function decodedSampleCount(runs: IPacketRun[], trim: IDecoderTrim, appendedSamples = 0): number {
++  let frames: IEditedFrames = { skip: 0, kept: totalSamples(runs), discarded: 0 };
++  if (trim.editList.length > 0 && runs.length > 0) {
++    const edit = trim.editList.find(entry => entry.mediaTime >= 0);
++    const duration = edit ? Math.round((edit.segmentDuration * trim.mediaTimeScale) / trim.movieTimeScale) : 0;
++    // An edit lasting no media time-scale unit, also after rescaling from the movie time scale, keeps nothing
++    frames =
++      edit && duration > 0
++        ? applyEdit(runs, edit.mediaTime, duration, trim.mediaTimeScale)
++        : { skip: 0, kept: 0, discarded: 0 };
++  }
++  frames.kept += appendedSamples;
++  if (trim.delayedDiscard && frames.lastDiscarded !== undefined) {
++    frames.discarded -= frames.lastDiscarded;
++    frames.kept += frames.lastDiscarded;
++  }
++  // ffmpeg hands the decoder the skipped media time as a sample count, without rescaling it to the sample rate
++  const skip = trim.encoderDelay ?? frames.skip;
++  const decoderSkip = skip > 0 ? skip : trim.decoderDelay;
++  return Math.max(0, frames.kept - Math.max(0, decoderSkip - frames.discarded));
++}
++
++/**
++ * Encoder delay of an iTunSMPB value (reserved, encoder delay, end padding and sample count, in hexadecimal), if it lies
++ * in the range ffmpeg accepts
++ */
++export function iTunSMPBEncoderDelay(value: string): number | undefined {
++  const fields = value.trim().split(/\s+/).slice(1, 4);
++  const priming = Number.parseInt(fields[0] ?? '', 16);
++  return fields.length === 3 && fields.every(field => /^[0-9a-f]+$/i.test(field)) && priming > 0 && priming < 16384
++    ? priming
++    : undefined;
++}
++
++/**
++ * Sample frames (at 48 kHz) an Opus packet decodes to, from its table-of-contents byte
++ * Ref: https://www.rfc-editor.org/rfc/rfc6716#section-3.1
++ */
++export function opusPacketSamples(packet: Uint8Array): number {
++  if (packet.length === 0) {
++    return 0;
++  }
++  const config = packet[0] >> 3;
++  let frameSize: number;
++  if (config < 12) {
++    frameSize = [480, 960, 1920, 2880][config & 3];
++  } else if (config < 16) {
++    frameSize = config & 1 ? 960 : 480;
++  } else {
++    frameSize = 120 << (config & 3);
++  }
++  const code = packet[0] & 3;
++  const frames = code === 0 ? 1 : code < 3 ? 2 : (packet[1] ?? 0) & 0x3f;
++  return frames * frameSize;
++}
++
++const ac3Bitrates = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640];
++
++/**
++ * Size and decoded length of an AC-3 or E-AC-3 syncframe, from its header
++ * Ref: ETSI TS 102 366, sections 4.4.1 and E.1.2
++ */
++export function ac3Frame(header: Uint8Array): { size: number; samples: number } | undefined {
++  if (header.length < 6 || header[0] !== 0x0b || header[1] !== 0x77) {
++    return undefined;
++  }
++  const fscod = header[4] >> 6;
++  if (header[5] >> 3 <= 10) {
++    const bitrate = ac3Bitrates[(header[4] & 0x3f) >> 1];
++    if (fscod === 3 || bitrate === undefined) {
++      return undefined;
++    }
++    // Frame size in 16-bit words: 48 kHz, 44.1 kHz (padded by the odd frame size codes) and 32 kHz
++    const words =
++      fscod === 0 ? 2 * bitrate : fscod === 1 ? Math.floor((bitrate * 320) / 147) + (header[4] & 1) : 3 * bitrate;
++    return { size: 2 * words, samples: 1536 };
++  }
++  // E-AC-3 holds 1, 2, 3 or 6 audio blocks of 256 samples; a dependent substream belongs to the frame before it
++  const size = 2 * ((((header[2] & 0x07) << 8) | header[3]) + 1);
++  const blocks = fscod === 3 ? 6 : [1, 2, 3, 6][(header[4] >> 4) & 3];
++  return { size, samples: header[2] >> 6 === 1 ? 0 : 256 * blocks };
++}
++
++/**
++ * Sample frames of an MPEG audio frame, from its frame header
++ * Ref: https://www.mp3-tech.org/programmer/frame_header.html
++ */
++export function mpegFrameSamples(frame: Uint8Array): number | undefined {
++  if (frame.length < 4 || frame[0] !== 0xff || (frame[1] & 0xe0) !== 0xe0) {
++    return undefined;
++  }
++  const mpeg1 = ((frame[1] >> 3) & 3) === 3;
++  switch ((frame[1] >> 1) & 3) {
++    case 3: // Layer I
++      return 384;
++    case 2: // Layer II
++      return 1152;
++    case 1: // Layer III
++      return mpeg1 ? 1152 : 576;
++    default:
++      return undefined;
++  }
++}
++
++/**
++ * Sample frames of an ALAC frame: the frame length of the magic cookie, unless the frame header states its own
++ * Ref: https://github.com/macosforge/alac/blob/master/ALACMagicCookieDescription.txt
++ */
++export function alacFrameSamples(frame: Uint8Array, frameLength: number): number {
++  // Element tag (3 bits), instance tag (4), unused (12), has-size (1), shift (2), escape (1), then the sample count
++  if (frame.length < 7 || ((frame[2] >> 4) & 1) === 0) {
++    return frameLength;
++  }
++  return (frame[2] & 1) * 2 ** 31 + frame[3] * 2 ** 23 + frame[4] * 2 ** 15 + frame[5] * 2 ** 7 + (frame[6] >> 1);
++}
++
++/**
++ * Block size of a FLAC frame, from its frame header
++ * Ref: https://www.rfc-editor.org/rfc/rfc9639.html#name-frame-header
++ */
++export function flacBlockSize(frame: Uint8Array): number | undefined {
++  if (frame.length < 5 || frame[0] !== 0xff || (frame[1] & 0xfe) !== 0xf8) {
++    return undefined;
++  }
++  const code = frame[2] >> 4;
++  if (code === 1) {
++    return 192;
++  }
++  if (code >= 2 && code <= 5) {
++    return 576 << (code - 2);
++  }
++  if (code >= 8) {
++    return 256 << (code - 8);
++  }
++  if (code < 6) {
++    return undefined;
++  }
++  // The block size follows the frame or sample number, coded like UTF-8
++  let numberLength = 1;
++  if (frame[4] & 0x80) {
++    while (numberLength < 7 && frame[4] & (0x80 >> numberLength)) {
++      ++numberLength;
++    }
++  }
++  const offset = 4 + numberLength;
++  if (code === 6) {
++    return offset < frame.length ? frame[offset] + 1 : undefined;
++  }
++  return offset + 1 < frame.length ? ((frame[offset] << 8) | frame[offset + 1]) + 1 : undefined;
++}
+diff --git a/lib/mp4/MP4Parser.ts b/lib/mp4/MP4Parser.ts
+index f195e9e6..04d1bf9a 100644
+--- a/lib/mp4/MP4Parser.ts
++++ b/lib/mp4/MP4Parser.ts
+@@ -1,16 +1,27 @@
+ import { textDecode } from '@borewit/text-codec';
+ import type { IGetToken } from '@tokenizer/token';
+ import initDebug from 'debug';
+-import type { IRandomAccessTokenizer, ITokenizer } from 'strtok3';
++import { EndOfStreamError, type IRandomAccessTokenizer, type ITokenizer } from 'strtok3';
+ import * as Token from 'token-types';
+ import { uint8ArrayToHex } from 'uint8array-extras';
+-import { readToken, validateAllocation } from '../common/Allocation.js';
++import { getMaxMemoryAllocation, readToken, validateAllocation } from '../common/Allocation.js';
+ import { BasicParser } from '../common/BasicParser.js';
+ import { Genres } from '../id3v1/ID3v1Parser.js';
+ import { type AnyTagValue, type IChapter, type ITrackInfo, TrackType } from '../type.js';
+ import { Atom } from './Atom.js';
+ import * as AtomToken from './AtomToken.js';
+ import { ChapterTrackReferenceBox, Mp4ContentError } from './AtomToken.js';
++import {
++  ac3Frame,
++  alacFrameSamples,
++  appendPacketRun,
++  decodedSampleCount,
++  flacBlockSize,
++  type IPacketRun,
++  iTunSMPBEncoderDelay,
++  mpegFrameSamples,
++  opusPacketSamples
++} from './DecodedDuration.js';
+ 
+ const debug = initDebug('music-metadata:parser:MP4');
+ const tagFormat = 'iTunes';
+@@ -43,6 +54,15 @@ interface ISoundSampleDescription {
+     packetSize?: number;
+     sampleRate: number;
+   };
++  decoderConfig?: AtomToken.IDecoderConfig;
++  /**
++   * Opus pre-skip, from the Opus Specific Box ('dOps')
++   */
++  preSkip?: number;
++  /**
++   * ALAC frame length, from the ALAC magic cookie
++   */
++  frameLength?: number;
+ }
+ 
+ interface ITrackDescription {
+@@ -59,8 +79,21 @@ interface ITrackDescription {
+   sampleSizeTable: number[];
+   sampleToChunkTable: AtomToken.ISampleToChunk[];
+   timeToSampleTable: AtomToken.ITimeToSampleToken[];
++  editList?: AtomToken.IEditListEntry[];
++  /**
++   * Encoder delay of the iTunSMPB tag ffmpeg assigns to the track, from the metadata following its track box
++   */
++  encoderDelay?: number;
+   handler?: AtomToken.IHandlerBox;
+-  fragments: { trackRun: AtomToken.ITrackRunBox; header: AtomToken.ITrackFragmentHeaderBox; decodeTime?: number }[];
++  fragments: {
++    trackRun: AtomToken.ITrackRunBox;
++    header: AtomToken.ITrackFragmentHeaderBox;
++    decodeTime?: number;
++    /**
++     * File position of the first sample of the run
++     */
++    dataOffset?: number;
++  }[];
+   endTime?: number;
+   frameRate?: number;
+ 
+@@ -70,6 +103,42 @@ interface ITrackDescription {
+ 
+ type IAtomParser = (payloadLength: number) => Promise<void>;
+ 
++/**
++ * Codecs whose decoded length can be derived from the container and packet headers
++ */
++type DecodedCodec = 'aac' | 'mpeg' | 'ac3' | 'opus' | 'alac' | 'flac' | 'pcm';
++
++interface IPacketPosition {
++  offset: number;
++  size: number;
++  /**
++   * Packet duration, in media time-scale units
++   */
++  ticks: number;
++  /**
++   * Index, from 1, of the sample description the packet's chunk selects
++   */
++  description?: number;
++}
++
++interface IDecodedPacket {
++  samples: number;
++  lastFrameSamples?: number;
++}
++
++type ByteReader = (offset: number, length: number) => Promise<Uint8Array | undefined>;
++
++/**
++ * Bits per sample of uncompressed QuickTime formats, when not taken from the sound sample description
++ */
++const pcmSampleBits: { [dataFormat: string]: number } = {
++  in24: 24,
++  in32: 32,
++  fl32: 32,
++  fl64: 64,
++  'raw ': 8
++};
++
+ const encoderDict: { [dataFormatId: string]: IEncoder } = {
+   raw: {
+     lossy: false,
+@@ -200,7 +269,7 @@ export class MP4Parser extends BasicParser {
+   }
+ 
+   private movieHeader?: AtomToken.IAtomMvhd;
+-  private trackDefaults = new Map<number, { duration: number; size: number }>();
++  private trackDefaults = new Map<number, { duration: number; size: number; description: number }>();
+   private tracks = new Map<number, ITrackDescription>();
+   private mediaDataRanges: IMediaDataRange[] = [];
+   private streamedChapters = new Map<number, IChapter>();
+@@ -208,10 +277,20 @@ export class MP4Parser extends BasicParser {
+   private neroChapters: IChapter[] = [];
+   private hasVideoTrack = false;
+   private hasAudioTrack = false;
++  private lastStream?: ITrackDescription;
++  private streamedRuns?: { indexed: IPacketRun[]; appended: IPacketRun[]; packets: number };
++  private retainedMediaData: { offset: number; data: Uint8Array }[] = [];
++  private mediaDataDropped = false;
++  private fragmentData?: { moofOffset: number; end: number };
+ 
+   public async parse(): Promise<void> {
+     this.hasVideoTrack = false;
+     this.hasAudioTrack = false;
++    this.lastStream = undefined;
++    this.streamedRuns = undefined;
++    this.retainedMediaData = [];
++    this.mediaDataDropped = false;
++    this.fragmentData = undefined;
+     this.tracks.clear();
+     this.mediaDataRanges = [];
+     this.streamedChapters.clear();
+@@ -337,6 +416,14 @@ export class MP4Parser extends BasicParser {
+           this.metadata.setFormat('bitrate', (8 * firstAudioTrack.sizeInBytes) / firstAudioTrack.duration);
+         }
+       }
++      const { sampleRate } = this.metadata.format;
++      if (this.options.decodedDuration && sampleRate) {
++        const numberOfSamples = await this.decodedSampleCount(firstAudioTrack, sampleRate);
++        if (numberOfSamples !== undefined) {
++          this.metadata.setFormat('numberOfSamples', numberOfSamples);
++          this.metadata.setFormat('duration', numberOfSamples / sampleRate);
++        }
++      }
+     }
+ 
+     for (const track of this.tracks.values()) {
+@@ -371,8 +458,6 @@ export class MP4Parser extends BasicParser {
+           switch (atom.header.name) {
+             case 'trak':
+               return this.parseTrackBox(atom);
+-            case 'udta':
+-              return this.parseTrackBox(atom);
+           }
+           break;
+         case 'moof':
+@@ -410,6 +495,12 @@ export class MP4Parser extends BasicParser {
+   }
+ 
+   private async addTag(id: string, value: AnyTagValue): Promise<void> {
++    const priming = id.endsWith(':iTunSMPB') && typeof value === 'string' ? iTunSMPBEncoderDelay(value) : undefined;
++    if (priming !== undefined && this.lastStream) {
++      // ffmpeg assigns the delay to the stream it created last: the track declared last before the tag, which in a
++      // movie with an audio track followed by a video track is the video track, or a cover image listed before the tag
++      this.lastStream.encoderDelay = priming;
++    }
+     await this.metadata.addTag(tagFormat, id, value);
+   }
+ 
+@@ -461,6 +552,11 @@ export class MP4Parser extends BasicParser {
+       throw new Mp4ContentError(`Unsupported type-set != 0: ${dataAtom.type.set}`);
+     }
+ 
++    if (tagKey === 'covr' && [13, 14, 27].includes(dataAtom.type.type)) {
++      // ffmpeg turns each JPEG, PNG or BMP cover image into a stream of its own
++      this.lastStream = undefined;
++    }
++
+     // Use well-known-type table
+     // Ref: https://developer.apple.com/library/content/documentation/QuickTime/QTFF/Metadata/Metadata.html#//apple_ref/doc/uid/TP40000939-CH1-SW35
+     switch (dataAtom.type.type) {
+@@ -826,6 +922,10 @@ export class MP4Parser extends BasicParser {
+             break;
+           }
+ 
++          case 'elst':
++            track.editList = await this.readToken(new AtomToken.ElstAtom(payLoadLength));
++            break;
++
+           case 'stsz': {
+             const stsz = await this.readToken(new AtomToken.StszAtom(payLoadLength));
+             track.sampleSize = stsz.sampleSize;
+@@ -853,6 +953,7 @@ export class MP4Parser extends BasicParser {
+     if (track.header) {
+       this.tracks.set(track.header.trackId, { ...track, header: track.header });
+     }
++    this.lastStream = track.header ? this.tracks.get(track.header.trackId) : undefined;
+   }
+ 
+   private async parseTrackFragmentBox(trafBox: Atom): Promise<void> {
+@@ -895,10 +996,30 @@ export class MP4Parser extends BasicParser {
+     );
+     if (tfhd) {
+       const track = this.tracks.get(tfhd.trackId);
++      const defaults = this.trackDefaults.get(tfhd.trackId);
++      // The data of a track fragment starts at its base data offset, which defaults to the start of the movie
++      // fragment box for the first track fragment, and to the end of the preceding one otherwise
++      const moofOffset = trafBox.parent?.offset ?? 0;
++      const baseDataOffset =
++        tfhd.baseDataOffset !== undefined
++          ? Number(tfhd.baseDataOffset)
++          : !tfhd.flags.defaultBaseIsMoof && this.fragmentData?.moofOffset === moofOffset
++            ? this.fragmentData.end
++            : moofOffset;
++      let dataOffset = baseDataOffset;
+       for (const run of runs) {
+-        track?.fragments.push({ header: tfhd, trackRun: run, decodeTime });
++        if (run.dataOffset !== undefined) {
++          dataOffset = baseDataOffset + run.dataOffset;
++        }
++        track?.fragments.push({ header: tfhd, trackRun: run, decodeTime, dataOffset });
+         decodeTime = undefined;
++        const sampleSize = tfhd.defaultSampleSize ?? defaults?.size ?? 0;
++        dataOffset +=
++          run.samples.length > 0
++            ? run.samples.reduce((sum, sample) => sum + (sample.sampleSize ?? sampleSize), 0)
++            : run.sampleCount * sampleSize;
+       }
++      this.fragmentData = { moofOffset, end: dataOffset };
+     }
+   }
+ 
+@@ -929,7 +1050,8 @@ export class MP4Parser extends BasicParser {
+       }
+       this.trackDefaults.set(Token.UINT32_BE.get(data, 4), {
+         duration: Token.UINT32_BE.get(data, 12),
+-        size: Token.UINT32_BE.get(data, 16)
++        size: Token.UINT32_BE.get(data, 16),
++        description: Token.UINT32_BE.get(data, 8)
+       });
+     },
+ 
+@@ -939,13 +1061,22 @@ export class MP4Parser extends BasicParser {
+      */
+     mdat: async (len: number) => {
+       const range = { offset: this.tokenizer.position, end: this.tokenizer.position + len };
++      const streamPackets = this.options.decodedDuration && !supportsSeeking(this.tokenizer);
+       if (this.options.includeChapters) {
+         if (supportsSeeking(this.tokenizer)) {
+           this.mediaDataRanges.push(range);
+         } else {
+-          await this.parseChapters([range], true);
++          // The stream only moves forward: read the packet heads stored before each chapter sample first
++          await this.parseChapters(
++            [range],
++            true,
++            streamPackets ? offset => this.streamPacketHeads(range, offset) : undefined
++          );
+         }
+       }
++      if (streamPackets) {
++        await this.streamPacketHeads(range);
++      }
+       await this.tokenizer.ignore(range.end - this.tokenizer.position);
+     },
+ 
+@@ -995,6 +1126,11 @@ export class MP4Parser extends BasicParser {
+         // Sound Sample Description (Version 0)
+         if (description.length >= offset + AtomToken.SoundSampleDescriptionV0.len) {
+           ssd.description = AtomToken.SoundSampleDescriptionV0.get(description, offset);
++          // Version 1 adds four 32-bit fields before the extension atoms
++          this.parseSoundSampleExtensions(
++            ssd,
++            description.subarray(offset + AtomToken.SoundSampleDescriptionV0.len + (version.version === 1 ? 16 : 0))
++          );
+         } else {
+           debug(`Warning: sound-sample-description too short: ${description.length} bytes`);
+         }
+@@ -1005,7 +1141,471 @@ export class MP4Parser extends BasicParser {
+     return ssd;
+   }
+ 
+-  private async parseChapters(mediaDataRanges: IMediaDataRange[], forwardOnly = false): Promise<void> {
++  /**
++   * Read the codec configuration boxes that follow a sound sample description, also inside a QuickTime 'wave' box
++   */
++  private parseSoundSampleExtensions(ssd: ISoundSampleDescription, extensions: Uint8Array): void {
++    for (let offset = 0; offset + 8 <= extensions.length; ) {
++      const size = Token.UINT32_BE.get(extensions, offset);
++      if (size < 8 || offset + size > extensions.length) {
++        break;
++      }
++      const payload = extensions.subarray(offset + 8, offset + size);
++      switch (textDecode(extensions.subarray(offset + 4, offset + 8), 'latin1')) {
++        case 'wave':
++          this.parseSoundSampleExtensions(ssd, payload);
++          break;
++        case 'esds':
++          ssd.decoderConfig = AtomToken.readDecoderConfig(payload);
++          break;
++        case 'dOps': // Opus Specific Box
++          if (payload.length >= 4) {
++            ssd.preSkip = Token.UINT16_BE.get(payload, 2);
++          }
++          break;
++        case 'alac': // ALAC magic cookie, after the version and flags
++          if (payload.length >= 8) {
++            ssd.frameLength = Token.UINT32_BE.get(payload, 4);
++          }
++          break;
++      }
++      offset += size;
++    }
++  }
++
++  private decodedCodec(ssd: ISoundSampleDescription): DecodedCodec | undefined {
++    switch (ssd.dataFormat) {
++      case 'mp4a':
++        switch (ssd.decoderConfig?.objectTypeIndication) {
++          case undefined:
++          case 0x40: // MPEG-4 audio
++          case 0x66: // MPEG-2 AAC
++          case 0x67:
++          case 0x68:
++            return 'aac';
++          case 0x69: // MPEG-2 audio
++          case 0x6b: // MPEG-1 audio
++            return 'mpeg';
++          case 0xa5:
++          case 0xa6:
++            return 'ac3';
++          default:
++            return undefined;
++        }
++      case '.mp3':
++      case '.mp2':
++        return 'mpeg';
++      case 'ac-3':
++      case 'ec-3':
++        return 'ac3';
++      case 'Opus':
++        return 'opus';
++      case 'alac':
++        return 'alac';
++      case 'fLaC':
++        return 'flac';
++      case 'sowt':
++      case 'twos':
++      case 'in24':
++      case 'in32':
++      case 'fl32':
++      case 'fl64':
++      case 'raw ':
++      case 'NONE':
++      case 'lpcm':
++        return 'pcm';
++      default:
++        return undefined;
++    }
++  }
++
++  /**
++   * Samples (packets) indexed by the sample tables of the movie box, in decoding order
++   */
++  private *indexedPackets(track: ITrackDescription): Generator<IPacketPosition> {
++    const timing = track.timeToSampleTable;
++    let sample = 0;
++    let timingIndex = 0;
++    let timingRemaining = timing[0]?.count ?? 0;
++    let entry = 0;
++    for (const [chunk, chunkOffset] of track.chunkOffsetTable.entries()) {
++      while (
++        entry + 1 < track.sampleToChunkTable.length &&
++        track.sampleToChunkTable[entry + 1].firstChunk <= chunk + 1
++      ) {
++        ++entry;
++      }
++      let offset = chunkOffset;
++      for (let n = track.sampleToChunkTable[entry]?.samplesPerChunk ?? 0; n > 0 && sample < track.sampleCount; --n) {
++        while (timingRemaining === 0 && timingIndex + 1 < timing.length) {
++          timingRemaining = timing[++timingIndex].count;
++        }
++        const size = track.sampleSize > 0 ? track.sampleSize : (track.sampleSizeTable[sample] ?? 0);
++        yield {
++          offset,
++          size,
++          ticks: timing[timingIndex]?.duration ?? 0,
++          description: track.sampleToChunkTable[entry]?.sampleDescriptionId
++        };
++        --timingRemaining;
++        offset += size;
++        ++sample;
++      }
++    }
++  }
++
++  /**
++   * Samples (packets) of the movie fragments, from a given file position on. Like ffmpeg, a track holding a single sample
++   * description of its format drops the runs of a track fragment that selects another description.
++   */
++  private *fragmentPackets(track: ITrackDescription, from = 0): Generator<IPacketPosition> {
++    const defaults = this.trackDefaults.get(track.header.trackId);
++    const [first] = track.soundSampleDescription;
++    const descriptions = track.soundSampleDescription.filter(({ dataFormat }) => dataFormat === first?.dataFormat);
++    for (const { header, trackRun, dataOffset = 0 } of track.fragments) {
++      if (descriptions.length < 2 && (header.sampleDescriptionIndex ?? defaults?.description ?? 1) !== 1) {
++        continue;
++      }
++      const ticks = header.defaultSampleDuration ?? defaults?.duration ?? 0;
++      const size = header.defaultSampleSize ?? defaults?.size ?? 0;
++      let offset = dataOffset;
++      if (trackRun.samples.length === 0) {
++        for (let n = 0; n < trackRun.sampleCount; ++n, offset += size) {
++          if (offset >= from) {
++            yield { offset, size, ticks };
++          }
++        }
++      }
++      for (const sample of trackRun.samples) {
++        const sampleSize = sample.sampleSize ?? size;
++        if (offset >= from) {
++          yield { offset, size: sampleSize, ticks: sample.sampleDuration ?? ticks };
++        }
++        offset += sampleSize;
++      }
++    }
++  }
++
++  /**
++   * Sample frames a decoder outputs for a packet, from the headers inside it
++   */
++  private async decodePacket(
++    codec: DecodedCodec,
++    ssd: ISoundSampleDescription,
++    { offset, size }: IPacketPosition,
++    read: ByteReader
++  ): Promise<IDecodedPacket | undefined> {
++    if (size === 0) {
++      return { samples: 0 };
++    }
++    switch (codec) {
++      case 'opus': {
++        const head = await read(offset, Math.min(size, 2));
++        return head && { samples: opusPacketSamples(head) };
++      }
++      case 'alac': {
++        const head = await read(offset, Math.min(size, 7));
++        return head && { samples: alacFrameSamples(head, ssd.frameLength ?? 4096) };
++      }
++      case 'flac': {
++        const head = await read(offset, Math.min(size, 16));
++        return head && { samples: flacBlockSize(head) ?? 0 };
++      }
++      case 'mpeg': {
++        const head = await read(offset, Math.min(size, 4));
++        const samples = head && mpegFrameSamples(head);
++        return samples === undefined ? undefined : { samples };
++      }
++      case 'ac3': {
++        // The frame parser splits a packet into the syncframes it holds
++        let samples = 0;
++        let lastFrameSamples = 0;
++        for (let frameOffset = offset; frameOffset + 6 <= offset + size; ) {
++          const head = await read(frameOffset, 6);
++          if (!head) {
++            return undefined;
++          }
++          const frame = ac3Frame(head);
++          if (!frame) {
++            break;
++          }
++          samples += frame.samples;
++          lastFrameSamples = frame.samples > 0 ? frame.samples : lastFrameSamples;
++          frameOffset += frame.size;
++        }
++        return lastFrameSamples === samples ? { samples } : { samples, lastFrameSamples };
++      }
++      default:
++        return undefined;
++    }
++  }
++
++  /**
++   * The packets of a track in decoding order: those indexed by the movie box, then those of movie fragments
++   */
++  private *trackPackets(track: ITrackDescription): Generator<IPacketPosition & { fragment: boolean }> {
++    for (const packet of this.indexedPackets(track)) {
++      yield { ...packet, fragment: false };
++    }
++    for (const packet of this.fragmentPackets(track)) {
++      yield { ...packet, fragment: true };
++    }
++  }
++
++  private retainedBytes(offset: number, length: number): Uint8Array | undefined {
++    const media = this.retainedMediaData.find(
++      ({ offset: start, data }) => offset >= start && offset + length <= start + data.length
++    );
++    return media?.data.subarray(offset - media.offset, offset - media.offset + length);
++  }
++
++  /**
++   * Decode the packet headers a forward-only input will not offer again: while the media data passes when the sample
++   * tables are known, building the packet runs in decoding order, or by keeping the media data itself, within the
++   * allocation limit, when the movie box follows it
++   * @param range Media data passing by
++   * @param limit Offset before which to stop, to continue in a later call
++   */
++  private async streamPacketHeads(range: IMediaDataRange, limit = range.end): Promise<void> {
++    const track = [...this.tracks.values()].find(isAudioTrack);
++    if (!track) {
++      if (this.tracks.size === 0) {
++        await this.retainMediaData(range);
++      }
++      return;
++    }
++    const ssd = track.soundSampleDescription[0];
++    const codec = this.decodedCodec(ssd);
++    if (!codec || codec === 'aac' || codec === 'pcm') {
++      return;
++    }
++    const runs = this.streamedRuns ?? { indexed: [], appended: [], packets: 0 };
++    this.streamedRuns = runs;
++    const read: ByteReader = async (offset, length) =>
++      offset >= this.tokenizer.position && offset + length <= range.end
++        ? this.readToken(new Token.Uint8ArrayType(length), offset)
++        : undefined;
++    let index = 0;
++    for (const packet of this.trackPackets(track)) {
++      if (index++ < runs.packets) {
++        continue;
++      }
++      if (packet.offset >= limit) {
++        break;
++      }
++      const decoded = await this.decodePacket(codec, ssd, packet, read);
++      if (!decoded) {
++        break;
++      }
++      appendPacketRun(
++        packet.fragment ? runs.appended : runs.indexed,
++        1,
++        packet.ticks,
++        decoded.samples,
++        decoded.lastFrameSamples
++      );
++      ++runs.packets;
++    }
++    if (limit === range.end && this.tokenizer.position === range.offset) {
++      // No known packet lies in this media data: a movie fragment box after it may still describe its packets
++      await this.retainMediaData(range);
++    }
++  }
++
++  /**
++   * Keep the media data within the allocation limit, counted back from its end: the end holds the last packets, which
++   * may decode to more than their duration in the sample table
++   */
++  private async retainMediaData(range: IMediaDataRange): Promise<void> {
++    const cutoff = range.end - getMaxMemoryAllocation(this.options);
++    if (this.tokenizer.position < cutoff || this.retainedMediaData.some(({ offset }) => offset < cutoff)) {
++      this.mediaDataDropped = true;
++    }
++    if (this.tokenizer.position < cutoff) {
++      await this.tokenizer.ignore(cutoff - this.tokenizer.position);
++    }
++    this.retainedMediaData = this.retainedMediaData
++      .filter(({ offset, data }) => offset + data.length > cutoff)
++      .map(media =>
++        media.offset < cutoff ? { offset: cutoff, data: media.data.slice(cutoff - media.offset) } : media
++      );
++    const offset = this.tokenizer.position;
++    this.retainedMediaData.push({ offset, data: await this.readToken(new Token.Uint8ArrayType(range.end - offset)) });
++  }
++
++  /**
++   * Sample frames decoded from each packet of a track: the indexed packets, and those of movie fragments
++   */
++  private async packetRuns(
++    track: ITrackDescription,
++    codec: DecodedCodec,
++    sampleRate: number
++  ): Promise<{ indexed: IPacketRun[]; appended: IPacketRun[]; fromSampleTable?: boolean } | undefined> {
++    const ssd = track.soundSampleDescription[0];
++    const indexed: IPacketRun[] = [];
++    const appended: IPacketRun[] = [];
++    const timing = track.timeToSampleTable;
++    if (codec === 'pcm') {
++      const bits = pcmSampleBits[ssd.dataFormat] ?? ssd.description?.sampleSize ?? 16;
++      const frameBytes = Math.max(1, (bits / 8) * (ssd.description?.numAudioChannels ?? 1));
++      const samples = (size: number) => Math.max(1, Math.floor(size / frameBytes));
++      if (timing.length === 1 && timing[0].duration === 1) {
++        // ffmpeg demuxes such uncompressed audio in packets of up to 1024 samples of a chunk
++        let entry = 0;
++        for (let chunk = 1; chunk <= track.chunkOffsetTable.length; ++chunk) {
++          while (
++            entry + 1 < track.sampleToChunkTable.length &&
++            track.sampleToChunkTable[entry + 1].firstChunk <= chunk
++          ) {
++            ++entry;
++          }
++          const chunkSamples = track.sampleToChunkTable[entry]?.samplesPerChunk ?? 0;
++          appendPacketRun(indexed, Math.floor(chunkSamples / 1024), 1024, 1024);
++          appendPacketRun(indexed, chunkSamples % 1024 > 0 ? 1 : 0, chunkSamples % 1024, chunkSamples % 1024);
++        }
++      } else if (track.sampleSize > 0) {
++        this.appendTimingRuns(indexed, track, samples(track.sampleSize));
++      } else {
++        for (const { size, ticks } of this.indexedPackets(track)) {
++          appendPacketRun(indexed, 1, ticks, samples(size));
++        }
++      }
++      for (const { size, ticks } of this.fragmentPackets(track)) {
++        appendPacketRun(appended, 1, ticks, samples(size));
++      }
++      return { indexed, appended };
++    }
++    if (codec === 'aac') {
++      const frameLength = (description?: ISoundSampleDescription) =>
++        description?.dataFormat === ssd.dataFormat ? description.decoderConfig?.frameLength : undefined;
++      let samples = ssd.decoderConfig?.frameLength ?? 1024;
++      if (track.soundSampleDescription.every(description => (frameLength(description) ?? samples) === samples)) {
++        this.appendTimingRuns(indexed, track, samples);
++      } else {
++        // ffmpeg passes the AAC decoder the configuration of the sample description a chunk of the movie box selects
++        // whenever it changes
++        for (const { ticks, description = 0 } of this.indexedPackets(track)) {
++          samples = frameLength(track.soundSampleDescription[description - 1]) ?? samples;
++          appendPacketRun(indexed, 1, ticks, samples);
++        }
++      }
++      // Movie fragments keep the configuration in use after the movie box: ffmpeg 5.1 switches it from the movie box's
++      // sample-to-chunk table only, never for the sample description a track fragment header selects
++      for (const { ticks } of this.fragmentPackets(track)) {
++        appendPacketRun(appended, 1, ticks, samples);
++      }
++      return { indexed, appended };
++    }
++    const seekable = supportsSeeking(this.tokenizer);
++    // A forward-only input decoded the packets it could while they passed; the others come from the kept media data
++    const streamed = seekable ? undefined : this.streamedRuns;
++    indexed.push(...(streamed?.indexed ?? []).map(run => ({ ...run })));
++    appended.push(...(streamed?.appended ?? []).map(run => ({ ...run })));
++    // A packet whose media data was dropped at maxMemoryAllocation counts its duration in the sample table, provided
++    // the media time scale is the sample rate; the last packets, whose duration may be shorter than what they decode
++    // to, lie in the kept end of the media data
++    const useSampleTable = !seekable && this.mediaDataDropped && track.media.header?.timeScale === sampleRate;
++    let fromSampleTable = false;
++    let packets = 0;
++    for (const packet of this.trackPackets(track)) {
++      if (packets++ < (streamed?.packets ?? 0)) {
++        continue;
++      }
++      let dropped = false;
++      let decoded = await this.decodePacket(codec, ssd, packet, async (offset, length) => {
++        if (seekable) {
++          return this.readToken(new Token.Uint8ArrayType(length), offset);
++        }
++        const bytes = this.retainedBytes(offset, length);
++        dropped ||= !bytes;
++        return bytes;
++      });
++      if (!decoded && dropped && useSampleTable) {
++        const samples = packet.ticks;
++        // An AC-3 frame decodes to 1536 samples, so a packet holding several ends in one of 1536
++        decoded = codec === 'ac3' && samples > 1536 ? { samples, lastFrameSamples: 1536 } : { samples };
++        fromSampleTable = true;
++      }
++      if (!decoded) {
++        return undefined;
++      }
++      appendPacketRun(packet.fragment ? appended : indexed, 1, packet.ticks, decoded.samples, decoded.lastFrameSamples);
++    }
++    return { indexed, appended, fromSampleTable };
++  }
++
++  /**
++   * Packets of the movie box decoding to a fixed number of samples, from the time-to-sample table
++   */
++  private appendTimingRuns(runs: IPacketRun[], track: ITrackDescription, samples: number): void {
++    let remaining = track.sampleCount;
++    for (const [index, { count, duration }] of track.timeToSampleTable.entries()) {
++      const packets = index === track.timeToSampleTable.length - 1 ? remaining : Math.min(count, remaining);
++      appendPacketRun(runs, packets, duration, samples);
++      remaining -= packets;
++    }
++  }
++
++  /**
++   * Number of sample frames ffmpeg 5.1 decodes from the track, or undefined if it cannot be determined
++   */
++  private async decodedSampleCount(track: ITrackDescription, sampleRate: number): Promise<number | undefined> {
++    const ssd = track.soundSampleDescription[0];
++    const codec = ssd && this.decodedCodec(ssd);
++    const mediaTimeScale = track.media.header?.timeScale;
++    if (!codec || !mediaTimeScale) {
++      return undefined;
++    }
++    const tokenizer = this.tokenizer;
++    const seekable = supportsSeeking(tokenizer) ? tokenizer : undefined;
++    const position = tokenizer.position;
++    let runs: { indexed: IPacketRun[]; appended: IPacketRun[]; fromSampleTable?: boolean } | undefined;
++    try {
++      runs = await this.packetRuns(track, codec, sampleRate);
++    } catch (error) {
++      if (!(error instanceof EndOfStreamError)) {
++        throw error;
++      }
++    } finally {
++      seekable?.setPosition(position);
++    }
++    if (!runs) {
++      this.addWarning(
++        this.mediaDataDropped
++          ? 'Cannot read the packet headers required for the decoded duration: the media data exceeds maxMemoryAllocation'
++          : 'Cannot read the packet headers required for the decoded duration'
++      );
++      return undefined;
++    }
++    if (runs.fromSampleTable) {
++      this.addWarning('The decoded duration is read from the sample table: the media data exceeds maxMemoryAllocation');
++    }
++    // ffmpeg applies the edit list while indexing the packets of the movie box, so it never trims movie fragments, nor
++    // a track whose packets are all in fragments
++    const editList = runs.indexed.length > 0 ? (track.editList ?? []) : [];
++    const movieTimeScale = this.movieHeader?.timeScale ?? 0;
++    if (editList.length > 0 && movieTimeScale === 0) {
++      return undefined;
++    }
++    return decodedSampleCount(
++      runs.indexed,
++      {
++        mediaTimeScale,
++        movieTimeScale,
++        editList,
++        encoderDelay: codec === 'aac' ? track.encoderDelay : undefined,
++        decoderDelay: codec === 'opus' ? (ssd.preSkip ?? 0) : 0,
++        delayedDiscard: codec === 'ac3'
++      },
++      runs.appended.reduce((sum, run) => sum + run.count * run.samples, 0)
++    );
++  }
++
++  private async parseChapters(
++    mediaDataRanges: IMediaDataRange[],
++    forwardOnly = false,
++    beforeRead?: (offset: number) => Promise<void>
++  ): Promise<void> {
+     for (const track of this.tracks.values()) {
+       for (const id of track.chapterList ?? []) {
+         const chapterTrack = this.tracks.get(id);
+@@ -1017,7 +1617,7 @@ export class MP4Parser extends BasicParser {
+           continue;
+         }
+         try {
+-          await this.parseChapterTrack(chapterTrack, track, mediaDataRanges, forwardOnly);
++          await this.parseChapterTrack(chapterTrack, track, mediaDataRanges, forwardOnly, beforeRead);
+         } catch (error) {
+           // A broken QuickTime track must not hide an independently usable Nero list.
+           if (this.neroChapters.length === 0 || !(error instanceof Mp4ContentError)) {
+@@ -1036,7 +1636,8 @@ export class MP4Parser extends BasicParser {
+     chapterTrack: ITrackDescription,
+     track: ITrackDescription,
+     mediaDataRanges: IMediaDataRange[],
+-    forwardOnly: boolean
++    forwardOnly: boolean,
++    beforeRead?: (offset: number) => Promise<void>
+   ): Promise<void> {
+     const sampleCount = Math.min(chapterTrack.sampleCount, maxChapterCount);
+     if (chapterTrack.sampleCount > maxChapterCount) {
+@@ -1084,6 +1685,7 @@ export class MP4Parser extends BasicParser {
+             ) {
+               throw new Mp4ContentError('Chapter chunk exceeding media data bounds');
+             }
++            await beforeRead?.(offset);
+             if (forwardOnly && offset < this.tokenizer.position) {
+               throw new Mp4ContentError('Chapter chunk exceeding media data bounds');
+             }
+diff --git a/lib/type.ts b/lib/type.ts
+index d90efb13..88a9306a 100644
+--- a/lib/type.ts
++++ b/lib/type.ts
+@@ -691,6 +691,15 @@ export interface IOptions {
+    */
+   duration?: boolean;
+ 
++  /**
++   * default: `false`, if set to `true`, `format.numberOfSamples` and `format.duration` of MP4 files describe the
++   * sample frames ffmpeg 5.1 decodes from the first audio track, without the encoder delay marked by its edit list or
++   * an iTunSMPB tag. It applies to AAC-LC, MP3, MP2, AC-3, E-AC-3, ALAC, FLAC, Opus and PCM; the README lists the cases
++   * it does not support, such as fragmented files. AAC and PCM are counted from the sample tables, the other codecs
++   * from their packet headers.
++   */
++  decodedDuration?: boolean;
++
+   /**
+    * default: `false`, if set to `true`, it will skip parsing covers.
+    */

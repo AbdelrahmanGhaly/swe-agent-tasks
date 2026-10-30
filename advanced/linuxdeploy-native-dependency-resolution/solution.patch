@@ -1,0 +1,1314 @@
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 0632c70..fd64c99 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -36,7 +36,7 @@ execute_process(
+ 
+ add_subdirectory(copyright)
+ 
+-add_library(linuxdeploy_core STATIC elf_file.cpp appdir.cpp ${HEADERS} appdir_root_setup.cpp)
++add_library(linuxdeploy_core STATIC elf_file.cpp appdir.cpp ${HEADERS} appdir_root_setup.cpp dynamic_loader.cpp)
+ target_link_libraries(linuxdeploy_core PUBLIC
+     linuxdeploy_plugin linuxdeploy_log linuxdeploy_util linuxdeploy_desktopfile_static
+     CImg ${CMAKE_THREAD_LIBS_INIT}
+diff --git a/src/core/dynamic_loader.cpp b/src/core/dynamic_loader.cpp
+new file mode 100644
+index 0000000..9ea0e38
+--- /dev/null
++++ b/src/core/dynamic_loader.cpp
+@@ -0,0 +1,1153 @@
++// system headers
++#include <algorithm>
++#include <cerrno>
++#include <cstddef>
++#include <cstdlib>
++#include <cstring>
++#include <elf.h>
++#include <fcntl.h>
++#include <fstream>
++#include <iterator>
++#include <optional>
++#include <stdexcept>
++#include <sys/auxv.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <utility>
++#if defined(__x86_64__) || defined(__i386__)
++#include <cpuid.h>
++#endif
++
++// local headers
++#include "dynamic_loader.h"
++
++namespace fs = std::filesystem;
++
++namespace linuxdeploy {
++    namespace core {
++        namespace elf_file {
++            namespace {
++                struct ElfIdentity {
++                    uint8_t elfClass = ELFCLASSNONE;
++                    uint8_t dataEncoding = ELFDATANONE;
++                    uint16_t machine = EM_NONE;
++
++                    bool operator==(const ElfIdentity& other) const {
++                        return elfClass == other.elfClass && dataEncoding == other.dataEncoding && machine == other.machine;
++                    }
++                };
++
++                struct Dependency {
++                    // DT_NEEDED, DT_FILTER or DT_AUXILIARY
++                    int64_t tag;
++                    std::string name;
++                };
++
++                struct DynamicInfo {
++                    // in the order of the dynamic section
++                    std::vector<Dependency> dependencies;
++                    std::string soname;
++                    std::optional<std::string> rpath;
++                    std::optional<std::string> runpath;
++                    bool nodeflib = false;
++                    std::string interpreter;
++                    uint16_t type = ET_NONE;
++                    bool hasLoadSegments = false;
++                    bool hasDynamicSection = false;
++                    bool pie = false;
++                };
++
++                template<typename T>
++                bool readAt(std::ifstream& ifs, uint64_t offset, T* out, size_t count = 1) {
++                    ifs.clear();
++                    ifs.seekg(static_cast<std::streamoff>(offset));
++                    ifs.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(sizeof(T) * count));
++                    return static_cast<size_t>(ifs.gcount()) == sizeof(T) * count;
++                }
++
++                std::optional<ElfIdentity> readIdentity(const std::string& path) {
++                    std::ifstream ifs(path, std::ios::binary);
++
++                    unsigned char ident[EI_NIDENT];
++                    uint16_t machine;
++
++                    if (!ifs || !readAt(ifs, 0, ident, EI_NIDENT) || !readAt(ifs, offsetof(Elf32_Ehdr, e_machine), &machine))
++                        return std::nullopt;
++
++                    if (memcmp(ident, ELFMAG, SELFMAG) != 0)
++                        return std::nullopt;
++
++                    ElfIdentity identity;
++                    identity.elfClass = ident[EI_CLASS];
++                    identity.dataEncoding = ident[EI_DATA];
++
++                    const bool hostIsLittleEndian = __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__;
++                    if ((identity.dataEncoding == ELFDATA2LSB) != hostIsLittleEndian)
++                        machine = static_cast<uint16_t>((machine >> 8) | (machine << 8));
++
++                    identity.machine = machine;
++                    return identity;
++                }
++
++                // the ABI linuxdeploy itself was built for
++                const ElfIdentity& hostIdentity() {
++                    static const ElfIdentity identity = []() {
++                        auto own = readIdentity("/proc/self/exe");
++
++                        if (!own.has_value())
++                            throw std::runtime_error("Could not read the ELF header of /proc/self/exe");
++
++                        return own.value();
++                    }();
++
++                    return identity;
++                }
++
++                bool isInFile(uint64_t offset, uint64_t size, uint64_t fileSize) {
++                    return offset <= fileSize && size <= fileSize - offset;
++                }
++
++                std::string stringAt(const std::vector<char>& table, uint64_t offset) {
++                    if (offset >= table.size())
++                        return {};
++
++                    const auto* begin = table.data() + offset;
++                    return std::string(begin, strnlen(begin, table.size() - offset));
++                }
++
++                template<typename Ehdr_T, typename Phdr_T, typename Dyn_T>
++                DynamicInfo readDynamicInfoFrom(std::ifstream& ifs) {
++                    DynamicInfo info;
++
++                    ifs.seekg(0, std::ios::end);
++                    const auto fileSize = static_cast<uint64_t>(ifs.tellg());
++
++                    Ehdr_T ehdr;
++                    if (!readAt(ifs, 0, &ehdr))
++                        return info;
++
++                    info.type = ehdr.e_type;
++
++                    if (ehdr.e_phentsize != sizeof(Phdr_T) ||
++                        !isInFile(ehdr.e_phoff, static_cast<uint64_t>(ehdr.e_phnum) * sizeof(Phdr_T), fileSize))
++                        return info;
++
++                    std::vector<Phdr_T> phdrs(ehdr.e_phnum);
++                    if (!phdrs.empty() && !readAt(ifs, ehdr.e_phoff, phdrs.data(), phdrs.size()))
++                        return info;
++
++                    const Phdr_T* dynamicSegment = nullptr;
++
++                    for (const auto& phdr : phdrs) {
++                        if (phdr.p_type == PT_LOAD) {
++                            info.hasLoadSegments = true;
++                        } else if (phdr.p_type == PT_DYNAMIC) {
++                            dynamicSegment = &phdr;
++                            info.hasDynamicSection = phdr.p_filesz > 0;
++                        } else if (phdr.p_type == PT_INTERP && phdr.p_filesz > 0 && isInFile(phdr.p_offset, phdr.p_filesz, fileSize)) {
++                            std::vector<char> interpreter(phdr.p_filesz);
++                            if (readAt(ifs, phdr.p_offset, interpreter.data(), interpreter.size()))
++                                info.interpreter = stringAt(interpreter, 0);
++                        }
++                    }
++
++                    if (dynamicSegment == nullptr || !isInFile(dynamicSegment->p_offset, dynamicSegment->p_filesz, fileSize))
++                        return info;
++
++                    std::vector<Dyn_T> entries(dynamicSegment->p_filesz / sizeof(Dyn_T));
++                    if (!entries.empty() && !readAt(ifs, dynamicSegment->p_offset, entries.data(), entries.size()))
++                        return info;
++
++                    uint64_t stringTableAddress = 0;
++                    uint64_t stringTableSize = 0;
++                    std::vector<std::pair<int64_t, uint64_t>> dependencyOffsets;
++                    std::optional<uint64_t> sonameOffset, rpathOffset, runpathOffset;
++
++                    for (const auto& entry : entries) {
++                        if (entry.d_tag == DT_NULL)
++                            break;
++
++                        switch (entry.d_tag) {
++                            case DT_NEEDED:
++                            case DT_FILTER:
++                            case DT_AUXILIARY:
++                                dependencyOffsets.emplace_back(entry.d_tag, entry.d_un.d_val);
++                                break;
++                            case DT_SONAME:
++                                sonameOffset = entry.d_un.d_val;
++                                break;
++                            case DT_RPATH:
++                                rpathOffset = entry.d_un.d_val;
++                                break;
++                            case DT_RUNPATH:
++                                runpathOffset = entry.d_un.d_val;
++                                break;
++                            case DT_STRTAB:
++                                stringTableAddress = entry.d_un.d_ptr;
++                                break;
++                            case DT_STRSZ:
++                                stringTableSize = entry.d_un.d_val;
++                                break;
++                            case DT_FLAGS_1:
++                                info.nodeflib = (entry.d_un.d_val & DF_1_NODEFLIB) != 0;
++                                info.pie = (entry.d_un.d_val & DF_1_PIE) != 0;
++                                break;
++                        }
++                    }
++
++                    // the string table is referenced by its address, which needs to be mapped to a file offset
++                    std::optional<uint64_t> stringTableOffset;
++                    for (const auto& phdr : phdrs) {
++                        if (phdr.p_type == PT_LOAD && stringTableAddress >= phdr.p_vaddr &&
++                            stringTableAddress < phdr.p_vaddr + phdr.p_filesz) {
++                            stringTableOffset = stringTableAddress - phdr.p_vaddr + phdr.p_offset;
++                            break;
++                        }
++                    }
++
++                    if (!stringTableOffset.has_value() || stringTableSize == 0 || !isInFile(stringTableOffset.value(), stringTableSize, fileSize))
++                        return info;
++
++                    std::vector<char> stringTable(stringTableSize);
++                    if (!readAt(ifs, stringTableOffset.value(), stringTable.data(), stringTable.size()))
++                        return info;
++
++                    for (const auto& dependency : dependencyOffsets)
++                        info.dependencies.push_back({dependency.first, stringAt(stringTable, dependency.second)});
++
++                    if (sonameOffset.has_value())
++                        info.soname = stringAt(stringTable, sonameOffset.value());
++                    if (rpathOffset.has_value())
++                        info.rpath = stringAt(stringTable, rpathOffset.value());
++                    if (runpathOffset.has_value())
++                        info.runpath = stringAt(stringTable, runpathOffset.value());
++
++                    return info;
++                }
++
++                // only meant to be used on files of the given ELF class in the host's byte order
++                DynamicInfo readDynamicInfo(const std::string& path, uint8_t elfClass) {
++                    std::ifstream ifs(path, std::ios::binary);
++
++                    if (!ifs)
++                        return {};
++
++                    if (elfClass == ELFCLASS32)
++                        return readDynamicInfoFrom<Elf32_Ehdr, Elf32_Phdr, Elf32_Dyn>(ifs);
++
++                    return readDynamicInfoFrom<Elf64_Ehdr, Elf64_Phdr, Elf64_Dyn>(ifs);
++                }
++
++                // how the loader treats a file it comes across while looking for an object
++                enum class Candidate {
++                    // an ELF file of the other class or for another machine, which the loader skips
++                    ForOtherSystem,
++                    // the loader stops looking at this file, but fails to load it
++                    Unloadable,
++                    Loadable,
++                };
++
++                // as seen by the loader for the given ABI
++                Candidate classifyCandidate(const std::string& path, const ElfIdentity& abi) {
++                    struct stat st{};
++                    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
++                        return Candidate::Unloadable;
++
++                    std::ifstream ifs(path, std::ios::binary);
++                    std::vector<unsigned char> header(abi.elfClass == ELFCLASS32 ? sizeof(Elf32_Ehdr) : sizeof(Elf64_Ehdr));
++
++                    if (!ifs || !readAt(ifs, 0, header.data(), header.size()) || memcmp(header.data(), ELFMAG, SELFMAG) != 0)
++                        return Candidate::Unloadable;
++
++                    // like the loader, check the ELF class before anything else
++                    if (header[EI_CLASS] != abi.elfClass)
++                        return Candidate::ForOtherSystem;
++
++                    uint16_t machine;
++                    uint32_t version;
++                    memcpy(&machine, header.data() + offsetof(Elf32_Ehdr, e_machine), sizeof(machine));
++                    memcpy(&version, header.data() + offsetof(Elf32_Ehdr, e_version), sizeof(version));
++
++                    if (header[EI_DATA] != abi.dataEncoding || header[EI_VERSION] != EV_CURRENT || version != EV_CURRENT)
++                        return Candidate::Unloadable;
++
++                    if (machine != abi.machine)
++                        return Candidate::ForOtherSystem;
++
++                    // executables, including position independent ones, cannot be loaded as dependencies
++                    const auto info = readDynamicInfo(path, abi.elfClass);
++                    if (info.type != ET_DYN || info.pie || !info.hasLoadSegments || !info.hasDynamicSection)
++                        return Candidate::Unloadable;
++
++                    return Candidate::Loadable;
++                }
++
++                struct CacheEntry {
++                    int32_t flags;
++                    uint64_t hwcap;
++                    std::string name;
++                    std::string path;
++                };
++
++                // reads the library mappings from ld.so.cache in the order in which they are stored (the loader uses the
++                // first matching one)
++                std::vector<CacheEntry> readLdSoCache(const fs::path& path) {
++                    std::ifstream ifs(path, std::ios::binary);
++                    const std::vector<char> data{std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>()};
++
++                    static const std::string oldMagic = "ld.so-1.7.0";
++                    static const std::string newMagic = "glibc-ld.so.cache1.1";
++
++                    const auto startsWith = [&data](size_t offset, const std::string& magic) {
++                        return data.size() >= offset + magic.size() &&
++                               std::equal(magic.begin(), magic.end(), data.begin() + static_cast<std::ptrdiff_t>(offset));
++                    };
++
++                    const auto readU32 = [&data](size_t offset) {
++                        uint32_t value;
++                        memcpy(&value, data.data() + offset, sizeof(value));
++                        return value;
++                    };
++
++                    const auto stringAtOffset = [&data](size_t base, uint32_t offset) -> std::string {
++                        const size_t position = base + offset;
++                        if (position >= data.size())
++                            return {};
++                        return std::string(data.data() + position, strnlen(data.data() + position, data.size() - position));
++                    };
++
++                    size_t start = 0;
++
++                    // old style caches may be followed by a cache in the current format, which is used instead if present
++                    if (startsWith(0, oldMagic)) {
++                        if (data.size() < 16)
++                            return {};
++
++                        const auto oldCount = static_cast<size_t>(readU32(12));
++                        const size_t oldEnd = 16 + oldCount * 12;
++
++                        if (data.size() < oldEnd)
++                            return {};
++
++                        start = (oldEnd + 7) & ~size_t(7);
++
++                        if (!startsWith(start, newMagic)) {
++                            // in the old format, string offsets count from the end of the entries
++                            const size_t stringTableBase = oldEnd;
++                            std::vector<CacheEntry> entries;
++
++                            for (size_t i = 0; i < oldCount; ++i) {
++                                const auto entryOffset = 16 + i * 12;
++
++                                CacheEntry entry{};
++                                memcpy(&entry.flags, data.data() + entryOffset, sizeof(entry.flags));
++                                entry.name = stringAtOffset(stringTableBase, readU32(entryOffset + 4));
++                                entry.path = stringAtOffset(stringTableBase, readU32(entryOffset + 8));
++
++                                entries.push_back(entry);
++                            }
++
++                            return entries;
++                        }
++                    }
++
++                    const size_t headerSize = 48;
++                    const size_t entrySize = 24;
++
++                    if (!startsWith(start, newMagic) || data.size() < start + headerSize)
++                        return {};
++
++                    const auto entryCount = readU32(start + 20);
++
++                    // the loader ignores caches written for the other byte order
++                    const auto endianness = static_cast<uint8_t>(data[start + 28]) & 3u;
++                    const bool hostIsLittleEndian = __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__;
++                    if (endianness != 0 && endianness != (hostIsLittleEndian ? 2u : 3u))
++                        return {};
++
++                    if (data.size() < start + headerSize + static_cast<size_t>(entryCount) * entrySize)
++                        return {};
++
++                    // in the current format, string offsets count from the start of its header, i.e., ldconfig already
++                    // includes the header and the entries in them; like the loader, entries pointing outside the file are
++                    // ignored
++                    const size_t stringTableBase = start;
++                    const size_t stringTableSize = data.size() - start;
++
++                    std::vector<CacheEntry> entries;
++
++                    for (uint32_t i = 0; i < entryCount; ++i) {
++                        const auto entryOffset = start + headerSize + static_cast<size_t>(i) * entrySize;
++                        const auto keyOffset = readU32(entryOffset + 4);
++                        const auto valueOffset = readU32(entryOffset + 8);
++
++                        if (keyOffset >= stringTableSize || valueOffset >= stringTableSize)
++                            continue;
++
++                        CacheEntry entry;
++                        memcpy(&entry.flags, data.data() + entryOffset, sizeof(entry.flags));
++                        memcpy(&entry.hwcap, data.data() + entryOffset + 16, sizeof(entry.hwcap));
++                        entry.name = stringAtOffset(stringTableBase, keyOffset);
++                        entry.path = stringAtOffset(stringTableBase, valueOffset);
++
++                        entries.push_back(entry);
++                    }
++
++                    return entries;
++                }
++
++                // glibc's built-in list of system library directories ("default path"), which follows the directory the
++                // dynamic loader is installed in: Debian and its derivatives use multiarch directories, which come before
++                // the plain ones, other distributions use lib or lib64 directly; Debian's loaders for the secondary
++                // 32-bit ABIs (lib32, libx32) search the plain directories as well
++                std::vector<std::string> systemDirectories(const std::string& loader) {
++                    const auto directory = fs::canonical(loader).parent_path().filename().string();
++
++                    if (directory.compare(0, 3, "lib") != 0)
++                        return {"/lib/" + directory + "/", "/usr/lib/" + directory + "/", "/lib/", "/usr/lib/"};
++
++                    if (directory == "lib32" || directory == "libx32")
++                        return {"/" + directory + "/", "/usr/" + directory + "/", "/lib/", "/usr/lib/"};
++
++                    return {"/" + directory + "/", "/usr/" + directory + "/"};
++                }
++
++                // the value glibc's dynamic loader for the given machine uses for $PLATFORM: the platform the kernel
++                // reports, which it replaces on x86 depending on the instructions the CPU supports
++                std::optional<std::string> loaderPlatform([[maybe_unused]] uint16_t machine) {
++#if defined(__x86_64__) || defined(__i386__)
++                    const auto maxLeaf = __get_cpuid_max(0, nullptr);
++                    unsigned int eax, ebx, ecx, edx;
++
++                    // CPUs with CMOV are i686, those with CMPXCHG8B i586
++                    if (machine == EM_386 && maxLeaf >= 1) {
++                        __cpuid(1, eax, ebx, ecx, edx);
++
++                        if ((edx & bit_CMOV) != 0)
++                            return "i686";
++
++                        if ((edx & bit_CMPXCHG8B) != 0)
++                            return "i586";
++                    }
++
++                    if (maxLeaf >= 1)
++                        __cpuid(0, eax, ebx, ecx, edx);
++
++                    // Intel CPUs only ("GenuineIntel")
++                    if (machine == EM_X86_64 && maxLeaf >= 1 && ebx == 0x756e6547 && ecx == 0x6c65746e && edx == 0x49656e69) {
++                        unsigned int leaf1Ecx = 0, leaf7Ebx = 0, extendedEcx = 0;
++                        __cpuid(1, eax, ebx, leaf1Ecx, edx);
++
++                        if (maxLeaf >= 7)
++                            __cpuid_count(7, 0, eax, leaf7Ebx, ecx, edx);
++
++                        __cpuid(0x80000000, eax, ebx, ecx, edx);
++                        if (eax >= 0x80000001)
++                            __cpuid(0x80000001, eax, ebx, extendedEcx, edx);
++
++                        // AVX and AVX-512 instructions are only usable if the kernel saves the registers they use
++                        unsigned int xcr0 = 0, xcr0High = 0;
++                        if ((leaf1Ecx & bit_OSXSAVE) != 0)
++                            asm("xgetbv" : "=a"(xcr0), "=d"(xcr0High) : "c"(0));
++
++                        const bool avx = (xcr0 & 0x6) == 0x6 && (leaf1Ecx & bit_AVX) != 0;
++                        const bool avx512 = (xcr0 & 0xe6) == 0xe6 && (leaf7Ebx & bit_AVX512F) != 0;
++
++                        const unsigned int xeonPhi = bit_AVX512CD | bit_AVX512ER | bit_AVX512PF;
++                        if (avx512 && (leaf7Ebx & xeonPhi) == xeonPhi)
++                            return "xeon_phi";
++
++                        const unsigned int haswellLeaf1 = bit_FMA | bit_MOVBE | bit_POPCNT;
++                        const unsigned int haswellLeaf7 = bit_AVX2 | bit_BMI | bit_BMI2;
++                        if (avx && (leaf1Ecx & haswellLeaf1) == haswellLeaf1 && (leaf7Ebx & haswellLeaf7) == haswellLeaf7 &&
++                            (extendedEcx & bit_LZCNT) != 0)
++                            return "haswell";
++                    }
++#endif
++
++                    const auto* platform = reinterpret_cast<const char*>(getauxval(AT_PLATFORM));
++
++                    // like the loader, take an empty platform for an unknown one
++                    if (platform == nullptr || platform[0] == '\0')
++                        return std::nullopt;
++
++                    return std::string(platform);
++                }
++
++                // the values the loader substitutes for the dynamic string tokens $ORIGIN, $LIB and $PLATFORM
++                struct TokenValues {
++                    std::string origin;
++                    std::string lib;
++                    std::optional<std::string> platform;
++                };
++
++                bool isIdentifierCharacter(char c) {
++                    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
++                }
++
++                // the length of the token NAME or {NAME} at the given position, or 0; an unbraced NAME must not be followed
++                // by a character that could continue it
++                size_t tokenLength(const std::string& value, size_t position, const std::string& name) {
++                    const bool braced = position < value.size() && value[position] == '{';
++                    const auto start = braced ? position + 1 : position;
++
++                    if (value.compare(start, name.size(), name) != 0)
++                        return 0;
++
++                    const auto next = start + name.size();
++
++                    if (braced)
++                        return next < value.size() && value[next] == '}' ? name.size() + 2 : 0;
++
++                    return next < value.size() && isIdentifierCharacter(value[next]) ? 0 : name.size();
++                }
++
++                // replaces the dynamic string tokens like the loader, which gives up on the whole string if a token has no
++                // value; other uses of $ are kept
++                std::optional<std::string> expandTokens(const std::string& value, const TokenValues& values) {
++                    std::string result;
++
++                    for (size_t i = 0; i < value.size();) {
++                        if (value[i] != '$') {
++                            result += value[i++];
++                            continue;
++                        }
++
++                        std::optional<std::string> replacement;
++                        size_t length = 0;
++
++                        if ((length = tokenLength(value, i + 1, "ORIGIN")) != 0)
++                            replacement = values.origin;
++                        else if ((length = tokenLength(value, i + 1, "PLATFORM")) != 0)
++                            replacement = values.platform;
++                        else if ((length = tokenLength(value, i + 1, "LIB")) != 0)
++                            replacement = values.lib;
++
++                        if (length == 0) {
++                            result += value[i++];
++                            continue;
++                        }
++
++                        if (!replacement.has_value())
++                            return std::nullopt;
++
++                        result += replacement.value();
++                        i += 1 + length;
++                    }
++
++                    return result;
++                }
++
++                // splits a search path into directories, leaving out the ones the loader drops because of a token without
++                // a value
++                // an empty element stands for the current working directory, and is kept as an empty string
++                std::vector<std::string> splitSearchPath(const std::string& value, const char* separators, const TokenValues& values) {
++                    std::vector<std::string> directories;
++
++                    size_t start = 0;
++                    while (true) {
++                        const auto end = value.find_first_of(separators, start);
++
++                        auto directory = expandTokens(value.substr(start, end == std::string::npos ? std::string::npos : end - start), values);
++
++                        if (directory.has_value()) {
++                            while (directory->size() > 1 && directory->back() == '/')
++                                directory->pop_back();
++
++                            directories.push_back(directory.value());
++                        }
++
++                        if (end == std::string::npos)
++                            break;
++
++                        start = end + 1;
++                    }
++
++                    return directories;
++                }
++
++                // splits a list of objects to preload at the given separators, leaving out empty names
++                std::vector<std::string> splitPreloadList(const std::string& value, const char* separators) {
++                    std::vector<std::string> names;
++
++                    size_t start = 0;
++                    while (true) {
++                        const auto end = value.find_first_of(separators, start);
++                        auto name = value.substr(start, end == std::string::npos ? std::string::npos : end - start);
++
++                        if (!name.empty())
++                            names.push_back(std::move(name));
++
++                        if (end == std::string::npos)
++                            break;
++
++                        start = end + 1;
++                    }
++
++                    return names;
++                }
++
++                // the objects /etc/ld.so.preload names, separated by white space or colons; comments start with #
++                std::vector<std::string> readPreloadFile(const fs::path& path) {
++                    std::ifstream ifs(path);
++                    std::vector<std::string> names;
++
++                    std::string line;
++                    while (std::getline(ifs, line)) {
++                        for (auto& name : splitPreloadList(line.substr(0, line.find('#')), ": \t"))
++                            names.push_back(std::move(name));
++                    }
++
++                    return names;
++                }
++
++                std::string joinPath(const std::string& directory, const std::string& name) {
++                    if (directory.empty())
++                        return name;
++
++                    if (directory.back() == '/')
++                        return directory + name;
++
++                    return directory + "/" + name;
++                }
++
++                class LoaderSimulation {
++                    private:
++                        struct Object {
++                            // path the object was loaded from, exactly as the loader composed it
++                            std::string realName;
++                            std::vector<std::string> names;
++                            DynamicInfo info;
++                            std::optional<size_t> loader;
++                            // device and inode of the file, unknown for the file the loader was started with
++                            std::optional<std::pair<dev_t, ino_t>> fileId;
++                            bool found = true;
++                            bool listed = true;
++                            bool inSearchList = false;
++                            // placed in front of the file the loader was started with, where neither ldd nor the loader
++                            // itself can see it anymore
++                            bool hidden = false;
++                            // the object whose DT_FILTER or DT_AUXILIARY entry placed this one there
++                            std::optional<size_t> placedBy;
++                        };
++
++                        std::vector<Object> objects;
++                        size_t loaderIndex = 0;
++                        std::optional<std::vector<std::string>> ldLibraryPath;
++                        // the objects named in LD_PRELOAD and /etc/ld.so.preload
++                        std::vector<std::string> preloadNames;
++                        std::optional<std::vector<std::pair<std::string, std::string>>> cache;
++                        std::vector<std::string> defaultDirectories;
++                        std::string lib;
++                        std::optional<std::string> platform;
++                        // the ABI of the file the loader is started with, which may differ from linuxdeploy's own (e.g., i386
++                        // files on x86_64 systems)
++                        ElfIdentity target;
++
++                    private:
++                        static std::string originOf(const std::string& realName) {
++                            std::string path = realName;
++
++                            if (path.empty() || path.front() != '/')
++                                path = fs::current_path().string() + "/" + path;
++
++                            const auto lastSlash = path.find_last_of('/');
++                            if (lastSlash == 0)
++                                return "/";
++
++                            return path.substr(0, lastSlash);
++                        }
++
++                        // the token values for the dependency names and search paths of an object
++                        TokenValues tokenValuesOf(size_t index) const {
++                            return {originOf(objects[index].realName), lib, platform};
++                        }
++
++                        bool isUsable(const std::string& path) const {
++                            struct stat st{};
++                            if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
++                                return false;
++
++                            const auto identity = readIdentity(path);
++                            return identity.has_value() && identity.value() == target;
++                        }
++
++                        // the loader stops looking at the first file it can open that is not for another system, even if
++                        // it cannot load it
++                        bool isCandidate(const std::string& path) const {
++                            const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
++
++                            if (fd < 0)
++                                return false;
++
++                            close(fd);
++                            return classifyCandidate(path, target) != Candidate::ForOtherSystem;
++                        }
++
++                        // like ldd, which runs the dynamic loader that accepts the file, use the loader for the file's ABI: the
++                        // one the file names, the one linuxdeploy runs with, or the one the C library of that ABI names
++                        std::optional<std::string> findInterpreter() const {
++                            const auto ownInterpreter = readDynamicInfo("/proc/self/exe", hostIdentity().elfClass).interpreter;
++
++                            for (const auto& interpreter : {objects[0].info.interpreter, ownInterpreter}) {
++                                if (!interpreter.empty() && isUsable(interpreter))
++                                    return interpreter;
++                            }
++
++                            for (const auto& entry : readLdSoCache("/etc/ld.so.cache")) {
++                                if (entry.name != "libc.so.6" || !isUsable(entry.path))
++                                    continue;
++
++                                const auto interpreter = readDynamicInfo(entry.path, target.elfClass).interpreter;
++                                if (!interpreter.empty() && isUsable(interpreter))
++                                    return interpreter;
++                            }
++
++                            return std::nullopt;
++                        }
++
++                        std::optional<std::string> searchDirectories(const std::vector<std::string>& directories, const std::string& name) {
++                            for (const auto& directory : directories) {
++                                const auto candidate = joinPath(directory, name);
++
++                                const int fd = open(candidate.c_str(), O_RDONLY | O_CLOEXEC);
++                                const int error = errno;
++
++                                if (fd >= 0) {
++                                    close(fd);
++
++                                    if (classifyCandidate(candidate, target) != Candidate::ForOtherSystem)
++                                        return candidate;
++
++                                    continue;
++                                }
++
++                                // like the loader, give up on the rest of the list if a file in an existing directory cannot
++                                // be opened for another reason than its absence or missing permissions (e.g., a symlink loop);
++                                // the loader takes relative directories for existing without checking
++                                std::error_code ec;
++                                const bool isRelative = directory.empty() || directory.front() != '/';
++                                if (error != ENOENT && error != EACCES && (isRelative || fs::is_directory(directory, ec)))
++                                    return std::nullopt;
++                            }
++
++                            return std::nullopt;
++                        }
++
++                        // the loader only uses the cache entries ldconfig recorded for its own ABI, which are the ones with the
++                        // flags of the loader's own entry; entries for glibc-hwcaps subdirectories are not supported
++                        std::vector<std::pair<std::string, std::string>> readCacheMappings() const {
++                            const auto entries = readLdSoCache("/etc/ld.so.cache");
++
++                            std::optional<int32_t> loaderFlags;
++                            for (const auto& entry : entries) {
++                                struct stat st{};
++                                if (entry.hwcap == 0 && stat(entry.path.c_str(), &st) == 0 &&
++                                    objects[loaderIndex].fileId == std::make_pair(st.st_dev, st.st_ino)) {
++                                    loaderFlags = entry.flags;
++                                    break;
++                                }
++                            }
++
++                            std::vector<std::pair<std::string, std::string>> mappings;
++
++                            for (const auto& entry : entries) {
++                                if (entry.flags == loaderFlags && entry.hwcap == 0)
++                                    mappings.emplace_back(entry.name, entry.path);
++                            }
++
++                            return mappings;
++                        }
++
++                        std::optional<std::string> lookUpCache(const std::string& name) {
++                            if (!cache.has_value())
++                                cache = readCacheMappings();
++
++                            for (const auto& mapping : cache.value()) {
++                                if (mapping.first == name)
++                                    return mapping.second;
++                            }
++
++                            return std::nullopt;
++                        }
++
++                        bool isInDefaultDirectory(const std::string& path) const {
++                            for (const auto& directory : defaultDirectories) {
++                                if (path.compare(0, directory.size(), directory) == 0)
++                                    return true;
++                            }
++
++                            return false;
++                        }
++
++                        std::optional<std::string> search(size_t requesterIndex, const std::string& name) {
++                            const auto& requester = objects[requesterIndex];
++
++                            // the DT_RPATH entries of the requesting object and the objects that caused it to be loaded
++                            // are only used if the requesting object has no DT_RUNPATH
++                            if (!requester.info.runpath.has_value()) {
++                                std::optional<size_t> current = requesterIndex;
++
++                                while (current.has_value()) {
++                                    const auto& object = objects[current.value()];
++
++                                    // the main object's DT_RPATH is ignored if it has a DT_RUNPATH
++                                    const bool rpathIgnored = current.value() == 0 && object.info.runpath.has_value();
++
++                                    if (object.info.rpath.has_value() && !rpathIgnored) {
++                                        const auto directories = splitSearchPath(object.info.rpath.value(), ":", tokenValuesOf(current.value()));
++
++                                        if (auto path = searchDirectories(directories, name))
++                                            return path;
++                                    }
++
++                                    current = object.loader;
++                                }
++                            }
++
++                            if (ldLibraryPath.has_value()) {
++                                if (auto path = searchDirectories(ldLibraryPath.value(), name))
++                                    return path;
++                            }
++
++                            if (requester.info.runpath.has_value()) {
++                                const auto directories = splitSearchPath(requester.info.runpath.value(), ":", tokenValuesOf(requesterIndex));
++
++                                if (auto path = searchDirectories(directories, name))
++                                    return path;
++                            }
++
++                            // with DF_1_NODEFLIB, neither the cache entries pointing into the default directories nor the
++                            // default directories themselves may be used
++                            if (auto cached = lookUpCache(name)) {
++                                if (!(requester.info.nodeflib && isInDefaultDirectory(cached.value())) && isCandidate(cached.value()))
++                                    return cached;
++                            }
++
++                            if (!requester.info.nodeflib) {
++                                if (auto path = searchDirectories(defaultDirectories, name))
++                                    return path;
++                            }
++
++                            return std::nullopt;
++                        }
++
++                        std::optional<size_t> findLoaded(const std::string& name) const {
++                            for (size_t i = 0; i < objects.size(); ++i) {
++                                const auto& object = objects[i];
++
++                                if (!object.found || object.hidden)
++                                    continue;
++
++                                if ((i != 0 && object.realName == name) || object.info.soname == name ||
++                                    std::find(object.names.begin(), object.names.end(), name) != object.names.end()) {
++                                    return i;
++                                }
++                            }
++
++                            return std::nullopt;
++                        }
++
++                        std::optional<size_t> findLoaded(dev_t device, ino_t inode) const {
++                            for (size_t i = 0; i < objects.size(); ++i) {
++                                const auto& object = objects[i];
++
++                                if (object.found && !object.hidden && object.fileId == std::make_pair(device, inode))
++                                    return i;
++                            }
++
++                            return std::nullopt;
++                        }
++
++                        // whether the object, or one of the hidden objects whose filters led to it, is the given file
++                        bool isOnFilterPath(size_t index, const std::pair<dev_t, ino_t>& fileId) const {
++                            for (std::optional<size_t> current = index; current.has_value(); current = objects[current.value()].placedBy) {
++                                if (objects[current.value()].fileId == fileId)
++                                    return true;
++                            }
++
++                            return false;
++                        }
++
++                        size_t addObject(const std::string& realName, const std::string& name, std::optional<size_t> loader, bool listed) {
++                            Object object;
++                            object.realName = realName;
++                            object.names.push_back(name);
++                            object.loader = loader;
++                            object.listed = listed;
++
++                            struct stat st{};
++                            if (stat(realName.c_str(), &st) == 0)
++                                object.fileId = std::make_pair(st.st_dev, st.st_ino);
++
++                            object.info = readDynamicInfo(realName, target.elfClass);
++
++                            objects.push_back(object);
++                            return objects.size() - 1;
++                        }
++
++                        // the loader loads the objects to preload on behalf of the main object, but unlike dependencies, it
++                        // skips the ones it cannot find or load (it only prints an error) and the ones already loaded, and
++                        // only expands dynamic string tokens in names containing a slash
++                        // returns the object if it was loaded
++                        std::optional<size_t> preload(const std::string& preloadName) {
++                            if (findLoaded(preloadName).has_value())
++                                return std::nullopt;
++
++                            auto name = preloadName;
++                            std::optional<std::string> path;
++
++                            if (name.find('/') != std::string::npos) {
++                                const auto expanded = expandTokens(name, tokenValuesOf(0));
++                                if (!expanded.has_value() || !isCandidate(expanded.value()))
++                                    return std::nullopt;
++
++                                name = expanded.value();
++                                path = name;
++                            } else {
++                                path = search(0, name);
++                            }
++
++                            if (!path.has_value())
++                                return std::nullopt;
++
++                            struct stat st{};
++                            if (stat(path.value().c_str(), &st) == 0 && findLoaded(st.st_dev, st.st_ino).has_value())
++                                return std::nullopt;
++
++                            if (classifyCandidate(path.value(), target) != Candidate::Loadable)
++                                return std::nullopt;
++
++                            return addObject(path.value(), preloadName, 0, true);
++                        }
++
++                        // returns the object the dependency refers to, if there is one
++                        std::optional<size_t> load(size_t requesterIndex, const Dependency& dependency) {
++                            auto name = dependency.name;
++
++                            if (name.find('$') != std::string::npos) {
++                                const auto expanded = expandTokens(name, tokenValuesOf(requesterIndex));
++
++                                // the loader skips entries with a token it has no value for
++                                if (!expanded.has_value())
++                                    return std::nullopt;
++
++                                name = expanded.value();
++                            }
++
++                            if (auto loaded = findLoaded(name)) {
++                                objects[loaded.value()].names.push_back(name);
++                                return loaded;
++                            }
++
++                            std::optional<std::string> path;
++
++                            // names containing a slash are used as paths, relative ones being relative to the working
++                            // directory
++                            if (name.find('/') != std::string::npos) {
++                                if (isCandidate(name))
++                                    path = name;
++                            } else {
++                                path = search(requesterIndex, name);
++                            }
++
++                            // when ldd runs the loader, it records the objects it cannot find instead of giving up, and ldd
++                            // lists them as "not found"; that includes the ones named by DT_AUXILIARY entries, which the loader
++                            // only leaves out if it finds a file it cannot load (see below)
++                            if (!path.has_value()) {
++                                Object missing;
++                                missing.names.push_back(name);
++                                missing.loader = requesterIndex;
++                                missing.found = false;
++                                objects.push_back(missing);
++                                return objects.size() - 1;
++                            }
++
++                            // a file that is already loaded under a different name is not loaded a second time
++                            struct stat st{};
++                            if (stat(path.value().c_str(), &st) == 0) {
++                                if (auto loaded = findLoaded(st.st_dev, st.st_ino)) {
++                                    objects[loaded.value()].names.push_back(name);
++                                    return loaded;
++                                }
++                            }
++
++                            // an auxiliary object the loader finds but fails to load is left out, anything else it fails to load
++                            // makes it give up
++                            if (classifyCandidate(path.value(), target) != Candidate::Loadable) {
++                                if (dependency.tag == DT_AUXILIARY)
++                                    return std::nullopt;
++
++                                throw std::runtime_error("The dynamic loader cannot load " + path.value());
++                            }
++
++                            return addObject(path.value(), name, requesterIndex, true);
++                        }
++
++                    public:
++                        explicit LoaderSimulation(const fs::path& path) {
++                            const auto* const ldLibraryPathValue = getenv("LD_LIBRARY_PATH");
++                            const auto* const preloadValue = getenv("LD_PRELOAD");
++
++                            const auto identity = readIdentity(path.string());
++                            if (!identity.has_value())
++                                throw std::runtime_error("Could not read the ELF header of " + path.string());
++
++                            target = identity.value();
++
++                            addObject(path.string(), path.string(), std::nullopt, false);
++
++                            // the loader knows the file it was started with only by its DT_SONAME, neither by its path nor by
++                            // its device and inode, therefore any other name for that file loads it once more
++                            objects[0].names.clear();
++                            objects[0].fileId.reset();
++
++                            const auto interpreter = findInterpreter();
++                            if (!interpreter.has_value())
++                                throw std::runtime_error("Could not find the dynamic loader for " + path.string());
++
++                            // the dynamic loader is present before any other object is loaded, therefore requests for it
++                            // never load anything
++                            loaderIndex = addObject(interpreter.value(), interpreter.value(), std::nullopt, false);
++
++                            // the loader does not load its own dependencies
++                            objects[loaderIndex].info.dependencies.clear();
++
++                            defaultDirectories = systemDirectories(interpreter.value());
++
++                            // $LIB is the first default directory without its slashes (e.g., lib/x86_64-linux-gnu on Debian,
++                            // lib64 on Fedora)
++                            const auto& firstDirectory = defaultDirectories.front();
++                            lib = firstDirectory.substr(1, firstDirectory.size() - 2);
++                            platform = loaderPlatform(target.machine);
++
++                            if (ldLibraryPathValue != nullptr && ldLibraryPathValue[0] != '\0')
++                                ldLibraryPath = splitSearchPath(ldLibraryPathValue, ":;", tokenValuesOf(0));
++
++                            if (preloadValue != nullptr)
++                                preloadNames = splitPreloadList(preloadValue, " :");
++
++                            for (auto& name : readPreloadFile("/etc/ld.so.preload"))
++                                preloadNames.push_back(std::move(name));
++                        }
++
++                        std::vector<LoadedObject> run() {
++                            // for a file without DT_NEEDED entries, ldd only prints "statically linked" and lists nothing, even
++                            // if the file has DT_FILTER or DT_AUXILIARY entries (the loader checks for DT_NEEDED alone)
++                            const auto& mainDependencies = objects[0].info.dependencies;
++                            if (std::none_of(mainDependencies.begin(), mainDependencies.end(), [](const Dependency& dependency) {
++                                return dependency.tag == DT_NEEDED;
++                            })) {
++                                return {};
++                            }
++
++                            struct SearchListEntry {
++                                size_t object;
++                                bool handled;
++                            };
++
++                            // the loader handles the dependencies of the objects in the order of its search list,
++                            // appending the objects named in DT_NEEDED entries, so that they are loaded breadth first,
++                            // while the ones named in DT_FILTER and DT_AUXILIARY entries go right in front of the object
++                            // naming them, and are handled next
++                            std::vector<SearchListEntry> searchList{{0, false}};
++                            objects[0].inSearchList = true;
++
++                            // the objects to preload come right after the main object
++                            for (const auto& name : preloadNames) {
++                                if (const auto index = preload(name)) {
++                                    objects[index.value()].inSearchList = true;
++                                    searchList.push_back({index.value(), false});
++                                }
++                            }
++
++                            // the position of an object in the search list, starting at the given one
++                            const auto find = [&searchList](size_t object, size_t from) {
++                                while (from < searchList.size() && searchList[from].object != object)
++                                    ++from;
++
++                                return from;
++                            };
++
++                            for (size_t position = 0; position < searchList.size();) {
++                                const auto current = searchList[position].object;
++                                searchList[position].handled = true;
++
++                                auto currentPosition = position;
++
++                                // copy, as loading dependencies extends the list of objects
++                                const auto dependencies = objects[current].info.dependencies;
++
++                                for (const auto& dependency : dependencies) {
++                                    const auto loaded = load(current, dependency);
++
++                                    if (!loaded.has_value())
++                                        continue;
++
++                                    const auto index = loaded.value();
++
++                                    if (dependency.tag == DT_NEEDED) {
++                                        if (!objects[index].inSearchList) {
++                                            objects[index].inSearchList = true;
++                                            searchList.push_back({index, false});
++                                        }
++
++                                        continue;
++                                    }
++
++                                    // an object further down the list moves up, while one in front of the current
++                                    // object stays where it is; a handled object can only be further down if filters
++                                    // name each other in a circle, which the loader never finishes, so it stays as well
++                                    if (objects[index].inSearchList) {
++                                        const auto later = find(index, currentPosition + 1);
++
++                                        if (later == searchList.size() || searchList[later].handled)
++                                            continue;
++
++                                        searchList.erase(searchList.begin() + static_cast<std::ptrdiff_t>(later));
++                                    }
++
++                                    objects[index].inSearchList = true;
++                                    objects[index].hidden = currentPosition <= find(0, 0);
++
++                                    // every filter of a hidden object places another object, as the loader cannot find the
++                                    // hidden ones, so a filter leading back to a file on its own path never ends
++                                    if (objects[index].hidden) {
++                                        const auto& fileId = objects[index].fileId;
++                                        if (fileId.has_value() && isOnFilterPath(current, fileId.value()))
++                                            throw std::runtime_error("The dynamic loader never finishes loading the filters of " + objects[current].realName);
++
++                                        objects[index].placedBy = current;
++                                    }
++
++                                    searchList.insert(searchList.begin() + static_cast<std::ptrdiff_t>(currentPosition), {index, false});
++                                    ++currentPosition;
++                                }
++
++                                while (position < searchList.size() && searchList[position].handled)
++                                    ++position;
++                            }
++
++                            // ldd lists the objects which follow the main object
++                            std::vector<LoadedObject> result;
++
++                            for (auto position = find(0, 0) + 1; position < searchList.size(); ++position) {
++                                const auto& object = objects[searchList[position].object];
++
++                                if (!object.listed)
++                                    continue;
++
++                                result.push_back({object.names.front(), object.found ? fs::path(object.realName) : fs::path()});
++                            }
++
++                            return result;
++                        }
++                };
++            }
++
++            std::vector<LoadedObject> listLoadedObjects(const fs::path& path) {
++                return LoaderSimulation(path).run();
++            }
++        }
++    }
++}
+diff --git a/src/core/dynamic_loader.h b/src/core/dynamic_loader.h
+new file mode 100644
+index 0000000..d09e6f8
+--- /dev/null
++++ b/src/core/dynamic_loader.h
+@@ -0,0 +1,27 @@
++// system headers
++#include <filesystem>
++#include <string>
++#include <vector>
++
++#pragma once
++
++namespace linuxdeploy {
++    namespace core {
++        namespace elf_file {
++            // an object glibc's dynamic loader loads for an ELF file
++            struct LoadedObject {
++                // the name the object was first requested as
++                std::string name;
++
++                // the path the object was found at, empty if no file could be found for the name
++                std::filesystem::path path;
++            };
++
++            // works out the objects glibc's dynamic loader would load for the given ELF file, in the order in which ldd
++            // lists them, using the current LD_LIBRARY_PATH and working directory
++            // the dynamic loader is never part of the result, the file itself only if a dependency loads it once more
++            // throws std::runtime_error if the dynamic loader cannot be found, or would fail to load a dependency
++            std::vector<LoadedObject> listLoadedObjects(const std::filesystem::path& path);
++        }
++    }
++}
+diff --git a/src/core/elf_file.cpp b/src/core/elf_file.cpp
+index c8772ac..290271a 100644
+--- a/src/core/elf_file.cpp
++++ b/src/core/elf_file.cpp
+@@ -3,7 +3,6 @@
+ #include <fcntl.h>
+ #include <fstream>
+ #include <memory>
+-#include <regex>
+ #include <sys/mman.h>
+ #include <utility>
+ 
+@@ -12,6 +11,7 @@
+ #include "linuxdeploy/log/log.h"
+ #include "linuxdeploy/util/util.h"
+ #include "linuxdeploy/subprocess/subprocess.h"
++#include "dynamic_loader.h"
+ 
+ using namespace linuxdeploy::log;
+ 
+@@ -184,77 +184,27 @@ namespace linuxdeploy {
+             }
+ 
+             std::vector<fs::path> ElfFile::traceDynamicDependencies(const std::vector<std::string>& excludeLibraryPatterns) {
+-                // this method's purpose is to abstract this process
+-                // the caller doesn't care _how_ it's done, after all
+-
+-                // for now, we use the same ldd based method linuxdeployqt uses
+-
+                 // of course, it makes no sense to call this method on statically linked binaries
+                 assert(isDynamicallyLinked());
+ 
+                 std::vector<fs::path> paths;
+ 
+-                auto env = subprocess::get_environment();
+-                env["LC_ALL"] = "C";
+-
+-                // workaround for https://sourceware.org/bugzilla/show_bug.cgi?id=25263
+-                // when you pass an absolute path to ldd, it can find libraries referenced in the rpath properly
+-                // this bug was first found when trying to find a library next to the binary which contained $ORIGIN
+-                // note that this is just a bug in ldd, the linker has always worked as intended
++                // like with the ldd based method used before, dependencies are looked up for the file's canonical path,
++                // i.e., $ORIGIN refers to the directory the file actually resides in
+                 const auto resolvedPath = fs::canonical(d->path);
+ 
+-                subprocess::subprocess lddProc({"ldd", resolvedPath.string()}, env);
+-
+-                const auto result = lddProc.run();
+-
+-                if (result.exit_code() != 0) {
+-                    if (result.stdout_string().find("not a dynamic executable") != std::string::npos || result.stderr_string().find("not a dynamic executable") != std::string::npos) {
+-                        ldLog() << LD_WARNING << this->d->path << "is not linked dynamically" << std::endl;
+-                        return {};
++                for (const auto& object : listLoadedObjects(resolvedPath)) {
++                    if (!object.path.empty()) {
++                        paths.push_back(fs::absolute(object.path));
++                        continue;
+                     }
+ 
+-                    throw std::runtime_error{"Failed to run ldd: exited with code " + std::to_string(result.exit_code())};
+-                }
+-
+-                const std::regex expr(R"(\s*(.+)\s+\=>\s+(.+)\s+\((.+)\)\s*)");
+-                std::smatch what;
+-
+-                auto lddLines = util::splitLines(result.stdout_string());
+-
+-                // filter known-problematic, known-unneeded lines
+-                // see https://github.com/linuxdeploy/linuxdeploy/issues/210
+-                lddLines.erase(
+-                    std::remove_if(lddLines.begin(), lddLines.end(), [&lddLines](auto line) {
+-                        if (util::stringContains(line, "linux-vdso.so") || util::stringContains(line, "ld-linux-")) {
+-                            ldLog() << LD_DEBUG << "skipping linker related object" << line << std::endl;
+-                            return true;
+-                        }
+-
+-                        return false;
+-                    }),
+-                    lddLines.end()
+-                );
+-
+-                for (const auto& line : lddLines) {
+-                    if (std::regex_search(line, what, expr)) {
+-                        auto libraryPath = what[2].str();
+-                        util::trim(libraryPath);
+-                        paths.push_back(fs::absolute(libraryPath));
+-                    } else {
+-                        if (util::stringContains(line, "=> not found")) {
+-                            auto missingLib = line;
+-                            static const std::string pattern = "=> not found";
+-                            missingLib.erase(missingLib.find(pattern), pattern.size());
+-                            util::trim(missingLib);
+-                            util::trim(missingLib, '\t');
+-                            if (!util::isInExcludelist(missingLib, excludeLibraryPatterns)) {
+-                                throw DependencyNotFoundError("Could not find dependency: " + missingLib);
+-                            }
+-                            ldLog() << LD_WARNING << resolvedPath.string() << "depends on excluded library:" << missingLib << std::endl;
+-                        } else {
+-                            ldLog() << LD_DEBUG << "Invalid ldd output: " << line << std::endl;
+-                        }
++                    // every object ldd would list as "not found", also one named by a DT_AUXILIARY entry
++                    if (!util::isInExcludelist(object.name, excludeLibraryPatterns)) {
++                        throw DependencyNotFoundError("Could not find dependency: " + object.name);
+                     }
++
++                    ldLog() << LD_WARNING << resolvedPath.string() << "depends on excluded library:" << object.name << std::endl;
+                 }
+ 
+                 return paths;

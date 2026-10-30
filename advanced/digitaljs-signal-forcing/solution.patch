@@ -1,0 +1,263 @@
+diff --git a/src/cells/base.mjs b/src/cells/base.mjs
+index e0eebc9..3251572 100644
+--- a/src/cells/base.mjs
++++ b/src/cells/base.mjs
+@@ -117,14 +117,44 @@ export const Gate = joint.dia.Element.define('Gate', {
+     _changeOutputSignals(sigs) {
+         this.graph.getConnectedLinks(this, {outbound: true})
+             .forEach(wire => {
+-                wire.set('signal', sigs[wire.get('source').port]);
++                const port = wire.get('source').port;
++                wire.set('signal', this._forcedSignal(port, sigs[port]));
+             });
+     },
+     _setInput(sig, port) {
++        if (this._isForced(port))
++            this._connected[port] = sig;
+         const signals = joint.util.clone(this.get('inputSignals'));
+-        signals[port] = sig;
++        signals[port] = this._forcedSignal(port, sig);
+         this.set('inputSignals', signals);
+     },
++    _isForced(port) {
++        return Boolean(this._forced && port in this._forced);
++    },
++    _forcedSignal(port, sig) {
++        if (!this._isForced(port)) return sig;
++        const { value, mask } = this._forced[port];
++        return value.and(mask).or(sig.and(mask.not()));
++    },
++    _shownSignal(port) {
++        if (this.getPort(port).dir == 'in')
++            return this.get('inputSignals')[port];
++        return this._forcedSignal(port, this.get('outputSignals')[port]);
++    },
++    _setForce(port, force) {
++        if (!this._forced) {
++            this._forced = Object.create(null);
++            this._connected = Object.create(null);
++        }
++        const connected = this._isForced(port) ? this._connected[port] : this.get('inputSignals')[port];
++        delete this._forced[port];
++        delete this._connected[port];
++        if (force) this._forced[port] = force;
++        if (this.getPort(port).dir == 'out')
++            this._changeOutputSignals(this.get('outputSignals'));
++        else
++            this._setInput(connected, port);
++    },
+     _clearInput(port) {
+         const bits = this.getPort(port).bits;
+         this._setInput(Vector3vl.xes(bits), port);
+@@ -439,7 +469,7 @@ export const Wire = joint.shapes.standard.Link.define('Wire', {
+             this.set('bits', source.getPort(src.port).bits);
+             this._checkConnection();
+             //set signal after checking connection to avoid false signal propagation
+-            this.set('signal', source.get('outputSignals')[src.port]);
++            this.set('signal', source._forcedSignal(src.port, source.get('outputSignals')[src.port]));
+         } else {
+             this.set('signal', Vector3vl.xes(this.get('bits')));
+         }
+diff --git a/src/circuit.mjs b/src/circuit.mjs
+index 0692a9d..f1bca0a 100644
+--- a/src/circuit.mjs
++++ b/src/circuit.mjs
+@@ -232,6 +232,28 @@ export class HeadlessCircuit {
+         if (cell.isOutput) return cell.getOutput();
+         else throw new Error('Invalid call to getOutput');
+     }
++    force(cell, target, value, mask) {
++        const selected = mask || Vector3vl.ones(value.bits);
++        const prev = this._forceRecord(cell, target);
++        this._setForce(cell, target, {
++            value: prev ? value.and(selected).or(prev.value.and(selected.not())) : value,
++            mask: prev ? prev.mask.or(selected) : selected
++        });
++    }
++    release(cell, target, mask) {
++        const prev = this._forceRecord(cell, target);
++        if (!prev) return;
++        this._setForce(cell, target, mask && { value: prev.value, mask: prev.mask.and(mask.not()) });
++    }
++    _forceRecord(cell, target) {
++        return cell._isForced(target) ? cell._forced[target] : undefined;
++    }
++    _setForce(cell, target, force) {
++        if (force && force.mask.isLow) force = undefined;
++        const before = cell._shownSignal(target);
++        cell._setForce(target, force);
++        this._engine.forcePort(cell, target, force, before, cell._shownSignal(target));
++    }
+     makeLabelIndex() {
+         // TODO: update label index on changes
+         if (this._labelIndex) return this._labelIndex;
+diff --git a/src/engines/base.mjs b/src/engines/base.mjs
+index 2f954ff..2578404 100644
+--- a/src/engines/base.mjs
++++ b/src/engines/base.mjs
+@@ -50,6 +50,8 @@ export class BaseEngine {
+     }
+     _changeLinkWarning(graph, link, warn, prevWarn) {
+     }
++    forcePort(gate, port, force, before, after) {
++    }
+ };
+ 
+ util.assign(BaseEngine.prototype, mvc.Events);
+diff --git a/src/engines/synch.mjs b/src/engines/synch.mjs
+index dfc502f..303b1b8 100644
+--- a/src/engines/synch.mjs
++++ b/src/engines/synch.mjs
+@@ -12,6 +12,7 @@ export class SynchEngine extends BaseEngine {
+         this._tick = 0;
+         this._cells = cells;
+         this._monitorChecks = new Map();
++        this._monitors = new Map();
+         this._alarms = new Map();
+         this._alarmQueue = new Map();
+         this._addGraph(graph);
+@@ -144,17 +145,28 @@ export class SynchEngine extends BaseEngine {
+     unobserveGraph(graph) {
+     }
+     monitor(gate, port, callback, {triggerValues, stopOnTrigger, oneShot}) {
+-        const cb = (gate, sigs) => {
+-            const sig = sigs[port];
+-            this._monitorChecks.set(cb, {gate, sig, cb, callback, triggerValues, stopOnTrigger, oneShot});
++        const monitor = {gate, port, callback, triggerValues, stopOnTrigger, oneShot};
++        const cb = monitor.cb = (gate, sigs) => {
++            const sig = gate._forcedSignal(port, sigs[port]);
++            if (gate._isForced(port) && sig.eq(gate._forcedSignal(port, gate.previous('outputSignals')[port])))
++                return;
++            this._monitorChecks.set(cb, {...monitor, sig});
+         };
++        this._monitors.set(cb, monitor);
+         gate.on('change:outputSignals', cb);
+         if (triggerValues == undefined)
+-            callback(this._tick, gate.get('outputSignals')[port]);
++            callback(this._tick, gate._shownSignal(port));
+         return { gate: gate, callback: cb };
+     }
+     unmonitor(monitorId) {
+         monitorId.gate.off('change:outputSignals', monitorId.callback);
++        this._monitors.delete(monitorId.callback);
++    }
++    forcePort(gate, port, force, before, after) {
++        if (gate.getPort(port).dir != 'out' || after.eq(before)) return;
++        for (const monitor of this._monitors.values())
++            if (monitor.gate == gate && monitor.port == port)
++                this._monitorChecks.set(monitor.cb, {...monitor, sig: after});
+     }
+     alarm(tick, callback, {stopOnAlarm}) {
+         console.assert(tick > this._tick);
+@@ -184,7 +196,10 @@ export class SynchEngine extends BaseEngine {
+             if (triggerValues != undefined)
+                 triggered = triggerValues.some((triggerValue) => sig.eq(triggerValue));
+             if (triggered) {
+-                if (oneShot) gate.off('change:outputSignals', cb);
++                if (oneShot) {
++                    gate.off('change:outputSignals', cb);
++                    this._monitors.delete(cb);
++                }
+                 const ret = callback(this._tick, sig);
+                 if (ret && stopOnTrigger) this.stop();
+             }
+diff --git a/src/engines/worker-worker.mjs b/src/engines/worker-worker.mjs
+index ec31c21..27de312 100644
+--- a/src/engines/worker-worker.mjs
++++ b/src/engines/worker-worker.mjs
+@@ -31,6 +31,8 @@ class Gate {
+         this._presentationParams = cell._presentationParams;
+         this._presentationParamChanged = Object.create(null);
+         this._monitors = Object.create(null);
++        this._forced = Object.create(null);
++        this._connected = Object.create(null);
+         this._ports = Object.create(null);
+         for (const port of ports) {
+             this._ports[port.id] = port;
+@@ -250,7 +252,7 @@ class WorkerEngineWorker {
+         graph.addLink(linkId, source, target);
+         const sourceGate = graph.getGate(source.id);
+         const targetGate = graph.getGate(target.id);
+-        const sig = sourceGate.get('outputSignals')[source.port];
++        const sig = this._forcedSignal(sourceGate, source.port, sourceGate.get('outputSignals')[source.port]);
+         this._setGateInputSignal(targetGate, target.port, sig);
+     }
+     addGate(graphId, gateId, gateParams, ports, inputSignals, outputSignals) {
+@@ -305,6 +307,24 @@ class WorkerEngineWorker {
+         const gate = this._graphs[graphId].getGate(gateId);
+         gate.set(paramName, val);
+     }
++    forcePort(graphId, gateId, port, value, mask) {
++        const gate = this._graphs[graphId].getGate(gateId);
++        const force = value && { value: Vector3vl.fromClonable(value), mask: Vector3vl.fromClonable(mask) };
++        if (gate.getPort(port).dir == 'out') {
++            const sig = gate.get('outputSignals')[port];
++            const before = this._forcedSignal(gate, port, sig);
++            delete gate._forced[port];
++            if (force) gate._forced[port] = force;
++            const after = this._forcedSignal(gate, port, sig);
++            if (!after.eq(before)) this._propagateOutput(gate, port, after);
++        } else {
++            const connected = port in gate._forced ? gate._connected[port] : gate.get('inputSignals')[port];
++            delete gate._forced[port];
++            delete gate._connected[port];
++            if (force) gate._forced[port] = force;
++            this._setGateInputSignal(gate, port, connected);
++        }
++    }
+     manualMemChange(graphId, gateId, addr, data) {
+         const gate = this._graphs[graphId].getGate(gateId);
+         gate.memdata.set(addr, Vector3vl.fromClonable(data));
+@@ -318,7 +338,7 @@ class WorkerEngineWorker {
+         this._monitors[monitorId] = { gate, port, triggerValues, stopOnTrigger, oneShot, synchronous };
+         gate.monitor(port, monitorId);
+         if (triggerValues == undefined)
+-            postMessage({ type: 'monitorValue', args: [monitorId, this._tick, gate.get('outputSignals')[port]] });
++            postMessage({ type: 'monitorValue', args: [monitorId, this._tick, this._forcedSignal(gate, port, gate.get('outputSignals')[port])] });
+     }
+     unmonitor(monitorId) {
+         const monitor = this._monitors[monitorId];
+@@ -394,6 +414,11 @@ class WorkerEngineWorker {
+         if (sig.eq(oldOutput)) return;
+         outputs[port] = sig;
+         this._markUpdate(gate, port);
++        const shown = this._forcedSignal(gate, port, sig);
++        if (shown.eq(this._forcedSignal(gate, port, oldOutput))) return;
++        this._propagateOutput(gate, port, shown);
++    }
++    _propagateOutput(gate, port, sig) {
+         for (const target of gate.targets(port)) {
+             const targetGate = gate.graph.getGate(target.id);
+             this._setGateInputSignal(targetGate, target.port, sig);
+@@ -402,7 +427,16 @@ class WorkerEngineWorker {
+         for (const monitorId of monitors)
+             this._monitorChecks[monitorId] = sig;
+     }
++    _forcedSignal(gate, port, sig) {
++        if (!(port in gate._forced)) return sig;
++        const { value, mask } = gate._forced[port];
++        return value.and(mask).or(sig.and(mask.not()));
++    }
+     _setGateInputSignal(targetGate, port, sig) {
++        if (port in targetGate._forced) {
++            targetGate._connected[port] = sig;
++            sig = this._forcedSignal(targetGate, port, sig);
++        }
+         const inputs = targetGate.get('inputSignals');
+         const oldInput = inputs[port];
+         if (sig.eq(oldInput)) return;
+diff --git a/src/engines/worker.mjs b/src/engines/worker.mjs
+index 35d0726..4aea937 100644
+--- a/src/engines/worker.mjs
++++ b/src/engines/worker.mjs
+@@ -200,6 +200,10 @@ export class WorkerEngine extends BaseEngine {
+         this._worker.postMessage({ type: 'unalarm', arg: alarmId });
+         delete this._alarms[alarmId];
+     }
++    forcePort(gate, port, force) {
++        const args = force ? [force.value, force.mask] : [];
++        this._worker.postMessage({ type: 'forcePort', args: [gate.graph.cid, gate.id, port, ...args] });
++    }
+     _handleMessage(msg) {
+         const name = '_handle_' + msg.type;
+         if ('arg' in msg)

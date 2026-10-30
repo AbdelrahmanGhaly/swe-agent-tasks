@@ -1,0 +1,1654 @@
+diff --git a/integration/backup_7235f9/backup_7235f9_test.go b/integration/backup_7235f9/backup_7235f9_test.go
+new file mode 100644
+index 0000000..263f500
+--- /dev/null
++++ b/integration/backup_7235f9/backup_7235f9_test.go
+@@ -0,0 +1,1464 @@
++//go:build linux
++
++package backup_test
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"io"
++	"io/fs"
++	"log"
++	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"slices"
++	"sort"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/gokrazy/rsync/internal/rsynctest"
++	"github.com/gokrazy/rsync/rsynccmd"
++	"github.com/gokrazy/rsync/rsyncd"
++	"github.com/google/go-cmp/cmp"
++	"golang.org/x/sys/unix"
++)
++
++func TestMain(m *testing.M) {
++	if err := rsynctest.CommandMain(m); err != nil {
++		log.Fatal(err)
++	}
++}
++
++type node struct {
++	path  string
++	kind  byte // 'd' directory, 'f' file, 'l' symlink, 'p' FIFO, 'c' or 'b' device, 'h' hard link to data
++	perm  fs.FileMode
++	mtime int64
++	data  string
++	rdev  uint64
++}
++
++func setTime(t *testing.T, path string, mtime int64) {
++	t.Helper()
++	ts := []unix.Timespec{unix.NsecToTimespec(mtime * 1e9), unix.NsecToTimespec(mtime * 1e9)}
++	if err := unix.UtimesNanoAt(unix.AT_FDCWD, path, ts, unix.AT_SYMLINK_NOFOLLOW); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func build(t *testing.T, root string, nodes []node) {
++	t.Helper()
++	if err := os.MkdirAll(root, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	var dirs []node
++	for _, n := range nodes {
++		p := filepath.Join(root, n.path)
++		if n.kind == 'd' {
++			if err := os.MkdirAll(p, 0o755); err != nil {
++				t.Fatal(err)
++			}
++			dirs = append(dirs, n)
++			continue
++		}
++		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		var err error
++		switch n.kind {
++		case 'f':
++			err = os.WriteFile(p, []byte(n.data), 0o600)
++			if err == nil {
++				err = os.Chmod(p, n.perm)
++			}
++		case 'l':
++			err = os.Symlink(n.data, p)
++		case 'p':
++			err = unix.Mkfifo(p, 0o600)
++			if err == nil {
++				err = os.Chmod(p, n.perm)
++			}
++		case 'c', 'b':
++			mode := uint32(unix.S_IFCHR)
++			if n.kind == 'b' {
++				mode = unix.S_IFBLK
++			}
++			err = unix.Mknod(p, mode|0o600, int(n.rdev))
++			if errors.Is(err, unix.EPERM) {
++				// Creating a device needs CAP_MKNOD: without it, the tree
++				// has no devices.
++				continue
++			}
++			if err == nil {
++				err = os.Chmod(p, n.perm)
++			}
++		case 'h':
++			if err := os.Link(filepath.Join(root, n.data), p); err != nil {
++				t.Fatal(err)
++			}
++			continue
++		}
++		if err != nil {
++			t.Fatal(err)
++		}
++		setTime(t, p, n.mtime)
++	}
++	sort.SliceStable(dirs, func(i, j int) bool {
++		return strings.Count(dirs[i].path, "/") > strings.Count(dirs[j].path, "/")
++	})
++	for _, d := range dirs {
++		p := filepath.Join(root, d.path)
++		if err := os.Chmod(p, d.perm); err != nil {
++			t.Fatal(err)
++		}
++		setTime(t, p, d.mtime)
++	}
++}
++
++func copyTree(t *testing.T, src, dst string) {
++	t.Helper()
++	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if out, err := exec.Command("cp", "-a", src, dst).CombinedOutput(); err != nil {
++		t.Fatalf("cp -a %s %s: %v\n%s", src, dst, err, out)
++	}
++}
++
++type entry struct {
++	Kind   string
++	Mode   fs.FileMode
++	Size   int64
++	Sum    string
++	Target string
++	MTime  int64
++	Links  uint64
++	Uid    uint32
++	Gid    uint32
++	Rdev   uint64
++}
++
++func snapshot(t *testing.T, dir string, withRoot bool) map[string]entry {
++	t.Helper()
++	m := make(map[string]entry)
++	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		rel, err := filepath.Rel(dir, path)
++		if err != nil {
++			return err
++		}
++		if rel == "." && !withRoot {
++			return nil
++		}
++		info, err := os.Lstat(path)
++		if err != nil {
++			return err
++		}
++		st := info.Sys().(*syscall.Stat_t)
++		e := entry{
++			Mode:  info.Mode() & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky),
++			MTime: info.ModTime().Unix(),
++			Links: uint64(st.Nlink),
++			Uid:   st.Uid,
++			Gid:   st.Gid,
++		}
++		switch {
++		case info.IsDir():
++			e.Kind = "dir"
++			e.Links = 0
++		case info.Mode().IsRegular():
++			e.Kind = "file"
++			data, err := os.ReadFile(path)
++			if err != nil {
++				return err
++			}
++			sum := sha256.Sum256(data)
++			e.Size = int64(len(data))
++			e.Sum = hex.EncodeToString(sum[:8])
++		case info.Mode()&fs.ModeSymlink != 0:
++			e.Kind = "symlink"
++			e.Mode = 0
++			target, err := os.Readlink(path)
++			if err != nil {
++				return err
++			}
++			e.Target = target
++		case info.Mode()&fs.ModeNamedPipe != 0:
++			e.Kind = "fifo"
++		case info.Mode()&fs.ModeDevice != 0:
++			e.Kind = info.Mode().Type().String()
++			e.Rdev = uint64(st.Rdev)
++		default:
++			e.Kind = info.Mode().Type().String()
++		}
++		m[filepath.ToSlash(rel)] = e
++		return nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return m
++}
++
++// fileID identifies a file by its device and inode number.
++type fileID struct{ dev, ino uint64 }
++
++// inodes maps every entry below dir, and dir itself, to its device and inode
++// number.
++func inodes(t *testing.T, dir string) map[string]fileID {
++	t.Helper()
++	m := make(map[string]fileID)
++	if _, err := os.Stat(dir); os.IsNotExist(err) {
++		return m
++	}
++	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		info, err := os.Lstat(path)
++		if err != nil {
++			return err
++		}
++		rel, err := filepath.Rel(dir, path)
++		if err != nil {
++			return err
++		}
++		st := info.Sys().(*syscall.Stat_t)
++		m[filepath.ToSlash(rel)] = fileID{uint64(st.Dev), st.Ino}
++		return nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return m
++}
++
++// linkGroups maps every entry below dir that shares its inode with other
++// entries below dir or below prev (named "prev/..." then) to those entries.
++func linkGroups(t *testing.T, dir, prev string) map[string][]string {
++	t.Helper()
++	byID := make(map[fileID][]string)
++	for name, id := range inodes(t, dir) {
++		byID[id] = append(byID[id], name)
++	}
++	if prev != "" {
++		for name, id := range inodes(t, prev) {
++			byID[id] = append(byID[id], "prev/"+name)
++		}
++	}
++	m := make(map[string][]string)
++	for _, names := range byID {
++		if len(names) < 2 {
++			continue
++		}
++		sort.Strings(names)
++		for _, name := range names {
++			if strings.HasPrefix(name, "prev/") {
++				continue
++			}
++			var others []string
++			for _, other := range names {
++				if other != name {
++					others = append(others, other)
++				}
++			}
++			m[name] = others
++		}
++	}
++	return m
++}
++
++// untouched returns the entries below dir that still have the inode they had
++// before the transfer.
++func untouched(t *testing.T, dir string, before map[string]fileID) []string {
++	t.Helper()
++	var names []string
++	for name, id := range inodes(t, dir) {
++		if prior, ok := before[name]; ok && prior == id {
++			names = append(names, name)
++		}
++	}
++	sort.Strings(names)
++	return names
++}
++
++type harness struct {
++	root      string
++	rsync     string
++	exe       string
++	stockAddr string
++	gokrAddr  string
++}
++
++// startDaemon serves rsync's daemon on ip until the test ends. Every
++// connection gets its own rsync, started the way inetd starts it, with the
++// connection as standard input.
++func startDaemon(t *testing.T, rsync, conf, ip string) string {
++	t.Helper()
++	ln, err := net.Listen("tcp", ip+":0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var (
++		mu      sync.Mutex
++		running = make(map[*exec.Cmd]bool)
++		wg      sync.WaitGroup
++	)
++	t.Cleanup(func() {
++		ln.Close()
++		mu.Lock()
++		for cmd := range running {
++			cmd.Process.Kill()
++		}
++		mu.Unlock()
++		wg.Wait()
++	})
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for {
++			conn, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			f, err := conn.(*net.TCPConn).File()
++			conn.Close()
++			if err != nil {
++				continue
++			}
++			cmd := exec.Command(rsync, "--daemon", "--config="+conf)
++			cmd.Stdin = f
++			err = cmd.Start()
++			f.Close()
++			if err != nil {
++				continue
++			}
++			mu.Lock()
++			running[cmd] = true
++			mu.Unlock()
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				cmd.Wait()
++				mu.Lock()
++				delete(running, cmd)
++				mu.Unlock()
++			}()
++		}
++	}()
++	return ln.Addr().String()
++}
++
++// newHarness starts an rsync daemon on ip (each test uses its own loopback
++// address) and a gokr-rsync daemon, both serving the module "t" from a new
++// temporary directory. rsync's daemon also serves its src directory as the
++// module "src".
++func newHarness(t *testing.T, ip string) *harness {
++	t.Helper()
++	h := &harness{
++		root:  t.TempDir(),
++		rsync: rsynctest.TridgeOrGTFO(t, "rsync 3.2.7 is the reference implementation"),
++	}
++	if out, err := exec.Command(h.rsync, "--version").Output(); err != nil || !strings.Contains(string(out), " version 3.2.7 ") {
++		t.Fatalf("%s is not rsync 3.2.7, the reference implementation: %v\n%s", h.rsync, err, out)
++	}
++	exe, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	h.exe = exe
++
++	conf := filepath.Join(t.TempDir(), "rsyncd.conf")
++	stockConfig := "use chroot = false\nmunge symlinks = false\nlog file = " + filepath.Join(filepath.Dir(conf), "rsyncd.log") + "\n" +
++		"[t]\npath = " + h.root + "\nread only = false\n"
++	if os.Getuid() == 0 {
++		stockConfig += "uid = 0\ngid = 0\n"
++	}
++	stockConfig += "[src]\npath = " + h.abs("src") + "\n"
++	if os.Getuid() == 0 {
++		stockConfig += "uid = 0\ngid = 0\n"
++	}
++	if err := os.WriteFile(conf, []byte(stockConfig), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	h.stockAddr = startDaemon(t, h.rsync, conf, ip)
++	h.gokrAddr = "127.0.0.1:" + rsynctest.New(t, []rsyncd.Module{{Name: "t", Path: h.root, Writable: true}}).Port
++	return h
++}
++
++// abs returns rel relative to the harness root, or rel itself if it is
++// absolute.
++func (h *harness) abs(rel string) string {
++	if filepath.IsAbs(rel) {
++		return rel
++	}
++	return filepath.Join(h.root, rel)
++}
++
++// otherFS returns a new directory on another file system than dir if /dev/shm
++// is one, and a new temporary directory otherwise.
++func otherFS(t *testing.T, dir string) string {
++	t.Helper()
++	if other, err := os.MkdirTemp("/dev/shm", "backup"); err == nil {
++		t.Cleanup(func() { os.RemoveAll(other) })
++		var a, b unix.Stat_t
++		if unix.Stat(other, &a) == nil && unix.Stat(dir, &b) == nil && a.Dev != b.Dev {
++			return other
++		}
++	}
++	return t.TempDir()
++}
++
++// local turns a source argument (relative to the harness root) into an
++// absolute path that names the same files, for a sender that does not run in
++// the harness root. With -R, the /./ keeps the names the relative argument has.
++func (h *harness) local(arg string) string {
++	if strings.Contains(arg, "/./") {
++		return h.root + "/" + arg
++	}
++	return h.root + "/./" + arg
++}
++
++// sources returns the source arguments for a gokr-rsync client: as given (a
++// relative one names files below the harness root, the client's working
++// directory) for a transfer with asGiven, and as absolute paths otherwise.
++func (h *harness) sources(x transfer) []string {
++	if x.asGiven {
++		return x.args
++	}
++	var src []string
++	for _, arg := range x.args {
++		src = append(src, h.local(arg))
++	}
++	return src
++}
++
++// shell writes a remote shell that runs the command in the harness root, like
++// ssh would run it in the home directory, and returns the command that starts
++// it. The script is run by sh rather than executed directly: executing a file
++// that was just written fails with ETXTBSY if another test forks at the same
++// time. For a restricted transfer, the command gets a TMPDIR of its own (see
++// runRestricted).
++func (h *harness) shell(t *testing.T, x transfer) string {
++	t.Helper()
++	run := "exec sh -c \"$*\"\n"
++	if x.restricted {
++		run = "TMPDIR='" + t.TempDir() + "'\nexport TMPDIR\n" + run
++	}
++	return h.writeShell(t, run)
++}
++
++// clientShell is like shell, for gokr-rsync clients: it keeps running until
++// the client closes its end, so that the client reads everything the command
++// wrote before the remote shell exits. rsync leaves the connection in
++// non-blocking mode, so cat is retried until it reaches the end.
++func (h *harness) clientShell(t *testing.T) string {
++	t.Helper()
++	return h.writeShell(t, "sh -c \"$*\"\nstatus=$?\nuntil cat >/dev/null 2>&1; do sleep 0.01; done\nexit $status\n")
++}
++
++func (h *harness) writeShell(t *testing.T, run string) string {
++	t.Helper()
++	f, err := os.CreateTemp(t.TempDir(), "shell")
++	if err != nil {
++		t.Fatal(err)
++	}
++	script := "#!/bin/sh\nshift\ncd '" + h.root + "' || exit 1\n" + run
++	if _, err := f.WriteString(script); err != nil {
++		t.Fatal(err)
++	}
++	if err := f.Close(); err != nil {
++		t.Fatal(err)
++	}
++	return "sh " + f.Name()
++}
++
++// gokrRemote is the rsync-path that starts gokr-rsync on the other end of the
++// remote shell.
++func (h *harness) gokrRemote() string {
++	return h.exe + " localhost gokr-rsync"
++}
++
++// transferTimeout bounds each transfer (they take well under a second), so
++// that a hanging transfer fails its own test instead of the whole test binary.
++const transferTimeout = time.Minute
++
++type nopCloser struct{ io.Writer }
++
++func (nopCloser) Close() error { return nil }
++
++// syncBuffer is a bytes.Buffer that can be written to while another
++// goroutine reads it after a timeout.
++type syncBuffer struct {
++	mu  sync.Mutex
++	buf bytes.Buffer
++}
++
++func (b *syncBuffer) Write(p []byte) (int, error) {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.buf.Write(p)
++}
++
++func (b *syncBuffer) String() string {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	return b.buf.String()
++}
++
++// runGokr runs gokr-rsync in the test process without restricting its file
++// system access, or as a command of its own in the harness root: a restricted
++// transfer, and a relative one, whose source arguments are relative to the
++// working directory.
++func (h *harness) runGokr(t *testing.T, x transfer, args ...string) {
++	t.Helper()
++	if x.restricted {
++		h.runRestricted(t, args...)
++		return
++	}
++	if x.asGiven {
++		// The rule the test hook adds for the temporary directory covers
++		// the harness root, so the command is not restricted in effect.
++		h.runCommand(t, os.Environ(), args...)
++		return
++	}
++	var out syncBuffer
++	cmd := rsynccmd.Command("gokr-rsync", args...)
++	cmd.Stdout = nopCloser{&out}
++	cmd.Stderr = nopCloser{&out}
++	cmd.DontRestrict = true
++	done := make(chan error, 1)
++	go func() {
++		_, err := cmd.Run(context.Background())
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatalf("gokr-rsync %q: %v\n%s", args, err, out.String())
++		}
++	case <-time.After(transferTimeout):
++		t.Fatalf("gokr-rsync %q did not finish within %v\n%s", args, transferTimeout, out.String())
++	}
++}
++
++// runRestricted runs gokr-rsync as a command of its own, which restricts its
++// file system access like a normal invocation does (Landlock on Linux). Its
++// TMPDIR is a new directory, so that the rule the test hook adds for the
++// temporary directory does not cover the transfer.
++func (h *harness) runRestricted(t *testing.T, args ...string) {
++	t.Helper()
++	h.runCommand(t, append(os.Environ(), "TMPDIR="+t.TempDir()), args...)
++}
++
++// runCommand runs gokr-rsync as a command of its own in the harness root, with
++// the environment env.
++func (h *harness) runCommand(t *testing.T, env []string, args ...string) {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), transferTimeout)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, h.exe, append([]string{"localhost", "gokr-rsync"}, args...)...)
++	cmd.Dir = h.root
++	cmd.Env = env
++	cmd.WaitDelay = 5 * time.Second
++	if out, err := cmd.CombinedOutput(); err != nil {
++		t.Fatalf("gokr-rsync %q: %v\n%s", args, err, out)
++	}
++}
++
++// runRsync runs rsync in the harness root.
++func (h *harness) runRsync(t *testing.T, args ...string) {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), transferTimeout)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, h.rsync, args...)
++	cmd.Dir = h.root
++	cmd.WaitDelay = 5 * time.Second
++	out, err := cmd.CombinedOutput()
++	if err != nil {
++		t.Fatalf("rsync %q: %v\n%s", args, err, out)
++	}
++}
++
++// runRsyncMayFail is runRsync for a transfer that may end with an error: only
++// the destination it leaves behind is compared.
++func (h *harness) runRsyncMayFail(t *testing.T, args ...string) {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), transferTimeout)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, h.rsync, args...)
++	cmd.Dir = h.root
++	cmd.WaitDelay = 5 * time.Second
++	out, err := cmd.CombinedOutput()
++	var exit *exec.ExitError
++	if err != nil && (!errors.As(err, &exit) || ctx.Err() != nil) {
++		t.Fatalf("rsync %q: %v\n%s", args, err, out)
++	}
++}
++
++// transfer describes one run: source arguments as a local rsync started in the
++// harness root gets them, and the destination, relative to the harness root.
++// With srcModule, rsync's daemon sends the source from its module "src"; with
++// restricted, gokr-rsync restricts its file system access; with asGiven, the
++// gokr-rsync clients get the source arguments as given.
++type transfer struct {
++	opts       []string
++	args       []string
++	dst        string
++	srcModule  bool
++	restricted bool
++	asGiven    bool
++}
++
++type role struct {
++	name string
++	// pullsOneSource is set for roles in which gokr-rsync is the client of a
++	// remote sender, which gokr-rsync only asks for its first source.
++	pullsOneSource bool
++	run            func(t *testing.T, h *harness, x transfer)
++}
++
++func prefixed(prefix string, args []string) []string {
++	var out []string
++	for _, arg := range args {
++		out = append(out, prefix+arg)
++	}
++	return out
++}
++
++var roles = []role{
++	{
++		name: "gokr-client-push-shell",
++		run: func(t *testing.T, h *harness, x transfer) {
++			src := h.sources(x)
++			args := append(append(append([]string{}, x.opts...), "-e", h.clientShell(t)), src...)
++			h.runGokr(t, x, append(args, "localhost:"+h.abs(x.dst)+"/")...)
++		},
++	},
++	{
++		name:           "gokr-client-pull-shell",
++		pullsOneSource: true,
++		run: func(t *testing.T, h *harness, x transfer) {
++			args := append(append([]string{}, x.opts...), "-e", h.clientShell(t), "localhost:"+x.args[0], h.abs(x.dst)+"/")
++			h.runGokr(t, x, args...)
++		},
++	},
++	{
++		name: "gokr-server-receive-shell",
++		run: func(t *testing.T, h *harness, x transfer) {
++			args := append(append(append([]string{}, x.opts...), "-e", h.shell(t, x), "--rsync-path="+h.gokrRemote()), x.args...)
++			h.runRsync(t, append(args, "localhost:"+h.abs(x.dst)+"/")...)
++		},
++	},
++	{
++		name: "gokr-server-send-shell",
++		run: func(t *testing.T, h *harness, x transfer) {
++			args := append(append(append([]string{}, x.opts...), "-e", h.shell(t, x), "--rsync-path="+h.gokrRemote()), prefixed("localhost:", x.args)...)
++			h.runRsync(t, append(args, h.abs(x.dst)+"/")...)
++		},
++	},
++	{
++		name: "gokr-client-push-daemon",
++		run: func(t *testing.T, h *harness, x transfer) {
++			src := h.sources(x)
++			args := append(append([]string{}, x.opts...), src...)
++			h.runGokr(t, x, append(args, "rsync://"+h.stockAddr+"/t/"+x.dst+"/")...)
++		},
++	},
++	{
++		name:           "gokr-client-pull-daemon",
++		pullsOneSource: true,
++		run: func(t *testing.T, h *harness, x transfer) {
++			src := "rsync://" + h.stockAddr + "/t/" + x.args[0]
++			if x.srcModule {
++				src = "rsync://" + h.stockAddr + "/src/" + strings.TrimPrefix(x.args[0], "src/")
++			}
++			args := append(append([]string{}, x.opts...), src, h.abs(x.dst)+"/")
++			h.runGokr(t, x, args...)
++		},
++	},
++	{
++		name: "gokr-daemon-receive",
++		run: func(t *testing.T, h *harness, x transfer) {
++			args := append(append([]string{}, x.opts...), x.args...)
++			h.runRsync(t, append(args, "rsync://"+h.gokrAddr+"/t/"+x.dst+"/")...)
++		},
++	},
++	{
++		name: "gokr-daemon-send",
++		run: func(t *testing.T, h *harness, x transfer) {
++			args := append(append([]string{}, x.opts...), prefixed("rsync://"+h.gokrAddr+"/t/", x.args)...)
++			h.runRsync(t, append(args, h.abs(x.dst)+"/")...)
++		},
++	},
++	{
++		name: "gokr-local",
++		run: func(t *testing.T, h *harness, x transfer) {
++			src := h.sources(x)
++			args := append(append([]string{}, x.opts...), src...)
++			h.runGokr(t, x, append(args, h.abs(x.dst)+"/")...)
++		},
++	},
++}
++
++func rolesNamed(names ...string) []role {
++	var out []role
++	for _, name := range names {
++		for _, r := range roles {
++			if r.name == name {
++				out = append(out, r)
++			}
++		}
++	}
++	return out
++}
++
++// receivingRoles are the roles in which gokr-rsync builds the destination.
++func receivingRoles() []role {
++	return rolesNamed("gokr-client-pull-shell", "gokr-server-receive-shell", "gokr-client-pull-daemon", "gokr-daemon-receive", "gokr-local")
++}
++
++var optSets = [][]string{{"-a"}, {"-a", "-c"}}
++
++func optsName(opts []string) string {
++	return strings.ReplaceAll(strings.Join(opts, ""), "-", "")
++}
++
++// scenario is one transfer, run once by rsync talking to itself and once in
++// each role, starting from the same destination (and --link-dest directory).
++type scenario struct {
++	name string
++	opts []string // options besides the option set
++	args []string // source arguments (ROOT stands for the harness root)
++	pre  string   // directory holding the initial destination, if any
++	prev string   // directory holding the --link-dest directory, if any
++	root bool     // the destination root is part of the transfer
++	// noDaemonDest skips the roles in which a daemon receives: a daemon
++	// resolves --link-dest inside its module (an absolute path from the
++	// module root), so a path on the host, or one leading out of the
++	// destination, means something else there. TestLinkDestForwarded
++	// compares those roles with rsync's daemon.
++	noDaemonDest bool
++	// srcModule makes rsync's daemon send src/ from its module "src": without
++	// chroot, rsync 3.2.7's daemon does not find --files-from names in a
++	// directory below the module ("file has vanished").
++	srcModule bool
++	// noListForwarding skips the roles in which the client passes the
++	// --files-from list to a remote sender. There rsync passes comment lines
++	// on as names, unlike in a list it reads itself, and rejects the cleaned-up
++	// names a sender returns for .. entries.
++	noListForwarding bool
++	// onlyRoles limits the scenario to the named roles.
++	onlyRoles []string
++	// daemonReference makes the reference rsync talking to rsync's daemon,
++	// for options a daemon interprets in its module (MODPREV is the
++	// --link-dest directory as a path in the module).
++	daemonReference bool
++	// prevOtherFS puts the --link-dest directory on another file system
++	// than the destination, if there is one.
++	prevOtherFS bool
++	// restricted runs gokr-rsync with its file system access restricted.
++	restricted bool
++	// asGiven passes the source arguments to the gokr-rsync clients as
++	// given: a relative one is relative to their working directory (the
++	// harness root).
++	asGiven bool
++	// optSets replaces the option sets (-a and -a -c).
++	optSets [][]string
++}
++
++type side struct {
++	dst, prev string
++	before    map[string]fileID
++}
++
++func (h *harness) prepare(t *testing.T, sc scenario, dir string) side {
++	t.Helper()
++	s := side{dst: filepath.Join(dir, "dst")}
++	if sc.pre != "" {
++		copyTree(t, h.abs(sc.pre), h.abs(s.dst))
++	} else if err := os.MkdirAll(h.abs(s.dst), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if sc.prev != "" {
++		s.prev = filepath.Join(dir, "prev")
++		if sc.prevOtherFS {
++			s.prev = filepath.Join(otherFS(t, h.root), "prev")
++		}
++		copyTree(t, h.abs(sc.prev), h.abs(s.prev))
++	}
++	s.before = inodes(t, h.abs(s.dst))
++	return s
++}
++
++// options returns the options for one side, with PREV standing for the
++// absolute path of its --link-dest directory, MODPREV for that directory as a
++// path in the module, and MODUPPREV for the same with .. elements that would
++// climb above the module root.
++func (h *harness) options(opts []string, sc scenario, s side) []string {
++	out := append(append([]string{}, opts...), sc.opts...)
++	for i, o := range out {
++		o = strings.ReplaceAll(o, "MODUPPREV", "/../../../"+s.prev)
++		o = strings.ReplaceAll(o, "MODPREV", "/"+s.prev)
++		o = strings.ReplaceAll(o, "PREV", h.abs(s.prev))
++		out[i] = strings.ReplaceAll(o, "ROOT", h.root)
++	}
++	return out
++}
++
++// sourceArgs returns the source arguments of a scenario, with ROOT standing
++// for the harness root.
++func (h *harness) sourceArgs(sc scenario) []string {
++	var args []string
++	for _, arg := range sc.args {
++		args = append(args, strings.ReplaceAll(arg, "ROOT", h.root))
++	}
++	return args
++}
++
++// systemTimes leaves out the modification times of the system's temporary
++// directory and the directories leading to it, which -R recreates for an
++// absolute source below it: tests in other processes change them all the time.
++// The directories of the test below it keep their times.
++func systemTimes(m map[string]entry) map[string]entry {
++	tmp := strings.TrimPrefix(filepath.Clean(os.TempDir()), "/") + "/"
++	for name, e := range m {
++		if strings.HasPrefix(tmp, name+"/") {
++			e.MTime = 0
++			m[name] = e
++		}
++	}
++	return m
++}
++
++func (h *harness) check(t *testing.T, sc scenario, r role, opts []string) {
++	t.Helper()
++	base := filepath.Join("out", t.Name())
++
++	want := h.prepare(t, sc, filepath.Join(base, "want"))
++	wantDst := want.dst + "/"
++	if sc.daemonReference {
++		wantDst = "rsync://" + h.stockAddr + "/t/" + wantDst
++	}
++	args := h.sourceArgs(sc)
++	h.runRsync(t, append(append(append([]string{"--protocol=27"}, h.options(opts, sc, want)...), args...), wantDst)...)
++
++	got := h.prepare(t, sc, filepath.Join(base, "got"))
++	r.run(t, h, transfer{opts: h.options(opts, sc, got), args: args, dst: got.dst, srcModule: sc.srcModule, restricted: sc.restricted, asGiven: sc.asGiven})
++
++	if diff := cmp.Diff(systemTimes(snapshot(t, h.abs(want.dst), sc.root)), systemTimes(snapshot(t, h.abs(got.dst), sc.root))); diff != "" {
++		t.Errorf("destination differs from rsync 3.2.7 talking to itself: diff (-want +got):\n%s", diff)
++	}
++	wantPrev, gotPrev := "", ""
++	if sc.prev != "" {
++		wantPrev, gotPrev = h.abs(want.prev), h.abs(got.prev)
++	}
++	if diff := cmp.Diff(linkGroups(t, h.abs(want.dst), wantPrev), linkGroups(t, h.abs(got.dst), gotPrev)); diff != "" {
++		t.Errorf("hard links differ from rsync 3.2.7 talking to itself: diff (-want +got):\n%s", diff)
++	}
++	kept := untouched(t, h.abs(got.dst), got.before)
++	var replaced []string
++	for _, name := range untouched(t, h.abs(want.dst), want.before) {
++		if !slices.Contains(kept, name) {
++			replaced = append(replaced, name)
++		}
++	}
++	if len(replaced) > 0 {
++		t.Errorf("entries that rsync 3.2.7 talking to itself leaves untouched were replaced: %q", replaced)
++	}
++}
++
++func (h *harness) runAll(t *testing.T, scenarios []scenario, rs []role) {
++	for _, sc := range scenarios {
++		t.Run(sc.name, func(t *testing.T) {
++			t.Parallel()
++			for _, r := range rs {
++				if r.pullsOneSource && len(sc.args) > 1 {
++					continue
++				}
++				if sc.noDaemonDest && (r.name == "gokr-client-push-daemon" || r.name == "gokr-daemon-receive") {
++					continue
++				}
++				if sc.noListForwarding && slices.Contains([]string{"gokr-server-send-shell", "gokr-daemon-send", "gokr-client-pull-shell", "gokr-client-pull-daemon"}, r.name) {
++					continue
++				}
++				if sc.onlyRoles != nil && !slices.Contains(sc.onlyRoles, r.name) {
++					continue
++				}
++				sets := optSets
++				if sc.optSets != nil {
++					sets = sc.optSets
++				}
++				t.Run(r.name, func(t *testing.T) {
++					t.Parallel()
++					for _, opts := range sets {
++						t.Run(optsName(opts), func(t *testing.T) {
++							h.check(t, sc, r, opts)
++						})
++					}
++				})
++			}
++		})
++	}
++}
++
++func relativeTree() []node {
++	return []node{
++		{path: "src/a/b/c/f1.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "relative f1"},
++		{path: "src/a/b/c/sub/f2.txt", kind: 'f', perm: 0o600, mtime: 1577959200, data: "relative f2, a little longer"},
++		{path: "src/a/b/x.txt", kind: 'f', perm: 0o640 | fs.ModeSetuid, mtime: 1578045600, data: "relative x"},
++		{path: "src/a/b/lnk", kind: 'l', mtime: 1578045600, data: "x.txt"},
++		{path: "src/a/y.txt", kind: 'f', perm: 0o644 | fs.ModeSetgid, mtime: 1578132000, data: "relative y"},
++		{path: "src/a/b/c/sub", kind: 'd', perm: 0o750, mtime: 1557032705},
++		{path: "src/a/b/c", kind: 'd', perm: 0o755, mtime: 1554350644},
++		{path: "src/a/b", kind: 'd', perm: 0o711 | fs.ModeSetgid, mtime: 1551582183},
++		{path: "src/a", kind: 'd', perm: 0o705 | fs.ModeSticky, mtime: 1549072922},
++		{path: "src", kind: 'd', perm: 0o751, mtime: 1546300800},
++	}
++}
++
++func TestRelative(t *testing.T) {
++	t.Parallel()
++	h := newHarness(t, "127.0.0.41")
++	build(t, h.root, append(relativeTree(),
++		node{path: "src/g/g.sh", kind: 'f', perm: 0o750 | fs.ModeSetgid, mtime: 1578218400, data: "setgid, group executable"},
++		node{path: "src/g", kind: 'd', perm: 0o755, mtime: 1546300800},
++		node{path: "src/f/node", kind: 'f', perm: 0o644, mtime: 1578304800, data: "a file named node"},
++		node{path: "src/d/node/child.txt", kind: 'f', perm: 0o644, mtime: 1578391200, data: "in the directory named node"},
++		node{path: "src/d/node", kind: 'd', perm: 0o750, mtime: 1546387200},
++		node{path: "src/d", kind: 'd', perm: 0o755, mtime: 1546473600},
++		node{path: "src/f", kind: 'd', perm: 0o755, mtime: 1546560000},
++	))
++	build(t, h.abs("pre/stale-parents"), []node{
++		{path: "src/a/b/c/extra.txt", kind: 'f', perm: 0o644, mtime: 1600000000, data: "extra"},
++		{path: "src/a/b/c", kind: 'd', perm: 0o700, mtime: 1600000000},
++		{path: "src/a/b", kind: 'd', perm: 0o777, mtime: 1600000000},
++		{path: "src/a", kind: 'd', perm: 0o700, mtime: 1600000000},
++		{path: "src", kind: 'd', perm: 0o755, mtime: 1600000000},
++	})
++	build(t, h.abs("pre/empty-dir"), []node{
++		{path: "src/a/b/c/sub", kind: 'd', perm: 0o700, mtime: 1600000000},
++	})
++	build(t, h.abs("pre/owner-changes"), []node{
++		{path: "src/a/b/x.txt", kind: 'f', perm: 0o640 | fs.ModeSetuid, mtime: 1578045600, data: "relative x"},
++	})
++	build(t, h.abs("pre/owner-changes-setgid"), []node{
++		{path: "src/g/g.sh", kind: 'f', perm: 0o750 | fs.ModeSetgid, mtime: 1578218400, data: "setgid, group executable"},
++	})
++	clients := []string{"gokr-client-push-shell", "gokr-client-push-daemon", "gokr-local"}
++	// The owner changes run with -a only: with -c the receiver reads the
++	// destination file first, and under gVisor a process that has had a file
++	// open can go on seeing its setuid and setgid bits after a chown cleared
++	// them, so a receiver that checks the mode after the chown, as rsync
++	// does, would sometimes leave them cleared.
++	archiveOnly := [][]string{{"-a"}}
++	// As root, the destination copies belong to uid 4242, so the receiver
++	// gives them the owner of the source, which clears their setuid and
++	// setgid bits. A receiver that is not root changes no owner, and neither
++	// does rsync: the copies then start without those bits, the way a chown
++	// leaves them. Either way the receiver has to set them again.
++	for _, f := range []struct {
++		path string
++		perm fs.FileMode
++	}{
++		{"pre/owner-changes/src/a/b/x.txt", 0o640 | fs.ModeSetuid},
++		{"pre/owner-changes-setgid/src/g/g.sh", 0o750 | fs.ModeSetgid},
++	} {
++		perm := f.perm.Perm()
++		if os.Getuid() == 0 {
++			if err := os.Lchown(h.abs(f.path), 4242, 4242); err != nil {
++				t.Fatal(err)
++			}
++			perm = f.perm
++		}
++		if err := os.Chmod(h.abs(f.path), perm); err != nil {
++			t.Fatal(err)
++		}
++	}
++	h.runAll(t, []scenario{
++		{name: "nested", opts: []string{"-R"}, args: []string{"src/a/b/c"}},
++		{name: "dot-dir", opts: []string{"-R"}, args: []string{"src/a/./b/c"}},
++		{name: "dot-dir-first", opts: []string{"-R"}, args: []string{"src/./a/b"}},
++		{name: "file", opts: []string{"-R"}, args: []string{"src/a/b/c/sub/f2.txt"}},
++		{name: "two-args", opts: []string{"-R"}, args: []string{"src/a/b/c", "src/a/y.txt"}},
++		{name: "nested-from-cwd", opts: []string{"-R"}, args: []string{"src/a/b/c"}, asGiven: true, onlyRoles: clients},
++		{name: "dot-dir-from-cwd", opts: []string{"-R"}, args: []string{"src/a/./b/c"}, asGiven: true, onlyRoles: clients},
++		{name: "two-args-from-cwd", opts: []string{"-R"}, args: []string{"src/a/b/c", "src/a/y.txt"}, asGiven: true, onlyRoles: clients},
++		{name: "absolute-path", opts: []string{"-R"}, args: []string{"ROOT/src/a/b/c"}, asGiven: true, onlyRoles: append(clients, "gokr-server-send-shell")},
++		{name: "overlap", opts: []string{"-R"}, args: []string{"src/a/b/c", "src/a/b"}},
++		{name: "file-then-dir", opts: []string{"-R"}, args: []string{"src/f/./node", "src/d/./node"}},
++		{name: "file-then-implied-dir", opts: []string{"-R"}, args: []string{"src/f/./node", "src/d/./node/child.txt"}},
++		{name: "stale-parents", opts: []string{"-R"}, args: []string{"src/a/b/c"}, pre: "pre/stale-parents"},
++		{name: "empty-dir", opts: []string{"-R"}, args: []string{"src/a/b/c"}, pre: "pre/empty-dir"},
++		{name: "owner-changes", opts: []string{"-R"}, args: []string{"src/a/b/x.txt"}, pre: "pre/owner-changes", optSets: archiveOnly},
++		{name: "owner-changes-setgid", opts: []string{"-R"}, args: []string{"src/g/g.sh"}, pre: "pre/owner-changes-setgid", optSets: archiveOnly},
++	}, roles)
++}
++
++func hardLinkTree() []node {
++	return []node{
++		{path: "src/a1", kind: 'f', perm: 0o644, mtime: 1577872800, data: "group a, shared by three names"},
++		{path: "src/a2", kind: 'h', data: "src/a1"},
++		{path: "src/sub/a3", kind: 'h', data: "src/a1"},
++		{path: "src/x1", kind: 'f', perm: 0o600, mtime: 1577959200, data: "group x"},
++		{path: "src/x2", kind: 'h', data: "src/x1"},
++		{path: "src/solo", kind: 'f', perm: 0o644, mtime: 1578045600, data: "not linked"},
++		{path: "src/z/z1", kind: 'f', perm: 0o640, mtime: 1578132000, data: "group z, in another directory"},
++		{path: "src/z/z2", kind: 'h', data: "src/z/z1"},
++		{path: "src/sub", kind: 'd', perm: 0o755, mtime: 1546300800},
++		{path: "src/z", kind: 'd', perm: 0o750, mtime: 1546387200},
++		{path: "src", kind: 'd', perm: 0o755, mtime: 1546473600},
++	}
++}
++
++func TestHardLinks(t *testing.T) {
++	t.Parallel()
++	h := newHarness(t, "127.0.0.42")
++	build(t, h.root, hardLinkTree())
++	pre := func(name string, nodes ...node) string {
++		build(t, h.abs(filepath.Join("pre", name)), nodes)
++		return filepath.Join("pre", name)
++	}
++	a := node{kind: 'f', perm: 0o644, mtime: 1577872800, data: "group a, shared by three names"}
++	x := node{kind: 'f', perm: 0o600, mtime: 1577959200, data: "group x"}
++	at := func(n node, path string) node {
++		n.path = path
++		return n
++	}
++	h.runAll(t, []scenario{
++		{name: "fresh", opts: []string{"-H"}, args: []string{"src/"}, root: true},
++		{name: "first-exists", opts: []string{"-H"}, args: []string{"src/"}, root: true,
++			pre: pre("first-exists", at(a, "a1"))},
++		{name: "middle-exists", opts: []string{"-H"}, args: []string{"src/"}, root: true,
++			pre: pre("middle-exists", at(a, "a2"))},
++		{name: "last-exists", opts: []string{"-H"}, args: []string{"src/"}, root: true,
++			pre: pre("last-exists", at(a, "sub/a3"))},
++		{name: "separate-copies", opts: []string{"-H"}, args: []string{"src/"}, root: true,
++			pre: pre("separate-copies", at(a, "a1"), at(a, "a2"), at(x, "x1"), at(x, "x2"))},
++		{name: "stale-member", opts: []string{"-H"}, args: []string{"src/"}, root: true,
++			pre: pre("stale-member",
++				node{path: "x1", kind: 'f', perm: 0o600, mtime: 1500000000, data: "old x"},
++				at(x, "x2"))},
++		{name: "wrong-link", opts: []string{"-H"}, args: []string{"src/"}, root: true,
++			pre: pre("wrong-link", at(a, "a2"), node{path: "x1", kind: 'h', data: "a2"})},
++		{name: "two-groups-exist", opts: []string{"-H"}, args: []string{"src/"}, root: true,
++			pre: pre("two-groups-exist", at(a, "sub/a3"), at(a, "a2"), at(x, "x2"))},
++		{name: "without-archive", opts: []string{"-H"}, args: []string{"src/"}, root: true,
++			pre: pre("without-archive", at(a, "a2"), at(x, "x1"), at(x, "x2")), optSets: [][]string{{"-rt"}, {"-rt", "-c"}}},
++		{name: "dir-in-the-way", opts: []string{"-H"}, args: []string{"src/"}, root: true,
++			pre: pre("dir-in-the-way",
++				node{path: "a1", kind: 'f', perm: 0o644, mtime: 1500000000, data: "old a"},
++				node{path: "a2", kind: 'd', perm: 0o755, mtime: 1500000000})},
++		{name: "dir-in-the-way-up-to-date", opts: []string{"-H"}, args: []string{"src/"}, root: true,
++			pre: pre("dir-in-the-way-up-to-date", at(a, "a1"),
++				node{path: "a2", kind: 'd', perm: 0o755, mtime: 1500000000})},
++	}, roles)
++}
++
++func linkDestTree() []node {
++	return []node{
++		{path: "src/same.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "same in both"},
++		{path: "src/mode.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "other mode in prev"},
++		{path: "src/mtime.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "other mtime in prev"},
++		{path: "src/edited.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "edited in the middle of the file, 1234567890"},
++		{path: "src/new.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "only in src"},
++		{path: "src/d/inner.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "inner, same in both"},
++		{path: "src/fifo", kind: 'p', perm: 0o644, mtime: 1577872800},
++		{path: "src/lnk", kind: 'l', mtime: 1577872800, data: "same.txt"},
++		{path: "src/other-lnk", kind: 'l', mtime: 1577872800, data: "new.txt"},
++		{path: "src/d", kind: 'd', perm: 0o755, mtime: 1546300800},
++		{path: "src", kind: 'd', perm: 0o755, mtime: 1546387200},
++	}
++}
++
++// noBasisTree is linkDestTree without the files that rsync transfers against a
++// basis file in the --link-dest directory, under rel/: rsync 3.2.7 discards
++// such a file ("failed verification") when the directory is given as ../prev
++// and it transfers deltas, as it does between hosts.
++func noBasisTree() []node {
++	var nodes []node
++	for _, n := range linkDestTree() {
++		if n.path == "src/mtime.txt" || n.path == "src/edited.txt" {
++			continue
++		}
++		n.path = "rel" + strings.TrimPrefix(n.path, "src")
++		nodes = append(nodes, n)
++	}
++	return nodes
++}
++
++func prevTree() []node {
++	return []node{
++		{path: "same.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "same in both"},
++		{path: "mode.txt", kind: 'f', perm: 0o600, mtime: 1577872800, data: "other mode in prev"},
++		{path: "mtime.txt", kind: 'f', perm: 0o644, mtime: 1500000000, data: "other mtime in prev"},
++		{path: "edited.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "edited in the MIDDLE of the file, 1234567890"},
++		{path: "only-prev.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "only in prev"},
++		{path: "d/inner.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "inner, same in both"},
++		{path: "fifo", kind: 'p', perm: 0o644, mtime: 1577872800},
++		{path: "lnk", kind: 'l', mtime: 1577872800, data: "same.txt"},
++		{path: "other-lnk", kind: 'l', mtime: 1500000000, data: "new.txt"},
++		{path: "d", kind: 'd', perm: 0o700, mtime: 1500000000},
++	}
++}
++
++func TestLinkDest(t *testing.T) {
++	t.Parallel()
++	h := newHarness(t, "127.0.0.43")
++	build(t, h.root, append(linkDestTree(), noBasisTree()...))
++	build(t, h.abs("prev"), prevTree())
++	existing := []node{
++		{path: "same.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "same in both"},
++		{path: "new.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "only in src"},
++		{path: "mtime.txt", kind: 'f', perm: 0o644, mtime: 1500000000, data: "stale"},
++	}
++	build(t, h.abs("pre/existing"), existing)
++	build(t, h.abs("pre/inside/prev"), prevTree())
++	build(t, h.abs("pre/inside-existing/prev"), prevTree())
++	build(t, h.abs("pre/inside-existing"), existing)
++	build(t, h.abs("regular"), []node{
++		{path: "same.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "same in both"},
++		{path: "mode.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "other mode in prev"},
++		{path: "mtime.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "other mtime in prev"},
++		{path: "edited.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "edited in the middle of the file, 1234567890"},
++		{path: "new.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "only in src"},
++		{path: "d/inner.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "inner, same in both"},
++		{path: "d", kind: 'd', perm: 0o755, mtime: 1546300800},
++	})
++	build(t, h.abs("pre/inside-mismatch/prev"), prevTree())
++	build(t, h.abs("pre/inside-mismatch"), []node{
++		{path: "lnk", kind: 'l', mtime: 1577872800, data: "x.txt"},
++		{path: "fifo", kind: 'p', perm: 0o600, mtime: 1500000000},
++	})
++	build(t, h.abs("pre/inside-linked/prev"), prevTree())
++	build(t, h.abs("pre/inside-linked"), []node{
++		{path: "same.txt", kind: 'h', data: "prev/same.txt"},
++		{path: "mode.txt", kind: 'h', data: "prev/mode.txt"},
++		{path: "mtime.txt", kind: 'h', data: "prev/mtime.txt"},
++		{path: "d/inner.txt", kind: 'h', data: "prev/d/inner.txt"},
++	})
++	if os.Getuid() == 0 {
++		if err := os.Lchown(h.abs("pre/inside-linked/prev/d/inner.txt"), 4242, 4242); err != nil {
++			t.Fatal(err)
++		}
++	}
++	build(t, h.abs("devsrc"), []node{
++		{path: "same-b", kind: 'b', perm: 0o660, mtime: 1577872800, rdev: unix.Mkdev(7, 4)},
++		{path: "rdev-c", kind: 'c', perm: 0o600, mtime: 1577872800, rdev: unix.Mkdev(1, 5)},
++		{path: "rdev-b", kind: 'b', perm: 0o660, mtime: 1577872800, rdev: unix.Mkdev(7, 0)},
++		{path: "linked-b", kind: 'b', perm: 0o660, mtime: 1577872800, rdev: unix.Mkdev(7, 2)},
++		{path: "kind-b", kind: 'b', perm: 0o660, mtime: 1577872800, rdev: unix.Mkdev(7, 5)},
++	})
++	build(t, h.abs("pre/devices/prev"), []node{
++		{path: "linked-b", kind: 'b', perm: 0o660, mtime: 1577872800, rdev: unix.Mkdev(7, 2)},
++	})
++	build(t, h.abs("pre/devices"), []node{
++		{path: "same-b", kind: 'b', perm: 0o660, mtime: 1577872800, rdev: unix.Mkdev(7, 4)},
++		{path: "rdev-c", kind: 'c', perm: 0o600, mtime: 1577872800, rdev: unix.Mkdev(1, 3)},
++		{path: "rdev-b", kind: 'b', perm: 0o660, mtime: 1577872800, rdev: unix.Mkdev(7, 3)},
++		{path: "kind-b", kind: 'c', perm: 0o660, mtime: 1577872800, rdev: unix.Mkdev(7, 5)},
++	})
++	h.runAll(t, []scenario{
++		{name: "relative", opts: []string{"--link-dest=../prev"}, args: []string{"rel/"}, prev: "prev", root: true, noDaemonDest: true},
++		{name: "absolute", opts: []string{"--link-dest=PREV"}, args: []string{"src/"}, prev: "prev", root: true, noDaemonDest: true},
++		{name: "existing", opts: []string{"--link-dest=../prev"}, args: []string{"rel/"}, prev: "prev", pre: "pre/existing", root: true, noDaemonDest: true},
++		{name: "inside", opts: []string{"--link-dest=prev"}, args: []string{"src/"}, pre: "pre/inside", root: true},
++		{name: "inside-existing", opts: []string{"--link-dest=prev"}, args: []string{"src/"}, pre: "pre/inside-existing", root: true},
++		{name: "inside-mismatch", opts: []string{"--link-dest=prev"}, args: []string{"src/"}, pre: "pre/inside-mismatch", root: true},
++		{name: "inside-linked", opts: []string{"--link-dest=prev"}, args: []string{"src/"}, pre: "pre/inside-linked", root: true},
++		{name: "devices", opts: []string{"--link-dest=prev"}, args: []string{"devsrc/"}, pre: "pre/devices", root: true},
++		{name: "other-fs", opts: []string{"--link-dest=PREV"}, args: []string{"regular/"}, prev: "prev", root: true, noDaemonDest: true, prevOtherFS: true},
++	}, receivingRoles())
++}
++
++func forwardedTree() []node {
++	return []node{
++		{path: "src/same.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "same in both"},
++		{path: "src/mode.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "other mode in prev"},
++		{path: "src/new.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "only in src"},
++		{path: "src/d/inner.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "inner, same in both"},
++		{path: "src/fifo", kind: 'p', perm: 0o644, mtime: 1577872800},
++		{path: "src/lnk", kind: 'l', mtime: 1577872800, data: "same.txt"},
++		{path: "src/d", kind: 'd', perm: 0o755, mtime: 1546300800},
++		{path: "src", kind: 'd', perm: 0o755, mtime: 1546387200},
++	}
++}
++
++func forwardedPrev() []node {
++	return []node{
++		{path: "same.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "same in both"},
++		{path: "mode.txt", kind: 'f', perm: 0o600, mtime: 1577872800, data: "other mode in prev"},
++		{path: "d/inner.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "inner, same in both"},
++		{path: "fifo", kind: 'p', perm: 0o644, mtime: 1577872800},
++		{path: "lnk", kind: 'l', mtime: 1577872800, data: "same.txt"},
++		{path: "d", kind: 'd', perm: 0o700, mtime: 1500000000},
++	}
++}
++
++// TestLinkDestForwarded covers a gokr-rsync client that sends to rsync. Its
++// trees leave out the files rsync would transfer against a basis file in the
++// --link-dest directory: rsync 3.2.7 talking to itself at protocol 27 over a
++// remote shell or socket discards those ("failed verification").
++func TestLinkDestForwarded(t *testing.T) {
++	t.Parallel()
++	h := newHarness(t, "127.0.0.44")
++	build(t, h.root, forwardedTree())
++	build(t, h.abs("prev"), forwardedPrev())
++	existing := []node{
++		{path: "same.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "same in both"},
++		{path: "new.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "only in src"},
++	}
++	build(t, h.abs("pre/existing"), existing)
++	build(t, h.abs("pre/inside/prev"), forwardedPrev())
++	forwarding := []string{"gokr-client-push-shell", "gokr-client-push-daemon"}
++	daemons := []string{"gokr-client-push-daemon", "gokr-daemon-receive"}
++	h.runAll(t, []scenario{
++		{name: "relative", opts: []string{"--link-dest=../prev"}, args: []string{"src/"}, prev: "prev", root: true, noDaemonDest: true, onlyRoles: forwarding},
++		{name: "existing", opts: []string{"--link-dest=../prev"}, args: []string{"src/"}, prev: "prev", pre: "pre/existing", root: true, noDaemonDest: true, onlyRoles: forwarding},
++		{name: "inside", opts: []string{"--link-dest=prev"}, args: []string{"src/"}, pre: "pre/inside", root: true, onlyRoles: forwarding},
++		{name: "absolute-in-module", opts: []string{"--link-dest=MODPREV"}, args: []string{"src/"}, prev: "prev", root: true, onlyRoles: daemons, daemonReference: true},
++		{name: "absolute-outside-module", opts: []string{"--link-dest=PREV"}, args: []string{"src/"}, prev: "prev", root: true, onlyRoles: daemons, daemonReference: true},
++		{name: "absolute-dotdot-in-module", opts: []string{"--link-dest=MODUPPREV"}, args: []string{"src/"}, prev: "prev", root: true, onlyRoles: daemons, daemonReference: true},
++	}, rolesNamed("gokr-client-push-shell", "gokr-client-push-daemon", "gokr-daemon-receive"))
++}
++
++func TestHardLinksLinkDest(t *testing.T) {
++	t.Parallel()
++	h := newHarness(t, "127.0.0.45")
++	build(t, h.root, hardLinkTree())
++	a := node{kind: 'f', perm: 0o644, mtime: 1577872800, data: "group a, shared by three names"}
++	x := node{kind: 'f', perm: 0o600, mtime: 1577959200, data: "group x"}
++	at := func(n node, path string) node {
++		n.path = "prev/" + path
++		return n
++	}
++	pre := func(name string, nodes ...node) string {
++		build(t, h.abs(filepath.Join("pre", name)), nodes)
++		return filepath.Join("pre", name)
++	}
++	scenarios := []scenario{
++		{name: "first-in-prev", pre: pre("first-in-prev", at(a, "a1"))},
++		{name: "middle-in-prev", pre: pre("middle-in-prev", at(a, "a2"), at(x, "x2"))},
++		{name: "separate-in-prev", pre: pre("separate-in-prev", at(a, "a1"), at(a, "a2"), at(x, "x1"), at(x, "x2"))},
++		{name: "linked-in-prev", pre: pre("linked-in-prev", at(a, "sub/a3"), node{path: "prev/a2", kind: 'h', data: "prev/sub/a3"}, at(x, "x1"))},
++		{name: "other-mode-in-prev", pre: pre("other-mode-in-prev",
++			node{path: "prev/x1", kind: 'f', perm: 0o644, mtime: 1577959200, data: "group x"},
++			at(a, "sub/a3"))},
++	}
++	for i := range scenarios {
++		scenarios[i].opts = []string{"-H", "--link-dest=prev"}
++		scenarios[i].args = []string{"src/"}
++		scenarios[i].root = true
++	}
++	h.runAll(t, scenarios, roles)
++}
++
++func TestRelativeHardLinks(t *testing.T) {
++	t.Parallel()
++	h := newHarness(t, "127.0.0.46")
++	build(t, h.root, append(relativeTree(),
++		node{path: "src/a/b/c/sub/f1-link", kind: 'h', data: "src/a/b/c/f1.txt"},
++		node{path: "src/a/y-link", kind: 'h', data: "src/a/b/c/f1.txt"},
++		node{path: "src/a/b/x-link", kind: 'h', data: "src/a/b/x.txt"},
++	))
++	build(t, h.abs("pre/one-exists"), []node{
++		{path: "src/a/y-link", kind: 'f', perm: 0o644, mtime: 1577872800, data: "relative f1"},
++	})
++	h.runAll(t, []scenario{
++		{name: "one-arg", opts: []string{"-R", "-H"}, args: []string{"src/a/b"}},
++		{name: "two-args", opts: []string{"-R", "-H"}, args: []string{"src/a/b/c", "src/a/y-link"}},
++		{name: "dot-dir", opts: []string{"-R", "-H"}, args: []string{"src/a/./b"}},
++		{name: "one-exists", opts: []string{"-R", "-H"}, args: []string{"src/a/b/c", "src/a/y-link"}, pre: "pre/one-exists"},
++	}, roles)
++}
++
++func TestFilesFrom(t *testing.T) {
++	t.Parallel()
++	h := newHarness(t, "127.0.0.47")
++	build(t, h.root, append(relativeTree(),
++		node{path: "src/a/b/c/f1-link", kind: 'h', data: "src/a/b/c/f1.txt"},
++		node{path: "src/a/y-link", kind: 'h', data: "src/a/b/c/f1.txt"},
++		node{path: "src/a/dlink", kind: 'l', mtime: 1578045600, data: "b"},
++		node{path: "src/root.txt", kind: 'f', perm: 0o644, mtime: 1578218400, data: "root.txt inside src"},
++		node{path: "src/a/root.txt", kind: 'f', perm: 0o644, mtime: 1578564000, data: "root.txt below a"},
++		node{path: "root.txt", kind: 'f', perm: 0o644, mtime: 1578304800, data: "root.txt outside the source directory"},
++		node{path: "src/#keep", kind: 'f', perm: 0o644, mtime: 1578391200, data: "a name that starts with #"},
++		node{path: "src/;semi", kind: 'f', perm: 0o644, mtime: 1578477600, data: "a name that starts with ;"},
++	))
++	// A long list names a directory of many files first, then many single
++	// files. The list and the file list the sender sends back for it are each
++	// far larger than what the connection buffers hold, so a client that pulls
++	// with it has to send the names while it receives the file list.
++	var long strings.Builder
++	long.WriteString("many\n")
++	manyTree := []node{
++		{path: "src/many", kind: 'd', perm: 0o755, mtime: 1546646400},
++		{path: "src/tail", kind: 'd', perm: 0o755, mtime: 1546732800},
++	}
++	for i := range 4096 {
++		name := fmt.Sprintf("%04d-%s", i, strings.Repeat("n", 145))
++		manyTree = append(manyTree,
++			node{path: "src/many/" + name, kind: 'f', perm: 0o644, mtime: 1578650400},
++			node{path: "src/tail/" + name, kind: 'f', perm: 0o644, mtime: 1578736800})
++		long.WriteString("tail/" + name + "\n")
++	}
++	build(t, h.root, manyTree)
++	lists := map[string]string{
++		"long":     long.String(),
++		"plain":    "a/b/c/f1.txt\na/y.txt\n\na/b\n",
++		"slash":    "a/b/\na/y.txt\n",
++		"link":     "a/dlink\n",
++		"link-dir": "a/dlink/\n",
++		"crlf":     "a/b/c/sub/f2.txt\r\n/a/b/x.txt\r\n",
++		"dot-dir":  "a/b/./c/sub/f2.txt\na/./y.txt\n",
++		"dirs":     "a/b/c\na/y.txt\na/y-link\n",
++		"comments": "# backup list\na/b/c/f1.txt\n; old entry\n\na/y.txt\n",
++		"dot-dot":  "../root.txt\na/b/../y.txt\na/./../root.txt\n",
++		"nul":      "#keep\x00a/b/c/f1.txt\x00;semi\x00a/y.txt\x00",
++	}
++	for name, list := range lists {
++		if err := os.MkdirAll(h.abs("lists"), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(h.abs("lists/"+name), []byte(list), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	// rsync's daemon in the image (Debian, with the 2025 security fixes) follows a
++	// symlink below its module only where the kernel has openat2, so pulling a
++	// symlinked directory from it is left out.
++	notFromDaemon := []string{"gokr-local", "gokr-client-push-shell", "gokr-client-pull-shell", "gokr-client-push-daemon", "gokr-server-receive-shell", "gokr-server-send-shell", "gokr-daemon-receive", "gokr-daemon-send"}
++	h.runAll(t, []scenario{
++		{name: "plain", opts: []string{"--files-from=ROOT/lists/plain"}, args: []string{"src/"}, srcModule: true},
++		{name: "no-relative", opts: []string{"--files-from=ROOT/lists/plain", "--no-R"}, args: []string{"src/"}, srcModule: true},
++		{name: "trailing-slash", opts: []string{"--files-from=ROOT/lists/slash"}, args: []string{"src/"}, srcModule: true},
++		{name: "trailing-slash-no-relative", opts: []string{"--files-from=ROOT/lists/slash", "--no-R"}, args: []string{"src/"}, srcModule: true},
++		{name: "symlink", opts: []string{"--files-from=ROOT/lists/link"}, args: []string{"src/"}, srcModule: true},
++		{name: "symlink-no-relative", opts: []string{"--files-from=ROOT/lists/link", "--no-R"}, args: []string{"src/"}, srcModule: true},
++		{name: "symlink-slash", opts: []string{"--files-from=ROOT/lists/link-dir"}, args: []string{"src/"}, srcModule: true, onlyRoles: notFromDaemon},
++		{name: "symlink-slash-no-relative", opts: []string{"--files-from=ROOT/lists/link-dir", "--no-R"}, args: []string{"src/"}, srcModule: true, onlyRoles: notFromDaemon},
++		{name: "crlf", opts: []string{"--files-from=ROOT/lists/crlf"}, args: []string{"src/"}, srcModule: true},
++		{name: "dot-dir", opts: []string{"--files-from=ROOT/lists/dot-dir"}, args: []string{"src/"}, srcModule: true},
++		{name: "recursive", opts: []string{"--files-from=ROOT/lists/dirs", "-r"}, args: []string{"src/"}, srcModule: true},
++		{name: "hard-links", opts: []string{"--files-from=ROOT/lists/dirs", "-r", "-H"}, args: []string{"src/"}, srcModule: true},
++		{name: "long-list", opts: []string{"--files-from=ROOT/lists/long", "-r"}, args: []string{"src/"}, srcModule: true, onlyRoles: []string{"gokr-client-pull-shell", "gokr-client-pull-daemon"}},
++		{name: "comments", opts: []string{"--files-from=ROOT/lists/comments"}, args: []string{"src/"}, srcModule: true, noListForwarding: true},
++		{name: "dot-dot", opts: []string{"--files-from=ROOT/lists/dot-dot"}, args: []string{"src/"}, srcModule: true, noListForwarding: true},
++		{name: "from0", opts: []string{"-0", "--files-from=ROOT/lists/nul"}, args: []string{"src/"}, srcModule: true, noListForwarding: true},
++	}, roles)
++}
++
++// TestExcludedImpliedDir pulls from gokr-rsync with a rule that excludes a
++// directory that -R or --files-from implies. rsync's sender does not filter
++// the directories it implies, and the receiving client refuses a file list
++// with a name its rules exclude, so rsync talking to itself leaves the
++// destination as it was. With gokr-rsync as the sender, the destination must
++// come out the same, as it must for the same pull without the rule.
++func TestExcludedImpliedDir(t *testing.T) {
++	t.Parallel()
++	h := newHarness(t, "127.0.0.49")
++	build(t, h.root, []node{
++		{path: "src/a/b/f.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "f, below the excluded a"},
++		{path: "src/c/g.txt", kind: 'f', perm: 0o644, mtime: 1577872800, data: "g, not excluded"},
++		{path: "src/a/b", kind: 'd', perm: 0o755, mtime: 1546300800},
++		{path: "src/a", kind: 'd', perm: 0o755, mtime: 1546387200},
++		{path: "src/c", kind: 'd', perm: 0o755, mtime: 1546473600},
++		{path: "src", kind: 'd', perm: 0o755, mtime: 1546560000},
++	})
++	build(t, h.abs("pre/stale"), []node{
++		{path: "a/b/f.txt", kind: 'f', perm: 0o644, mtime: 1500000000, data: "stale f"},
++	})
++	if err := os.MkdirAll(h.abs("lists"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(h.abs("lists/excluded"), []byte("a/b/f.txt\nc/g.txt\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	cases := []struct {
++		name string
++		opts []string
++		args []string
++	}{
++		{"relative", []string{"-aR"}, []string{"src/./a/b/f.txt", "src/./c/g.txt"}},
++		{"files-from", []string{"-a", "--files-from=" + h.abs("lists/excluded")}, []string{"src/"}},
++	}
++	for _, c := range cases {
++		for _, transport := range []string{"shell", "daemon"} {
++			t.Run(c.name+"/"+transport, func(t *testing.T) {
++				t.Parallel()
++				pull := func(gokr bool, opts []string, dst string) {
++					args := append([]string{"--protocol=27"}, opts...)
++					src := prefixed("localhost:", c.args)
++					switch {
++					case transport == "shell":
++						args = append(args, "-e", h.shell(t, transfer{}))
++						if gokr {
++							args = append(args, "--rsync-path="+h.gokrRemote())
++						}
++					case gokr:
++						src = prefixed("rsync://"+h.gokrAddr+"/t/", c.args)
++					case c.name == "files-from":
++						// See srcModule.
++						src = []string{"rsync://" + h.stockAddr + "/src/"}
++					default:
++						src = prefixed("rsync://"+h.stockAddr+"/t/", c.args)
++					}
++					h.runRsyncMayFail(t, append(append(args, src...), h.abs(dst)+"/")...)
++				}
++				for _, rule := range []struct {
++					name string
++					opts []string
++				}{
++					{"without-rule", nil},
++					{"with-rule", []string{"--exclude=a"}},
++				} {
++					base := filepath.Join("out", t.Name(), rule.name)
++					want := filepath.Join(base, "want", "dst")
++					got := filepath.Join(base, "got", "dst")
++					copyTree(t, h.abs("pre/stale"), h.abs(want))
++					copyTree(t, h.abs("pre/stale"), h.abs(got))
++					opts := append(append([]string{}, c.opts...), rule.opts...)
++					pull(false, opts, want)
++					pull(true, opts, got)
++					if diff := cmp.Diff(snapshot(t, h.abs(want), false), snapshot(t, h.abs(got), false)); diff != "" {
++						t.Errorf("%s: destination differs from rsync 3.2.7 talking to itself: diff (-want +got):\n%s", rule.name, diff)
++					}
++				}
++			})
++		}
++	}
++}
++
++// TestRestricted runs gokr-rsync as a command of its own, whose file system
++// access is restricted as in a normal invocation, with a --link-dest directory
++// outside the destination and a --files-from list.
++func TestRestricted(t *testing.T) {
++	t.Parallel()
++	h := newHarness(t, "127.0.0.48")
++	build(t, h.root, append(noBasisTree(), relativeTree()...))
++	build(t, h.abs("prev"), prevTree())
++	if err := os.MkdirAll(h.abs("lists"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(h.abs("lists/plain"), []byte("a/b/c/f1.txt\na/y.txt\n\na/b\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	commands := []string{"gokr-local", "gokr-client-push-shell", "gokr-client-pull-shell", "gokr-client-push-daemon", "gokr-client-pull-daemon", "gokr-server-receive-shell", "gokr-server-send-shell"}
++	// A sending server never sees --link-dest: rsync's client applies it.
++	linkDest := commands[:len(commands)-1]
++	h.runAll(t, []scenario{
++		{name: "link-dest-relative", opts: []string{"--link-dest=../prev"}, args: []string{"rel/"}, prev: "prev", root: true, noDaemonDest: true, onlyRoles: linkDest, restricted: true},
++		{name: "link-dest-absolute", opts: []string{"--link-dest=PREV"}, args: []string{"rel/"}, prev: "prev", root: true, noDaemonDest: true, onlyRoles: linkDest, restricted: true},
++		{name: "files-from", opts: []string{"--files-from=ROOT/lists/plain"}, args: []string{"src/"}, srcModule: true, onlyRoles: commands, restricted: true},
++	}, roles)
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..4930b31
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,178 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || { echo "missing value for --output_path" >&2; usage; }
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 2
++
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++if [ -n "${GOCACHE:-}" ] && [ ! -w "$GOCACHE" ]; then
++  export GOCACHE="/tmp/go-build-$(id -u)"
++fi
++
++NEW_DIR="integration/backup_7235f9"
++NEW_PKG="github.com/gokrazy/rsync/$NEW_DIR"
++LOG="$(mktemp)"
++LIST="$(mktemp)"
++trap 'rm -f "$LOG" "$LIST"' EXIT
++
++# Base mode runs every test of the repository except the new package and these:
++# - TestInteropRemoteDaemonSSH and TestReceiverSSH start the system ssh client. ssh and ssh-keygen
++#   refuse to run for a uid without an account entry, the image only has entries for root and
++#   uid 1000, and the tests may run as another uid. The new tests cover the remote shell path
++#   without ssh.
++# - TestReceiverSparse requires the received file to keep its 8 MiB holes unallocated. That depends
++#   on the file system under the temporary directory: where it allocates holes, the test fails on
++#   the unpatched repository. Sparse files are unrelated to the options the new tests cover.
++# - TestPath unit-tests getStrip, an unexported helper that splits a source path for transfers
++#   without -R. Adding -R and --files-from reworks this part of the sender, and the helper can go
++#   away with it; how source paths map to names stays checked end to end by the repository's sender
++#   and interop tests and by the new tests.
++# - TestSenderNamedSourceParentUnreadable and TestSenderNamedFileParentUnreadable check a source
++#   below a directory the sender cannot read. Root can read every directory, so as root they skip
++#   themselves: whether they pass depends on the user running them, and the set of base tests
++#   must not.
++EXCLUDED="TestInteropRemoteDaemonSSH|TestReceiverSSH|TestReceiverSparse|TestPath|TestSenderNamedSourceParentUnreadable|TestSenderNamedFileParentUnreadable"
++
++# The timeouts end a run in which a test hangs early enough for both runs to still write their reports.
++if [ "$MODE" = "base" ]; then
++  ALL_PKGS="$(go list ./... 2>>"$LOG")"
++  LIST_STATUS=$?
++  PKGS="$(printf '%s\n' "$ALL_PKGS" | grep -v "/$NEW_DIR\$")"
++  go test -list . $PKGS >"$LIST" 2>&1
++  STATUS=$?
++  BASE_TESTS="$(grep -E '^(Test|Example|Fuzz)[A-Za-z0-9_]*$' "$LIST" | grep -vxE "$EXCLUDED" | sort -u | paste -sd '|' -)"
++  if [ "$LIST_STATUS" -eq 0 ] && [ "$STATUS" -eq 0 ] && [ -n "$BASE_TESTS" ]; then
++    go test -v -count=1 -timeout 8m -run "^(${BASE_TESTS})\$" $PKGS >>"$LOG" 2>&1
++    STATUS=$?
++  else
++    cat "$LIST" >>"$LOG"
++  fi
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    echo "go list ./... failed with exit status $LIST_STATUS" >>"$LOG"
++    STATUS=$LIST_STATUS
++  fi
++else
++  go test -v -count=1 -timeout 15m "./$NEW_DIR/" >>"$LOG" 2>&1
++  STATUS=$?
++fi
++
++if ! grep -qE '^ *--- (PASS|FAIL|SKIP):' "$LOG"; then
++  echo "no tests were collected in mode $MODE" >>"$LOG"
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++cat "$LOG"
++
++expected_tests() {
++  grep -ho '^func Test[A-Za-z0-9_]*(t \*testing\.T)' "$NEW_DIR"/*_test.go | sed -e 's/^func //' -e 's/(.*//'
++}
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  go-junit-report <"$LOG" >"$OUTPUT_PATH" 2>/dev/null || true
++  PANICKED="$(awk '/^--- FAIL: /{name=$3} /^panic: /{print name; exit}' "$LOG")"
++  if [ -n "$PANICKED" ] && grep -q "<testcase name=\"$PANICKED\"" "$OUTPUT_PATH" 2>/dev/null; then
++    PANIC_TEXT="$(mktemp)"
++    PATCHED="$(mktemp)"
++    sed -n '/^panic: /,$p' "$LOG" | head -n 40 | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' >"$PANIC_TEXT"
++    awk -v name="$PANICKED" -v text="$PANIC_TEXT" '
++      index($0, "<testcase name=\"" name "\"") { inside = 1 }
++      inside && /<failure message="Failed"><\/failure>/ {
++        sub(/<failure message="Failed"><\/failure>/, "<failure message=\"panic\">")
++        printf "%s", $0
++        while ((getline line < text) > 0) print line
++        print "</failure>"
++        inside = 0
++        next
++      }
++      /<\/testcase>/ { inside = 0 }
++      { print }
++    ' "$OUTPUT_PATH" >"$PATCHED" && cat "$PATCHED" >"$OUTPUT_PATH"
++    rm -f "$PANIC_TEXT" "$PATCHED"
++  fi
++  RAN=0
++  NAMES=""
++  if [ "$MODE" = "new" ]; then
++    SUITE="$NEW_PKG"
++    for name in $(expected_tests); do
++      if grep -q "<testcase name=\"$name\"" "$OUTPUT_PATH" 2>/dev/null; then
++        RAN=1
++      else
++        NAMES="$NAMES $name"
++      fi
++    done
++  else
++    SUITE="github.com/gokrazy/rsync"
++    if grep -q '<testcase ' "$OUTPUT_PATH" 2>/dev/null; then
++      RAN=1
++    else
++      NAMES="build"
++    fi
++  fi
++  if [ -n "$NAMES" ]; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    DETAIL="$(grep -E '^# |\.go:[0-9]+:[0-9]+: |\[(build|setup) failed\]|^panic' "$LOG" | head -n 40)"
++    [ -n "$DETAIL" ] || DETAIL="$(tail -n 40 "$LOG")"
++    DETAIL="$(printf '%s\n' "$DETAIL" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++    if [ "$RAN" -eq 1 ] && [ -n "$PANICKED" ]; then
++      MESSAGE="not run: the test binary exited after $PANICKED panicked"
++    elif [ "$RAN" -eq 1 ]; then
++      MESSAGE="not run: the test binary exited before reaching this test"
++    else
++      MESSAGE="the test package failed to build or run"
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++    fi
++    COUNT="$(printf '%s\n' $NAMES | grep -c .)"
++    EXTRA="$(mktemp)"
++    MERGED="$(mktemp)"
++    {
++      echo "<testsuite name=\"$SUITE\" tests=\"$COUNT\" failures=\"$COUNT\" errors=\"0\">"
++      for name in $NAMES; do
++        echo "<testcase name=\"$name\" classname=\"$SUITE\"><failure message=\"$MESSAGE\">$DETAIL</failure></testcase>"
++      done
++      echo '</testsuite>'
++    } >"$EXTRA"
++    awk -v extra="$EXTRA" '/<\/testsuites>/ { while ((getline line < extra) > 0) print line } { print }' "$OUTPUT_PATH" >"$MERGED"
++    TESTS="$(grep -c '<testcase ' "$MERGED")"
++    FAILURES="$(grep -c '<failure' "$MERGED")"
++    ERRORS="$(grep -c '<error' "$MERGED")"
++    sed -E "1,/<testsuites/ s#<testsuites[^>]*>#<testsuites tests=\"$TESTS\" failures=\"$FAILURES\" errors=\"$ERRORS\">#" "$MERGED" >"$OUTPUT_PATH"
++    rm -f "$EXTRA" "$MERGED"
++  fi
++fi
++
++exit "$STATUS"

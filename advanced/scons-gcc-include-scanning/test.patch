@@ -1,0 +1,2295 @@
+diff --git a/SCons/Scanner/CConditional35735aTests.py b/SCons/Scanner/CConditional35735aTests.py
+new file mode 100644
+index 000000000..49534566f
+--- /dev/null
++++ b/SCons/Scanner/CConditional35735aTests.py
+@@ -0,0 +1,2162 @@
++# MIT License
++#
++# Copyright The SCons Foundation
++#
++# Permission is hereby granted, free of charge, to any person obtaining
++# a copy of this software and associated documentation files (the
++# "Software"), to deal in the Software without restriction, including
++# without limitation the rights to use, copy, modify, merge, publish,
++# distribute, sublicense, and/or sell copies of the Software, and to
++# permit persons to whom the Software is furnished to do so, subject to
++# the following conditions:
++#
++# The above copyright notice and this permission notice shall be included
++# in all copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
++# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
++# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++
++import collections
++import contextlib
++import os
++import shutil
++import subprocess
++import tempfile
++import unittest
++from unittest import mock
++
++import SCons.Environment
++import SCons.Node.FS
++import SCons.Scanner.C
++
++try:
++    import _posixsubprocess
++except ImportError:
++    _posixsubprocess = None
++
++LAUNCHERS = [(subprocess, 'Popen'), (os, 'system'), (os, 'popen')]
++LAUNCHERS += [
++    (os, name)
++    for name in (
++        'fork',
++        'forkpty',
++        'posix_spawn',
++        'posix_spawnp',
++        'spawnv',
++        'spawnve',
++        'spawnvp',
++        'spawnvpe',
++        'execv',
++        'execve',
++        'execvp',
++        'execvpe',
++        'startfile',
++    )
++    if hasattr(os, name)
++]
++if _posixsubprocess is not None:
++    LAUNCHERS.append((_posixsubprocess, 'fork_exec'))
++
++
++class Environment(collections.UserDict):
++    def __init__(self, fs, **kwargs) -> None:
++        super().__init__()
++        self.data.update(kwargs)
++        self.fs = fs
++
++    def Dictionary(self, *args):
++        return self.data
++
++    def subst(self, strSubst, target=None, source=None, conv=None):
++        if strSubst[0] == '$':
++            return self.data[strSubst[1:]]
++        return strSubst
++
++    def subst_list(self, strSubst, target=None, source=None, conv=None):
++        if strSubst[0] == '$':
++            return [self.data[strSubst[1:]]]
++        return [[strSubst]]
++
++    def subst_path(self, path, target=None, source=None, conv=None):
++        if not isinstance(path, list):
++            path = [path]
++        return list(map(self.subst, path))
++
++    def get_calculator(self):
++        return None
++
++    def get_factory(self, factory):
++        return factory or self.fs.File
++
++    def Dir(self, filename):
++        return self.fs.Dir(filename)
++
++    def File(self, filename):
++        return self.fs.File(filename)
++
++
++class ConditionalScannerTestCase(unittest.TestCase):
++    def run_without_programs(self, function, *args, **kwargs):
++        started = []
++
++        def refuse(*a, **k):
++            started.append(a)
++            raise OSError('no program may be started while scanning')
++
++        with contextlib.ExitStack() as stack:
++            for module, name in LAUNCHERS:
++                stack.enter_context(mock.patch.object(module, name, refuse))
++            result = function(*args, **kwargs)
++        self.assertEqual(started, [])
++        return result
++
++    def scan(self, files, source='main.c', cpppath=(), cppdefines=None, depth=-1):
++        root = tempfile.mkdtemp()
++        self.addCleanup(shutil.rmtree, root)
++        for name, text in files.items():
++            path = os.path.join(root, *name.split('/'))
++            os.makedirs(os.path.dirname(path), exist_ok=True)
++            if isinstance(text, bytes):
++                with open(path, 'wb') as f:
++                    f.write(text)
++            else:
++                with open(path, 'w', newline='', encoding='utf-8') as f:
++                    f.write(text)
++        fs = SCons.Node.FS.FS(root)
++        variables = {'CPPPATH': list(cpppath)}
++        if cppdefines is not None:
++            variables['CPPDEFINES'] = cppdefines
++        env = Environment(fs, **variables)
++        scanner = SCons.Scanner.C.CConditionalScanner()
++        deps = self.run_without_programs(
++            scanner, fs.File(source), env, scanner.path(env), depth
++        )
++        return sorted(os.path.normpath(str(d)).replace(os.sep, '/') for d in deps)
++
++    def test_object_like_chain_from_cppdefines(self) -> None:
++        files = {
++            'main.c': (
++                '#if A == B\n#include "yes.h"\n#else\n#include "no.h"\n#endif\n'
++            ),
++            'no.h': '',
++            'yes.h': '',
++        }
++        deps = self.scan(files, cppdefines=['A=1', 'B=C', 'C=1'])
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_macros_from_a_header_steer_the_includer(self) -> None:
++        files = {
++            'main.c': (
++                '#include "cfg.h"\n'
++                '#if MODE == FAST\n'
++                '#include "fast.h"\n'
++                '#else\n'
++                '#include "slow.h"\n'
++                '#endif\n'
++            ),
++            'cfg.h': ('#define MODE (FAST + 0)\n#define FAST 2\n'),
++            'fast.h': '',
++            'slow.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['cfg.h', 'fast.h'])
++
++    def test_is_enabled_idiom(self) -> None:
++        files = {
++            'main.c': (
++                '#define IS_ENABLED(config_macro) _IS_ENABLED1(config_macro)\n'
++                '#define _IS_ENABLED1(config_macro) _IS_ENABLED2(_XXXX##config_macro)\n'
++                '#define _XXXX1 _YYYY,\n'
++                '#define _IS_ENABLED2(one_or_two_args) _IS_ENABLED3(one_or_two_args 1, 0)\n'
++                '#define _IS_ENABLED3(ignore_this, val, ...) val\n'
++                '#if IS_ENABLED(FEATURE_A_ENABLED)\n'
++                '#include "header1.h"\n'
++                '#endif\n'
++                '#if !IS_ENABLED(FEATURE_B)\n'
++                '#include "header2.h"\n'
++                '#endif\n'
++                '#if IS_ENABLED(FEATURE_C_ENABLED)\n'
++                '#include "header3.h"\n'
++                '#endif\n'
++            ),
++            'header1.h': '',
++            'header2.h': '',
++            'header3.h': '',
++        }
++        deps = self.scan(
++            files, cppdefines=['FEATURE_A_ENABLED=1', 'FEATURE_C_ENABLED=0']
++        )
++        self.assertEqual(deps, ['header1.h', 'header2.h'])
++
++    def test_nested_function_like_macros(self) -> None:
++        files = {
++            'main.c': (
++                '#define G(x) x*2\n'
++                '#define F(x) G(x)+1\n'
++                '#if F(3) == 7\n'
++                '#include "seven.h"\n'
++                '#endif\n'
++                '#if F(1+1) == 5\n'
++                '#include "five.h"\n'
++                '#endif\n'
++            ),
++            'five.h': '',
++            'seven.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['seven.h'])
++
++    def test_rescan_takes_arguments_that_follow_the_expansion(self) -> None:
++        files = {
++            'main.c': (
++                '#define FOO(x) BAR x\n'
++                '#define BAR(x) (x+1)\n'
++                '#if FOO((2)) == 3\n'
++                '#include "yes.h"\n'
++                '#endif\n'
++            ),
++            'yes.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_function_like_name_without_arguments(self) -> None:
++        files = {
++            'main.c': (
++                '#define F(x) 1\n'
++                '#if F\n'
++                '#include "no.h"\n'
++                '#else\n'
++                '#include "yes.h"\n'
++                '#endif\n'
++            ),
++            'no.h': '',
++            'yes.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_arguments_with_nested_commas(self) -> None:
++        files = {
++            'main.c': (
++                '#define SECOND(a, b) b\n'
++                '#define PAIR(x, y) x + y\n'
++                '#if SECOND((1, 2), (3)) == 3 && SECOND(PAIR(1, 2), PAIR(3, 4)) == 7\n'
++                '#include "yes.h"\n'
++                '#endif\n'
++            ),
++            'yes.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_self_referential_macros_stop_expanding(self) -> None:
++        files = {
++            'main.c': (
++                '#define SELF SELF + 1\n'
++                '#if SELF == 1\n'
++                '#include "self.h"\n'
++                '#endif\n'
++                '#define AA BB\n'
++                '#define BB AA\n'
++                '#if defined AA && AA == 0\n'
++                '#include "cycle.h"\n'
++                '#endif\n'
++            ),
++            'cycle.h': '',
++            'self.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['cycle.h', 'self.h'])
++
++    def test_arguments_expand_before_substitution_unless_pasted(self) -> None:
++        files = {
++            'main.c': (
++                '#define ONE 1\n'
++                '#define ONE1 11\n'
++                '#define CAT(a, b) a ## b\n'
++                '#define XCAT(a, b) CAT(a, b)\n'
++                '#if XCAT(ONE, 2) == 12\n'
++                '#include "xcat.h"\n'
++                '#endif\n'
++                '#if CAT(ONE, 1) == 11\n'
++                '#include "cat.h"\n'
++                '#endif\n'
++            ),
++            'cat.h': '',
++            'xcat.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['cat.h', 'xcat.h'])
++
++    def test_pasting_with_empty_operands(self) -> None:
++        files = {
++            'main.c': (
++                '#define PASTE(a, b) a##b\n'
++                '#if PASTE(, 1) == 1 && PASTE(1, ) == 1 && PASTE(0x, 10) == 16\n'
++                '#include "yes.h"\n'
++                '#endif\n'
++            ),
++            'yes.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_variadic_argument_counting(self) -> None:
++        files = {
++            'main.c': (
++                '#define CNT_(a, b, c, n, ...) n\n'
++                '#define COUNT(...) CNT_(__VA_ARGS__, 3, 2, 1, 0)\n'
++                '#if COUNT(x, y) == 2\n'
++                '#include "two.h"\n'
++                '#endif\n'
++                '#if COUNT(x) == 1\n'
++                '#include "one.h"\n'
++                '#endif\n'
++            ),
++            'one.h': '',
++            'two.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['one.h', 'two.h'])
++
++    def test_comma_before_empty_variadic_argument(self) -> None:
++        files = {
++            'main.c': (
++                '#define CNT_(a, b, c, n, ...) n\n'
++                '#define COUNT0(...) CNT_(0, ##__VA_ARGS__, 3, 2, 1, 0)\n'
++                '#if COUNT0() == 1\n'
++                '#include "zero.h"\n'
++                '#endif\n'
++                '#if COUNT0(a) == 2\n'
++                '#include "one.h"\n'
++                '#endif\n'
++            ),
++            'one.h': '',
++            'zero.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['one.h', 'zero.h'])
++
++    def test_va_opt(self) -> None:
++        files = {
++            'main.c': (
++                '#define F(a, ...) a __VA_OPT__(+ 1)\n'
++                '#if F(1, x) == 2\n'
++                '#include "with.h"\n'
++                '#endif\n'
++                '#if F(1) == 1\n'
++                '#include "without.h"\n'
++                '#endif\n'
++            ),
++            'with.h': '',
++            'without.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['with.h', 'without.h'])
++
++    def test_named_variadic_parameter(self) -> None:
++        files = {
++            'main.c': (
++                '#define L(args...) LAST(args)\n'
++                '#define LAST(a, b) b\n'
++                '#if L(1, 4) == 4\n'
++                '#include "yes.h"\n'
++                '#endif\n'
++            ),
++            'yes.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_unsigned_arithmetic(self) -> None:
++        files = {
++            'main.c': (
++                '#if -1 < 0u\n'
++                '#include "lt.h"\n'
++                '#endif\n'
++                '#if -1 > 0u\n'
++                '#include "gt.h"\n'
++                '#endif\n'
++                '#if (1 ? -1 : 0u) > 0\n'
++                '#include "cond.h"\n'
++                '#endif\n'
++                '#if 18446744073709551615 == -1\n'
++                '#include "wrap.h"\n'
++                '#endif\n'
++                '#if 0x7fffffffffffffff + 0 > 0\n'
++                '#include "max.h"\n'
++                '#endif\n'
++            ),
++            'cond.h': '',
++            'gt.h': '',
++            'lt.h': '',
++            'max.h': '',
++            'wrap.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['cond.h', 'gt.h', 'max.h', 'wrap.h'])
++
++    def test_division_and_short_circuit(self) -> None:
++        files = {
++            'main.c': (
++                '#if (-7) / 2 == -3 && (-7) % 2 == -1 && 7 % -2 == 1\n'
++                '#include "trunc.h"\n'
++                '#endif\n'
++                '#if 1 / 2\n'
++                '#include "half.h"\n'
++                '#endif\n'
++                '#if 0 && 1 / 0\n'
++                '#include "and.h"\n'
++                '#endif\n'
++                '#if 1 || 1 / 0\n'
++                '#include "or.h"\n'
++                '#endif\n'
++            ),
++            'and.h': '',
++            'half.h': '',
++            'or.h': '',
++            'trunc.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['or.h', 'trunc.h'])
++
++    def test_shifts_and_bitwise_operators(self) -> None:
++        files = {
++            'main.c': (
++                '#if (1 << 62) > 0 && (-8 >> 1) == -4 && (0xF0 & 0x3C) == 0x30 && (5 ^ 1) == 4 && (~0u >> 60) == 15\n'
++                '#include "yes.h"\n'
++                '#endif\n'
++            ),
++            'yes.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_character_constants(self) -> None:
++        files = {
++            'main.c': (
++                "#if 'A' == 65 && '\\n' == 10 && '\\x41' == 'A' && '\\101' == 65\n"
++                '#include "single.h"\n'
++                '#endif\n'
++                "#if 'ab' == 0x6162\n"
++                '#include "multi.h"\n'
++                '#endif\n'
++            ),
++            'multi.h': '',
++            'single.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['multi.h', 'single.h'])
++
++    def test_identifiers_left_after_expansion_are_zero(self) -> None:
++        files = {
++            'main.c': (
++                '#if !UNKNOWN && !(true || false)\n'
++                '#include "zero.h"\n'
++                '#endif\n'
++                '#if UNKNOWN == 0 && 0 == UNKNOWN\n'
++                '#include "eq.h"\n'
++                '#endif\n'
++            ),
++            'eq.h': '',
++            'zero.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['eq.h', 'zero.h'])
++
++    def test_comma_and_conditional_operators(self) -> None:
++        files = {
++            'main.c': (
++                '#if (0, 1) ? 2 : (1 / 0)\n'
++                '#include "yes.h"\n'
++                '#endif\n'
++                '#if 1 ? 0 : 1\n'
++                '#include "zero_middle.h"\n'
++                '#endif\n'
++            ),
++            'yes.h': '',
++            'zero_middle.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_defined_operator_forms(self) -> None:
++        files = {
++            'main.c': (
++                '#define X\n'
++                '#if defined X && defined(X) && defined ( X ) && !defined Y\n'
++                '#include "yes.h"\n'
++                '#endif\n'
++            ),
++            'yes.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_defined_produced_by_macro_expansion(self) -> None:
++        files = {
++            'main.c': (
++                '#define D defined(FOO)\n'
++                '#define FOO\n'
++                '#if D\n'
++                '#include "foo.h"\n'
++                '#endif\n'
++                '#define HAS(m) defined(m)\n'
++                '#if HAS(BAR)\n'
++                '#include "bar.h"\n'
++                '#endif\n'
++                '#define QUX_ON defined(QUX)\n'
++                '#if QUX_ON\n'
++                '#include "qux.h"\n'
++                '#endif\n'
++            ),
++            'bar.h': '',
++            'foo.h': '',
++            'qux.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['foo.h'])
++
++    def test_skipped_groups_are_not_evaluated(self) -> None:
++        files = {
++            'main.c': (
++                '#if 1\n'
++                '#else\n'
++                '#if garbage (\n'
++                '#include "inner.h"\n'
++                '#endif\n'
++                '#if 1 / 0\n'
++                '#endif\n'
++                '#endif\n'
++                '#if 1\n'
++                '#elif 1/0\n'
++                '#include "elif.h"\n'
++                '#else\n'
++                '#include "else.h"\n'
++                '#endif\n'
++                '#include "after.h"\n'
++            ),
++            'after.h': '',
++            'elif.h': '',
++            'else.h': '',
++            'inner.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['after.h'])
++
++    def test_elifdef_and_elifndef(self) -> None:
++        files = {
++            'main.c': (
++                '#if 0\n'
++                '#elifdef __STDC__\n'
++                '#include "stdc.h"\n'
++                '#else\n'
++                '#include "no.h"\n'
++                '#endif\n'
++                '#if 0\n'
++                '#elifndef NOPE\n'
++                '#include "nope.h"\n'
++                '#endif\n'
++            ),
++            'no.h': '',
++            'nope.h': '',
++            'stdc.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['nope.h', 'stdc.h'])
++
++    def test_predefined_macros(self) -> None:
++        files = {
++            'main.c': (
++                '#if __STDC_VERSION__ >= 201112L && __STDC__ == 1 && __STDC_HOSTED__\n'
++                '#include "std.h"\n'
++                '#endif\n'
++                '#ifdef __GNUC__\n'
++                '#include "gnuc.h"\n'
++                '#endif\n'
++                '#ifdef __has_include\n'
++                '#include "hi.h"\n'
++                '#endif\n'
++                '#ifdef __cplusplus\n'
++                '#include "cpp.h"\n'
++                '#endif\n'
++            ),
++            'cpp.h': '',
++            'gnuc.h': '',
++            'hi.h': '',
++            'std.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['hi.h', 'std.h'])
++
++    def test_nested_conditionals(self) -> None:
++        files = {
++            'main.c': (
++                '#define A 1\n'
++                '#if A\n'
++                '# if B\n'
++                '#  include "b.h"\n'
++                '# elif A + 1 == 2 && !UNDEFINED_THING\n'
++                '#  include "a.h"\n'
++                '# endif\n'
++                '#elif 1\n'
++                '#include "outer.h"\n'
++                '#endif\n'
++            ),
++            'a.h': '',
++            'b.h': '',
++            'outer.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['a.h'])
++
++    def test_computed_include_from_object_like_macros(self) -> None:
++        files = {
++            'main.c': (
++                '#define QH "q.h"\n'
++                '#define AH <a.h>\n'
++                '#include QH\n'
++                '#include AH\n'
++                '#define NAME b\n'
++                '#define BH <NAME.h>\n'
++                '#include BH\n'
++            ),
++            'inc/a.h': '',
++            'inc/b.h': '',
++            'q.h': '',
++        }
++        deps = self.scan(files, cpppath=['inc'])
++        self.assertEqual(deps, ['inc/a.h', 'inc/b.h', 'q.h'])
++
++    def test_computed_include_from_stringification(self) -> None:
++        files = {
++            'main.c': (
++                '#define HDR(n) #n\n'
++                '#define XHDR(n) HDR(n)\n'
++                '#define NAME sub/target.h\n'
++                '#include XHDR(NAME)\n'
++            ),
++            'sub/target.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['sub/target.h'])
++
++    def test_computed_include_from_pasted_name(self) -> None:
++        files = {
++            'main.c': (
++                '#define STR(x) #x\n'
++                '#define XSTR(x) STR(x)\n'
++                '#define CAT(a,b) a##b\n'
++                '#include XSTR(CAT(plat_, linux).h)\n'
++            ),
++            'plat_linux.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['plat_linux.h'])
++
++    def test_computed_include_from_cppdefines(self) -> None:
++        files = {
++            'main.c': (
++                '#include CONFIG_HEADER\n'
++                '#define STR(x) #x\n'
++                '#define XSTR(x) STR(x)\n'
++                '#include XSTR(BOARD_HEADER)\n'
++            ),
++            'boards/acme/board.h': '',
++            'cfg/config.h': '',
++        }
++        deps = self.scan(
++            files,
++            cppdefines=[
++                'CONFIG_HEADER=\\"cfg/config.h\\"',
++                'BOARD_DIR=boards/acme',
++                'BOARD_HEADER=BOARD_DIR/board.h',
++            ],
++        )
++        self.assertEqual(deps, ['boards/acme/board.h', 'cfg/config.h'])
++
++    def test_cpppath_order_holds_after_a_header_is_found(self) -> None:
++        files = {
++            'main.c': ('#include <x.h>\n#include <y.h>\n'),
++            'A/y.h': '',
++            'B/x.h': '',
++            'B/y.h': '',
++        }
++        deps = self.scan(files, cpppath=['A', 'B'])
++        self.assertEqual(deps, ['A/y.h', 'B/x.h'])
++
++    def test_quoted_include_falls_back_to_cpppath(self) -> None:
++        files = {
++            'src/main.c': '#include "inc/a.h"\n',
++            'include/b.h': '',
++            'include/c.h': '',
++            'src/b.h': '',
++            'src/inc/a.h': ('#include "b.h"\n#include "c.h"\n'),
++            'src/inc/c.h': '',
++        }
++        deps = self.scan(files, source='src/main.c', cpppath=['include'])
++        self.assertEqual(deps, ['include/b.h', 'src/inc/a.h', 'src/inc/c.h'])
++
++    def test_angle_include_skips_the_includers_directory(self) -> None:
++        files = {
++            'main.c': ('#include <first.h>\n#include "sub/h.h"\n'),
++            'A/k.h': '',
++            'B/first.h': '',
++            'B/k.h': '',
++            'sub/h.h': '#include <k.h>\n',
++            'sub/k.h': '',
++        }
++        deps = self.scan(files, cpppath=['A', 'B'])
++        self.assertEqual(deps, ['A/k.h', 'B/first.h', 'sub/h.h'])
++
++    def test_include_next_walks_the_rest_of_cpppath(self) -> None:
++        files = {
++            'main.c': '#include <x.h>\n',
++            'a/x.h': '#include_next <x.h>\n',
++            'b/bx.h': '',
++            'b/x.h': ('#include "bx.h"\n#include_next <x.h>\n'),
++            'c/cx.h': '',
++            'c/x.h': '#include "cx.h"\n',
++        }
++        deps = self.scan(files, cpppath=['a', 'b', 'c'])
++        self.assertEqual(deps, ['a/x.h', 'b/bx.h', 'b/x.h', 'c/cx.h', 'c/x.h'])
++
++    def test_include_next_in_the_source_file(self) -> None:
++        files = {
++            'sub/m2.c': '#include_next "y.h"\n',
++            'i1/y.h': '',
++            'sub/y.h': '',
++        }
++        deps = self.scan(files, source='sub/m2.c', cpppath=['i1'])
++        self.assertEqual(deps, ['sub/y.h'])
++
++    def test_has_include_next(self) -> None:
++        files = {
++            'main.c': '#include <w.h>\n',
++            'a/never.h': '',
++            'a/only_a.h': '',
++            'a/w.h': (
++                '#if __has_include_next(<w.h>)\n'
++                '#include_next <w.h>\n'
++                '#endif\n'
++                '#if __has_include_next(<only_a.h>)\n'
++                '#include "never.h"\n'
++                '#endif\n'
++            ),
++            'b/w.h': '',
++        }
++        deps = self.scan(files, cpppath=['a', 'b'])
++        self.assertEqual(deps, ['a/w.h', 'b/w.h'])
++
++    def test_unguarded_header_is_read_each_time(self) -> None:
++        files = {
++            'main.c': (
++                '#define X 1\n#include "x.h"\n#undef X\n#define X 2\n#include "x.h"\n'
++            ),
++            'one.h': '',
++            'two.h': '',
++            'x.h': (
++                '#if X == 1\n#include "one.h"\n#elif X == 2\n#include "two.h"\n#endif\n'
++            ),
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['one.h', 'two.h', 'x.h'])
++
++    def test_pragma_once(self) -> None:
++        files = {
++            'main.c': (
++                '#include "p.h"\n'
++                '#include "u.h"\n'
++                '#define X\n'
++                '#include "p.h"\n'
++                '#include "u.h"\n'
++            ),
++            'p.h': ('#pragma once\n#ifdef X\n#include "px.h"\n#endif\n'),
++            'px.h': '',
++            'u.h': ('#ifdef X\n#include "ux.h"\n#endif\n'),
++            'ux.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['p.h', 'u.h', 'ux.h'])
++
++    def test_include_guard(self) -> None:
++        files = {
++            'main.c': (
++                '#include "g.h"\n'
++                '#define X\n'
++                '#include "g.h"\n'
++                '#define Y\n'
++                '#undef G_H\n'
++                '#include "g.h"\n'
++            ),
++            'g.h': (
++                '#ifndef G_H\n'
++                '#define G_H\n'
++                '#ifdef X\n'
++                '#include "x.h"\n'
++                '#endif\n'
++                '#ifdef Y\n'
++                '#include "y.h"\n'
++                '#endif\n'
++                '#endif\n'
++            ),
++            'x.h': '',
++            'y.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['g.h', 'x.h', 'y.h'])
++
++    def test_import_reads_a_header_once(self) -> None:
++        files = {
++            'main.c': ('#import "h.h"\n#define X\n#include "h.h"\n'),
++            'h.h': ('#ifdef X\n#include "x.h"\n#endif\n'),
++            'x.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['h.h'])
++
++    def test_recursive_inclusion_driven_by_macros(self) -> None:
++        files = {
++            'main.c': ('#define N 0\n#include "r.h"\n'),
++            'done.h': '',
++            'r.h': (
++                '#if N == 0\n'
++                '#undef N\n'
++                '#define N 1\n'
++                '#include "r.h"\n'
++                '#elif N == 1\n'
++                '#undef N\n'
++                '#define N 2\n'
++                '#include "r.h"\n'
++                '#elif N == 2\n'
++                '#include "done.h"\n'
++                '#endif\n'
++            ),
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['done.h', 'r.h'])
++
++    def test_include_next_after_a_header_found_beside_its_includer(self) -> None:
++        files = {
++            'main.c': ('#include <top.h>\n#include <other.h>\n'),
++            'A/a_kid_mark.h': '',
++            'A/child.h': (
++                '#ifndef CHILD_H\n'
++                '#define CHILD_H\n'
++                '#if __has_include_next(<only_b.h>)\n'
++                '#include "saw_only_b.h"\n'
++                '#endif\n'
++                '#include_next <child.h>\n'
++                '#endif\n'
++            ),
++            'A/kid.h': '#include "a_kid_mark.h"\n',
++            'A/saw_only_b.h': '',
++            'A/top.h': '#include "child.h"\n',
++            'B/b_mark.h': '',
++            'B/child.h': '#include "b_mark.h"\n',
++            'B/kid.h': (
++                '#ifndef KID_H\n#define KID_H\n#include_next <kid.h>\n#endif\n'
++            ),
++            'B/only_b.h': '',
++            'B/other.h': '#include "kid.h"\n',
++        }
++        deps = self.scan(files, cpppath=['A', 'B'])
++        self.assertEqual(
++            deps,
++            [
++                'A/a_kid_mark.h',
++                'A/child.h',
++                'A/kid.h',
++                'A/saw_only_b.h',
++                'A/top.h',
++                'B/kid.h',
++                'B/other.h',
++            ],
++        )
++
++    def test_has_include_forms(self) -> None:
++        files = {
++            'main.c': (
++                '#define HDR "inc/ab.h"\n'
++                '#if __has_include(HDR)\n'
++                '#include "a1.h"\n'
++                '#endif\n'
++                '#if __has_include(<ab.h>)\n'
++                '#include "a2.h"\n'
++                '#endif\n'
++                '#if __has_include("missing.h")\n'
++                '#include "missing.h"\n'
++                '#elif defined(__has_include)\n'
++                '#include "a3.h"\n'
++                '#endif\n'
++                '#if __has_include(<only_here.h>)\n'
++                '#include "a4.h"\n'
++                '#endif\n'
++            ),
++            'a1.h': '',
++            'a2.h': '',
++            'a3.h': '',
++            'a4.h': '',
++            'inc/ab.h': '',
++            'only_here.h': '',
++        }
++        deps = self.scan(files, cpppath=['inc'])
++        self.assertEqual(deps, ['a1.h', 'a2.h', 'a3.h'])
++
++    def test_comments_spanning_lines(self) -> None:
++        files = {
++            'main.c': (
++                '/* comment\n'
++                '#include "in_comment.h"\n'
++                '*/ #include "after_comment.h"\n'
++                '#if 1 /* c\n'
++                '*/ + 1 == 2\n'
++                '#include "continued.h"\n'
++                '#endif\n'
++            ),
++            'after_comment.h': '',
++            'continued.h': '',
++            'in_comment.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['after_comment.h', 'continued.h'])
++
++    def test_include_after_a_comment_that_spans_lines(self) -> None:
++        files = {
++            'main.c': (
++                'int x; /* a comment that\n'
++                'ends here */ #include "after_text.h"\n'
++                '   /* only white space before\n'
++                'this comment */ #include "after_white_space.h"\n'
++                '/* one line */ #include "after_one_line_comment.h"\n'
++                'char *s = "/*"; /* a real comment\n'
++                '*/ #include "after_string.h"\n'
++                '#define A 1 /* a comment inside\n'
++                'a definition */ #include "in_definition.h"\n'
++                'int y; /* closed */\n'
++                '#include "next_line.h"\n'
++            ),
++            'after_one_line_comment.h': '',
++            'after_string.h': '',
++            'after_text.h': '',
++            'after_white_space.h': '',
++            'in_definition.h': '',
++            'next_line.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(
++            deps, ['after_one_line_comment.h', 'after_white_space.h', 'next_line.h']
++        )
++
++    def test_string_and_character_literals(self) -> None:
++        files = {
++            'main.c': (
++                'const char *s = "/*";\n'
++                '#include "one.h"\n'
++                'const char *t = "*/";\n'
++                'char c = \'"\';\n'
++                '#include "two.h"\n'
++                '#include "sub//three.h"\n'
++            ),
++            'one.h': '',
++            'sub/three.h': '',
++            'two.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['one.h', 'sub/three.h', 'two.h'])
++
++    def test_line_splices_in_directives(self) -> None:
++        files = {
++            'main.c': (
++                '#inc\\\n'
++                'lude "spliced.h"\n'
++                '#if 1 \\\n'
++                ' && 2\n'
++                '#include "cont.h"\n'
++                '#endif\n'
++                '# /* why */ include "commented.h"\n'
++            ),
++            'commented.h': '',
++            'cont.h': '',
++            'spliced.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['commented.h', 'cont.h', 'spliced.h'])
++
++    def test_cppdefines_entry_forms(self) -> None:
++        files = {
++            'main.c': (
++                '#if defined(A) && A == 1 && B == 2 && C == 1 && D == 4\n'
++                '#include "yes.h"\n'
++                '#endif\n'
++            ),
++            'yes.h': '',
++        }
++        deps = self.scan(files, cppdefines=['A', ('B', 2), ('C', None), {'D': 4}])
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_cppdefines_string_holds_several_entries(self) -> None:
++        files = {
++            'main.c': ('#if defined(A) && B == 2\n#include "yes.h"\n#endif\n'),
++            'yes.h': '',
++        }
++        deps = self.scan(files, cppdefines='A B=2')
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_cppdefines_empty_value(self) -> None:
++        files = {
++            'main.c': ('#if defined(E) && E 1 == 1\n#include "yes.h"\n#endif\n'),
++            'yes.h': '',
++        }
++        deps = self.scan(files, cppdefines=[('E', '')])
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_scanning_runs_no_programs(self) -> None:
++        files = {
++            'main.c': (
++                '#define IS_ENABLED(config_macro) _IS_ENABLED1(config_macro)\n'
++                '#define _IS_ENABLED1(config_macro) _IS_ENABLED2(_XXXX##config_macro)\n'
++                '#define _XXXX1 _YYYY,\n'
++                '#define _IS_ENABLED2(one_or_two_args) _IS_ENABLED3(one_or_two_args 1, 0)\n'
++                '#define _IS_ENABLED3(ignore_this, val, ...) val\n'
++                '#if IS_ENABLED(OPT)\n'
++                '#include <cfg.h>\n'
++                '#endif\n'
++            ),
++            'a/cfg.h': '#include_next <cfg.h>\n',
++            'b/cfg.h': '',
++        }
++        with mock.patch.dict(os.environ, {'PATH': ''}):
++            deps = self.scan(files, cpppath=['a', 'b'], cppdefines=['OPT=1'])
++        self.assertEqual(deps, ['a/cfg.h', 'b/cfg.h'])
++
++    def test_header_name_spellings(self) -> None:
++        files = {
++            'main.c': (
++                '#include <sub//four.h> /* doubled slash */\n'
++                '#include "it\'s here.h" // apostrophe and space\n'
++                '#include "dir/../c.h"\n'
++                '#include "sub/./five.h"\n'
++            ),
++            'c.h': '',
++            'dir/d.h': '',
++            'inc/sub/four.h': '',
++            "it's here.h": '',
++            'sub/five.h': '',
++        }
++        deps = self.scan(files, cpppath=['inc'])
++        self.assertEqual(deps, ['c.h', 'inc/sub/four.h', "it's here.h", 'sub/five.h'])
++
++    def test_include_operand_from_nested_function_like_macros(self) -> None:
++        files = {
++            'main.c': (
++                '#define STR(x) #x\n'
++                '#define XSTR(x) STR(x)\n'
++                '#define PATH(dir, file) XSTR(dir/file.h)\n'
++                '#define BOARD_FILE(name) PATH(boards, name)\n'
++                '#include BOARD_FILE(acme)\n'
++                '#define PICK BOARD_FILE\n'
++                '#include PICK(zed)\n'
++                '#define ANGLE(dir, file) <dir/file.h>\n'
++                '#define SYS_FILE(name) ANGLE(sys, name)\n'
++                '#include SYS_FILE(io)\n'
++            ),
++            'boards/acme.h': '',
++            'boards/zed.h': '',
++            'inc/sys/io.h': '',
++        }
++        deps = self.scan(files, cpppath=['inc'])
++        self.assertEqual(deps, ['boards/acme.h', 'boards/zed.h', 'inc/sys/io.h'])
++
++    def test_predefined_macro_branches(self) -> None:
++        files = {
++            'main.c': (
++                '#if __STDC_VERSION__ > 201710L\n'
++                '#include "c2x.h"\n'
++                '#elif __STDC_VERSION__ == 201710L\n'
++                '#include "c17.h"\n'
++                '#else\n'
++                '#include "c11.h"\n'
++                '#endif\n'
++                '#if defined(__STDC_UTF_16__) && defined(__STDC_UTF_32__) && __STDC_HOSTED__ == 1\n'
++                '#include "utf.h"\n'
++                '#endif\n'
++                '#if defined(__x86_64__) || defined(__linux__) || defined(unix) || defined(__SIZEOF_INT__) || defined(__CHAR_BIT__) || defined(__OPTIMIZE__)\n'
++                '#include "target.h"\n'
++                '#else\n'
++                '#include "no_target.h"\n'
++                '#endif\n'
++                '#if defined(__STDC_ISO_10646__) || defined(__STDC_IEC_559__)\n'
++                '#include "libc_predef.h"\n'
++                '#endif\n'
++            ),
++            'c11.h': '',
++            'c17.h': '',
++            'c2x.h': '',
++            'libc_predef.h': '',
++            'no_target.h': '',
++            'target.h': '',
++            'utf.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['c17.h', 'no_target.h', 'utf.h'])
++
++    def test_definitions_and_search_working_together(self) -> None:
++        files = {
++            'main.c': (
++                '#define STR(x) #x\n'
++                '#define XSTR(x) STR(x)\n'
++                '#include XSTR(CFG_DIR/BOARD.h)\n'
++                '#if LEVEL > 1\n'
++                '#include <feature.h>\n'
++                '#endif\n'
++                '#if LEVEL == 1\n'
++                '#include "after.h"\n'
++                '#endif\n'
++            ),
++            'after.h': '',
++            'base/cfg/acme.h': '#include "shadowed.h"\n',
++            'base/deep.h': '',
++            'base/feature.h': ('#if LEVEL == 1\n#include "deep.h"\n#endif\n'),
++            'over/cfg/acme.h': '#define FAST 1\n',
++            'over/deep.h': '',
++            'over/feature.h': (
++                '#undef LEVEL\n'
++                '#define LEVEL 1\n'
++                '#if FAST\n'
++                '#include_next <feature.h>\n'
++                '#endif\n'
++            ),
++            'shadowed.h': '',
++        }
++        deps = self.scan(
++            files,
++            cpppath=['over', 'base'],
++            cppdefines=['BOARD=acme', ('LEVEL', 2), 'CFG_DIR=cfg'],
++        )
++        self.assertEqual(
++            deps,
++            [
++                'after.h',
++                'base/deep.h',
++                'base/feature.h',
++                'over/cfg/acme.h',
++                'over/feature.h',
++            ],
++        )
++
++    def test_command_line_macros_steer_a_header_chain(self) -> None:
++        files = {
++            'main.c': (
++                '#define STR(x) #x\n'
++                '#define XSTR(x) STR(x)\n'
++                '#define CAT(a, b) a ## b\n'
++                '#define XCAT(a, b) CAT(a, b)\n'
++                '#include XSTR(XCAT(os_, PLATFORM).h)\n'
++                '#include <config.h>\n'
++                '#if VERSION >= 4 && defined(HAVE_COMPAT)\n'
++                '#include <shim.h>\n'
++                '#endif\n'
++                '#include <config.h>\n'
++            ),
++            'compat/shim.h': '',
++            'include/config.h': (
++                '#if VERSION == 4\n'
++                '#include "v4.h"\n'
++                '#undef VERSION\n'
++                '#define VERSION 5\n'
++                '#elif VERSION == 5\n'
++                '#include "v5.h"\n'
++                '#else\n'
++                '#include "v3.h"\n'
++                '#endif\n'
++            ),
++            'include/os_linux.h': (
++                '#define HAVE_COMPAT\n#undef VERSION\n#define VERSION 4\n'
++            ),
++            'include/os_win.h': '',
++            'include/v3.h': '',
++            'include/v4.h': '',
++            'include/v5.h': '',
++        }
++        deps = self.scan(
++            files,
++            cpppath=['include', 'compat'],
++            cppdefines=[('PLATFORM', 'linux'), 'VERSION=3'],
++        )
++        self.assertEqual(
++            deps,
++            [
++                'compat/shim.h',
++                'include/config.h',
++                'include/os_linux.h',
++                'include/v4.h',
++                'include/v5.h',
++            ],
++        )
++
++    def test_headers_with_odd_bytes_and_a_directory_in_the_way(self) -> None:
++        files = {
++            'main.c': ('#include "latin.h"\n#include "bom.h"\n#include "cfg.h"\n'),
++            'after_bom.h': '',
++            'after_latin.h': '',
++            'bom.h': b'\xef\xbb\xbf#include "after_bom.h"\n',
++            'cfg.h/readme.txt': '',
++            'inc/cfg.h': '',
++            'latin.h': (
++                b'/* caf\xe9 */\n'
++                b'#define STR(x) #x\n'
++                b'#define XSTR(x) STR(x)\n'
++                b'#include XSTR(after_latin.h)\n'
++            ),
++        }
++        deps = self.scan(files, cpppath=['inc'])
++        self.assertEqual(
++            deps, ['after_bom.h', 'after_latin.h', 'bom.h', 'inc/cfg.h', 'latin.h']
++        )
++
++    def test_pushed_and_popped_macros_choose_headers(self) -> None:
++        files = {
++            'main.c': (
++                '#define CFG "first.h"\n'
++                '#pragma push_macro("CFG")\n'
++                '#undef CFG\n'
++                '#define CFG <second.h>\n'
++                '#include CFG\n'
++                '#pragma pop_macro("CFG")\n'
++                '#include CFG\n'
++                '#pragma push_macro("NEVER")\n'
++                '#define NEVER 1\n'
++                '#pragma pop_macro("NEVER")\n'
++                '#ifdef NEVER\n'
++                '#include "never.h"\n'
++                '#endif\n'
++            ),
++            'first.h': '',
++            'inc/second.h': '',
++            'never.h': '',
++        }
++        deps = self.scan(files, cpppath=['inc'])
++        self.assertEqual(deps, ['first.h', 'inc/second.h'])
++
++    def test_include_next_beside_the_includer_and_include_level(self) -> None:
++        files = {
++            'main.c': (
++                '%:include "local.h"\n'
++                '#if __INCLUDE_LEVEL__ == 0\n'
++                '#include <lvl.h>\n'
++                '#endif\n'
++            ),
++            'a/local.h': '',
++            'a/lvl.h': ('#if __INCLUDE_LEVEL__ == 1\n#include "one.h"\n#endif\n'),
++            'a/one.h': '',
++            'b/local.h': '',
++            'local.h': '#include_next <local.h>\n',
++            'one.h': '',
++        }
++        deps = self.scan(files, cpppath=['a', 'b'])
++        self.assertEqual(deps, ['a/local.h', 'a/lvl.h', 'a/one.h', 'local.h'])
++
++    def test_generated_include_graph_with_three_search_paths(self) -> None:
++        files = {
++            'src/main.c': (
++                '/* main */\n'
++                '#define Y 0\n'
++                '#if defined(Y) && Y == 2\n'
++                '#include <a.h>\n'
++                '#endif\n'
++                '#define Z 0\n'
++                '#include "a.h"\n'
++            ),
++            'I0/a.h': (
++                '/* I0/a.h */\n'
++                '#pragma once\n'
++                '#if __has_include(<b.h>)\n'
++                '#include <b.h>\n'
++                '#elif __has_include("b.h")\n'
++                '#include "b.h"\n'
++                '#endif\n'
++                '#if defined(X) && X == 0\n'
++                '#include <c.h>\n'
++                '#endif\n'
++                '#include <c.h>\n'
++            ),
++            'I0/b.h': (
++                '/* I0/b.h */\n'
++                '#if __INCLUDE_LEVEL__ < 4\n'
++                '#define Z 0\n'
++                '#import "a.h"\n'
++                '#if defined(Y) && Y == 2\n'
++                '#include <a.h>\n'
++                '#endif\n'
++                '#endif\n'
++            ),
++            'I0/c.h': (
++                '/* I0/c.h */\n'
++                '#if __INCLUDE_LEVEL__ < 4\n'
++                '#ifdef X\n'
++                '#include "d.h"\n'
++                '#else\n'
++                '#include <d.h>\n'
++                '#endif\n'
++                '#ifdef Z\n'
++                '#include "a.h"\n'
++                '#else\n'
++                '#include <a.h>\n'
++                '#endif\n'
++                '#include <a.h>\n'
++                '#endif\n'
++            ),
++            'I1/a.h': (
++                '/* I1/a.h */\n'
++                '#ifndef G_I1_a_h\n'
++                '#define G_I1_a_h\n'
++                '#include_next "a.h"\n'
++                '#import "b.h"\n'
++                '#endif\n'
++            ),
++            'I1/d.h': (
++                '/* I1/d.h */\n'
++                '#ifndef G_I1_d_h\n'
++                '#define G_I1_d_h\n'
++                '#define Y\n'
++                '#include_next "a.h"\n'
++                '#if __has_include_next(<c.h>)\n'
++                '#include_next <c.h>\n'
++                '#endif\n'
++                '#include <b.h>\n'
++                '#endif\n'
++            ),
++            'I2/a.h': (
++                '/* I2/a.h */\n'
++                '#pragma once\n'
++                '#include <d.h>\n'
++                '#if __has_include_next(<d.h>)\n'
++                '#include_next <d.h>\n'
++                '#endif\n'
++                '#if __has_include_next(<a.h>)\n'
++                '#include_next <a.h>\n'
++                '#endif\n'
++            ),
++            'I2/b.h': (
++                '/* I2/b.h */\n'
++                '#pragma once\n'
++                '#ifdef X\n'
++                '#include "a.h"\n'
++                '#else\n'
++                '#include <a.h>\n'
++                '#endif\n'
++                '#define X\n'
++                '#if defined(Z) && Z == 1\n'
++                '#include <c.h>\n'
++                '#endif\n'
++            ),
++            'I2/c.h': ('/* I2/c.h */\n#pragma once\n#include "b.h"\n'),
++            'src/a.h': (
++                '/* src/a.h */\n'
++                '#if __INCLUDE_LEVEL__ < 4\n'
++                '#include "a.h"\n'
++                '#import "c.h"\n'
++                '#include "b.h"\n'
++                '#include_next <c.h>\n'
++                '#endif\n'
++            ),
++            'src/b.h': (
++                '/* src/b.h */\n'
++                '#if __INCLUDE_LEVEL__ < 4\n'
++                '#ifdef Z\n'
++                '#include "d.h"\n'
++                '#else\n'
++                '#include <d.h>\n'
++                '#endif\n'
++                '#endif\n'
++            ),
++            'src/c.h': (
++                '/* src/c.h */\n'
++                '#ifndef G_src_c_h\n'
++                '#define G_src_c_h\n'
++                '#define Z 1\n'
++                '#define Y 1\n'
++                '#endif\n'
++            ),
++            'src/sub/b.h': (
++                '/* src/sub/b.h */\n'
++                '#if __INCLUDE_LEVEL__ < 4\n'
++                '#include <c.h>\n'
++                '#define Z 0\n'
++                '#endif\n'
++            ),
++        }
++        deps = self.scan(
++            files, source='src/main.c', cpppath=['I1', 'I2', 'I0'], cppdefines=['Y']
++        )
++        self.assertEqual(
++            deps,
++            [
++                'I0/a.h',
++                'I1/a.h',
++                'I1/d.h',
++                'I2/a.h',
++                'I2/b.h',
++                'I2/c.h',
++                'src/a.h',
++                'src/b.h',
++                'src/c.h',
++            ],
++        )
++
++    def test_generated_include_graph_with_command_line_values(self) -> None:
++        files = {
++            'src/main.c': (
++                '/* main */\n'
++                '#include "c.h"\n'
++                '#ifdef Z\n'
++                '#include "a.h"\n'
++                '#else\n'
++                '#include <a.h>\n'
++                '#endif\n'
++                '#define Z 2\n'
++                '#include "d.h"\n'
++                '#define Z\n'
++            ),
++            'I0/a.h': (
++                '/* I0/a.h */\n'
++                '#ifndef G_I0_a_h\n'
++                '#define G_I0_a_h\n'
++                '#include <a.h>\n'
++                '#include <b.h>\n'
++                '#endif\n'
++            ),
++            'I0/b.h': (
++                '/* I0/b.h */\n'
++                '#ifndef G_I0_b_h\n'
++                '#define G_I0_b_h\n'
++                '#if __has_include_next(<b.h>)\n'
++                '#include_next <b.h>\n'
++                '#endif\n'
++                '#if __has_include(<a.h>)\n'
++                '#include <a.h>\n'
++                '#elif __has_include("a.h")\n'
++                '#include "a.h"\n'
++                '#endif\n'
++                '#if defined(X) && X == 1\n'
++                '#include <b.h>\n'
++                '#endif\n'
++                '#undef Y\n'
++                '#endif\n'
++            ),
++            'I0/d.h': (
++                '/* I0/d.h */\n'
++                '#ifndef G_I0_d_h\n'
++                '#define G_I0_d_h\n'
++                '#include_next <c.h>\n'
++                '#include_next <b.h>\n'
++                '#endif\n'
++            ),
++            'I1/a.h': (
++                '/* I1/a.h */\n'
++                '#ifndef G_I1_a_h\n'
++                '#define G_I1_a_h\n'
++                '#import "a.h"\n'
++                '#if defined(Z) && Z == 2\n'
++                '#include <b.h>\n'
++                '#endif\n'
++                '#endif\n'
++            ),
++            'I1/b.h': (
++                '/* I1/b.h */\n'
++                '#pragma once\n'
++                '#if __has_include(<d.h>)\n'
++                '#include <d.h>\n'
++                '#elif __has_include("d.h")\n'
++                '#include "d.h"\n'
++                '#endif\n'
++                '#include_next "a.h"\n'
++                '#if __has_include_next(<c.h>)\n'
++                '#include_next <c.h>\n'
++                '#endif\n'
++                '#include "b.h"\n'
++            ),
++            'I1/c.h': (
++                '/* I1/c.h */\n'
++                '#pragma once\n'
++                '#if __has_include(<d.h>)\n'
++                '#include <d.h>\n'
++                '#elif __has_include("d.h")\n'
++                '#include "d.h"\n'
++                '#endif\n'
++                '#include <a.h>\n'
++            ),
++            'I2/b.h': (
++                '/* I2/b.h */\n'
++                '#ifndef G_I2_b_h\n'
++                '#define G_I2_b_h\n'
++                '#include "c.h"\n'
++                '#define X 0\n'
++                '#endif\n'
++            ),
++            'I2/c.h': (
++                '/* I2/c.h */\n'
++                '#ifndef G_I2_c_h\n'
++                '#define G_I2_c_h\n'
++                '#if __has_include(<d.h>)\n'
++                '#include <d.h>\n'
++                '#elif __has_include("d.h")\n'
++                '#include "d.h"\n'
++                '#endif\n'
++                '#endif\n'
++            ),
++            'I2/d.h': (
++                '/* I2/d.h */\n'
++                '#ifndef G_I2_d_h\n'
++                '#define G_I2_d_h\n'
++                '#define X 1\n'
++                '#include_next <c.h>\n'
++                '#if __has_include(<b.h>)\n'
++                '#include <b.h>\n'
++                '#elif __has_include("b.h")\n'
++                '#include "b.h"\n'
++                '#endif\n'
++                '#if __has_include(<b.h>)\n'
++                '#include <b.h>\n'
++                '#elif __has_include("b.h")\n'
++                '#include "b.h"\n'
++                '#endif\n'
++                '#endif\n'
++            ),
++            'src/a.h': (
++                '/* src/a.h */\n'
++                '#pragma once\n'
++                '#if defined(X) && X == 0\n'
++                '#include <b.h>\n'
++                '#endif\n'
++                '#import "a.h"\n'
++                '#if defined(X) && X == 0\n'
++                '#include <b.h>\n'
++                '#endif\n'
++                '#include "c.h"\n'
++            ),
++            'src/b.h': (
++                '/* src/b.h */\n'
++                '#ifndef G_src_b_h\n'
++                '#define G_src_b_h\n'
++                '#ifdef Y\n'
++                '#include "c.h"\n'
++                '#else\n'
++                '#include <c.h>\n'
++                '#endif\n'
++                '#include_next <b.h>\n'
++                '#endif\n'
++            ),
++            'src/c.h': (
++                '/* src/c.h */\n'
++                '#if __INCLUDE_LEVEL__ < 4\n'
++                '#include "c.h"\n'
++                '#include <c.h>\n'
++                '#include <c.h>\n'
++                '#endif\n'
++            ),
++            'src/d.h': (
++                '/* src/d.h */\n'
++                '#if __INCLUDE_LEVEL__ < 4\n'
++                '#if __has_include(<b.h>)\n'
++                '#include <b.h>\n'
++                '#elif __has_include("b.h")\n'
++                '#include "b.h"\n'
++                '#endif\n'
++                '#endif\n'
++            ),
++            'src/sub/b.h': (
++                '/* src/sub/b.h */\n'
++                '#if __INCLUDE_LEVEL__ < 4\n'
++                '#include <b.h>\n'
++                '#ifdef Y\n'
++                '#include "b.h"\n'
++                '#else\n'
++                '#include <b.h>\n'
++                '#endif\n'
++                '#endif\n'
++            ),
++        }
++        deps = self.scan(
++            files, source='src/main.c', cpppath=['I2', 'I1'], cppdefines=['Z=2', 'X=0']
++        )
++        self.assertEqual(
++            deps,
++            [
++                'I1/a.h',
++                'I1/c.h',
++                'I2/b.h',
++                'I2/c.h',
++                'I2/d.h',
++                'src/a.h',
++                'src/c.h',
++                'src/d.h',
++            ],
++        )
++
++    def test_line_numbers_choose_headers(self) -> None:
++        files = {
++            'main.c': (
++                '#if __LINE__ == 1\n'
++                '#include "physical.h"\n'
++                '#endif\n'
++                '#line 100\n'
++                '#if __LINE__ == 100\n'
++                '#include "remapped.h"\n'
++                '#endif\n'
++                '#line 200 "renamed.c"\n'
++                '#if __LINE__ == 200\n'
++                '#include "named.h"\n'
++                '#endif\n'
++                '#include "line.h"\n'
++                '#define STR(x) #x\n'
++                '#define XSTR(x) STR(x)\n'
++                '#line 40\n'
++                '#include XSTR(__LINE__.h)\n'
++            ),
++            '40.h': '',
++            'line.h': ('#if __LINE__ == 1\n#include "own_count.h"\n#endif\n'),
++            'named.h': '',
++            'own_count.h': '',
++            'physical.h': '',
++            'remapped.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(
++            deps,
++            ['40.h', 'line.h', 'named.h', 'own_count.h', 'physical.h', 'remapped.h'],
++        )
++
++    def test_line_numbers_inside_macro_arguments(self) -> None:
++        files = {
++            'main.c': (
++                '#define ID(x) x\n'
++                '#define AT_LINE __LINE__\n'
++                '#define LINE_OF(x) __LINE__\n'
++                '#if ID( \\\n'
++                '__LINE__) == 5\n'
++                '#include "argument_line.h"\n'
++                '#endif\n'
++                '#if ID( /* a comment\n'
++                'ending here */ __LINE__) == 9\n'
++                '#include "after_comment_line.h"\n'
++                '#endif\n'
++                '#if ID( \\\n'
++                'AT_LINE) == 13\n'
++                '#include "macro_name_line.h"\n'
++                '#endif\n'
++                '#if LINE_OF( \\\n'
++                'x) == 16\n'
++                '#include "invocation_line.h"\n'
++                '#endif\n'
++                '#if ID( \\\n'
++                '__LINE__) == 20\n'
++                '#include "first_line.h"\n'
++                '#endif\n'
++                '#define STR(x) #x\n'
++                '#define XSTR(x) STR(x)\n'
++                '#include XSTR( \\\n'
++                '__LINE__.h)\n'
++            ),
++            '26.h': '',
++            '27.h': '',
++            'after_comment_line.h': '',
++            'argument_line.h': '',
++            'first_line.h': '',
++            'invocation_line.h': '',
++            'macro_name_line.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(
++            deps,
++            [
++                '27.h',
++                'after_comment_line.h',
++                'argument_line.h',
++                'invocation_line.h',
++                'macro_name_line.h',
++            ],
++        )
++
++    def test_line_numbers_in_a_call_named_by_an_object_like_macro(self) -> None:
++        files = {
++            'main.c': (
++                '#define ID(x) x\n'
++                '#define FN ID\n'
++                '#if FN( \\\n'
++                '__LINE__) == 3\n'
++                '#include "name_line.h"\n'
++                '#endif\n'
++                '#if FN( \\\n'
++                '__LINE__) == 8\n'
++                '#include "argument_line.h"\n'
++                '#endif\n'
++                '#if FN( /* a comment\n'
++                'ending here */ __LINE__) == 11\n'
++                '#include "name_line_after_comment.h"\n'
++                '#endif\n'
++                '#if ID( \\\n'
++                '__LINE__) == 16\n'
++                '#include "direct_call_argument_line.h"\n'
++                '#endif\n'
++            ),
++            'argument_line.h': '',
++            'direct_call_argument_line.h': '',
++            'name_line.h': '',
++            'name_line_after_comment.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(
++            deps,
++            ['direct_call_argument_line.h', 'name_line.h', 'name_line_after_comment.h'],
++        )
++
++    def test_function_like_command_line_macros(self) -> None:
++        files = {
++            'main.c': (
++                '#if F(1) == 2 && G(2, 3) == 5 && H == 1 && SPACED(2, 3) == 7\n'
++                '#include "yes.h"\n'
++                '#else\n'
++                '#include "no.h"\n'
++                '#endif\n'
++            ),
++            'no.h': '',
++            'yes.h': '',
++        }
++        deps = self.scan(
++            files,
++            cppdefines=[
++                "'F(x)=x+1'",
++                'G\\(a,b\\)=a+b',
++                ('H', "'1'"),
++                ('SPACED(a, b)', 'a * b + 1'),
++            ],
++        )
++        self.assertEqual(deps, ['yes.h'])
++
++    def test_universal_character_names(self) -> None:
++        files = {
++            'main.c': (
++                '#define caf\\u00e9 1\n'
++                '#if caf\xe9 == 1 && defined(caf\\u00E9)\n'
++                '#include "same_name.h"\n'
++                '#endif\n'
++                "#if '\\u00E9' == '\xe9' && 'a\\u20AC' == 'a\u20ac'\n"
++                '#include "narrow.h"\n'
++                '#endif\n'
++                "#if L'\\u00E9' == L'\xe9' && L'\\u20AC' == L'\u20ac'\n"
++                '#include "wide.h"\n'
++                '#endif\n'
++                "#if u'\\u00E9' == u'\xe9' && U'\\U0001F600' == U'\U0001f600'\n"
++                '#include "utf.h"\n'
++                '#endif\n'
++                "#if '\\u00E9' == 'e' || L'\\u00E9' == L'\\u00E8' || u'\\u20AC' == u'$' || U'\\U0001F600' == U'\\U0001F601'\n"
++                '#include "distinct.h"\n'
++                '#endif\n'
++            ),
++            'distinct.h': '',
++            'narrow.h': '',
++            'same_name.h': '',
++            'utf.h': '',
++            'wide.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['narrow.h', 'same_name.h', 'utf.h', 'wide.h'])
++
++    def test_excluded_facilities_do_not_decide_the_headers_found(self) -> None:
++        files = {
++            'main.c': (
++                '#define STR(x) #x\n'
++                '#define XSTR(x) STR(x)\n'
++                '#define CAT(a, b) a ## b\n'
++                'static const char stamp[] = __DATE__ " " __TIME__ " " __TIMESTAMP__;\n'
++                'static const char *where = __FILE__ ":" __BASE_FILE__ ":" __FILE_NAME__;\n'
++                'static int first = __COUNTER__, second = __COUNTER__;\n'
++                '_Pragma("GCC diagnostic push")\n'
++                '#if defined(__has_builtin)\n'
++                '#if __has_builtin(__builtin_expect)\n'
++                '#define LIKELY(x) __builtin_expect(!!(x), 1)\n'
++                '#endif\n'
++                '#endif\n'
++                '#ifndef LIKELY\n'
++                '#define LIKELY(x) (x)\n'
++                '#endif\n'
++                '#include "middle.h"\n'
++                '#if 0\n'
++                '#if __has_attribute(unused) || __has_c_attribute(nodiscard) || #machine(vax)\n'
++                '#include "skipped.h"\n'
++                '#endif\n'
++                '#assert machine(vax)\n'
++                '#include __FILE__\n'
++                '#endif\n'
++                '_Pragma("GCC diagnostic pop")\n'
++                '#include XSTR(CAT(aft, er).h)\n'
++            ),
++            'after.h': '',
++            'middle.h': '',
++            'skipped.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['after.h', 'middle.h'])
++
++    def test_search_path_arrangements(self) -> None:
++        files = {
++            'main.c': ('#include <x.h>\n#include "sub/y.h"\n#include <w.h>\n'),
++            'inc/x.h': '#include_next <x.h>\n',
++            'inc/z.h': '',
++            'last/w.h': '',
++            'more/mx.h': '',
++            'more/w.h': '',
++            'more/x.h': '#include "mx.h"\n',
++            'sub/y.h': ('#include "z.h"\n#include <z.h>\n'),
++            'sub/z.h': '',
++        }
++        deps = self.scan(
++            files, cpppath=['inc', 'nowhere', 'inc', 'more', 'last', 'more']
++        )
++        self.assertEqual(
++            deps,
++            [
++                'inc/x.h',
++                'inc/z.h',
++                'more/mx.h',
++                'more/w.h',
++                'more/x.h',
++                'sub/y.h',
++                'sub/z.h',
++            ],
++        )
++
++    def test_guarded_header_with_alternate_branches(self) -> None:
++        files = {
++            'main.c': (
++                '#include "g.h"\n'
++                '#include "g.h"\n'
++                '#include "e.h"\n'
++                '#define X\n'
++                '#include "e.h"\n'
++            ),
++            'alternate.h': '',
++            'e.h': (
++                '#ifndef E_H\n'
++                '#define E_H\n'
++                '#elif defined X\n'
++                '#include "e_elif.h"\n'
++                '#endif\n'
++            ),
++            'e_elif.h': '',
++            'g.h': (
++                '#ifndef G_H\n'
++                '#define G_H\n'
++                '#include "inside.h"\n'
++                '#else\n'
++                '#include "alternate.h"\n'
++                '#endif\n'
++            ),
++            'inside.h': '',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['alternate.h', 'e.h', 'e_elif.h', 'g.h', 'inside.h'])
++
++    def test_generated_conditions_with_comma_swallowing_macros(self) -> None:
++        files = {
++            'main.c': (
++                '#define M1 (M3 ? M1 : M0)\n'
++                '#define M2 M3\n'
++                '#define F0(...) (0, ##__VA_ARGS__)\n'
++                '#define SEL(a, b, c, ...) c\n'
++                '#define F1(a, b) F0(b, a) + M0\n'
++                '#define F2(a, b) F0(b, a) + M1\n'
++                '#if !defined M1\n'
++                '#include "t0a.h"\n'
++                '#elif F0(7, 1u)\n'
++                '#include "t0b.h"\n'
++                '#else\n'
++                '#include "t0c.h"\n'
++                '#endif\n'
++                '#if ((010 % (M3 | 1)) ? (M0 ^ 18446744073709551615u) : defined ( M1 ))\n'
++                '#include "t1a.h"\n'
++                '#elif F1(0, 2)\n'
++                '#include "t1b.h"\n'
++                '#else\n'
++                '#include "t1c.h"\n'
++                '#endif\n'
++                '#if defined M0\n'
++                '#include "t2a.h"\n'
++                '#elif (M1 / (M2 | 1))\n'
++                '#include "t2b.h"\n'
++                '#else\n'
++                '#include "t2c.h"\n'
++                '#endif\n'
++            ),
++            't0a.h': '/* t0a */\n',
++            't0b.h': '/* t0b */\n',
++            't0c.h': '/* t0c */\n',
++            't1a.h': '/* t1a */\n',
++            't1b.h': '/* t1b */\n',
++            't1c.h': '/* t1c */\n',
++            't2a.h': '/* t2a */\n',
++            't2b.h': '/* t2b */\n',
++            't2c.h': '/* t2c */\n',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['t0b.h', 't1a.h', 't2c.h'])
++
++    def test_generated_conditions_with_selector_and_optional_arguments(self) -> None:
++        files = {
++            'main.c': (
++                '#define M0 ~M3\n'
++                '#define M1 ((18446744073709551615u % (M0 | 1)) ? F2(M2, M1) : (0 / (2 | 1)))\n'
++                '#define M2 M0\n'
++                '#define M3 (M1 || M1)\n'
++                '#define F0(a, b) b\n'
++                '#define F1(a, ...) 7 __VA_OPT__(+ __VA_ARGS__)\n'
++                '#define F2(...) (SEL(__VA_ARGS__, 5, 6))\n'
++                '#define SEL(a, b, c, ...) c\n'
++                '#if (M0 % (M1 | 1))\n'
++                '#include "t0a.h"\n'
++                '#elif 1u\n'
++                '#include "t0b.h"\n'
++                '#else\n'
++                '#include "t0c.h"\n'
++                '#endif\n'
++                '#if F1((M0 / (M2 | 1)), (M3 % (18446744073709551615u | 1)))\n'
++                '#include "t1a.h"\n'
++                '#elif (M3 - M1)\n'
++                '#include "t1b.h"\n'
++                '#else\n'
++                '#include "t1c.h"\n'
++                '#endif\n'
++                '#if 0\n'
++                '#include "t2a.h"\n'
++                '#elif F2(0u, M0)\n'
++                '#include "t2b.h"\n'
++                '#else\n'
++                '#include "t2c.h"\n'
++                '#endif\n'
++            ),
++            't0a.h': '/* t0a */\n',
++            't0b.h': '/* t0b */\n',
++            't0c.h': '/* t0c */\n',
++            't1a.h': '/* t1a */\n',
++            't1b.h': '/* t1b */\n',
++            't1c.h': '/* t1c */\n',
++            't2a.h': '/* t2a */\n',
++            't2b.h': '/* t2b */\n',
++            't2c.h': '/* t2c */\n',
++        }
++        deps = self.scan(files)
++        self.assertEqual(deps, ['t0b.h', 't1a.h', 't2b.h'])
++
++    def test_generated_include_graph_with_two_search_paths(self) -> None:
++        files = {
++            'src/main.c': (
++                '/* main */\n'
++                '#include <a.h>\n'
++                '#define Y 1\n'
++                '#define X 1\n'
++                '#include "b.h"\n'
++                '#include "d.h"\n'
++            ),
++            'I0/b.h': (
++                '/* I0/b.h */\n#if __INCLUDE_LEVEL__ < 4\n#include "b.h"\n#endif\n'
++            ),
++            'I0/c.h': (
++                '/* I0/c.h */\n'
++                '#ifndef G_I0_c_h\n'
++                '#define G_I0_c_h\n'
++                '#include "d.h"\n'
++                '#if __has_include(<b.h>)\n'
++                '#include <b.h>\n'
++                '#elif __has_include("b.h")\n'
++                '#include "b.h"\n'
++                '#endif\n'
++                '#import "d.h"\n'
++                '#include <c.h>\n'
++                '#endif\n'
++            ),
++            'I1/b.h': (
++                '/* I1/b.h */\n'
++                '#ifndef G_I1_b_h\n'
++                '#define G_I1_b_h\n'
++                '#include <b.h>\n'
++                '#endif\n'
++            ),
++            'I1/c.h': ('/* I1/c.h */\n#pragma once\n#define Y 1\n'),
++            'I1/d.h': (
++                '/* I1/d.h */\n'
++                '#if __INCLUDE_LEVEL__ < 4\n'
++                '#if __has_include_next(<c.h>)\n'
++                '#include_next <c.h>\n'
++                '#endif\n'
++                '#endif\n'
++            ),
++            'I2/a.h': (
++                '/* I2/a.h */\n'
++                '#ifndef G_I2_a_h\n'
++                '#define G_I2_a_h\n'
++                '#if defined(Y) && Y == 1\n'
++                '#include <d.h>\n'
++                '#endif\n'
++                '#endif\n'
++            ),
++            'I2/d.h': (
++                '/* I2/d.h */\n'
++                '#if __INCLUDE_LEVEL__ < 4\n'
++                '#if __has_include(<a.h>)\n'
++                '#include <a.h>\n'
++                '#elif __has_include("a.h")\n'
++                '#include "a.h"\n'
++                '#endif\n'
++                '#define Z 0\n'
++                '#endif\n'
++            ),
++            'src/b.h': (
++                '/* src/b.h */\n'
++                '#ifndef G_src_b_h\n'
++                '#define G_src_b_h\n'
++                '#include "a.h"\n'
++                '#include <a.h>\n'
++                '#include_next "a.h"\n'
++                '#import "d.h"\n'
++                '#endif\n'
++            ),
++            'src/d.h': (
++                '/* src/d.h */\n'
++                '#ifndef G_src_d_h\n'
++                '#define G_src_d_h\n'
++                '#include <b.h>\n'
++                '#endif\n'
++            ),
++            'src/sub/c.h': (
++                '/* src/sub/c.h */\n'
++                '#pragma once\n'
++                '#if defined(X) && X == 0\n'
++                '#include <b.h>\n'
++                '#endif\n'
++                '#undef X\n'
++            ),
++            'src/sub/d.h': (
++                '/* src/sub/d.h */\n'
++                '#ifndef G_src_sub_d_h\n'
++                '#define G_src_sub_d_h\n'
++                '#include <c.h>\n'
++                '#ifdef Y\n'
++                '#include "a.h"\n'
++                '#else\n'
++                '#include <a.h>\n'
++                '#endif\n'
++                '#include_next "c.h"\n'
++                '#endif\n'
++            ),
++        }
++        deps = self.scan(
++            files, source='src/main.c', cpppath=['I1', 'I2'], cppdefines=['Y']
++        )
++        self.assertEqual(deps, ['I1/b.h', 'I1/d.h', 'I2/a.h', 'src/b.h', 'src/d.h'])
++
++    def test_cppdefines_are_substituted_like_the_command_line(self) -> None:
++        root = tempfile.mkdtemp()
++        self.addCleanup(shutil.rmtree, root)
++        files = {
++            'main.c': (
++                '#if FEATURE == 1 && LEVEL == 3 && defined(TURBO)\n'
++                '#include "yes.h"\n'
++                '#else\n'
++                '#include "no.h"\n'
++                '#endif\n'
++            ),
++            'yes.h': '',
++            'no.h': '',
++        }
++        for name, text in files.items():
++            with open(os.path.join(root, name), 'w') as f:
++                f.write(text)
++        fs = SCons.Node.FS.FS(root)
++        env = SCons.Environment.Environment(
++            tools=[],
++            CPPPATH=[],
++            CPPDEFINES=['FEATURE=$MODE', ('LEVEL', '$LEVEL'), '$EXTRA'],
++            MODE=1,
++            LEVEL=3,
++            EXTRA='TURBO',
++        )
++        env.fs = fs
++        scanner = SCons.Scanner.C.CConditionalScanner()
++        deps = self.run_without_programs(
++            scanner, fs.File('main.c'), env, scanner.path(env)
++        )
++        self.assertEqual([str(d) for d in deps], ['yes.h'])
++
++    def test_real_environment_combines_paths_and_definitions(self) -> None:
++        root = tempfile.mkdtemp()
++        self.addCleanup(shutil.rmtree, root)
++        files = {
++            'main.c': (
++                '#define STR(x) #x\n'
++                '#define XSTR(x) STR(x)\n'
++                '#include <common.h>\n'
++                '#include XSTR(BOARD.h)\n'
++                '#if TWICE(LEVEL) == 6 && defined(TURBO)\n'
++                '#include <six.h>\n'
++                '#endif\n'
++            ),
++            'first/common.h': '#if MODE == 2\n#include <mode2.h>\n#endif\n',
++            'second/common.h': '',
++            'second/mode2.h': '',
++            'third/mode2.h': '',
++            'third/acme.h': '',
++            'third/six.h': '',
++        }
++        for name, text in files.items():
++            path = os.path.join(root, *name.split('/'))
++            os.makedirs(os.path.dirname(path), exist_ok=True)
++            with open(path, 'w') as f:
++                f.write(text)
++        fs = SCons.Node.FS.FS(root)
++        env = SCons.Environment.Environment(
++            tools=[],
++            INC='first',
++            CPPPATH=['$INC', 'second', 'third'],
++            CPPDEFINES=[
++                'MODE=$MODE',
++                ('LEVEL', '$LEVEL'),
++                {'BOARD': '$BOARD'},
++                "'TWICE(x)=x*2'",
++                '$EXTRA',
++            ],
++            MODE=2,
++            LEVEL=3,
++            BOARD='acme',
++            EXTRA='TURBO',
++        )
++        env.fs = fs
++        scanner = SCons.Scanner.C.CConditionalScanner()
++        deps = self.run_without_programs(
++            scanner, fs.File('main.c'), env, scanner.path(env)
++        )
++        self.assertEqual(
++            sorted(str(d).replace(os.sep, '/') for d in deps),
++            ['first/common.h', 'second/mode2.h', 'third/acme.h', 'third/six.h'],
++        )
++
++    def test_includes_nested_as_deep_as_gcc_allows(self) -> None:
++        files = {'main.c': '#include "h1.h"\n', 'after.h': ''}
++        for level in range(1, 199):
++            files[f'h{level}.h'] = f'#include "h{level + 1}.h"\n'
++        files['h198.h'] += '#if DEEP\n#include "after.h"\n#endif\n'
++        files['h199.h'] = '#if __INCLUDE_LEVEL__ == 199\n#define DEEP 1\n#endif\n'
++        deps = self.scan(files)
++        expected = [f'h{level}.h' for level in range(1, 200)] + ['after.h']
++        self.assertEqual(deps, sorted(expected))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..80c2be520
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,121 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() { echo "usage: $0 [--output_path <path>] base|new" >&2; exit 2; }
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new) MODE="$1"; MODE_COUNT=$((MODE_COUNT + 1)); shift ;;
++    --output_path) shift; [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }; OUTPUT_PATH="$1"; shift ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    *) echo "unknown argument: $1" >&2; usage ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++[ -n "$OUTPUT_PATH" ] || OUTPUT_PATH="test-results-$MODE.xml"
++mkdir -p "$(dirname "$OUTPUT_PATH")" || exit 2
++OUTPUT_PATH="$(cd "$(dirname "$OUTPUT_PATH")" && pwd)/$(basename "$OUTPUT_PATH")"
++
++cd "$(dirname "$0")" || exit 1
++export PYTHONPATH="$PWD/testing/framework:$PWD"
++export PYTHONDONTWRITEBYTECODE=1
++
++WORK="$(mktemp -d)"
++trap 'rm -rf "$WORK"' EXIT
++STATUS=0
++GROUP=0
++
++# Runs one group of tests in its own pytest process, so that a module
++# changing the working directory cannot disturb the others.  When a group
++# yields no test cases at all (a collection crash or a hang), every test
++# named in its files is recorded as failed, with pytest's exit status and
++# the end of its output.
++run_group() {
++  GROUP=$((GROUP + 1))
++  local xml="$WORK/group$GROUP.xml"
++  local log="$WORK/group$GROUP.log"
++  timeout 900 python -m pytest -p no:cacheprovider -o addopts= -q \
++    --junitxml="$xml" "$@" 2>&1 | tee "$log"
++  local rc=${PIPESTATUS[0]}
++  if [ "$rc" -ne 0 ]; then
++    STATUS=1
++  fi
++  if [ "$rc" -ne 0 ] && ! grep -q '<testcase' "$xml" 2>/dev/null; then
++    python - "$xml" "$rc" "$log" "$@" <<'PY'
++import re
++import sys
++from xml.sax.saxutils import escape, quoteattr
++
++xml, rc, log, args = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
++reason = 'it timed out after 900 seconds' if rc == '124' else f'pytest exited with status {rc}'
++with open(log, errors='replace') as f:
++    output = ''.join(f.readlines()[-60:])
++output = escape(re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', output))
++targets = []
++skip = False
++for arg in args:
++    if skip or arg.startswith('-'):
++        skip = arg == '--deselect'
++        continue
++    targets.append(arg)
++cases = []
++for target in targets:
++    path, _, wanted = target.partition('::')
++    module = path[:-3].replace('/', '.')
++    with open(path) as f:
++        source = f.read()
++    for cls, body in re.findall(r'^class (\w+)\(.*?\):\n((?:(?:[ \t]+.*)?\n)*)', source, re.M):
++        if wanted and cls != wanted:
++            continue
++        for name in re.findall(r'^    def (test\w*)\(', body, re.M):
++            cases.append((f'{module}.{cls}', name))
++lines = ['<?xml version="1.0" encoding="utf-8"?>',
++         f'<testsuites><testsuite name="pytest" tests="{len(cases)}" failures="{len(cases)}" errors="0">']
++for classname, name in cases:
++    lines.append(f'<testcase classname={quoteattr(classname)} name={quoteattr(name)}>'
++                 f'<failure message={quoteattr("the test module could not be run: " + reason)}>'
++                 f'{output}</failure></testcase>')
++lines.append('</testsuite></testsuites>')
++with open(xml, 'w') as f:
++    f.write('\n'.join(lines) + '\n')
++PY
++  fi
++}
++
++if [ "$MODE" = "base" ]; then
++  # cppTests.py's cppTestCase and cppAllTestCase are abstract bases without
++  # a cpp_class; only the concrete classes are meant to run.
++  run_group SCons/cppTests.py::PreProcessorTestCase \
++            SCons/cppTests.py::DumbPreProcessorTestCase \
++            SCons/cppTests.py::fileTestCase
++  run_group SCons/Scanner/CTests.py
++  run_group SCons/DefaultsTests.py
++  # test_tool is a helper that takes an environment, not a test.
++  run_group SCons/EnvironmentTests.py --deselect SCons/EnvironmentTests.py::test_tool
++  # test_remove_fail skips itself when run as root, and a skipped test
++  # does not count as passed.
++  run_group SCons/Node/FSTests.py --deselect SCons/Node/FSTests.py::FSTestCase::test_remove_fail
++else
++  run_group SCons/Scanner/CConditional35735aTests.py
++fi
++
++python - "$OUTPUT_PATH" "$WORK"/group*.xml <<'PY'
++import sys
++import xml.etree.ElementTree as ET
++
++out, parts = sys.argv[1], sys.argv[2:]
++root = ET.Element('testsuites')
++for part in parts:
++    try:
++        tree = ET.parse(part).getroot()
++    except (ET.ParseError, OSError):
++        continue
++    suites = [tree] if tree.tag == 'testsuite' else tree.findall('testsuite')
++    root.extend(suites)
++ET.ElementTree(root).write(out, encoding='utf-8', xml_declaration=True)
++PY
++
++exit "$STATUS"

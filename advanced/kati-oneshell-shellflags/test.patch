@@ -1,0 +1,954 @@
+diff --git a/oneshell_13cff4/oneshell_13cff4_test.go b/oneshell_13cff4/oneshell_13cff4_test.go
+new file mode 100644
+index 0000000..7c9adcb
+--- /dev/null
++++ b/oneshell_13cff4/oneshell_13cff4_test.go
+@@ -0,0 +1,730 @@
++package oneshell
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io/fs"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++)
++
++type scenario struct {
++	name     string
++	makefile string
++	env      []string
++}
++
++var scenarios = []scenario{
++	{
++		name: "oneshell_cd_and_variables_carry_over",
++		makefile: `.ONESHELL:
++all:
++	mkdir -p sub
++	cd sub
++	name=$$(basename "$$PWD")
++	echo "running in $$name" > here.txt
++	echo done
++`,
++	},
++	{
++		name: "oneshell_if_and_for_blocks",
++		makefile: `.ONESHELL:
++all:
++	@if test -d .; then
++	  echo here
++	else
++	  echo nowhere
++	fi
++	for n in 1 2 3
++	do
++	  printf '%s-%s\n' item "$$n"
++	done
++`,
++	},
++	{
++		name: "oneshell_heredoc_keeps_hash_lines_and_quotes",
++		makefile: `.ONESHELL:
++all:
++	@cat > notes.txt <<'EOF'
++	# heading
++	it's "quoted" and $$HOME stays
++	EOF
++	cat notes.txt
++`,
++	},
++	{
++		name: "oneshell_heredoc_lines_lose_leading_blanks_and_prefixes",
++		makefile: `.ONESHELL:
++all:
++	@cat <<EOF > doc.txt
++	    four spaces
++	-dash
++	@at +plus
++	EOF
++	cat doc.txt
++`,
++	},
++	{
++		name: "oneshell_first_line_at_silences_whole_recipe",
++		makefile: `.ONESHELL:
++all:
++	@echo one
++	echo two
++	echo three
++`,
++	},
++	{
++		name: "oneshell_echo_shows_script_without_later_prefixes",
++		makefile: `.ONESHELL:
++all:
++	echo one
++	@echo two
++	-echo three
++	+echo four
++`,
++	},
++	{
++		name: "oneshell_later_dash_does_not_ignore_failure",
++		makefile: `.ONESHELL:
++all: first
++	@echo all ran
++first:
++	@touch started.txt
++	-test -f missing.txt
++`,
++	},
++	{
++		name: "oneshell_first_dash_ignores_failure_under_errexit",
++		makefile: `.ONESHELL:
++.SHELLFLAGS := -ec
++all: first second
++first:
++	-@test -f missing.txt
++	echo never > never.txt
++second:
++	@echo second ran
++`,
++	},
++	{
++		name: "oneshell_ignored_failure_before_trailing_comment",
++		makefile: `.ONESHELL:
++all: first second
++first:
++	-@echo start > log.txt
++	false
++	# the dash on the first line covers the failure above
++second:
++	@cat log.txt
++`,
++	},
++	{
++		name: "oneshell_heredoc_on_last_line_with_ignored_failure",
++		makefile: `.ONESHELL:
++all: first second
++first:
++	-@grep missing > /dev/null <<EOF
++	some text
++	EOF
++second:
++	@echo second ran
++`,
++	},
++	{
++		name: "oneshell_prefix_from_variable",
++		makefile: `.ONESHELL:
++QUIET := @
++all:
++	$(QUIET)echo one
++	echo two
++`,
++	},
++	{
++		name: "oneshell_define_recipe_is_one_script",
++		makefile: `.ONESHELL:
++define build_steps
++@echo step one
++mkdir -p out
++cd out
++echo "step two in $$(basename "$$PWD")"
++endef
++all:
++	$(build_steps)
++	pwd | sed 's|.*/||'
++`,
++	},
++	{
++		name: "oneshell_declared_at_end_of_makefile",
++		makefile: `all:
++	@x=1
++	echo "x is $$x"
++.ONESHELL:
++`,
++	},
++	{
++		name: "oneshell_with_prerequisites_applies_to_every_recipe",
++		makefile: `.ONESHELL: all
++all: other
++	@x=all
++	echo "$$x done"
++other:
++	@x=other
++	echo "$$x done"
++`,
++	},
++	{
++		name: "oneshell_blank_lines_from_define_are_kept",
++		makefile: `.ONESHELL:
++define two_steps
++echo first
++
++echo second
++endef
++all:
++	$(two_steps)
++`,
++	},
++	{
++		name: "oneshell_python_keeps_indentation_and_decorators",
++		makefile: `.ONESHELL:
++all: report
++report: SHELL := /usr/bin/python3
++report:
++	@def shout(f):
++	    return lambda: f().upper() + "!"
++	@shout
++	def greet():
++	    return "hello"
++	print(greet())
++`,
++	},
++	{
++		name: "oneshell_python_recipe_is_echoed_verbatim",
++		makefile: `.ONESHELL:
++all: py
++py: SHELL := /usr/bin/python3
++py:
++	total = 0
++	for n in [1, 2, 3]:
++	    total += n
++	print("total", total)
++`,
++	},
++	{
++		name: "oneshell_perl_with_target_shellflags",
++		makefile: `.ONESHELL:
++all: words
++words: SHELL := /usr/bin/perl
++words: .SHELLFLAGS := -e
++words:
++	@my $$sep = "+";
++	@list = qw(make kati ninja);
++	print join($$sep, @list), "\n";
++`,
++	},
++	{
++		name: "python_lines_run_in_separate_shells_without_oneshell",
++		makefile: `all: calc
++calc: SHELL := /usr/bin/python3
++calc:
++	@print(6 * 7)
++	@print("second line")
++`,
++	},
++	{
++		name: "oneshell_posix_shells_recognized_by_name",
++		makefile: `.ONESHELL:
++all: a b
++a: SHELL := /usr/bin/bash
++a:
++	@echo a start
++	@echo a done
++b: SHELL := /bin/dash
++b:
++	@echo b start
++	-echo b done
++`,
++	},
++	{
++		name: "shellflags_errexit_stops_recipe_line",
++		makefile: `.SHELLFLAGS := -ec
++all:
++	@false; echo not reached
++`,
++	},
++	{
++		name: "shellflags_with_two_words",
++		makefile: `.SHELLFLAGS := -x -c
++all:
++	@echo traced
++`,
++	},
++	{
++		name: "shellflags_recursive_value_uses_final_definition",
++		makefile: `FLAGS = -u
++.SHELLFLAGS = $(FLAGS) -c
++all:
++	@false; echo reached
++FLAGS = -e
++`,
++	},
++	{
++		name: "shellflags_default_and_posix_values_are_readable",
++		makefile: `$(info [$(.SHELLFLAGS)])
++.POSIX:
++$(info [$(.SHELLFLAGS)])
++all:
++	@false; echo not reached
++`,
++	},
++	{
++		name: "shellflags_append_to_default",
++		makefile: `.SHELLFLAGS += -e
++$(info [$(.SHELLFLAGS)])
++all:
++	@false; echo not reached
++`,
++	},
++	{
++		name: "posix_keeps_shellflags_set_before_it",
++		makefile: `.SHELLFLAGS := -c
++.POSIX:
++$(info [$(.SHELLFLAGS)])
++all:
++	@false; echo reached
++`,
++	},
++	{
++		name: "shellflags_set_after_posix_wins",
++		makefile: `.POSIX:
++.SHELLFLAGS := -c
++all:
++	@false; echo reached
++`,
++	},
++	{
++		name: "shell_function_uses_shellflags",
++		makefile: `.SHELLFLAGS := -ec
++OUT := $(shell false; echo printed)
++$(info [$(OUT)] status $(.SHELLSTATUS))
++all:
++	@echo done
++`,
++	},
++	{
++		name: "shell_function_splits_shellflags",
++		makefile: `.SHELLFLAGS := -e -c
++OUT := $(shell false; echo printed)
++$(info [$(OUT)])
++all:
++	@echo done
++`,
++	},
++	{
++		name: "shellflags_quoted_words_parsed_like_make",
++		makefile: `.SHELLFLAGS := '-e' -c
++OUT := $(shell false; echo printed)
++$(info [$(OUT)])
++all:
++	@echo "[$(shell false; echo leaked)]"
++	@case $$- in *e*) echo errexit on;; esac
++`,
++	},
++	{
++		name: "oneshell_splits_shellflags_at_blanks_only",
++		makefile: `.SHELLFLAGS := '-e' -c
++$(shell printf 'echo "script file got [$$1]"\n' > "'-e'")
++.ONESHELL:
++all:
++	@echo not reached
++`,
++	},
++	{
++		name: "target_shellflags_apply_to_recipe_and_shell_calls",
++		makefile: `all: strict loose
++strict: .SHELLFLAGS := -ec
++strict loose:
++	@echo $@ [$(shell false; echo from-shell)]
++`,
++	},
++	{
++		name: "target_shellflags_inherited_by_prerequisites",
++		makefile: `all: release
++release: .SHELLFLAGS := -ec
++release: compile
++	@echo release done
++compile:
++	@false; echo compile continued
++`,
++	},
++	{
++		name: "pattern_specific_shellflags",
++		makefile: `all: one.loose two.strict
++%.strict: .SHELLFLAGS := -ec
++%.loose:
++	@false; echo $@ kept going
++%.strict:
++	false; echo $@ kept going
++`,
++	},
++	{
++		name: "pattern_specific_shell_selects_python",
++		makefile: `.ONESHELL:
++all: report.out
++%.out: SHELL := /usr/bin/python3
++%.out:
++	@lines = ["alpha", "beta"]
++	with open("$@", "w") as f:
++	    f.write("\n".join(lines) + "\n")
++	print(len(lines), "lines")
++`,
++	},
++	{
++		name: "oneshell_errexit_flags_stop_script",
++		makefile: `.ONESHELL:
++.SHELLFLAGS := -e -c
++all:
++	@touch first.txt
++	false
++	touch second.txt
++`,
++	},
++	{
++		name: "oneshell_mixed_shells_in_one_makefile",
++		makefile: `.ONESHELL:
++all: py sh
++py: SHELL := /usr/bin/python3
++py:
++	@for i in range(2):
++	    print("py", i)
++sh:
++	@for i in 1 2; do
++	    echo sh $$i
++	done
++`,
++	},
++	{
++		name: "lines_run_separately_without_oneshell",
++		makefile: `.SHELLFLAGS := -x -c
++all:
++	@x=1
++	@echo "x is [$$x]"
++`,
++	},
++	{
++		name: "oneshell_quotes_backslashes_and_dollars",
++		makefile: `.ONESHELL:
++all:
++	@printf '%s|%s\n' "a\"b" 'c"d'
++	v='single $$quoted'
++	echo ` + "`" + `echo back` + "`" + ` $$((1+2)) "$$v" "back\\slash"
++`,
++	},
++	{
++		name: "oneshell_continuation_lines_keep_leading_dashes",
++		makefile: `.ONESHELL:
++all:
++	@printf '%s\n' \
++	-first \
++	-second
++	echo done
++`,
++	},
++	{
++		name: "target_shell_runs_shell_calls_in_its_recipe",
++		makefile: `all: withbash plain
++withbash: SHELL := /bin/bash
++withbash:
++	@echo "$@ [$(shell echo $${BASH_VERSION:+bash})] [$${BASH_VERSINFO[0]:+array}]"
++plain:
++	@echo "$@ [$(shell echo $${BASH_VERSION:+bash})]"
++`,
++	},
++	{
++		name: "pattern_shell_runs_shell_calls_in_its_recipe",
++		makefile: `.PHONY: all
++all: one.bash two.sh
++%.bash: SHELL := /bin/bash
++%.bash:
++	@echo "$@ [$(shell echo $${BASH_VERSION:+bash})] [$${BASH_VERSINFO[0]:+array}]"
++%.sh:
++	@echo "$@ [$(shell echo $${BASH_VERSION:+bash})]"
++`,
++	},
++	{
++		name: "shellflags_from_environment",
++		makefile: `$(info [$(.SHELLFLAGS)] $(origin .SHELLFLAGS))
++all:
++	@false; echo reached
++`,
++		env: []string{".SHELLFLAGS=-ec"},
++	},
++	{
++		name: "pattern_shellflags_apply_to_shell_calls",
++		makefile: `.PHONY: all
++all: one.strict two.loose
++%.strict: .SHELLFLAGS := -ec
++%.strict:
++	@echo "$@ [$(shell false; echo leaked)]"
++%.loose:
++	@echo "$@ [$(shell false; echo leaked)]"
++`,
++	},
++	{
++		name: "oneshell_double_colon_recipes_run_separately",
++		makefile: `.ONESHELL:
++all::
++	@x=one
++	echo "first [$$x]"
++all::
++	@echo "second [$${x-unset}]"
++`,
++	},
++	{
++		name: "target_shell_inherited_by_prerequisites",
++		makefile: `all: report
++report: SHELL := /usr/bin/python3
++report: data
++	@print("report done")
++data:
++	@print("data built")
++`,
++	},
++	{
++		name: "python_target_runs_shell_calls_in_its_recipe",
++		makefile: `all: report
++report: SHELL := /usr/bin/python3
++report:
++	@print("outer [$(shell print('inner'))]")
++	@print($(shell print("6 * 7")))
++`,
++	},
++	{
++		name: "oneshell_shell_call_output_folds_newlines",
++		makefile: `.ONESHELL:
++all:
++	@printf '<%s>\n' "$(shell printf 'one\ntwo\n')"
++`,
++	},
++	{
++		name: "oneshell_shell_call_runs_before_the_script",
++		makefile: `$(shell touch top.txt)
++.ONESHELL:
++all:
++	@mkdir -p sub
++	cd sub
++	echo "[$(shell ls top.txt 2>/dev/null)]" > where.txt
++`,
++	},
++	{
++		name: "oneshell_recipe_keeps_its_own_kati_variables",
++		makefile: `.ONESHELL:
++all:
++	@KATI_LOCAL=works
++	printf '%s\n' "$${KATI_LOCAL}"
++`,
++	},
++	{
++		name: "target_errexit_flags_reach_shell_calls_under_bash",
++		makefile: `SHELL := /bin/bash
++all: strict loose
++strict: .SHELLFLAGS := -ec
++strict loose:
++	@echo "$@ [$(shell false; echo leaked)]"
++`,
++	},
++}
++
++type rewrite struct {
++	re   *regexp.Regexp
++	with string
++}
++
++var quotes = rewrite{regexp.MustCompile("([`'\"]|\xe2\x80\x98|\xe2\x80\x99)"), `"`}
++
++var makeRewrites = []rewrite{
++	quotes,
++	{regexp.MustCompile(`make(?:\[\d+\])?: (Entering|Leaving) directory[^\n]*\n`), ""},
++	{regexp.MustCompile(`make(?:\[\d+\])?: `), ""},
++	{regexp.MustCompile(`\s+Stop\.`), ""},
++	{regexp.MustCompile(`\[\S+:\d+: `), "["},
++}
++
++var silentMakeRewrites = []rewrite{
++	{regexp.MustCompile(`\*\*\* \[[^\n]*\] Error \d+\n`), ""},
++}
++
++var katiRewrites = []rewrite{
++	quotes,
++	{regexp.MustCompile(`\*kati\*[^\n]*`), ""},
++	{regexp.MustCompile(`c?kati: `), ""},
++}
++
++var ninjaRewrites = []rewrite{
++	{regexp.MustCompile(`NINJACMD: [^\n]*\n`), ""},
++	{regexp.MustCompile(`ninja: no work to do\.\n`), ""},
++	{regexp.MustCompile(`FAILED: [^\n]*\n[^\n]*\n`), ""},
++	{regexp.MustCompile(`ninja: build stopped: [^\n]*\n`), ""},
++}
++
++func apply(out []byte, rewrites []rewrite) []byte {
++	for _, r := range rewrites {
++		out = r.re.ReplaceAll(out, []byte(r.with))
++	}
++	return out
++}
++
++type outcome struct {
++	output string
++	ok     bool
++	files  string
++}
++
++func prepare(t *testing.T, sc scenario) string {
++	dir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(dir, "Makefile"), []byte(sc.makefile), 0666); err != nil {
++		t.Fatal(err)
++	}
++	return dir
++}
++
++func execute(dir string, env []string, name string, args ...string) ([]byte, bool) {
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, name, args...)
++	cmd.Dir = dir
++	cmd.Env = append(os.Environ(), env...)
++	out, err := cmd.CombinedOutput()
++	return out, err == nil
++}
++
++func leftovers(t *testing.T, dir string) string {
++	generated := map[string]bool{"Makefile": true, "build.ninja": true, "env.sh": true, "ninja.sh": true}
++	contents := map[string]string{}
++	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		rel, err := filepath.Rel(dir, path)
++		if err != nil || rel == "." {
++			return err
++		}
++		if !strings.Contains(rel, "/") && (generated[rel] || strings.HasPrefix(rel, ".") || strings.HasPrefix(rel, "kati")) {
++			if d.IsDir() {
++				return filepath.SkipDir
++			}
++			return nil
++		}
++		if !d.Type().IsRegular() {
++			return nil
++		}
++		data, err := os.ReadFile(path)
++		if err != nil {
++			return err
++		}
++		contents[rel] = string(data)
++		return nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	var names []string
++	for name := range contents {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	var b strings.Builder
++	for _, name := range names {
++		fmt.Fprintf(&b, "%s: %q\n", name, contents[name])
++	}
++	return b.String()
++}
++
++func runMake(t *testing.T, sc scenario, ninja bool) outcome {
++	dir := prepare(t, sc)
++	var args []string
++	if ninja {
++		args = append(args, "-s")
++	}
++	out, ok := execute(dir, sc.env, "make", args...)
++	out = apply(out, makeRewrites)
++	if ninja {
++		out = apply(out, silentMakeRewrites)
++	}
++	return outcome{string(out), ok, leftovers(t, dir)}
++}
++
++func runKati(t *testing.T, sc scenario, kati string, ninja bool) outcome {
++	dir := prepare(t, sc)
++	args := []string{"--use_find_emulator"}
++	if ninja {
++		args = append(args, "--ninja")
++	}
++	out, ok := execute(dir, sc.env, kati, args...)
++	if ok && ninja {
++		var ninjaOut []byte
++		ninjaOut, ok = execute(dir, sc.env, "./ninja.sh", "-j1", "-v")
++		out = append(out, apply(ninjaOut, ninjaRewrites)...)
++	}
++	return outcome{string(apply(out, katiRewrites)), ok, leftovers(t, dir)}
++}
++
++func TestMain(m *testing.M) {
++	os.Unsetenv("MAKEFLAGS")
++	os.Unsetenv("MAKELEVEL")
++	os.Setenv("NINJA_STATUS", "NINJACMD: ")
++	os.Exit(m.Run())
++}
++
++func TestOneShellAndShellFlags(t *testing.T) {
++	version, err := exec.Command("make", "--version").Output()
++	if err != nil || !bytes.HasPrefix(version, []byte("GNU Make 4.2.1\n")) {
++		t.Fatalf("GNU make 4.2.1 is needed as make: %q %v", version, err)
++	}
++	root, err := filepath.Abs("..")
++	if err != nil {
++		t.Fatal(err)
++	}
++	engines := []struct{ name, path string }{
++		{"ckati", filepath.Join(root, "ckati")},
++		{"rkati", filepath.Join(root, "target", "debug", "rkati")},
++	}
++	for _, e := range engines {
++		if _, err := os.Stat(e.path); err != nil {
++			t.Fatalf("%s must be built before testing: %v", e.name, err)
++		}
++	}
++	for _, sc := range scenarios {
++		sc := sc
++		t.Run(sc.name, func(t *testing.T) {
++			t.Parallel()
++			for _, ninja := range []bool{false, true} {
++				want := runMake(t, sc, ninja)
++				for _, e := range engines {
++					cell := e.name
++					if ninja {
++						cell += "_ninja"
++					}
++					t.Run(cell, func(t *testing.T) {
++						got := runKati(t, sc, e.path, ninja)
++						if got.output != want.output {
++							t.Errorf("output differs from make\nmake:\n%s\n%s:\n%s", want.output, cell, got.output)
++						}
++						if got.ok != want.ok {
++							t.Errorf("make succeeded: %v, %s succeeded: %v", want.ok, cell, got.ok)
++						}
++						if got.files != want.files {
++							t.Errorf("files differ from make\nmake:\n%s\n%s:\n%s", want.files, cell, got.files)
++						}
++					})
++				}
++			}
++		})
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..67ff01e
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,212 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++mode=""
++mode_count=0
++output_path=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      mode="$1"
++      mode_count=$((mode_count + 1))
++      shift
++      ;;
++    --output_path)
++      if [ $# -lt 2 ] || [ -z "$2" ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      output_path="$2"
++      shift 2
++      ;;
++    --output_path=*)
++      output_path="${1#--output_path=}"
++      if [ -z "$output_path" ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$mode_count" -eq 1 ] || usage
++case "$output_path" in
++  ""|/*) ;;
++  *) output_path="$PWD/$output_path" ;;
++esac
++
++cd "$(dirname "$0")" || exit 2
++
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export CARGO_NET_OFFLINE=true
++export RUSTC_BOOTSTRAP=1
++gocache="$(go env GOCACHE 2>/dev/null)"
++if [ -z "$gocache" ] || ! mkdir -p "$gocache" 2>/dev/null || [ ! -w "$gocache" ]; then
++  export GOCACHE="/tmp/kati-gocache-$(id -u)"
++fi
++
++base_commit=55ea1e26f4da6d52a4ddca8f36a130dc26120525
++new_package=./oneshell_13cff4/
++work="$(mktemp -d)"
++trap 'rm -rf "$work"' EXIT
++status=0
++runs=0
++
++record() {
++  runs=$((runs + 1))
++  echo "$runs $1 $2 $3" >>"$work/index"
++  cp "$4" "$work/$runs.log"
++  [ "$3" -ne 0 ] && status=1
++  return 0
++}
++
++build_engines() {
++  rm -rf out ckati find_test ninja_test strutil_test target/debug/rkati
++  local s=0
++  make -j"$(nproc)" ckati "$@" >"$work/build.log" 2>&1 || s=1
++  cargo build --offline >>"$work/build.log" 2>&1 || s=1
++  record build build "$s" "$work/build.log"
++}
++
++run_go() {
++  local name="$1"
++  shift
++  go test -v -count=1 -timeout 30m "$@" >"$work/go.log" 2>&1
++  local s=$?
++  if [ "$name" != TestKati ]; then
++    sed -i -E "s/\bTestKati\b/$name/g" "$work/go.log"
++  fi
++  record go "$name" "$s" "$work/go.log"
++}
++
++if [ "$mode" = base ]; then
++  cases=""
++  if git -c safe.directory='*' cat-file -e "$base_commit^{commit}" 2>/dev/null; then
++    git -c safe.directory='*' checkout -q "$base_commit" -- run_test.go testcase/
++    sed -i 's/t\.Errorf("Expected failure, but output is the same")/t.Logf("Expected failure, but output is the same")/' run_test.go
++    cases="$(git -c safe.directory='*' ls-tree --name-only "$base_commit" testcase/ | sed 's#^testcase/##')"
++  fi
++  [ -n "$cases" ] || cases="$(ls testcase)"
++  pattern="$(printf '%s\n' "$cases" | grep -E '\.(mk|sh)$' | sed 's/\./\\./g' | paste -sd '|' -)"
++  build_engines ckati_tests
++  run_go TestKati -run "^TestKati\$/^($pattern)\$" .
++  run_go TestKati_ninja -run "^TestKati\$/^($pattern)\$" . --ninja
++  run_go TestKati_rkati -run "^TestKati\$/^($pattern)\$" . --rkati
++  run_go TestKati_rkati_ninja -run "^TestKati\$/^($pattern)\$" . --rkati --ninja
++  for t in find_test ninja_test strutil_test; do
++    s=1
++    if [ -x "./$t" ]; then
++      "./$t" >"$work/unit.log" 2>&1 && s=0
++    else
++      echo "$t was not built" >"$work/unit.log"
++    fi
++    record unit "ckati_$t" "$s" "$work/unit.log"
++  done
++  cargo test --offline -- -Z unstable-options --format json --report-time >"$work/cargo.json" 2>"$work/cargo.err"
++  s=$?
++  cat "$work/cargo.err" >>"$work/cargo.json"
++  record cargo rkati_unit "$s" "$work/cargo.json"
++else
++  build_engines
++  run_go TestOneShellAndShellFlags "$new_package"
++fi
++
++while read -r i kind name s; do
++  echo "===== $name (exit $s)"
++  cat "$work/$i.log"
++done <"$work/index"
++
++if [ -n "$output_path" ]; then
++  mkdir -p "$(dirname "$output_path")"
++  while read -r i kind name s; do
++    case "$kind" in
++      go) go-junit-report -in "$work/$i.log" -out "$work/$i.xml" 2>"$work/$i.convert" || status=1 ;;
++      cargo) grep '^{' "$work/$i.log" | cargo2junit >"$work/$i.xml" 2>"$work/$i.convert" || status=1 ;;
++    esac
++  done <"$work/index"
++  if ! python3 - "$work" "$output_path" <<'PY'
++import os
++import sys
++import xml.etree.ElementTree as ET
++
++work, output = sys.argv[1], sys.argv[2]
++root = ET.Element("testsuites")
++
++
++def tail(path, lines=100):
++    try:
++        with open(path, errors="replace") as f:
++            return "".join(f.readlines()[-lines:])
++    except OSError:
++        return ""
++
++
++def failure(suite_name, case_name, message, text):
++    suite = ET.SubElement(root, "testsuite", name=suite_name)
++    case = ET.SubElement(suite, "testcase", classname=suite_name, name=case_name)
++    ET.SubElement(case, "failure", message=message).text = text
++
++
++def load(path):
++    try:
++        top = ET.parse(path).getroot()
++    except (OSError, ET.ParseError):
++        return []
++    return [top] if top.tag == "testsuite" else top.findall("testsuite")
++
++
++with open(os.path.join(work, "index")) as f:
++    runs = [line.split() for line in f if line.strip()]
++for i, kind, name, code in runs:
++    log = os.path.join(work, i + ".log")
++    if kind == "build":
++        if code != "0":
++            failure("kati_build", "build", "ckati or rkati failed to build", tail(log))
++        continue
++    if kind == "unit":
++        suite = ET.SubElement(root, "testsuite", name="ckati_unit")
++        case = ET.SubElement(suite, "testcase", classname="ckati_unit", name=name)
++        if code != "0":
++            ET.SubElement(case, "failure", message="exit status " + code).text = tail(log)
++        continue
++    suites = load(os.path.join(work, i + ".xml"))
++    cases = [c for s in suites for c in s.iter("testcase")]
++    if not cases:
++        failure(name, "results", "no test results could be read",
++                tail(os.path.join(work, i + ".convert")) + tail(log))
++        continue
++    for case in cases:
++        for problem in case.findall("failure") + case.findall("error"):
++            if not (problem.text or "").strip():
++                problem.text = tail(log, 60)
++    if code != "0" and not any(c.find("failure") is not None or c.find("error") is not None for c in cases):
++        failure(name, "exit_status", "the run failed without a failing test", tail(log))
++    root.extend(suites)
++
++if not list(root.iter("testcase")):
++    failure("kati", "collect", "no test results were produced", "")
++for suite in root.findall("testsuite"):
++    cases = suite.findall("testcase")
++    suite.set("tests", str(len(cases)))
++    suite.set("failures", str(sum(c.find("failure") is not None for c in cases)))
++    suite.set("errors", str(sum(c.find("error") is not None for c in cases)))
++ET.ElementTree(root).write(output, encoding="UTF-8", xml_declaration=True)
++PY
++  then
++    echo "could not write $output_path" >&2
++    status=1
++  fi
++fi
++
++exit "$status"

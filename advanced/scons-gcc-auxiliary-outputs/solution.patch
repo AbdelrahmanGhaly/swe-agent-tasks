@@ -1,0 +1,531 @@
+diff --git a/SCons/Tool/gas.py b/SCons/Tool/gas.py
+index 0288cf1c5..9a6966d5c 100644
+--- a/SCons/Tool/gas.py
++++ b/SCons/Tool/gas.py
+@@ -37,11 +37,16 @@ try:
+ except:
+     as_module = __import__(__package__+'.as', globals(), locals(), ['*'])
+ 
++import SCons.Tool.asm
++
++from . import gcc
++
+ assemblers = ['as', 'gas']
+ 
+ def generate(env) -> None:
+     """Add Builders and construction variables for as to an Environment."""
+     as_module.generate(env)
++    gcc.add_side_effect_emitters(env, SCons.Tool.asm.ASPPSuffixes, '$ASPPCOM', '$ASPPCOM')
+ 
+     env['AS']        = env.Detect(assemblers) or 'as'
+ 
+diff --git a/SCons/Tool/gcc.py b/SCons/Tool/gcc.py
+index 6d4aaa79c..888307bb8 100644
+--- a/SCons/Tool/gcc.py
++++ b/SCons/Tool/gcc.py
+@@ -33,9 +33,15 @@ selection method.
+ """
+ 
+ from . import cc
++import os
+ import re
++from functools import lru_cache
+ from subprocess import PIPE
+ 
++import SCons.Action
++import SCons.Builder
++import SCons.Defaults
++import SCons.Tool
+ import SCons.Util
+ 
+ compilers = ['gcc', 'cc']
+@@ -48,6 +54,7 @@ def generate(env) -> None:
+         env['CC'] = env.Detect(compilers) or compilers[0]
+ 
+     cc.generate(env)
++    add_side_effect_emitters(env, cc.CSuffixes, '$CCCOM', '$SHCCCOM')
+ 
+     if env['PLATFORM'] in ['cygwin', 'win32']:
+         env['SHCCFLAGS'] = SCons.Util.CLVar('$CCFLAGS')
+@@ -101,3 +108,446 @@ def detect_version(env, cc):
+         version = match.group(0)
+ 
+     return version
++
++
++# The language gcc gives an input from its suffix, for the inputs these
++# side effects cover.
++_SUFFIX_LANGUAGES = {
++    '.c': 'c',
++    '.i': 'cpp-output',
++    '.cc': 'c++',
++    '.cp': 'c++',
++    '.cxx': 'c++',
++    '.cpp': 'c++',
++    '.CPP': 'c++',
++    '.c++': 'c++',
++    '.C': 'c++',
++    '.ii': 'c++-cpp-output',
++    '.s': 'assembler',
++    '.S': 'assembler-with-cpp',
++    '.sx': 'assembler-with-cpp',
++}
++
++_COMPILED_LANGUAGES = {'c', 'cpp-output', 'c++', 'c++-cpp-output'}
++_PREPROCESSED_LANGUAGES = {'c', 'c++', 'assembler-with-cpp'}
++
++# The temporaries -save-temps keeps, by language.
++_TEMPORARIES = {
++    'c': ('.i', '.s'),
++    'c++': ('.ii', '.s'),
++    'cpp-output': ('.s',),
++    'c++-cpp-output': ('.s',),
++    'assembler-with-cpp': ('.s',),
++    'assembler': (),
++}
++
++# The name of a gcc driver: gcc, g++, cc, c++, with an optional target
++# prefix or version suffix (x86_64-linux-gnu-gcc-12).  The C++ drivers
++# compile .c and .i inputs as C++.
++_DRIVER_NAME = re.compile(r'(?:.*-)?(?:gcc|g\+\+|cc|c\+\+)(?:-\d+(?:\.\d+)*)?')
++_CXX_DRIVER_NAME = re.compile(r'(?:.*-)?(?:g\+\+|c\+\+)(?:-\d+(?:\.\d+)*)?')
++_CXX_DRIVER_LANGUAGES = {'c': 'c++', 'cpp-output': 'c++-cpp-output'}
++
++# Driver options whose value is the next argument.
++_SEPARATE_VALUE_OPTIONS = {
++    '-o', '-x', '-MF', '-MT', '-MQ', '-dumpdir', '-dumpbase', '-dumpbase-ext',
++    '-aux-info', '-include', '-imacros', '-isystem', '-idirafter', '-iquote',
++    '-iprefix', '-iwithprefix', '-iwithprefixbefore', '-isysroot',
++    '-imultilib', '-imultiarch', '-Xlinker', '-Xpreprocessor', '-Xassembler',
++    '-A', '-B', '-I', '-D', '-U', '-L', '-l', '-T', '-u', '-z', '--param',
++    '--sysroot', '-specs', '-wrapper',
++}
++
++
++def _driver_index(args) -> int:
++    # The compiler can come after a launcher such as ccache or distcc.
++    for i, arg in enumerate(args):
++        if not arg.startswith('-') and _DRIVER_NAME.fullmatch(os.path.basename(arg)):
++            return i
++    return 0
++
++
++def compile_side_effects(args) -> list[str]:
++    """Return the files a gcc compile command writes besides its object.
++
++    *args* is the command line, compiler (or its launcher) first.  The paths
++    are the ones gcc uses: relative to the directory the command runs in,
++    unless the command line gives an absolute path.
++    """
++    outputs = []
++    compile_only = False
++    inputs = []
++    language = None
++    dependencies = False
++    depfile = None
++    dependency_options = False
++    print_dependencies = False
++    missing_headers = False
++    preprocessor_args = []
++    coverage = False
++    test_coverage = False
++    note = None
++    stack_usage = False
++    split_dwarf = False
++    save_temps = None
++    optimization_record = False
++    lto = False
++    dumpdir = None
++    dumpbase = None
++    dumpbase_ext = None
++    assembler_args = []
++
++    driver = _driver_index(args)
++    cxx_driver = bool(args) and bool(_CXX_DRIVER_NAME.fullmatch(os.path.basename(args[driver])))
++    i = driver + 1
++    while i < len(args):
++        arg = args[i]
++        if arg in _SEPARATE_VALUE_OPTIONS and i + 1 < len(args):
++            value = args[i + 1]
++            i += 2
++            if arg == '-o':
++                outputs.append(value)
++            elif arg == '-x':
++                language = None if value == 'none' else value
++            elif arg in ('-MT', '-MQ'):
++                dependency_options = True
++            elif arg == '-MF':
++                depfile = value
++                dependency_options = True
++            elif arg == '-dumpdir':
++                dumpdir = value
++            elif arg == '-dumpbase':
++                dumpbase = value
++            elif arg == '-dumpbase-ext':
++                dumpbase_ext = value
++            elif arg == '-Xassembler':
++                assembler_args.append(value)
++            elif arg == '-Xpreprocessor':
++                preprocessor_args.append(value)
++            continue
++        i += 1
++        if arg == '-c':
++            compile_only = True
++        elif arg in ('-MD', '-MMD'):
++            dependencies = True
++        elif arg in ('-M', '-MM'):
++            print_dependencies = True
++        elif arg.startswith('-MF'):
++            depfile = arg[3:]
++            dependency_options = True
++        elif arg == '-MG':
++            missing_headers = True
++        elif arg.startswith(('-MT', '-MQ')) or arg == '-MP':
++            dependency_options = True
++        elif arg.startswith('-Wp,'):
++            preprocessor_args.extend(arg[4:].split(','))
++        elif arg.startswith('-Wa,'):
++            assembler_args.extend(arg[4:].split(','))
++        elif arg == '--coverage':
++            coverage = True
++        elif arg in ('-ftest-coverage', '-fno-test-coverage'):
++            test_coverage = arg == '-ftest-coverage'
++        elif arg.startswith('-fprofile-note='):
++            note = arg[len('-fprofile-note='):]
++        elif arg == '-fstack-usage':
++            stack_usage = True
++        elif arg in ('-gsplit-dwarf', '-gno-split-dwarf'):
++            split_dwarf = arg == '-gsplit-dwarf'
++        elif arg == '-save-temps':
++            if save_temps is None:
++                save_temps = 'default'
++        elif arg in ('-save-temps=cwd', '-save-temps=obj'):
++            # These two also drop any -dumpdir given before them.
++            save_temps = arg[len('-save-temps='):]
++            dumpdir = None
++        elif arg in ('-fsave-optimization-record', '-fno-save-optimization-record'):
++            optimization_record = arg == '-fsave-optimization-record'
++        elif arg == '-flto' or arg.startswith('-flto='):
++            lto = True
++        elif arg == '-fno-lto':
++            lto = False
++        elif arg.startswith('-o'):
++            outputs.append(arg[2:])
++        elif arg.startswith('-x'):
++            language = None if arg[2:] == 'none' else arg[2:]
++        elif not arg.startswith('-'):
++            inputs.append((arg, language))
++
++    # gcc -c compiles or assembles each input it knows and leaves the rest
++    # alone.  A second -o, or -o with more than one such input, makes the
++    # command fail, and without -c it does not make an object.
++    # Options for the preprocessor itself, from -Wp and -Xpreprocessor in the
++    # order given.  It sees them after the driver's own -MD, -MMD and -MF, so
++    # the file they name wins.
++    wp_dependencies = False
++    wp_depfile = None
++    j = 0
++    while j < len(preprocessor_args):
++        name = preprocessor_args[j]
++        j += 1
++        if name in ('-MD', '-MMD', '-MF') and j < len(preprocessor_args):
++            wp_dependencies = wp_dependencies or name != '-MF'
++            dependency_options = dependency_options or name == '-MF'
++            wp_depfile = preprocessor_args[j]
++            j += 1
++        elif name in ('-M', '-MM'):
++            print_dependencies = True
++        elif name == '-MG':
++            missing_headers = True
++        elif name in ('-MT', '-MQ', '-MP'):
++            dependency_options = True
++
++    sources = []
++    for source, source_language in inputs:
++        suffix = os.path.splitext(source)[1]
++        if source_language is None:
++            source_language = _SUFFIX_LANGUAGES.get(suffix)
++            if cxx_driver:
++                source_language = _CXX_DRIVER_LANGUAGES.get(source_language, source_language)
++        if source_language in _TEMPORARIES:
++            sources.append((source, source_language, suffix))
++    if not compile_only or not sources or len(outputs) > 1:
++        return []
++    if outputs and len(sources) > 1:
++        return []
++    # The preprocessor refuses -MF, -MT, -MQ and -MP without -MD, -MMD, -M
++    # or -MM, and -MG without -M or -MM.
++    if any(source_language in _PREPROCESSED_LANGUAGES for _, source_language, _ in sources):
++        if dependency_options and not (dependencies or wp_dependencies or print_dependencies):
++            return []
++        if missing_headers and not print_dependencies:
++            return []
++    output = outputs[0] if outputs else None
++
++    files = []
++    preprocessed = False
++    compiled = False
++    for source, source_language, suffix in sources:
++        stem = os.path.splitext(os.path.basename(source))[0]
++        # Without -o each object goes into the current directory.
++        directory, name = os.path.split(output if output is not None else stem + '.o')
++
++        # Auxiliary files are named from a prefix and a base name.  By
++        # default the prefix is the object's directory and the base name is
++        # the object's name with the source suffix in place of its own;
++        # -dumpdir, -dumpbase, -dumpbase-ext and -save-temps=cwd change them.
++        if dumpbase is None:
++            base = os.path.splitext(name)[0] + suffix
++            drop = suffix
++        elif len(sources) == 1:
++            base = dumpbase
++            drop = dumpbase_ext or ''
++        else:
++            # With several inputs, each one is named after the dump base,
++            # less -dumpbase-ext, a dash and its own name.
++            head = dumpbase
++            if dumpbase_ext and head.endswith(dumpbase_ext):
++                head = head[:-len(dumpbase_ext)]
++            base = head + '-' + stem + suffix
++            drop = suffix
++        if dumpbase is not None and '/' in dumpbase:
++            prefix = ''
++        elif dumpdir is not None:
++            prefix = dumpdir
++        elif save_temps == 'cwd':
++            prefix = ''
++        else:
++            prefix = directory + '/' if directory else ''
++        if drop and base.endswith(drop):
++            aux_base = base[:-len(drop)]
++        else:
++            aux_base = base
++
++        if source_language in _PREPROCESSED_LANGUAGES:
++            preprocessed = True
++            # Without -o or -MF the dependency file is named like the
++            # auxiliary files; with -o it goes beside the object.
++            if dependencies and wp_depfile is None and depfile is None:
++                if output is None:
++                    files.append(prefix + aux_base + '.d')
++                else:
++                    files.append(os.path.join(directory, os.path.splitext(name)[0] + '.d'))
++        if print_dependencies:
++            # -M and -MM only preprocess, so only dependency files are written.
++            continue
++        if source_language in _COMPILED_LANGUAGES:
++            compiled = True
++            if (coverage or test_coverage) and note is None:
++                files.append(prefix + aux_base + '.gcno')
++            if stack_usage and not lto:
++                files.append(prefix + aux_base + '.su')
++            if optimization_record:
++                files.append(prefix + base + '.opt-record.json.gz')
++        if split_dwarf:
++            files.append(prefix + aux_base + '.dwo')
++        if save_temps:
++            files.extend(prefix + aux_base + ext for ext in _TEMPORARIES[source_language])
++
++    # These name one file for every input.  A dependency file named - is
++    # standard output.
++    if preprocessed and (dependencies or wp_dependencies or print_dependencies):
++        named = wp_depfile if wp_depfile is not None else depfile
++        if named is not None and named != '-':
++            files.append(named)
++    if compiled and (coverage or test_coverage) and note is not None:
++        files.append(note)
++    listing = None if print_dependencies else _assembler_listing(assembler_args)
++    if listing is not None:
++        files.append(listing)
++    return list(dict.fromkeys(os.path.normpath(f) for f in files))
++
++
++def _assembler_listing(args):
++    # The GNU assembler's -a option takes listing letters and an optional
++    # =file; without a file the listing goes to standard output.
++    listing = None
++    for arg in args:
++        if arg.startswith('-a') and '=' in arg:
++            listing = arg.partition('=')[2]
++    return listing or None
++
++
++def link_side_effects(args, directory) -> list[str]:
++    """Return the map file the GNU linker writes for a gcc link command.
++
++    *args* is the command line, compiler (or its launcher) first;
++    *directory* is the one the command runs in, where relative paths start.
++    """
++    outputs = []
++    linker = 'bfd'
++    linker_args = []
++    i = _driver_index(args) + 1
++    while i < len(args):
++        arg = args[i]
++        if arg in ('-o', '-Xlinker') and i + 1 < len(args):
++            if arg == '-o':
++                outputs.append(args[i + 1])
++            else:
++                linker_args.append(args[i + 1])
++            i += 2
++            continue
++        i += 1
++        if arg.startswith('-Wl,'):
++            linker_args.extend(arg[4:].split(','))
++        elif arg.startswith('-fuse-ld='):
++            linker = arg[len('-fuse-ld='):]
++        elif arg.startswith('-o'):
++            outputs.append(arg[2:])
++
++    # When linking, gcc keeps the last of its own -o options and passes it to
++    # the linker before the -Wl and -Xlinker options; the linker writes the
++    # last output it is given, a.out if there is none.
++    linker_args = ['-o', outputs[-1]] + linker_args if outputs else linker_args
++    output = 'a.out'
++    mapfile = None
++    i = 0
++    while i < len(linker_args):
++        arg = linker_args[i]
++        i += 1
++        if arg in ('-Map', '--Map', '-o', '--output') and i < len(linker_args):
++            if arg in ('-o', '--output'):
++                output = linker_args[i]
++            else:
++                mapfile = linker_args[i]
++            i += 1
++        elif arg.startswith(('-Map=', '--Map=')):
++            mapfile = arg.split('=', 1)[1]
++        elif arg.startswith('--output='):
++            output = arg[len('--output='):]
++        elif arg.startswith('-o') and not arg.startswith(('-oformat', '-omagic', '-orphan', '-out-implib')):
++            output = arg[2:]
++        elif arg in ('-M', '--print-map') and linker != 'gold':
++            # ld.bfd prints the map to standard output instead.
++            mapfile = '-'
++
++    if not mapfile or mapfile == '-':
++        return []
++    is_directory = mapfile.endswith('/') or os.path.isdir(os.path.join(directory, mapfile))
++    if linker == 'gold':
++        # gold takes the name as it is, and cannot write to a directory.
++        return [] if is_directory else [os.path.normpath(mapfile)]
++    if is_directory:
++        mapfile = os.path.join(mapfile, os.path.basename(output) + '.map')
++    elif '%' in mapfile:
++        # The first % stands for the output; .map is added when nothing
++        # follows it.
++        head, _, tail = mapfile.partition('%')
++        mapfile = head + output + (tail or '.map')
++    return [os.path.normpath(mapfile)]
++
++
++def _command_lines(env, command, target, source) -> list[list[str]]:
++    # Node names expand relative to the directory of the SConscript being
++    # read, but SCons runs the command from the top-level directory, so
++    # expand it as it will be run.
++    fs = env.fs
++    cwd = fs.getcwd()
++    fs.chdir(fs.Top, change_os_dir=False)
++    try:
++        lines = _action_lines(SCons.Action.Action(command), target, source, env)
++        return [[str(arg) for arg in line] for line in lines]
++    finally:
++        fs.chdir(cwd, change_os_dir=False)
++
++
++def _action_lines(action, target, source, env) -> list:
++    # The command variable can hold a string, a list of commands or a
++    # command generator, as some tools (mingw) set.
++    if isinstance(action, SCons.Action.ListAction):
++        return [line for a in action.list for line in _action_lines(a, target, source, env)]
++    if isinstance(action, SCons.Action.LazyAction):
++        if action.get_parent_class(env) is SCons.Action.CommandAction:
++            return action.process(target, source, env)[0]
++        return _action_lines(action._generate(target, source, env, 0), target, source, env)
++    if isinstance(action, SCons.Action.CommandGeneratorAction):
++        return _action_lines(action._generate(target, source, env, 0), target, source, env)
++    if isinstance(action, SCons.Action.CommandAction):
++        return action.process(target, source, env)[0]
++    return []
++
++
++def _declare_side_effects(env, target, paths) -> None:
++    # gcc resolves relative paths against the directory SCons runs commands
++    # in, the top-level directory, not against the current SConscript.
++    nodes = [env.fs.File(path, env.fs.Top) for path in paths]
++    if nodes:
++        env.SideEffect(nodes, target)
++
++
++# The emitters are cached so that every environment gets the same ones and
++# builders set up by different environments still compare equal.
++@lru_cache(maxsize=None)
++def compile_side_effect_emitter(command):
++    """Return an emitter that declares the files gcc writes besides the
++    object when it runs *command*."""
++    def emitter(target, source, env):
++        for line in _command_lines(env, command, target, source):
++            _declare_side_effects(env, target, compile_side_effects(line))
++        return target, source
++    return emitter
++
++
++@lru_cache(maxsize=None)
++def link_side_effect_emitter(command):
++    """Return an emitter that declares the map file the GNU linker writes
++    when it runs *command*."""
++    def emitter(target, source, env):
++        directory = env.fs.Top.get_abspath()
++        for line in _command_lines(env, command, target, source):
++            _declare_side_effects(env, target, link_side_effects(line, directory))
++        return target, source
++    return emitter
++
++
++def add_side_effect_emitters(env, suffixes, static_command, shared_command) -> None:
++    """Add the gcc side-effect emitters to the object builders for *suffixes*."""
++    static_obj, shared_obj = SCons.Tool.createObjBuilders(env)
++    for suffix in suffixes:
++        static_obj.add_emitter(suffix, SCons.Builder.ListEmitter([
++            SCons.Defaults.StaticObjectEmitter,
++            compile_side_effect_emitter(static_command),
++        ]))
++        shared_obj.add_emitter(suffix, SCons.Builder.ListEmitter([
++            SCons.Defaults.SharedObjectEmitter,
++            compile_side_effect_emitter(shared_command),
++        ]))
+diff --git a/SCons/Tool/gnulink.py b/SCons/Tool/gnulink.py
+index 969a3c3e5..b15e7ebf6 100644
+--- a/SCons/Tool/gnulink.py
++++ b/SCons/Tool/gnulink.py
+@@ -36,12 +36,18 @@ import SCons.Tool.linkCommon
+ import SCons.Util
+ import SCons.Tool
+ 
++from . import gcc
+ from . import link
+ 
+ 
+ def generate(env) -> None:
+     """Add Builders and construction variables for gnulink to an Environment."""
+     link.generate(env)
++    env.Append(
++        PROGEMITTER=[gcc.link_side_effect_emitter('$LINKCOM')],
++        SHLIBEMITTER=[gcc.link_side_effect_emitter('$SHLINKCOM')],
++        LDMODULEEMITTER=[gcc.link_side_effect_emitter('$LDMODULECOM')],
++    )
+ 
+     if env['PLATFORM'] == 'hpux':
+         env['SHLINKFLAGS'] = SCons.Util.CLVar('$LINKFLAGS -shared -fPIC')
+diff --git a/SCons/Tool/gxx.py b/SCons/Tool/gxx.py
+index fdd5df5cf..79798685a 100644
+--- a/SCons/Tool/gxx.py
++++ b/SCons/Tool/gxx.py
+@@ -50,6 +50,7 @@ def generate(env) -> None:
+         env['CXX'] = env.Detect(compilers) or compilers[0]
+ 
+     cxx.generate(env)
++    gcc.add_side_effect_emitters(env, cxx.CXXSuffixes, '$CXXCOM', '$SHCXXCOM')
+ 
+     # platform specific settings
+     if env['PLATFORM'] == 'aix':

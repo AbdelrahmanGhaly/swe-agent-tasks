@@ -1,0 +1,1315 @@
+diff --git a/handoff_25a918/handoff_25a918_test.go b/handoff_25a918/handoff_25a918_test.go
+new file mode 100644
+index 0000000..cd573d7
+--- /dev/null
++++ b/handoff_25a918/handoff_25a918_test.go
+@@ -0,0 +1,422 @@
++package handoff
++
++import (
++	"errors"
++	"math/rand"
++	"slices"
++	"testing"
++
++	"go.etcd.io/raft/v3"
++	pb "go.etcd.io/raft/v3/raftpb"
++)
++
++func elected(t *testing.T, opts options, voters, learners []uint64) *cluster {
++	t.Helper()
++	c := newCluster(t, opts, voters, learners)
++	c.campaign(1)
++	c.propose(1, 2)
++	c.settle()
++	return c
++}
++
++func (c *cluster) changeWithTail(lead uint64, cc pb.ConfChangeI, tail int, lagging ...uint64) {
++	c.t.Helper()
++	conf := c.lastIndex(lead) + 1
++	c.drop = func(m *pb.Message) bool {
++		if len(c.removals) > 0 || m.GetType() != pb.MsgApp || !slices.Contains(lagging, m.GetTo()) {
++			return false
++		}
++		for _, e := range m.GetEntries() {
++			if e.GetIndex() > conf {
++				return true
++			}
++		}
++		return false
++	}
++	c.proposeConfChange(lead, cc)
++	c.propose(lead, tail)
++	c.settle()
++	c.drop = nil
++}
++
++func (c *cluster) unreachableTarget(lead uint64) {
++	c.drop = func(m *pb.Message) bool {
++		return len(c.removals) > 0 && m.GetFrom() == lead && m.GetTo() == expectedTarget(c.removals[0])
++	}
++}
++
++func testRemovedLeaderHandsOffWithoutAnElectionTimeout(t *testing.T, async bool) {
++	c := elected(t, options{async: async, handOff: true, stepDown: true}, []uint64{1, 2, 3}, nil)
++	c.proposeConfChange(1, removeNode(1))
++	c.settle()
++	c.requireHandOff(1, 2)
++}
++
++func TestRemovedLeaderHandsOffWithoutAnElectionTimeout(t *testing.T) {
++	testRemovedLeaderHandsOffWithoutAnElectionTimeout(t, false)
++}
++
++func TestAsyncRemovedLeaderHandsOffWithoutAnElectionTimeout(t *testing.T) {
++	testRemovedLeaderHandsOffWithoutAnElectionTimeout(t, true)
++}
++
++func testHandOffGoesToTheVoterThatAcknowledgedTheMost(t *testing.T, async bool) {
++	c := elected(t, options{async: async, handOff: true, stepDown: true}, []uint64{1, 2, 3}, nil)
++	c.drop = func(m *pb.Message) bool {
++		return len(c.removals) == 0 && m.GetType() == pb.MsgAppResp && m.GetFrom() == 2
++	}
++	c.proposeConfChange(1, removeNode(1))
++	c.settle()
++	c.drop = nil
++	c.requireHandOff(1, 3)
++}
++
++func TestHandOffGoesToTheVoterThatAcknowledgedTheMost(t *testing.T) {
++	testHandOffGoesToTheVoterThatAcknowledgedTheMost(t, false)
++}
++
++func TestAsyncHandOffGoesToTheVoterThatAcknowledgedTheMost(t *testing.T) {
++	testHandOffGoesToTheVoterThatAcknowledgedTheMost(t, true)
++}
++
++func testHandOffBreaksTiesTowardTheLowestID(t *testing.T, async bool) {
++	for round := 0; round < 10; round++ {
++		c := elected(t, options{async: async, handOff: true, stepDown: true}, []uint64{1, 2, 3, 4, 5}, nil)
++		c.proposeConfChange(1, removeNode(1))
++		c.settle()
++		c.requireHandOff(1, 2)
++	}
++}
++
++func TestHandOffBreaksTiesTowardTheLowestID(t *testing.T) {
++	testHandOffBreaksTiesTowardTheLowestID(t, false)
++}
++
++func TestAsyncHandOffBreaksTiesTowardTheLowestID(t *testing.T) {
++	testHandOffBreaksTiesTowardTheLowestID(t, true)
++}
++
++func testHandOffNeverPicksALearner(t *testing.T, async bool) {
++	c := elected(t, options{async: async, handOff: true, stepDown: true}, []uint64{1, 2, 3}, []uint64{4})
++	c.changeWithTail(1, removeNode(1), 2, 2, 3)
++	c.requireHandOff(1, 2)
++}
++
++func TestHandOffNeverPicksALearner(t *testing.T) {
++	testHandOffNeverPicksALearner(t, false)
++}
++
++func TestAsyncHandOffNeverPicksALearner(t *testing.T) {
++	testHandOffNeverPicksALearner(t, true)
++}
++
++func testHandOffPicksTheMostCaughtUpVoterDespiteAPendingTransfer(t *testing.T, async bool) {
++	c := elected(t, options{async: async, handOff: true, stepDown: true}, []uint64{1, 2, 3, 4}, nil)
++	c.drop = func(m *pb.Message) bool {
++		return m.GetFrom() == 4 || m.GetTo() == 4
++	}
++	c.proposeConfChange(1, removeNode(1))
++	c.nodes[1].rn.TransferLeader(4)
++	c.settle()
++	c.requireHandOff(1, 2)
++}
++
++func TestHandOffPicksTheMostCaughtUpVoterDespiteAPendingTransfer(t *testing.T) {
++	testHandOffPicksTheMostCaughtUpVoterDespiteAPendingTransfer(t, false)
++}
++
++func TestAsyncHandOffPicksTheMostCaughtUpVoterDespiteAPendingTransfer(t *testing.T) {
++	testHandOffPicksTheMostCaughtUpVoterDespiteAPendingTransfer(t, true)
++}
++
++func testHandOffKeepsTheRemovedLeadersWholeLog(t *testing.T, async bool) {
++	c := elected(t, options{async: async, handOff: true, stepDown: true}, []uint64{1, 2, 3}, nil)
++	c.nodes[1].holdApply = true
++	c.changeWithTail(1, removeNode(1), 3, 2, 3)
++	if len(c.removals) != 0 {
++		t.Fatalf("leader 1 applied the change before the voters did")
++	}
++	c.releaseApply(1)
++	last := c.lastIndex(1)
++	c.requireHandOff(1, 2)
++	c.settle()
++	if commit := c.nodes[2].rn.BasicStatus().HardState.GetCommit(); commit < last {
++		t.Fatalf("new leader 2 committed up to %d, want the removed leader's entries up to %d", commit, last)
++	}
++}
++
++func TestHandOffKeepsTheRemovedLeadersWholeLog(t *testing.T) {
++	testHandOffKeepsTheRemovedLeadersWholeLog(t, false)
++}
++
++func TestAsyncHandOffKeepsTheRemovedLeadersWholeLog(t *testing.T) {
++	testHandOffKeepsTheRemovedLeadersWholeLog(t, true)
++}
++
++func testRemovedLeaderDropsProposalsWhileHandingOff(t *testing.T, async bool) {
++	c := elected(t, options{async: async, handOff: true, stepDown: true}, []uint64{1, 2, 3}, nil)
++	c.nodes[1].holdApply = true
++	c.proposeConfChange(1, removeNode(1))
++	c.settle()
++	c.releaseApply(1)
++	if c.state(1) != raft.StateLeader {
++		t.Fatalf("removed leader 1 is %s while its handoff is in progress", c.state(1))
++	}
++	if err := c.nodes[1].rn.Propose([]byte("late")); !errors.Is(err, raft.ErrProposalDropped) {
++		t.Fatalf("removed leader 1 accepted a proposal while handing off: %v", err)
++	}
++	c.requireHandOff(1, 2)
++}
++
++func TestRemovedLeaderDropsProposalsWhileHandingOff(t *testing.T) {
++	testRemovedLeaderDropsProposalsWhileHandingOff(t, false)
++}
++
++func TestAsyncRemovedLeaderDropsProposalsWhileHandingOff(t *testing.T) {
++	testRemovedLeaderDropsProposalsWhileHandingOff(t, true)
++}
++
++func testRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t *testing.T, async, stepDown bool) {
++	c := elected(t, options{async: async, handOff: true, stepDown: stepDown}, []uint64{1, 2, 3}, nil)
++	for i := 0; i < electionTick/2; i++ {
++		c.tick(1)
++		c.settle()
++	}
++	c.unreachableTarget(1)
++	c.proposeConfChange(1, removeNode(1))
++	c.settle()
++	for i := 1; i < electionTick; i++ {
++		c.tick(1)
++		c.settle()
++		if c.state(1) != raft.StateLeader {
++			t.Fatalf("removed leader 1 stepped down %d ticks after applying the change, want %d", i, electionTick)
++		}
++	}
++	c.tick(1)
++	c.settle()
++	if c.state(1) != raft.StateFollower {
++		t.Fatalf("removed leader 1 is %s %d ticks after applying the change", c.state(1), electionTick)
++	}
++	if lead := c.leader(); lead != 0 {
++		t.Fatalf("node %d leads although the handoff target never heard from node 1", lead)
++	}
++}
++
++func TestRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t *testing.T) {
++	testRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t, false, true)
++}
++
++func TestAsyncRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t *testing.T) {
++	testRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t, true, true)
++}
++
++func TestRemovedLeaderStepsDownWithoutStepDownOnRemoval(t *testing.T) {
++	testRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t, false, false)
++}
++
++func TestAsyncRemovedLeaderStepsDownWithoutStepDownOnRemoval(t *testing.T) {
++	testRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t, true, false)
++}
++
++func testRemovedLeaderStepsDownAsSoonAsItHearsFromTheNewLeader(t *testing.T, async bool) {
++	c := elected(t, options{async: async, handOff: true, checkQuorum: true}, []uint64{1, 2, 3}, nil)
++	c.proposeConfChange(1, removeNode(1))
++	c.settle()
++	c.requireHandOff(1, 2)
++	c.tick(1)
++	c.settle()
++	if c.state(1) != raft.StateFollower {
++		t.Fatalf("removed leader 1 is %s after new leader 2 answered its heartbeat, %d ticks after the change", c.state(1), c.nodes[1].ticks)
++	}
++}
++
++func TestRemovedLeaderStepsDownAsSoonAsItHearsFromTheNewLeader(t *testing.T) {
++	testRemovedLeaderStepsDownAsSoonAsItHearsFromTheNewLeader(t, false)
++}
++
++func TestAsyncRemovedLeaderStepsDownAsSoonAsItHearsFromTheNewLeader(t *testing.T) {
++	testRemovedLeaderStepsDownAsSoonAsItHearsFromTheNewLeader(t, true)
++}
++
++func testDemotedLeaderStepsDownAsSoonAsItHearsFromTheNewLeader(t *testing.T, async bool) {
++	c := elected(t, options{async: async, handOff: true}, []uint64{1, 2, 3}, nil)
++	c.proposeConfChange(1, jointChange(single(pb.ConfChangeAddLearnerNode, 1)))
++	c.settle()
++	c.proposeConfChange(1, &pb.ConfChangeV2{})
++	c.settle()
++	c.requireHandOff(1, 2)
++	if c.state(1) != raft.StateFollower {
++		t.Fatalf("demoted leader 1 is %s after new leader 2 reached it, %d ticks after the change", c.state(1), c.nodes[1].ticks)
++	}
++}
++
++func TestDemotedLeaderStepsDownAsSoonAsItHearsFromTheNewLeader(t *testing.T) {
++	testDemotedLeaderStepsDownAsSoonAsItHearsFromTheNewLeader(t, false)
++}
++
++func TestAsyncDemotedLeaderStepsDownAsSoonAsItHearsFromTheNewLeader(t *testing.T) {
++	testDemotedLeaderStepsDownAsSoonAsItHearsFromTheNewLeader(t, true)
++}
++
++func testHandOffWithoutStepDownOnRemoval(t *testing.T, async bool) {
++	c := elected(t, options{async: async, handOff: true}, []uint64{1, 2, 3}, nil)
++	c.proposeConfChange(1, removeNode(1))
++	c.settle()
++	c.requireHandOff(1, 2)
++}
++
++func TestHandOffWithoutStepDownOnRemoval(t *testing.T) {
++	testHandOffWithoutStepDownOnRemoval(t, false)
++}
++
++func TestAsyncHandOffWithoutStepDownOnRemoval(t *testing.T) {
++	testHandOffWithoutStepDownOnRemoval(t, true)
++}
++
++func testHandOffWhenLeavingAJointConfiguration(t *testing.T, async bool) {
++	c := elected(t, options{async: async, handOff: true, stepDown: true}, []uint64{1, 2, 3}, []uint64{4})
++	c.proposeConfChange(1, jointChange(single(pb.ConfChangeRemoveNode, 1), single(pb.ConfChangeAddNode, 4)))
++	c.settle()
++	if c.state(1) != raft.StateLeader || len(c.removals) != 0 {
++		t.Fatalf("leader 1 is %s while it is still a voter of the outgoing configuration", c.state(1))
++	}
++	c.changeWithTail(1, &pb.ConfChangeV2{}, 2, 2, 3)
++	c.requireHandOff(1, 4)
++}
++
++func TestHandOffWhenLeavingAJointConfiguration(t *testing.T) {
++	testHandOffWhenLeavingAJointConfiguration(t, false)
++}
++
++func TestAsyncHandOffWhenLeavingAJointConfiguration(t *testing.T) {
++	testHandOffWhenLeavingAJointConfiguration(t, true)
++}
++
++func testDemotedLeaderHandsOff(t *testing.T, async bool) {
++	c := elected(t, options{async: async, handOff: true, stepDown: true}, []uint64{1, 2, 3}, nil)
++	c.proposeConfChange(1, jointChange(single(pb.ConfChangeAddLearnerNode, 1)))
++	c.settle()
++	if c.state(1) != raft.StateLeader || len(c.removals) != 0 {
++		t.Fatalf("leader 1 is %s while it is still a voter of the outgoing configuration", c.state(1))
++	}
++	c.nodes[1].holdApply = true
++	c.proposeConfChange(1, &pb.ConfChangeV2{})
++	c.settle()
++	c.releaseApply(1)
++	if c.state(1) != raft.StateLeader {
++		t.Fatalf("demoted leader 1 is %s while its handoff is in progress", c.state(1))
++	}
++	if err := c.nodes[1].rn.Propose([]byte("late")); !errors.Is(err, raft.ErrProposalDropped) {
++		t.Fatalf("demoted leader 1 accepted a proposal while handing off: %v", err)
++	}
++	c.requireHandOff(1, 2)
++}
++
++func TestDemotedLeaderHandsOff(t *testing.T) {
++	testDemotedLeaderHandsOff(t, false)
++}
++
++func TestAsyncDemotedLeaderHandsOff(t *testing.T) {
++	testDemotedLeaderHandsOff(t, true)
++}
++
++func testWithoutTheOptionARemovedLeaderStepsDownAtOnce(t *testing.T, async bool) {
++	c := elected(t, options{async: async, stepDown: true}, []uint64{1, 2, 3}, nil)
++	c.proposeConfChange(1, removeNode(1))
++	c.settle()
++	if c.state(1) != raft.StateFollower {
++		t.Fatalf("removed leader 1 is %s, want it to step down at once", c.state(1))
++	}
++	if lead := c.takeOver(1); lead != 0 {
++		t.Fatalf("node %d took over without an election timeout", lead)
++	}
++	if to := c.timeoutNowTo(1); len(to) != 0 {
++		t.Fatalf("removed leader 1 asked %v to take over", to)
++	}
++}
++
++func TestWithoutTheOptionARemovedLeaderStepsDownAtOnce(t *testing.T) {
++	testWithoutTheOptionARemovedLeaderStepsDownAtOnce(t, false)
++}
++
++func TestAsyncWithoutTheOptionARemovedLeaderStepsDownAtOnce(t *testing.T) {
++	testWithoutTheOptionARemovedLeaderStepsDownAtOnce(t, true)
++}
++
++func testWithoutEitherOptionARemovedLeaderKeepsLeading(t *testing.T, async bool) {
++	c := elected(t, options{async: async}, []uint64{1, 2, 3}, nil)
++	c.proposeConfChange(1, removeNode(1))
++	c.settle()
++	for i := 0; i < 2*electionTick; i++ {
++		c.tick(1)
++		c.settle()
++	}
++	if c.state(1) != raft.StateLeader {
++		t.Fatalf("removed leader 1 is %s, want it to keep leading", c.state(1))
++	}
++	if to := c.timeoutNowTo(1); len(to) != 0 {
++		t.Fatalf("removed leader 1 asked %v to take over", to)
++	}
++}
++
++func TestWithoutEitherOptionARemovedLeaderKeepsLeading(t *testing.T) {
++	testWithoutEitherOptionARemovedLeaderKeepsLeading(t, false)
++}
++
++func TestAsyncWithoutEitherOptionARemovedLeaderKeepsLeading(t *testing.T) {
++	testWithoutEitherOptionARemovedLeaderKeepsLeading(t, true)
++}
++
++func randomRemoval(t *testing.T, async bool, seed int64) {
++	rng := rand.New(rand.NewSource(seed))
++	n := uint64(3 + rng.Intn(3))
++	var voters, learners []uint64
++	for id := uint64(1); id <= n; id++ {
++		voters = append(voters, id)
++	}
++	if rng.Intn(2) == 0 {
++		learners = []uint64{n + 1}
++	}
++	c := elected(t, options{async: async, handOff: true, stepDown: rng.Intn(2) == 0}, voters, learners)
++	var lagging []uint64
++	for _, id := range voters[1:] {
++		if rng.Intn(2) == 0 {
++			lagging = append(lagging, id)
++		}
++	}
++	tail := rng.Intn(4)
++	switch kind := rng.Intn(3); {
++	case kind == 1 && len(learners) == 1:
++		c.proposeConfChange(1, jointChange(single(pb.ConfChangeRemoveNode, 1), single(pb.ConfChangeAddNode, learners[0])))
++		c.settle()
++		c.changeWithTail(1, &pb.ConfChangeV2{}, tail, lagging...)
++	case kind == 2:
++		c.proposeConfChange(1, jointChange(single(pb.ConfChangeAddLearnerNode, 1)))
++		c.settle()
++		c.changeWithTail(1, &pb.ConfChangeV2{}, tail, lagging...)
++	default:
++		c.changeWithTail(1, removeNode(1), tail, lagging...)
++	}
++	if len(c.removals) != 1 {
++		t.Fatalf("seed %d: leader 1 applied %d changes that removed it", seed, len(c.removals))
++	}
++	want := expectedTarget(c.removals[0])
++	defer func() {
++		if t.Failed() {
++			t.Logf("seed %d: voters %v learners %v lagging %v tail %d", seed, voters, learners, lagging, tail)
++		}
++	}()
++	c.requireHandOff(1, want)
++}
++
++func TestRandomRemovalsHandOffToTheRightVoter(t *testing.T) {
++	for seed := int64(1); seed <= 100; seed++ {
++		randomRemoval(t, false, seed)
++	}
++}
++
++func TestAsyncRandomRemovalsHandOffToTheRightVoter(t *testing.T) {
++	for seed := int64(1); seed <= 100; seed++ {
++		randomRemoval(t, true, seed)
++	}
++}
+diff --git a/handoff_25a918/harness_25a918_test.go b/handoff_25a918/harness_25a918_test.go
+new file mode 100644
+index 0000000..fe5e633
+--- /dev/null
++++ b/handoff_25a918/harness_25a918_test.go
+@@ -0,0 +1,435 @@
++package handoff
++
++import (
++	"io"
++	"log"
++	"slices"
++	"testing"
++
++	"google.golang.org/protobuf/proto"
++
++	"go.etcd.io/raft/v3"
++	pb "go.etcd.io/raft/v3/raftpb"
++	"go.etcd.io/raft/v3/tracker"
++)
++
++const electionTick = 10
++
++var discard = &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)}
++
++type options struct {
++	async       bool
++	handOff     bool
++	stepDown    bool
++	checkQuorum bool
++}
++
++type member struct {
++	id        uint64
++	storage   *raft.MemoryStorage
++	rn        *raft.RawNode
++	applied   uint64
++	local     []*pb.Message
++	ticks     int
++	holdApply bool
++	pending   []*pb.Entry
++	held      []*pb.Message
++}
++
++type removal struct {
++	leader   uint64
++	term     uint64
++	progress map[uint64]tracker.Progress
++	voters   []uint64
++}
++
++type cluster struct {
++	t        *testing.T
++	opts     options
++	ids      []uint64
++	nodes    map[uint64]*member
++	net      []*pb.Message
++	drop     func(m *pb.Message) bool
++	sent     []*pb.Message
++	removals []removal
++}
++
++func newCluster(t *testing.T, opts options, voters, learners []uint64) *cluster {
++	t.Helper()
++	c := &cluster{t: t, opts: opts, nodes: map[uint64]*member{}}
++	c.ids = append(slices.Clone(voters), learners...)
++	slices.Sort(c.ids)
++	for _, id := range c.ids {
++		st := raft.NewMemoryStorage()
++		snap := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{
++			Index:     proto.Uint64(1),
++			Term:      proto.Uint64(1),
++			ConfState: &pb.ConfState{Voters: slices.Clone(voters), Learners: slices.Clone(learners)},
++		}}
++		if err := st.ApplySnapshot(snap); err != nil {
++			t.Fatal(err)
++		}
++		if err := st.SetHardState(&pb.HardState{Term: proto.Uint64(1), Commit: proto.Uint64(1)}); err != nil {
++			t.Fatal(err)
++		}
++		rn, err := raft.NewRawNode(&raft.Config{
++			ID:                          id,
++			ElectionTick:                electionTick,
++			HeartbeatTick:               1,
++			Storage:                     st,
++			Applied:                     1,
++			MaxSizePerMsg:               1 << 20,
++			MaxInflightMsgs:             256,
++			AsyncStorageWrites:          opts.async,
++			TransferLeadershipOnRemoval: opts.handOff,
++			StepDownOnRemoval:           opts.stepDown,
++			CheckQuorum:                 opts.checkQuorum,
++			Logger:                      discard,
++		})
++		if err != nil {
++			t.Fatal(err)
++		}
++		c.nodes[id] = &member{id: id, storage: st, rn: rn, applied: 1}
++	}
++	return c
++}
++
++func (c *cluster) send(m *pb.Message) {
++	c.sent = append(c.sent, m)
++	c.net = append(c.net, m)
++}
++
++func (c *cluster) ready(id uint64) {
++	n := c.nodes[id]
++	rd := n.rn.Ready()
++	if c.opts.async {
++		for _, m := range rd.Messages {
++			if m.GetTo() == raft.LocalAppendThread || m.GetTo() == raft.LocalApplyThread {
++				n.local = append(n.local, m)
++			} else {
++				c.send(m)
++			}
++		}
++		return
++	}
++	if !raft.IsEmptySnap(rd.Snapshot) {
++		if err := n.storage.ApplySnapshot(rd.Snapshot); err != nil {
++			c.t.Fatalf("node %d: ApplySnapshot: %v", id, err)
++		}
++		n.applied = max(n.applied, rd.Snapshot.GetMetadata().GetIndex())
++	}
++	if err := n.storage.Append(rd.Entries); err != nil {
++		c.t.Fatalf("node %d: Append: %v", id, err)
++	}
++	if !raft.IsEmptyHardState(rd.HardState) {
++		if err := n.storage.SetHardState(rd.HardState); err != nil {
++			c.t.Fatalf("node %d: SetHardState: %v", id, err)
++		}
++	}
++	for _, m := range rd.Messages {
++		c.send(m)
++	}
++	if n.holdApply {
++		n.pending = append(n.pending, rd.CommittedEntries...)
++	} else {
++		c.apply(n, rd.CommittedEntries)
++	}
++	n.rn.Advance(rd)
++}
++
++func (c *cluster) processLocal(id uint64) {
++	n := c.nodes[id]
++	m := n.local[0]
++	n.local = n.local[1:]
++	switch m.GetType() {
++	case pb.MsgStorageAppend:
++		if m.GetSnapshot() != nil {
++			if err := n.storage.ApplySnapshot(m.GetSnapshot()); err != nil {
++				c.t.Fatalf("node %d: ApplySnapshot: %v", id, err)
++			}
++			n.applied = max(n.applied, m.GetSnapshot().GetMetadata().GetIndex())
++		}
++		if err := n.storage.Append(m.GetEntries()); err != nil {
++			c.t.Fatalf("node %d: Append: %v", id, err)
++		}
++		if m.Term != nil || m.Vote != nil || m.Commit != nil {
++			if err := n.storage.SetHardState(&pb.HardState{Term: m.Term, Vote: m.Vote, Commit: m.Commit}); err != nil {
++				c.t.Fatalf("node %d: SetHardState: %v", id, err)
++			}
++		}
++	case pb.MsgStorageApply:
++		if n.holdApply {
++			n.held = append(n.held, m)
++			return
++		}
++		c.apply(n, m.GetEntries())
++	default:
++		c.t.Fatalf("node %d: unexpected local message %s", id, m.GetType())
++	}
++	c.respond(n, m)
++}
++
++func (c *cluster) respond(n *member, m *pb.Message) {
++	id := n.id
++	for _, r := range m.GetResponses() {
++		if r.GetTo() == id {
++			if err := n.rn.Step(r); err != nil {
++				c.t.Fatalf("node %d: stepping %s: %v", id, r.GetType(), err)
++			}
++			continue
++		}
++		c.send(r)
++	}
++}
++
++func (c *cluster) releaseApply(id uint64) {
++	n := c.nodes[id]
++	n.holdApply = false
++	c.apply(n, n.pending)
++	n.pending = nil
++	held := n.held
++	n.held = nil
++	for _, m := range held {
++		c.apply(n, m.GetEntries())
++		c.respond(n, m)
++	}
++}
++
++func (c *cluster) apply(n *member, ents []*pb.Entry) {
++	for _, e := range ents {
++		if e.GetIndex() != n.applied+1 {
++			c.t.Fatalf("node %d applied entry %d right after %d", n.id, e.GetIndex(), n.applied)
++		}
++		n.applied = e.GetIndex()
++		var cc pb.ConfChangeI
++		switch e.GetType() {
++		case pb.EntryConfChange:
++			v1 := &pb.ConfChange{}
++			if err := proto.Unmarshal(e.GetData(), v1); err != nil {
++				c.t.Fatal(err)
++			}
++			cc = v1
++		case pb.EntryConfChangeV2:
++			v2 := &pb.ConfChangeV2{}
++			if err := proto.Unmarshal(e.GetData(), v2); err != nil {
++				c.t.Fatal(err)
++			}
++			cc = v2
++		default:
++			continue
++		}
++		st := n.rn.Status()
++		cs := n.rn.ApplyConfChange(cc)
++		if st.RaftState == raft.StateLeader && !slices.Contains(cs.GetVoters(), n.id) && !slices.Contains(cs.GetVotersOutgoing(), n.id) {
++			c.removals = append(c.removals, removal{leader: n.id, term: st.HardState.GetTerm(), progress: st.Progress, voters: slices.Clone(cs.GetVoters())})
++		}
++	}
++}
++
++func (c *cluster) deliver() bool {
++	if len(c.net) == 0 {
++		return false
++	}
++	msgs := c.net
++	c.net = nil
++	for _, m := range msgs {
++		if c.drop != nil && c.drop(m) {
++			if m.GetType() == pb.MsgSnap {
++				c.nodes[m.GetFrom()].rn.ReportSnapshot(m.GetTo(), raft.SnapshotFailure)
++			}
++			continue
++		}
++		n := c.nodes[m.GetTo()]
++		if n == nil {
++			continue
++		}
++		_ = n.rn.Step(m)
++		if m.GetType() == pb.MsgSnap {
++			c.nodes[m.GetFrom()].rn.ReportSnapshot(m.GetTo(), raft.SnapshotFinish)
++		}
++	}
++	return true
++}
++
++func (c *cluster) work(id uint64) bool {
++	n := c.nodes[id]
++	busy := false
++	for k := 0; ; k++ {
++		if k == 1000 {
++			c.t.Fatalf("node %d keeps reporting a Ready", id)
++		}
++		switch {
++		case n.rn.HasReady():
++			c.ready(id)
++		case len(n.local) > 0:
++			c.processLocal(id)
++		default:
++			return busy
++		}
++		busy = true
++	}
++}
++
++func (c *cluster) settle() {
++	for round := 0; ; round++ {
++		if round == 2000 {
++			c.t.Fatalf("cluster did not settle")
++		}
++		busy := false
++		for _, id := range c.ids {
++			if c.work(id) {
++				busy = true
++			}
++		}
++		if c.deliver() {
++			busy = true
++		}
++		if !busy {
++			return
++		}
++	}
++}
++
++func (c *cluster) tick(id uint64) {
++	c.nodes[id].ticks++
++	c.nodes[id].rn.Tick()
++}
++
++func (c *cluster) state(id uint64) raft.StateType {
++	return c.nodes[id].rn.BasicStatus().RaftState
++}
++
++func (c *cluster) term(id uint64) uint64 {
++	return c.nodes[id].rn.BasicStatus().HardState.GetTerm()
++}
++
++func (c *cluster) leader() uint64 {
++	var lead, term uint64
++	for _, id := range c.ids {
++		if c.state(id) == raft.StateLeader && c.term(id) > term {
++			lead, term = id, c.term(id)
++		}
++	}
++	return lead
++}
++
++func (c *cluster) campaign(id uint64) {
++	c.t.Helper()
++	if err := c.nodes[id].rn.Campaign(); err != nil {
++		c.t.Fatal(err)
++	}
++	c.settle()
++	if c.state(id) != raft.StateLeader {
++		c.t.Fatalf("node %d did not become leader", id)
++	}
++}
++
++func (c *cluster) propose(id uint64, n int) {
++	c.t.Helper()
++	for i := 0; i < n; i++ {
++		if err := c.nodes[id].rn.Propose([]byte{byte('a' + i)}); err != nil {
++			c.t.Fatalf("node %d: Propose: %v", id, err)
++		}
++	}
++}
++
++func (c *cluster) proposeConfChange(id uint64, cc pb.ConfChangeI) {
++	c.t.Helper()
++	if err := c.nodes[id].rn.ProposeConfChange(cc); err != nil {
++		c.t.Fatalf("node %d: ProposeConfChange: %v", id, err)
++	}
++}
++
++func (c *cluster) lastIndex(id uint64) uint64 {
++	last, err := c.nodes[id].storage.LastIndex()
++	if err != nil {
++		c.t.Fatal(err)
++	}
++	return last
++}
++
++func (c *cluster) takeOver(old uint64) uint64 {
++	for i := 0; ; i++ {
++		c.settle()
++		if lead := c.leader(); lead != 0 && lead != old {
++			return lead
++		}
++		if i == electionTick-1 {
++			return 0
++		}
++		c.tick(old)
++	}
++}
++
++func (c *cluster) requireHandOff(old, want uint64) {
++	c.t.Helper()
++	if len(c.removals) != 1 || c.removals[0].leader != old {
++		c.t.Fatalf("node %d did not apply a change that removed it as leader", old)
++	}
++	before := c.removals[0].term
++	got := c.takeOver(old)
++	if got == 0 {
++		c.t.Fatalf("no voter took over from removed leader %d after %d of its ticks", old, c.nodes[old].ticks)
++	}
++	if got != want {
++		c.t.Fatalf("node %d took over from removed leader %d, want node %d", got, old, want)
++	}
++	if c.term(got) <= before {
++		c.t.Fatalf("node %d leads at term %d, not after term %d", got, c.term(got), before)
++	}
++	c.requireLogKept(old, got)
++}
++
++func (c *cluster) requireLogKept(old, lead uint64) {
++	c.t.Helper()
++	first, err := c.nodes[old].storage.FirstIndex()
++	if err != nil {
++		c.t.Fatal(err)
++	}
++	for i := first; i <= c.lastIndex(old); i++ {
++		want, err := c.nodes[old].storage.Term(i)
++		if err != nil {
++			c.t.Fatal(err)
++		}
++		got, err := c.nodes[lead].storage.Term(i)
++		if err != nil || got != want {
++			c.t.Fatalf("new leader %d has entry %d at term %d (%v), removed leader %d had term %d", lead, i, got, err, old, want)
++		}
++	}
++}
++
++func (c *cluster) timeoutNowTo(from uint64) []uint64 {
++	var to []uint64
++	for _, m := range c.sent {
++		if m.GetFrom() == from && m.GetType() == pb.MsgTimeoutNow {
++			to = append(to, m.GetTo())
++		}
++	}
++	return to
++}
++
++func removeNode(id uint64) *pb.ConfChange {
++	return &pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: proto.Uint64(id)}
++}
++
++func jointChange(changes ...*pb.ConfChangeSingle) *pb.ConfChangeV2 {
++	return &pb.ConfChangeV2{Transition: pb.ConfChangeTransitionJointExplicit.Enum(), Changes: changes}
++}
++
++func single(typ pb.ConfChangeType, id uint64) *pb.ConfChangeSingle {
++	return &pb.ConfChangeSingle{Type: typ.Enum(), NodeId: proto.Uint64(id)}
++}
++
++func expectedTarget(r removal) uint64 {
++	var to, match uint64
++	for _, id := range r.voters {
++		pr, ok := r.progress[id]
++		if id == r.leader || !ok || pr.IsLearner {
++			continue
++		}
++		if to == 0 || pr.Match > match {
++			to, match = id, pr.Match
++		}
++	}
++	return to
++}
+diff --git a/handoff_25a918/node_25a918_test.go b/handoff_25a918/node_25a918_test.go
+new file mode 100644
+index 0000000..85cbfa1
+--- /dev/null
++++ b/handoff_25a918/node_25a918_test.go
+@@ -0,0 +1,257 @@
++package handoff
++
++import (
++	"context"
++	"slices"
++	"testing"
++	"time"
++
++	"google.golang.org/protobuf/proto"
++
++	"go.etcd.io/raft/v3"
++	pb "go.etcd.io/raft/v3/raftpb"
++)
++
++type nodeRun struct {
++	t          *testing.T
++	async      bool
++	n          raft.Node
++	st         *raft.MemoryStorage
++	state      raft.StateType
++	applied    uint64
++	removed    bool
++	silent     bool
++	timeoutNow []uint64
++}
++
++func startNode(t *testing.T, async bool) *nodeRun {
++	st := raft.NewMemoryStorage()
++	snap := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{
++		Index:     proto.Uint64(1),
++		Term:      proto.Uint64(1),
++		ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},
++	}}
++	if err := st.ApplySnapshot(snap); err != nil {
++		t.Fatal(err)
++	}
++	if err := st.SetHardState(&pb.HardState{Term: proto.Uint64(1), Commit: proto.Uint64(1)}); err != nil {
++		t.Fatal(err)
++	}
++	n := raft.RestartNode(&raft.Config{
++		ID:                          1,
++		ElectionTick:                electionTick,
++		HeartbeatTick:               1,
++		Storage:                     st,
++		Applied:                     1,
++		MaxSizePerMsg:               1 << 20,
++		MaxInflightMsgs:             256,
++		AsyncStorageWrites:          async,
++		TransferLeadershipOnRemoval: true,
++		StepDownOnRemoval:           true,
++		Logger:                      discard,
++	})
++	t.Cleanup(n.Stop)
++	return &nodeRun{t: t, async: async, n: n, st: st, applied: 1}
++}
++
++func (r *nodeRun) ctx() context.Context {
++	ctx, cancel := context.WithTimeout(r.t.Context(), 30*time.Second)
++	r.t.Cleanup(cancel)
++	return ctx
++}
++
++func (r *nodeRun) step(m *pb.Message) {
++	if err := r.n.Step(r.ctx(), m); err != nil {
++		r.t.Fatalf("stepping %s: %v", m.GetType(), err)
++	}
++}
++
++func (r *nodeRun) next() raft.Ready {
++	select {
++	case rd := <-r.n.Ready():
++		return rd
++	case <-time.After(30 * time.Second):
++		r.t.Fatalf("no Ready arrived: state %s, applied %d, removed %t, asked %v to take over", r.state, r.applied, r.removed, r.timeoutNow)
++	}
++	return raft.Ready{}
++}
++
++func (r *nodeRun) apply(ents []*pb.Entry) {
++	for _, e := range ents {
++		r.applied = e.GetIndex()
++		var cc pb.ConfChangeI
++		switch e.GetType() {
++		case pb.EntryConfChange:
++			v1 := &pb.ConfChange{}
++			if err := proto.Unmarshal(e.GetData(), v1); err != nil {
++				r.t.Fatal(err)
++			}
++			cc = v1
++		case pb.EntryConfChangeV2:
++			v2 := &pb.ConfChangeV2{}
++			if err := proto.Unmarshal(e.GetData(), v2); err != nil {
++				r.t.Fatal(err)
++			}
++			cc = v2
++		default:
++			continue
++		}
++		if cs := r.n.ApplyConfChange(cc); !slices.Contains(cs.GetVoters(), 1) {
++			r.removed = true
++		}
++	}
++}
++
++func (r *nodeRun) answer(m *pb.Message) {
++	if m.GetType() == pb.MsgTimeoutNow {
++		r.timeoutNow = append(r.timeoutNow, m.GetTo())
++		return
++	}
++	if r.silent {
++		return
++	}
++	resp := &pb.Message{From: proto.Uint64(m.GetTo()), To: proto.Uint64(1), Term: proto.Uint64(m.GetTerm())}
++	switch m.GetType() {
++	case pb.MsgVote:
++		resp.Type = pb.MsgVoteResp.Enum()
++	case pb.MsgApp:
++		resp.Type = pb.MsgAppResp.Enum()
++		resp.Index = proto.Uint64(m.GetIndex() + uint64(len(m.GetEntries())))
++	case pb.MsgHeartbeat:
++		resp.Type = pb.MsgHeartbeatResp.Enum()
++	default:
++		return
++	}
++	r.step(resp)
++}
++
++func (r *nodeRun) handle(rd raft.Ready) {
++	if rd.SoftState != nil {
++		r.state = rd.SoftState.RaftState
++	}
++	var out []*pb.Message
++	if !r.async {
++		if err := r.st.Append(rd.Entries); err != nil {
++			r.t.Fatal(err)
++		}
++		if !raft.IsEmptyHardState(rd.HardState) {
++			if err := r.st.SetHardState(rd.HardState); err != nil {
++				r.t.Fatal(err)
++			}
++		}
++		out = rd.Messages
++		r.apply(rd.CommittedEntries)
++		r.n.Advance()
++	} else {
++		for _, m := range rd.Messages {
++			if m.GetTo() != raft.LocalAppendThread && m.GetTo() != raft.LocalApplyThread {
++				out = append(out, m)
++				continue
++			}
++			switch m.GetType() {
++			case pb.MsgStorageAppend:
++				if err := r.st.Append(m.GetEntries()); err != nil {
++					r.t.Fatal(err)
++				}
++				if m.Term != nil || m.Vote != nil || m.Commit != nil {
++					if err := r.st.SetHardState(&pb.HardState{Term: m.Term, Vote: m.Vote, Commit: m.Commit}); err != nil {
++						r.t.Fatal(err)
++					}
++				}
++			case pb.MsgStorageApply:
++				r.apply(m.GetEntries())
++			}
++			for _, resp := range m.GetResponses() {
++				if resp.GetTo() == 1 || raft.IsLocalMsgTarget(resp.GetFrom()) {
++					r.step(resp)
++					continue
++				}
++				out = append(out, resp)
++			}
++		}
++	}
++	for _, m := range out {
++		r.answer(m)
++	}
++}
++
++func (r *nodeRun) drive(done func() bool) {
++	for k := 0; !done(); k++ {
++		if k == 500 {
++			r.t.Fatalf("node did not get there: state %s, applied %d, removed %t", r.state, r.applied, r.removed)
++		}
++		r.handle(r.next())
++	}
++}
++
++func (r *nodeRun) removeItself() {
++	if err := r.n.Campaign(r.ctx()); err != nil {
++		r.t.Fatalf("Campaign: %v", err)
++	}
++	r.drive(func() bool { return r.state == raft.StateLeader && r.applied > 1 })
++	for i := 0; i < 2; i++ {
++		if err := r.n.Propose(r.ctx(), []byte{byte('a' + i)}); err != nil {
++			r.t.Fatalf("Propose: %v", err)
++		}
++	}
++	if err := r.n.ProposeConfChange(r.ctx(), removeNode(1)); err != nil {
++		r.t.Fatalf("ProposeConfChange: %v", err)
++	}
++	r.drive(func() bool { return r.removed })
++}
++
++func (r *nodeRun) tick() {
++	r.n.Tick()
++	for beat := false; !beat && r.state == raft.StateLeader; {
++		rd := r.next()
++		beat = slices.ContainsFunc(rd.Messages, func(m *pb.Message) bool { return m.GetType() == pb.MsgHeartbeat })
++		r.handle(rd)
++	}
++}
++
++func testNodeRemovedLeaderAsksTheMostCaughtUpVoterToTakeOver(t *testing.T, async bool) {
++	r := startNode(t, async)
++	r.removeItself()
++	for i := 0; len(r.timeoutNow) == 0; i++ {
++		if i == electionTick-1 {
++			t.Fatalf("removed Node leader asked no voter to take over in %d ticks", i)
++		}
++		r.tick()
++	}
++	if r.timeoutNow[0] != 2 {
++		t.Fatalf("removed Node leader asked %d to take over, want 2", r.timeoutNow[0])
++	}
++}
++
++func TestNodeRemovedLeaderAsksTheMostCaughtUpVoterToTakeOver(t *testing.T) {
++	testNodeRemovedLeaderAsksTheMostCaughtUpVoterToTakeOver(t, false)
++}
++
++func TestAsyncNodeRemovedLeaderAsksTheMostCaughtUpVoterToTakeOver(t *testing.T) {
++	testNodeRemovedLeaderAsksTheMostCaughtUpVoterToTakeOver(t, true)
++}
++
++func testNodeRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t *testing.T, async bool) {
++	r := startNode(t, async)
++	r.removeItself()
++	r.silent = true
++	for i := 1; i <= electionTick; i++ {
++		r.tick()
++		if r.state == raft.StateLeader {
++			continue
++		}
++		if i < electionTick {
++			t.Fatalf("removed Node leader is %s %d ticks after applying the change, want it to keep handing off until %d", r.state, i, electionTick)
++		}
++		return
++	}
++	t.Fatalf("removed Node leader still leads %d ticks after applying the change", electionTick)
++}
++
++func TestNodeRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t *testing.T) {
++	testNodeRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t, false)
++}
++
++func TestAsyncNodeRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t *testing.T) {
++	testNodeRemovedLeaderStepsDownOneElectionTimeoutAfterTheChange(t, true)
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..66bbcc1
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,177 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || { echo "missing value for --output_path" >&2; usage; }
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 2
++
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++if [ -n "${GOCACHE:-}" ] && [ ! -w "$GOCACHE" ]; then
++  export GOCACHE="/tmp/go-build-$(id -u)"
++fi
++
++NEW_DIR="handoff_25a918"
++NEW_PKG="go.etcd.io/raft/v3/$NEW_DIR"
++LOG="$(mktemp)"
++LIST_ERR="$(mktemp)"
++trap 'rm -f "$LOG" "$LIST_ERR"' EXIT
++LIST_STATUS=0
++
++if [ "$MODE" = "base" ]; then
++  PKGS="$(go list ./... 2>"$LIST_ERR")"
++  LIST_STATUS=$?
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    PKGS="$(go list -e ./... 2>/dev/null)"
++  fi
++  cat "$LIST_ERR" >>"$LOG"
++  PKGS="$(printf '%s\n' "$PKGS" | grep -v -e '^$' -e "/$NEW_DIR\$")"
++  if [ -n "$PKGS" ]; then
++    go test -v -count=1 -timeout 20m $PKGS >>"$LOG" 2>&1
++    STATUS=$?
++  else
++    STATUS=1
++  fi
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    echo "[setup failed] go list ./... exited with status $LIST_STATUS" >>"$LOG"
++    [ "$STATUS" -eq 0 ] && STATUS="$LIST_STATUS"
++  fi
++else
++  go test -v -count=1 -timeout 20m "./$NEW_DIR/" >>"$LOG" 2>&1
++  STATUS=$?
++fi
++
++if ! grep -qE '^ *--- (PASS|FAIL|SKIP):' "$LOG"; then
++  echo "no tests were collected in mode $MODE" >>"$LOG"
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++cat "$LOG"
++
++expected_tests() {
++  grep -ho '^func Test[A-Za-z0-9_]*' "$NEW_DIR"/*_test.go | sed 's/^func //'
++}
++
++xml_escape() {
++  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
++}
++
++add_failures() {
++  suite="$1"
++  message="$2"
++  detail="$3"
++  shift 3
++  grep -q '</testsuites>' "$OUTPUT_PATH" 2>/dev/null || printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++  EXTRA="$(mktemp)"
++  MERGED="$(mktemp)"
++  {
++    echo "<testsuite name=\"$suite\" tests=\"$#\" failures=\"$#\" errors=\"0\">"
++    for name in "$@"; do
++      echo "<testcase name=\"$name\" classname=\"$suite\"><failure message=\"$message\">$detail</failure></testcase>"
++    done
++    echo '</testsuite>'
++  } >"$EXTRA"
++  awk -v extra="$EXTRA" '/<\/testsuites>/ { while ((getline line < extra) > 0) print line } { print }' "$OUTPUT_PATH" >"$MERGED"
++  TESTS="$(grep -c '<testcase ' "$MERGED")"
++  FAILURES="$(grep -c '<failure' "$MERGED")"
++  ERRORS="$(grep -c '<error' "$MERGED")"
++  sed -E "1,/<testsuites/ s#<testsuites[^>]*>#<testsuites tests=\"$TESTS\" failures=\"$FAILURES\" errors=\"$ERRORS\">#" "$MERGED" >"$OUTPUT_PATH"
++  rm -f "$EXTRA" "$MERGED"
++}
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  go-junit-report <"$LOG" >"$OUTPUT_PATH" 2>/dev/null || true
++  PANICKED="$(awk '/^--- FAIL: /{name=$3} /^panic: /{print name; exit}' "$LOG")"
++  if [ -n "$PANICKED" ] && grep -q "<testcase name=\"$PANICKED\"" "$OUTPUT_PATH" 2>/dev/null; then
++    PANIC_TEXT="$(mktemp)"
++    PATCHED="$(mktemp)"
++    sed -n '/^panic: /,$p' "$LOG" | head -n 40 | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' >"$PANIC_TEXT"
++    awk -v name="$PANICKED" -v text="$PANIC_TEXT" '
++      index($0, "<testcase name=\"" name "\"") { inside = 1 }
++      inside && /<failure message="Failed"><\/failure>/ {
++        sub(/<failure message="Failed"><\/failure>/, "<failure message=\"panic\">")
++        printf "%s", $0
++        while ((getline line < text) > 0) print line
++        print "</failure>"
++        inside = 0
++        next
++      }
++      /<\/testcase>/ { inside = 0 }
++      { print }
++    ' "$OUTPUT_PATH" >"$PATCHED" && cat "$PATCHED" >"$OUTPUT_PATH"
++    rm -f "$PANIC_TEXT" "$PATCHED"
++  fi
++  RAN=0
++  NAMES=""
++  if [ "$MODE" = "new" ]; then
++    SUITE="$NEW_PKG"
++    for name in $(expected_tests); do
++      if grep -q "<testcase name=\"$name\"" "$OUTPUT_PATH" 2>/dev/null; then
++        RAN=1
++      else
++        NAMES="$NAMES $name"
++      fi
++    done
++  else
++    SUITE="go.etcd.io/raft/v3"
++    if grep -q '<testcase ' "$OUTPUT_PATH" 2>/dev/null; then
++      RAN=1
++    else
++      NAMES="build"
++    fi
++  fi
++  if [ -n "$NAMES" ]; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    DETAIL="$(grep -E '^# |\.go:[0-9]+:[0-9]+: |\[(build|setup) failed\]|^panic' "$LOG" | head -n 40)"
++    [ -n "$DETAIL" ] || DETAIL="$(tail -n 40 "$LOG")"
++    DETAIL="$(printf '%s\n' "$DETAIL" | xml_escape)"
++    if [ "$RAN" -eq 1 ] && [ -n "$PANICKED" ]; then
++      MESSAGE="not run: the test binary exited after $PANICKED panicked"
++    elif [ "$RAN" -eq 1 ]; then
++      MESSAGE="not run: the test binary exited before reaching this test"
++    else
++      MESSAGE="the test package failed to build or run"
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++    fi
++    add_failures "$SUITE" "$MESSAGE" "$DETAIL" $NAMES
++  fi
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    DETAIL="$(head -n 40 "$LIST_ERR" | xml_escape)"
++    add_failures "$SUITE" "package discovery failed: go list ./... exited with status $LIST_STATUS" "$DETAIL" package_discovery
++  fi
++fi
++
++exit "$STATUS"

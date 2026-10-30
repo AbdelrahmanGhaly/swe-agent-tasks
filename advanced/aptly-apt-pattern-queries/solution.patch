@@ -1,0 +1,2339 @@
+diff --git a/man/aptly.1 b/man/aptly.1
+index 67351d7a..aed13d26 100644
+--- a/man/aptly.1
++++ b/man/aptly.1
+@@ -564,6 +564,9 @@ all binary packages with \fBnginx\fR as source package\.
+ matches all packages that provide \fBmail\-transport\fR with name that has no suffix \fB\-dev\fR and with version greater or equal to \fB3\.5\fR\.
+ .
+ .P
++Queries starting with \fB?\fR or \fB~\fR are apt patterns (see apt\-patterns(7)), e\.g\. \fB?depends(?virtual)\fR or \fB~nlib ~ri386\fR\. A pattern selects the binary packages \fBapt list \-\-all\-versions\fR would list for it, with the queried packages as the only source, \fBamd64\fR as the native architecture and nothing installed: every version of a matching package (name and architecture, packages of architecture \fBall\fR belong to \fBamd64\fR)\. Source packages are never selected\. As in apt, the arguments of \fB?name\fR, \fB?section\fR, \fB?source\-package\fR, \fB?source\-version\fR and \fB?version\fR are POSIX extended regular expressions matched case\-insensitively anywhere in the string, while \fB?exact\-name\fR and \fB?priority\fR compare names exactly\.
++.
++.P
+ When specified on command line, query may have to be quoted according to shell rules, so that it stays single argument:
+ .
+ .P
+diff --git a/man/aptly.1.ronn.tmpl b/man/aptly.1.ronn.tmpl
+index 2119e40a..ee89d732 100644
+--- a/man/aptly.1.ronn.tmpl
++++ b/man/aptly.1.ronn.tmpl
+@@ -557,6 +557,14 @@ Examples:
+     matches all packages that provide `mail-transport` with name that has no suffix `-dev` and
+     with version greater or equal to `3.5`.
+ 
++Queries starting with `?` or `~` are apt patterns (see apt-patterns(7)), e.g. `?depends(?virtual)` or
++`~nlib ~ri386`. A pattern selects the binary packages `apt list --all-versions` would list for it, with the
++queried packages as the only source, `amd64` as the native architecture and nothing installed: every version of
++a matching package (name and architecture, packages of architecture `all` belong to `amd64`). Source packages
++are never selected. As in apt, the arguments of `?name`, `?section`, `?source-package`, `?source-version` and
++`?version` are POSIX extended regular expressions matched case-insensitively anywhere in the string, while
++`?exact-name` and `?priority` compare names exactly.
++
+ When specified on command line, query may have to be quoted according to shell rules, so that it stays single argument:
+ 
+   `aptly repo import percona stable 'mysql-client (>= 3.6)'`
+diff --git a/query/pattern.go b/query/pattern.go
+new file mode 100644
+index 00000000..13819b5a
+--- /dev/null
++++ b/query/pattern.go
+@@ -0,0 +1,553 @@
++package query
++
++import (
++	"fmt"
++	"strings"
++
++	"github.com/aptly-dev/aptly/deb"
++)
++
++// patternNode is a node of apt pattern parse tree: pattern term with optional arguments or a word
++type patternNode struct {
++	start, end int
++	term       string
++	args       []*patternNode
++	haveArgs   bool
++	isWord     bool
++	word       string
++}
++
++// patternError is a syntax error in apt pattern, located like apt reports it
++type patternError struct {
++	start, end int
++	message    string
++}
++
++func (e *patternError) Error() string {
++	return fmt.Sprintf("input:%d-%d: error: %s", e.start, e.end, e.message)
++}
++
++// short forms of patterns, in the order apt tries them
++var shortPatterns = []struct {
++	short, long string
++	takesArg    bool
++}{
++	{"r", "?architecture", true},
++	{"A", "?archive", true},
++	{"M", "?automatic", false},
++	{"b", "?broken", false},
++	{"c", "?config-files", false},
++	{"DDepends:", "?depends", true},
++	{"DPre-Depends:", "?pre-depends", true},
++	{"DSuggests:", "?suggests", true},
++	{"DRecommends:", "?recommends", true},
++	{"DConflicts:", "?conflicts", true},
++	{"DReplaces:", "?replaces", true},
++	{"DObsoletes:", "?obsoletes", true},
++	{"DBreaks:", "?breaks", true},
++	{"DEnhances:", "?enhances", true},
++	{"D", "?depends", true},
++	{"RDepends:", "?reverse-depends", true},
++	{"RPre-Depends:", "?reverse-pre-depends", true},
++	{"RSuggests:", "?reverse-suggests", true},
++	{"RRecommends:", "?reverse-recommends", true},
++	{"RConflicts:", "?reverse-conflicts", true},
++	{"RReplaces:", "?reverse-replaces", true},
++	{"RObsoletes:", "?reverse-obsoletes", true},
++	{"RBreaks:", "?reverse-breaks", true},
++	{"REnhances:", "?reverse-enhances", true},
++	{"R", "?reverse-depends", true},
++	{"E", "?essential", false},
++	{"F", "?false", false},
++	{"g", "?garbage", false},
++	{"i", "?installed", false},
++	{"n", "?name", true},
++	{"o", "?obsolete", false},
++	{"O", "?origin", true},
++	{"p", "?priority", true},
++	{"s", "?section", true},
++	{"e", "?source-package", true},
++	{"T", "?true", false},
++	{"U", "?upgradable", false},
++	{"V", "?version", true},
++	{"v", "?virtual", false},
++}
++
++// relationship patterns: term of forward pattern, term of reverse pattern and relationship field;
++// for Pre-Depends apt 2.6 knows only ?predepends and ?reverse-predepends, so ?pre-depends and
++// ?reverse-pre-depends, which its short forms expand to, are rejected the way apt rejects them
++var relationPatterns = []struct {
++	forward, reverse string
++	kind             int
++}{
++	{"?depends", "?reverse-depends", relationDepends},
++	{"?predepends", "?reverse-predepends", relationPreDepends},
++	{"?suggests", "?reverse-suggests", relationSuggests},
++	{"?recommends", "?reverse-recommends", relationRecommends},
++	{"?conflicts", "?reverse-conflicts", relationConflicts},
++	{"?replaces", "?reverse-replaces", relationReplaces},
++	{"?obsoletes", "?reverse-obsoletes", relationObsoletes},
++	{"?breaks", "?reverse-breaks", relationBreaks},
++	{"?enhances", "?reverse-enhances", relationEnhances},
++}
++
++const (
++	wordDisallowedStart = "!?~|,() \x00"
++	wordDisallowedLong  = "|,()\x00"
++	wordDisallowedShort = "!?~|,() \x00"
++)
++
++type patternParser struct {
++	text string
++	pos  int
++}
++
++func (p *patternParser) at(i int) byte {
++	if i < len(p.text) {
++		return p.text[i]
++	}
++	return 0
++}
++
++func (p *patternParser) current() byte {
++	return p.at(p.pos)
++}
++
++func (p *patternParser) fail(start, end int, format string, args ...interface{}) {
++	panic(&patternError{start: start, end: end, message: fmt.Sprintf(format, args...)})
++}
++
++func (p *patternParser) skipSpace() int {
++	for {
++		switch p.current() {
++		case ' ', '\t', '\r', '\n':
++			p.pos++
++		default:
++			return p.pos
++		}
++	}
++}
++
++// parsePatternTree parses complete apt pattern, nothing but whitespace may surround it
++func parsePatternTree(text string) (node *patternNode, err error) {
++	p := &patternParser{text: text}
++
++	defer func() {
++		if r := recover(); r != nil {
++			e, ok := r.(*patternError)
++			if !ok {
++				panic(r)
++			}
++			node, err = nil, e
++		}
++	}()
++
++	p.skipSpace()
++	node = p.parseOr()
++	p.skipSpace()
++
++	if node == nil {
++		p.fail(0, len(text), "Expected pattern")
++	}
++	// trailing whitespace is fine, so that a pattern read from a file may end with a newline
++	if p.pos != len(text) {
++		p.fail(node.end, len(text), "Expected end of file")
++	}
++
++	return node, nil
++}
++
++func (p *patternParser) parseOr() *patternNode {
++	start := p.pos
++
++	first := p.parseAnd()
++	if first == nil {
++		return nil
++	}
++
++	nodes := []*patternNode{first}
++	for p.skipSpace(); p.current() == '|'; p.skipSpace() {
++		p.pos++
++		p.skipSpace()
++
++		node := p.parseAnd()
++		if node == nil {
++			p.fail(p.pos, len(p.text), "Expected pattern after |")
++		}
++		nodes = append(nodes, node)
++	}
++
++	if len(nodes) == 1 {
++		return nodes[0]
++	}
++
++	return &patternNode{start: start, end: nodes[len(nodes)-1].end, term: "?or", args: nodes, haveArgs: true}
++}
++
++func (p *patternParser) parseAnd() *patternNode {
++	start := p.pos
++
++	var nodes []*patternNode
++	for p.skipSpace(); p.pos < len(p.text); p.skipSpace() {
++		node := p.parseUnary()
++		if node == nil {
++			break
++		}
++		nodes = append(nodes, node)
++	}
++
++	switch len(nodes) {
++	case 0:
++		return nil
++	case 1:
++		return nodes[0]
++	}
++
++	return &patternNode{start: start, end: nodes[len(nodes)-1].end, term: "?and", args: nodes, haveArgs: true}
++}
++
++func (p *patternParser) parseUnary() *patternNode {
++	if p.current() != '!' {
++		return p.parsePrimary()
++	}
++
++	p.pos++
++	start := p.pos
++
++	primary := p.parsePrimary()
++	if primary == nil {
++		p.fail(start, len(p.text), "Expected pattern")
++	}
++
++	return &patternNode{start: start, end: primary.end, term: "?not", args: []*patternNode{primary}, haveArgs: true}
++}
++
++func (p *patternParser) parsePrimary() *patternNode {
++	if node := p.parseShortPattern(); node != nil {
++		return node
++	}
++	if node := p.parsePattern(); node != nil {
++		return node
++	}
++	return p.parseGroup()
++}
++
++func (p *patternParser) parseGroup() *patternNode {
++	if p.current() != '(' {
++		return nil
++	}
++
++	start := p.pos
++	p.pos++
++	p.skipSpace()
++
++	node := p.parseOr()
++	if node == nil {
++		p.fail(p.pos, len(p.text), "Expected pattern after '('")
++	}
++	p.skipSpace()
++
++	if p.current() != ')' {
++		p.fail(p.pos, len(p.text), "Expected closing parenthesis")
++	}
++	p.pos++
++
++	node.start, node.end = start, p.pos
++	return node
++}
++
++func (p *patternParser) parseArgument(short bool) *patternNode {
++	if node := p.parseQuotedWord(); node != nil {
++		return node
++	}
++	if node := p.parseWord(short); node != nil {
++		return node
++	}
++	if node := p.parseOr(); node != nil {
++		return node
++	}
++
++	p.fail(p.pos, len(p.text), "Expected pattern, quoted word, or word")
++	return nil
++}
++
++func (p *patternParser) parseShortPattern() *patternNode {
++	if p.current() != '~' {
++		return nil
++	}
++
++	for _, sp := range shortPatterns {
++		if !strings.HasPrefix(p.text[p.pos+1:], sp.short) {
++			continue
++		}
++
++		node := &patternNode{start: p.pos, term: sp.long}
++		p.pos += len(sp.short) + 1
++		if sp.takesArg {
++			node.args = append(node.args, p.parseArgument(true))
++			node.haveArgs = true
++		}
++		node.end = p.pos
++
++		return node
++	}
++
++	p.fail(p.pos, len(p.text), "Unknown short pattern")
++	return nil
++}
++
++func isPatternTermChar(c byte) bool {
++	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-'
++}
++
++func (p *patternParser) parsePattern() *patternNode {
++	if p.current() != '?' {
++		return nil
++	}
++
++	node := &patternNode{start: p.pos, end: p.pos}
++	p.pos++
++	for isPatternTermChar(p.current()) {
++		p.pos++
++	}
++
++	node.term = p.text[node.start:p.pos]
++	if len(node.term) <= 1 {
++		p.fail(node.start, node.end, "Pattern must have a term/name")
++	}
++
++	node.end = p.skipSpace()
++	if p.current() != '(' {
++		return node
++	}
++	p.pos++
++	node.end = p.pos
++	p.skipSpace()
++
++	node.haveArgs = true
++
++	if p.current() == ')' {
++		p.pos++
++		node.end = p.pos
++		return node
++	}
++
++	node.args = append(node.args, p.parseArgument(false))
++	p.skipSpace()
++	for p.current() == ',' {
++		p.pos++
++		p.skipSpace()
++		// trailing comma is allowed
++		if p.current() == ')' {
++			break
++		}
++		node.args = append(node.args, p.parseArgument(false))
++		p.skipSpace()
++	}
++
++	node.end = p.pos
++	if p.current() != ')' {
++		last := node
++		if len(node.args) > 0 {
++			last = node.args[len(node.args)-1]
++		}
++		p.fail(last.start, last.end, "Expected closing parenthesis or comma after last argument, received %c", p.current())
++	}
++	p.pos++
++	node.end = p.pos
++
++	return node
++}
++
++func (p *patternParser) parseQuotedWord() *patternNode {
++	if p.current() != '"' {
++		return nil
++	}
++
++	start := p.pos
++	p.pos++
++	for p.current() != '"' && p.current() != 0 {
++		p.pos++
++	}
++
++	if p.current() != '"' {
++		p.fail(start, start, "Could not find end of string")
++	}
++	p.pos++
++
++	return &patternNode{start: start, end: p.pos, isWord: true, word: p.text[start+1 : p.pos-1]}
++}
++
++func (p *patternParser) parseWord(short bool) *patternNode {
++	if strings.IndexByte(wordDisallowedStart, p.current()) != -1 {
++		return nil
++	}
++
++	disallowed := wordDisallowedLong
++	if short {
++		disallowed = wordDisallowedShort
++	}
++
++	start := p.pos
++	for strings.IndexByte(disallowed, p.current()) == -1 {
++		p.pos++
++	}
++
++	return &patternNode{start: start, end: p.pos, isWord: true, word: p.text[start:p.pos]}
++}
++
++// is checks that node is pattern with the given term and validates its arguments the way apt does,
++// max equal to -1 means any number of arguments
++func (n *patternNode) is(term string, min, max int) bool {
++	if n.term != term {
++		return false
++	}
++
++	fail := func(format string, args ...interface{}) {
++		panic(&patternError{start: n.start, end: n.end, message: fmt.Sprintf(format, args...)})
++	}
++
++	if max != 0 && !n.haveArgs {
++		fail("%s expects an argument list", term)
++	}
++	if max == 0 && n.haveArgs {
++		fail("%s does not expect an argument list", term)
++	}
++	if min >= 0 && min == max && len(n.args) != min {
++		fail("%s expects %d arguments, but received %d arguments", term, min, len(n.args))
++	}
++	if min >= 0 && len(n.args) < min {
++		fail("%s expects at least %d arguments, but received %d arguments", term, min, len(n.args))
++	}
++	if max >= 0 && len(n.args) > max {
++		fail("%s expects at most %d arguments, but received %d arguments", term, max, len(n.args))
++	}
++
++	return true
++}
++
++func expectWord(n *patternNode) string {
++	if !n.isWord {
++		panic(&patternError{start: n.start, end: n.end, message: "Expected a word"})
++	}
++	return n.word
++}
++
++func expectRegexp(n *patternNode) *posixRegexp {
++	re, err := compilePosixRegexp(expectWord(n))
++	if err != nil {
++		panic(&patternError{start: n.start, end: n.end, message: fmt.Sprintf("Regex compilation error - %s", err)})
++	}
++	return re
++}
++
++// compilePattern builds matcher out of parse tree, rejecting patterns apt doesn't know
++func compilePattern(n *patternNode) patternMatcher {
++	if n.isWord {
++		panic(&patternError{start: n.start, end: n.end, message: "Expected a pattern"})
++	}
++
++	switch {
++	case n.is("?architecture", 1, 1):
++		spec := expectWord(n.args[0])
++		return packageMatcher(func(p *patternPackage) bool { return architectureMatches(spec, p.arch) })
++	case n.is("?archive", 1, 1), n.is("?codename", 1, 1), n.is("?origin", 1, 1):
++		expectRegexp(n.args[0])
++		// release information isn't available for package lists
++		return versionMatcher(func(*patternVersion) bool { return false })
++	case n.is("?all-versions", 1, 1):
++		return &allVersionsMatcher{compilePattern(n.args[0])}
++	case n.is("?any-version", 1, 1):
++		return &anyVersionMatcher{compilePattern(n.args[0])}
++	case n.is("?automatic", 0, 0), n.is("?broken", 0, 0), n.is("?config-files", 0, 0), n.is("?garbage", 0, 0),
++		n.is("?installed", 0, 0), n.is("?obsolete", 0, 0), n.is("?upgradable", 0, 0):
++		// nothing is installed
++		return packageMatcher(func(*patternPackage) bool { return false })
++	}
++
++	for _, relation := range relationPatterns {
++		if n.is(relation.forward, 1, 1) {
++			return dependsMatcher(relation.kind, compilePattern(n.args[0]))
++		}
++		if n.is(relation.reverse, 1, 1) {
++			return reverseDependsMatcher(relation.kind, compilePattern(n.args[0]))
++		}
++	}
++
++	switch {
++	case n.is("?essential", 0, 0):
++		return packageMatcher(func(p *patternPackage) bool { return p.essential })
++	case n.is("?priority", 1, 1):
++		// apt compares the priority name exactly, it isn't a regular expression
++		priority := expectWord(n.args[0])
++		return versionMatcher(func(v *patternVersion) bool { return v.priority != "" && v.priority == priority })
++	case n.is("?exact-name", 1, 1):
++		// apt compares the name exactly, it isn't a regular expression
++		name := expectWord(n.args[0])
++		return packageMatcher(func(p *patternPackage) bool { return p.name == name })
++	case n.is("?false", 0, 0):
++		return constantMatcher(false)
++	case n.is("?name", 1, 1):
++		re := expectRegexp(n.args[0])
++		return packageMatcher(func(p *patternPackage) bool { return re.MatchString(p.name) })
++	case n.is("?not", 1, 1):
++		return &notMatcher{compilePattern(n.args[0])}
++	case n.is("?section", 1, 1):
++		re := expectRegexp(n.args[0])
++		return versionMatcher(func(v *patternVersion) bool { return v.section != "" && re.MatchString(v.section) })
++	case n.is("?source-package", 1, 1):
++		re := expectRegexp(n.args[0])
++		return versionMatcher(func(v *patternVersion) bool { return re.MatchString(v.sourceName) })
++	case n.is("?source-version", 1, 1):
++		re := expectRegexp(n.args[0])
++		return versionMatcher(func(v *patternVersion) bool { return re.MatchString(v.sourceVersion) })
++	case n.is("?true", 0, 0):
++		return constantMatcher(true)
++	case n.is("?version", 1, 1):
++		re := expectRegexp(n.args[0])
++		return versionMatcher(func(v *patternVersion) bool { return re.MatchString(v.version) })
++	case n.is("?virtual", 0, 0):
++		// as in apt, packages without versions are virtual, so are names only relationships refer to
++		return packageMatcher(func(p *patternPackage) bool { return len(p.versions) == 0 })
++	case n.is("?x-name-fnmatch", 1, 1):
++		glob := expectWord(n.args[0])
++		return packageMatcher(func(p *patternPackage) bool { return fnmatch(glob, p.name, true) })
++	case n.is("?and", 0, -1), n.is("?narrow", 0, -1):
++		matchers := make([]patternMatcher, len(n.args))
++		for i := range n.args {
++			matchers[i] = compilePattern(n.args[i])
++		}
++		if n.term == "?narrow" {
++			return &anyVersionMatcher{&andMatcher{matchers}}
++		}
++		return &andMatcher{matchers}
++	case n.is("?or", 0, -1):
++		matchers := make([]patternMatcher, len(n.args))
++		for i := range n.args {
++			matchers[i] = compilePattern(n.args[i])
++		}
++		return &orMatcher{matchers}
++	}
++
++	panic(&patternError{start: n.start, end: n.end, message: fmt.Sprintf("Unrecognized pattern '%s'", n.term)})
++}
++
++// parsePattern parses apt pattern into package query
++func parsePattern(text string) (q deb.PackageQuery, err error) {
++	node, err := parsePatternTree(text)
++	if err != nil {
++		return nil, fmt.Errorf("parsing failed: %s", err)
++	}
++
++	defer func() {
++		if r := recover(); r != nil {
++			e, ok := r.(*patternError)
++			if !ok {
++				panic(r)
++			}
++			q, err = nil, fmt.Errorf("parsing failed: %s", e)
++		}
++	}()
++
++	return &PatternQuery{Pattern: text, matcher: compilePattern(node)}, nil
++}
+diff --git a/query/pattern_arch.go b/query/pattern_arch.go
+new file mode 100644
+index 00000000..8e37dfb1
+--- /dev/null
++++ b/query/pattern_arch.go
+@@ -0,0 +1,138 @@
++package query
++
++import (
++	"strings"
++	"sync"
++)
++
++// dpkg tuple table (/usr/share/dpkg/tupletable): <abi>-<libc>-<os>-<cpu> tuple and Debian architecture
++var dpkgTupleTable = [][2]string{
++	{"eabi-uclibc-linux-arm", "uclibc-linux-armel"},
++	{"base-uclibc-linux-<cpu>", "uclibc-linux-<cpu>"},
++	{"eabihf-musl-linux-arm", "musl-linux-armhf"},
++	{"base-musl-linux-<cpu>", "musl-linux-<cpu>"},
++	{"ilp32-gnu-linux-arm64", "arm64ilp32"},
++	{"eabihf-gnu-linux-arm", "armhf"},
++	{"eabi-gnu-linux-arm", "armel"},
++	{"abin32-gnu-linux-mips64r6el", "mipsn32r6el"},
++	{"abin32-gnu-linux-mips64r6", "mipsn32r6"},
++	{"abin32-gnu-linux-mips64el", "mipsn32el"},
++	{"abin32-gnu-linux-mips64", "mipsn32"},
++	{"abi64-gnu-linux-mips64r6el", "mips64r6el"},
++	{"abi64-gnu-linux-mips64r6", "mips64r6"},
++	{"abi64-gnu-linux-mips64el", "mips64el"},
++	{"abi64-gnu-linux-mips64", "mips64"},
++	{"spe-gnu-linux-powerpc", "powerpcspe"},
++	{"x32-gnu-linux-amd64", "x32"},
++	{"base-gnu-linux-<cpu>", "<cpu>"},
++	{"eabihf-gnu-kfreebsd-arm", "kfreebsd-armhf"},
++	{"base-gnu-kfreebsd-<cpu>", "kfreebsd-<cpu>"},
++	{"base-gnu-knetbsd-<cpu>", "knetbsd-<cpu>"},
++	{"base-gnu-kopensolaris-<cpu>", "kopensolaris-<cpu>"},
++	{"base-gnu-hurd-<cpu>", "hurd-<cpu>"},
++	{"base-bsd-dragonflybsd-<cpu>", "dragonflybsd-<cpu>"},
++	{"base-bsd-freebsd-<cpu>", "freebsd-<cpu>"},
++	{"base-bsd-openbsd-<cpu>", "openbsd-<cpu>"},
++	{"base-bsd-netbsd-<cpu>", "netbsd-<cpu>"},
++	{"base-bsd-darwin-<cpu>", "darwin-<cpu>"},
++	{"base-sysv-aix-<cpu>", "aix-<cpu>"},
++	{"base-sysv-solaris-<cpu>", "solaris-<cpu>"},
++	{"eabi-uclibc-uclinux-arm", "uclinux-armel"},
++	{"base-uclibc-uclinux-<cpu>", "uclinux-<cpu>"},
++	{"base-tos-mint-m68k", "mint-m68k"},
++}
++
++// dpkg cpu table (/usr/share/dpkg/cputable)
++var dpkgCPUs = []string{
++	"alpha", "amd64", "arc", "armeb", "arm", "arm64", "avr32", "hppa", "loong64", "i386", "ia64", "m32r", "m68k",
++	"mips", "mipsel", "mipsr6", "mipsr6el", "mips64", "mips64el", "mips64r6", "mips64r6el", "nios2", "or1k",
++	"powerpc", "powerpcel", "ppc64", "ppc64el", "riscv64", "s390", "s390x", "sh3", "sh3eb", "sh4", "sh4eb",
++	"sparc", "sparc64", "tilegx",
++}
++
++var (
++	archTuples     map[string][]string
++	archTuplesOnce sync.Once
++)
++
++func archToTuple(arch string) []string {
++	archTuplesOnce.Do(func() {
++		archTuples = make(map[string][]string)
++		add := func(arch, tuple string) {
++			if _, ok := archTuples[arch]; !ok {
++				archTuples[arch] = strings.Split(tuple, "-")
++			}
++		}
++		for _, row := range dpkgTupleTable {
++			if !strings.Contains(row[0], "<cpu>") && !strings.Contains(row[1], "<cpu>") {
++				add(row[1], row[0])
++				continue
++			}
++			for _, cpu := range dpkgCPUs {
++				add(strings.ReplaceAll(row[1], "<cpu>", cpu), strings.ReplaceAll(row[0], "<cpu>", cpu))
++			}
++		}
++	})
++
++	arch = strings.TrimPrefix(arch, "linux-")
++	return append([]string(nil), archTuples[arch]...)
++}
++
++func patternToTuple(arch string) []string {
++	tuple := strings.Split(arch, "-")
++	hasAny := false
++	for _, part := range tuple {
++		hasAny = hasAny || part == "any"
++	}
++	if hasAny || strings.ContainsRune(arch, '*') {
++		for len(tuple) < 4 {
++			tuple = append([]string{"any"}, tuple...)
++		}
++		return tuple
++	}
++	return archToTuple(arch)
++}
++
++// completeArch expands architecture or architecture wildcard to <abi>-<libc>-<os>-<cpu> form
++func completeArch(arch string, isPattern bool) string {
++	var tuple []string
++	if isPattern {
++		tuple = patternToTuple(arch)
++	} else {
++		tuple = archToTuple(arch)
++	}
++
++	if strings.HasSuffix(arch, "-") || strings.HasPrefix(arch, "-") {
++		return "invalid-invalid-invalid-invalid"
++	}
++
++	if len(tuple) == 0 {
++		// unknown architectures
++		tuple = strings.Split(arch, "-")
++		switch len(tuple) {
++		case 1:
++			tuple = append([]string{"base", "gnu", "linux"}, tuple...)
++		case 2:
++			tuple = append([]string{"base", "gnu"}, tuple...)
++		case 3:
++			tuple = append([]string{"base"}, tuple...)
++		}
++	}
++
++	for i := range tuple {
++		if tuple[i] == "any" {
++			tuple[i] = "*"
++		}
++	}
++	return strings.Join(tuple, "-")
++}
++
++// architectureMatches checks package architecture against architecture specification, which may use wildcards
++// like any, linux-any or any-amd64
++func architectureMatches(spec, arch string) bool {
++	complete := completeArch(spec, true)
++	if spec == arch || complete == arch {
++		return true
++	}
++	return fnmatch(complete, completeArch(arch, false), false)
++}
+diff --git a/query/pattern_fnmatch.go b/query/pattern_fnmatch.go
+new file mode 100644
+index 00000000..d44372c5
+--- /dev/null
++++ b/query/pattern_fnmatch.go
+@@ -0,0 +1,321 @@
++package query
++
++import (
++	"unicode"
++	"unicode/utf8"
++)
++
++// fnmatchClassNameMax is CHARCLASS_NAME_MAX, the longest class name glibc's fnmatch reads
++const fnmatchClassNameMax = 2048
++
++// fnmatchUnknown is the collation sequence of the characters the C.UTF-8 locale doesn't order, those above U+00FF
++const fnmatchUnknown = ^uint32(0)
++
++// fnmatch matches name against shell pattern the way glibc's fnmatch does in the C.UTF-8 locale of the image,
++// ignoring case like FNM_CASEFOLD when caseFold is set: it compares characters, and when that doesn't match or
++// the strings aren't valid UTF-8, bytes
++func fnmatch(pattern, name string, caseFold bool) bool {
++	if utf8.ValidString(pattern) && utf8.ValidString(name) {
++		wide := fnmatcher{pattern: []rune(pattern), caseFold: caseFold, wide: true}
++		if wide.match([]rune(name)) {
++			return true
++		}
++	}
++	narrow := fnmatcher{pattern: fnmatchBytes(pattern), caseFold: caseFold}
++	return narrow.match(fnmatchBytes(name))
++}
++
++// fnmatchBytes takes every byte of s as a character
++func fnmatchBytes(s string) []rune {
++	chars := make([]rune, len(s))
++	for i := 0; i < len(s); i++ {
++		chars[i] = rune(s[i])
++	}
++	return chars
++}
++
++// fnmatcher is one of the two passes of fnmatch, over characters when wide, otherwise over bytes
++type fnmatcher struct {
++	pattern  []rune
++	caseFold bool
++	wide     bool
++}
++
++func (m *fnmatcher) at(i int) rune {
++	if i < len(m.pattern) {
++		return m.pattern[i]
++	}
++	return 0
++}
++
++func (m *fnmatcher) fold(c rune) rune {
++	if m.caseFold && (m.wide || c < utf8.RuneSelf) {
++		return unicode.ToLower(c)
++	}
++	return c
++}
++
++func (m *fnmatcher) collseq(c rune) uint32 {
++	if m.wide && c > 0xff {
++		return fnmatchUnknown
++	}
++	return uint32(c)
++}
++
++// match matches name, trying every longer stretch for the last '*' when the rest doesn't match
++func (m *fnmatcher) match(name []rune) bool {
++	p, n := 0, 0
++	star, starName := -1, 0
++	for p < len(m.pattern) || n < len(name) {
++		if p < len(m.pattern) && m.pattern[p] == '*' {
++			star, starName = p, n
++			p++
++			continue
++		}
++		if p < len(m.pattern) && n < len(name) {
++			if next, ok := m.element(p, name[n]); ok {
++				p, n = next, n+1
++				continue
++			}
++		}
++		if star < 0 || starName == len(name) {
++			return false
++		}
++		starName++
++		p, n = star+1, starName
++	}
++	return true
++}
++
++// element matches character c of the name against the pattern element at p, returning where the next one starts
++func (m *fnmatcher) element(p int, c rune) (int, bool) {
++	switch pc := m.fold(m.pattern[p]); pc {
++	case '?':
++		return p + 1, true
++	case '\\':
++		if p+1 == len(m.pattern) {
++			return 0, false
++		}
++		return p + 2, m.fold(m.pattern[p+1]) == m.fold(c)
++	case '[':
++		next, ok, unterminated := m.bracket(p+1, c)
++		if unterminated {
++			return p + 1, m.fold(c) == '['
++		}
++		return next, ok
++	default:
++		return p + 1, pc == m.fold(c)
++	}
++}
++
++// bracket matches c against the bracket expression with members from i, following glibc's fnmatch_loop.c; an
++// unterminated expression begins with an ordinary '['
++func (m *fnmatcher) bracket(i int, c rune) (next int, ok, unterminated bool) {
++	fc := m.fold(c)
++	not := m.at(i) == '!' || m.at(i) == '^'
++	if not {
++		i++
++	}
++	pc := m.at(i)
++	i++
++	for {
++		var low rune
++		member, canRange := false, false
++		switch {
++		case pc == '\\':
++			if m.at(i) == 0 {
++				return 0, false, false
++			}
++			pc, member = m.fold(m.at(i)), true
++			i++
++		case pc == '[' && m.at(i) == ':':
++			start := i
++			var name []rune
++			for !member {
++				if len(name) == fnmatchClassNameMax {
++					return 0, false, false
++				}
++				i++
++				pc = m.at(i)
++				if pc == ':' && m.at(i+1) == ']' {
++					i += 2
++					break
++				}
++				if pc < 'a' || pc >= 'z' {
++					// not a class name, the '[' is a member of its own
++					i, pc, member = start, '[', true
++					continue
++				}
++				name = append(name, pc)
++			}
++			if !member {
++				class, valid := posixClasses[string(name)]
++				if !valid {
++					return 0, false, false
++				}
++				if (m.wide || c < utf8.RuneSelf) && class(c) {
++					return m.skip(i, not)
++				}
++				pc = m.at(i)
++				i++
++			}
++		case pc == '[' && m.at(i) == '=':
++			start := i
++			equivalent := m.at(i + 1)
++			if equivalent == 0 || m.at(i+2) != '=' || m.at(i+3) != ']' {
++				i, pc, member = start, '[', true
++				break
++			}
++			i += 4
++			if c == equivalent {
++				return m.skip(i, not)
++			}
++			pc = m.at(i)
++			i++
++		case pc == 0:
++			return 0, false, true
++		case pc == '[' && m.at(i) == '.':
++			symbol, length, end := m.collatingSymbol(i)
++			if end < 0 {
++				return 0, false, false
++			}
++			i = end
++			isRange := m.at(i) == '-' && m.at(i+1) != 0
++			if length != 1 {
++				return 0, false, false
++			}
++			if !isRange && c == symbol {
++				return m.skip(i, not)
++			}
++			low, canRange = symbol, true
++			pc = m.at(i)
++			i++
++		default:
++			pc, member = m.fold(pc), true
++		}
++
++		if member {
++			isRange := m.at(i) == '-' && m.at(i+1) != 0 && m.at(i+1) != ']'
++			if !isRange && pc == fc {
++				return m.skip(i, not)
++			}
++			low, canRange = pc, true
++			pc = m.at(i)
++			i++
++		}
++
++		if canRange && pc == '-' && m.at(i) != ']' {
++			var matched bool
++			if i, matched, ok = m.rangeEnd(i, low, fc); !ok {
++				return 0, false, false
++			}
++			if matched {
++				return m.skip(i, not)
++			}
++			pc = m.at(i)
++			i++
++		}
++
++		if pc == ']' {
++			return i, not, false
++		}
++	}
++}
++
++// collatingSymbol reads [.x.] with i at its '.', returning the first character, the length and where it ends,
++// -1 when it isn't terminated
++func (m *fnmatcher) collatingSymbol(i int) (symbol rune, length, end int) {
++	start := i
++	for {
++		i++
++		if m.at(i) == '.' && m.at(i+1) == ']' {
++			return m.at(start + 1), i - start - 1, i + 2
++		}
++		if m.at(i) == 0 {
++			return 0, 0, -1
++		}
++	}
++}
++
++// rangeEnd reads the end of a range starting at low, with i at the character after '-', and tells whether fc is
++// in it; the C.UTF-8 locale only orders characters up to U+00FF, a range with an end above that matches nothing
++// but its start
++func (m *fnmatcher) rangeEnd(i int, low, fc rune) (next int, matched, ok bool) {
++	high := m.at(i)
++	i++
++	fseq := m.collseq(fc)
++	if fseq == fnmatchUnknown {
++		return i, false, true
++	}
++	lseq := m.collseq(low)
++	if high == '[' && m.at(i) == '.' {
++		symbol, length, end := m.collatingSymbol(i)
++		if end < 0 || length != 1 {
++			return 0, false, false
++		}
++		high, i = symbol, end
++	} else {
++		if high == '\\' {
++			high = m.at(i)
++			i++
++		}
++		if high == 0 {
++			return 0, false, false
++		}
++		high = m.fold(high)
++	}
++	if lseq == fnmatchUnknown || lseq <= fseq {
++		if hseq := m.collseq(high); hseq == fnmatchUnknown {
++			return i, lseq == fseq, true
++		} else if lseq <= hseq && fseq <= hseq {
++			return i, true, true
++		}
++	}
++	return i, false, true
++}
++
++// skip passes over the rest of a bracket expression with a matching member
++func (m *fnmatcher) skip(i int, not bool) (next int, ok, unterminated bool) {
++	for {
++		pc := m.at(i)
++		i++
++		switch {
++		case pc == ']':
++			return i, !not, false
++		case pc == 0:
++			return 0, false, true
++		case pc == '\\':
++			if m.at(i) == 0 {
++				return 0, false, false
++			}
++			i++
++		case pc == '[' && m.at(i) == ':':
++			start := i
++			for length := 1; ; length++ {
++				i++
++				if length == fnmatchClassNameMax {
++					return 0, false, false
++				}
++				if m.at(i) == ':' && m.at(i+1) == ']' {
++					break
++				}
++				if m.at(i) < 'a' || m.at(i) >= 'z' {
++					i = start - 2
++					break
++				}
++			}
++			i += 2
++		case pc == '[' && m.at(i) == '=':
++			if m.at(i+1) == 0 || m.at(i+2) != '=' || m.at(i+3) != ']' {
++				return 0, false, false
++			}
++			i += 4
++		case pc == '[' && m.at(i) == '.':
++			_, _, end := m.collatingSymbol(i)
++			if end < 0 {
++				return 0, false, false
++			}
++			i = end
++		}
++	}
++}
+diff --git a/query/pattern_match.go b/query/pattern_match.go
+new file mode 100644
+index 00000000..501e1d3a
+--- /dev/null
++++ b/query/pattern_match.go
+@@ -0,0 +1,380 @@
++package query
++
++import (
++	"strings"
++
++	"github.com/aptly-dev/aptly/deb"
++)
++
++// patternNativeArch is the native architecture apt patterns are evaluated for:
++// packages with architecture "all" belong to it
++const patternNativeArch = "amd64"
++
++// relationship fields apt keeps for packages
++const (
++	relationPreDepends = iota
++	relationDepends
++	relationConflicts
++	relationBreaks
++	relationRecommends
++	relationSuggests
++	relationReplaces
++	relationEnhances
++	relationObsoletes
++)
++
++// fields apt reads relationships from in Debian packages: there is no Obsoletes field, so ?obsoletes and
++// ?reverse-obsoletes never match
++var relationFields = []struct {
++	field string
++	kind  int
++}{
++	{"Pre-Depends", relationPreDepends},
++	{"Depends", relationDepends},
++	{"Conflicts", relationConflicts},
++	{"Breaks", relationBreaks},
++	{"Recommends", relationRecommends},
++	{"Suggests", relationSuggests},
++	{"Replaces", relationReplaces},
++	{"Enhances", relationEnhances},
++}
++
++var patternPriorities = map[string]string{
++	"required":  "required",
++	"important": "important",
++	"standard":  "standard",
++	"optional":  "optional",
++	"extra":     "extra",
++}
++
++// patternPackage is a package the way apt sees it: name and architecture with all its versions,
++// packages without versions are virtual
++type patternPackage struct {
++	name, arch string
++	versions   []*patternVersion
++	essential  bool
++	// relationships of other packages pointing to this package
++	reverse []patternRelation
++}
++
++// patternVersion is a version of a package, one package from the list
++type patternVersion struct {
++	pkg                       *patternPackage
++	source                    deb.PackageLike
++	version                   string
++	section, priority         string
++	sourceName, sourceVersion string
++	relations                 []patternRelation
++}
++
++type patternRelation struct {
++	kind   int
++	from   *patternVersion
++	target *patternPackage
++}
++
++// patternUniverse is set of packages patterns are evaluated against
++type patternUniverse struct {
++	packages map[string]*patternPackage
++	real     []*patternPackage
++}
++
++func (u *patternUniverse) lookup(name, arch string) *patternPackage {
++	key := name + " " + arch
++	p, ok := u.packages[key]
++	if !ok {
++		p = &patternPackage{name: name, arch: arch}
++		u.packages[key] = p
++	}
++	return p
++}
++
++// patternArchitecture maps architecture of the package to apt package architecture
++func patternArchitecture(arch string) string {
++	if arch == deb.ArchitectureAll {
++		return patternNativeArch
++	}
++	return arch
++}
++
++// relationTarget finds package relationship atom points to for package of architecture arch: unqualified names
++// point to the same architecture, names with architecture qualifier are separate packages for apt
++func relationTarget(atom, arch string) (name, targetArch string) {
++	atom = strings.TrimSpace(atom)
++	if i := strings.IndexAny(atom, " \t\n([<"); i != -1 {
++		atom = atom[:i]
++	}
++
++	i := strings.LastIndexByte(atom, ':')
++	if i == -1 {
++		return atom, arch
++	}
++	if atom[i+1:] == "native" {
++		return atom[:i] + ":" + patternNativeArch, deb.ArchitectureAny
++	}
++	return atom, deb.ArchitectureAny
++}
++
++// parseSource splits Source field into source package name and version
++func parseSource(field, name, version string) (string, string) {
++	if field == "" {
++		return name, version
++	}
++	if i := strings.IndexByte(field, ' '); i != -1 {
++		if open := strings.IndexByte(field[i:], '('); open != -1 {
++			if end := strings.IndexByte(field[i+open:], ')'); end != -1 {
++				version = field[i+open+1 : i+open+end]
++			}
++		}
++		field = field[:i]
++	}
++	return field, version
++}
++
++func newPatternUniverse(packages []deb.PackageLike) *patternUniverse {
++	u := &patternUniverse{packages: make(map[string]*patternPackage)}
++
++	var versions []*patternVersion
++	for _, source := range packages {
++		if source.GetArchitecture() == deb.ArchitectureSource {
++			continue
++		}
++
++		p := u.lookup(source.GetName(), patternArchitecture(source.GetArchitecture()))
++		if len(p.versions) == 0 {
++			u.real = append(u.real, p)
++		}
++
++		v := &patternVersion{pkg: p, source: source, version: source.GetVersion(), section: source.GetField("Section")}
++		if priority := strings.TrimSpace(source.GetField("Priority")); priority != "" {
++			if v.priority = patternPriorities[strings.ToLower(priority)]; v.priority == "" {
++				// apt treats unknown priorities as extra
++				v.priority = "extra"
++			}
++		}
++		v.sourceName, v.sourceVersion = parseSource(source.GetField("Source"), source.GetName(), v.version)
++
++		switch strings.ToLower(strings.TrimSpace(source.GetField("Essential"))) {
++		case "yes":
++			p.essential = true
++		}
++		// apt always considers apt itself essential
++		if p.name == "apt" {
++			p.essential = true
++		}
++
++		p.versions = append(p.versions, v)
++		versions = append(versions, v)
++	}
++
++	for _, v := range versions {
++		for _, relation := range relationFields {
++			for _, group := range strings.Split(v.source.GetField(relation.field), ",") {
++				for _, atom := range strings.Split(group, "|") {
++					if strings.TrimSpace(atom) == "" {
++						continue
++					}
++					name, arch := relationTarget(atom, v.pkg.arch)
++					r := patternRelation{kind: relation.kind, from: v, target: u.lookup(name, arch)}
++					v.relations = append(v.relations, r)
++					r.target.reverse = append(r.target.reverse, r)
++				}
++			}
++		}
++	}
++
++	return u
++}
++
++// selected returns packages from the list selected by the matcher: all versions of every matching package
++func (u *patternUniverse) selected(m patternMatcher) map[deb.PackageLike]bool {
++	result := make(map[deb.PackageLike]bool)
++	for _, p := range u.real {
++		if m.matchPackage(p) {
++			for _, v := range p.versions {
++				result[v.source] = true
++			}
++		}
++	}
++	return result
++}
++
++// patternMatcher is compiled apt pattern, it could be applied to packages and to versions
++type patternMatcher interface {
++	matchPackage(p *patternPackage) bool
++	matchVersion(v *patternVersion) bool
++}
++
++type constantMatcher bool
++
++func (m constantMatcher) matchPackage(*patternPackage) bool { return bool(m) }
++func (m constantMatcher) matchVersion(*patternVersion) bool { return bool(m) }
++
++// packageMatcher looks at the package, version matches when its package matches
++type packageMatcher func(p *patternPackage) bool
++
++func (m packageMatcher) matchPackage(p *patternPackage) bool { return m(p) }
++func (m packageMatcher) matchVersion(v *patternVersion) bool { return m(v.pkg) }
++
++// versionMatcher looks at the version, package matches when any of its versions match
++type versionMatcher func(v *patternVersion) bool
++
++func (m versionMatcher) matchPackage(p *patternPackage) bool {
++	for _, v := range p.versions {
++		if m(v) {
++			return true
++		}
++	}
++	return false
++}
++
++func (m versionMatcher) matchVersion(v *patternVersion) bool { return m(v) }
++
++type notMatcher struct{ m patternMatcher }
++
++func (m *notMatcher) matchPackage(p *patternPackage) bool { return !m.m.matchPackage(p) }
++func (m *notMatcher) matchVersion(v *patternVersion) bool { return !m.m.matchVersion(v) }
++
++type andMatcher struct{ matchers []patternMatcher }
++
++func (m *andMatcher) matchPackage(p *patternPackage) bool {
++	for _, matcher := range m.matchers {
++		if !matcher.matchPackage(p) {
++			return false
++		}
++	}
++	return true
++}
++
++func (m *andMatcher) matchVersion(v *patternVersion) bool {
++	for _, matcher := range m.matchers {
++		if !matcher.matchVersion(v) {
++			return false
++		}
++	}
++	return true
++}
++
++type orMatcher struct{ matchers []patternMatcher }
++
++func (m *orMatcher) matchPackage(p *patternPackage) bool {
++	for _, matcher := range m.matchers {
++		if matcher.matchPackage(p) {
++			return true
++		}
++	}
++	return false
++}
++
++func (m *orMatcher) matchVersion(v *patternVersion) bool {
++	for _, matcher := range m.matchers {
++		if matcher.matchVersion(v) {
++			return true
++		}
++	}
++	return false
++}
++
++// anyVersionMatcher matches package when some of its versions match
++type anyVersionMatcher struct{ m patternMatcher }
++
++func (m *anyVersionMatcher) matchPackage(p *patternPackage) bool {
++	for _, v := range p.versions {
++		if m.m.matchVersion(v) {
++			return true
++		}
++	}
++	return false
++}
++
++func (m *anyVersionMatcher) matchVersion(v *patternVersion) bool { return m.m.matchVersion(v) }
++
++// allVersionsMatcher matches package when every version of it matches
++type allVersionsMatcher struct{ m patternMatcher }
++
++func (m *allVersionsMatcher) matchPackage(p *patternPackage) bool {
++	for _, v := range p.versions {
++		if !m.m.matchVersion(v) {
++			return false
++		}
++	}
++	return true
++}
++
++func (m *allVersionsMatcher) matchVersion(v *patternVersion) bool { return m.m.matchVersion(v) }
++
++// dependsMatcher matches versions with relationship of the kind to a package matching m: like apt, it looks at the
++// package the relationship names, whatever its version constraint, and not at the packages providing it
++func dependsMatcher(kind int, m patternMatcher) patternMatcher {
++	return versionMatcher(func(v *patternVersion) bool {
++		for _, r := range v.relations {
++			if r.kind == kind && m.matchPackage(r.target) {
++				return true
++			}
++		}
++		return false
++	})
++}
++
++// reverseDependsMatcher matches packages some version matching m has relationship of the kind with
++func reverseDependsMatcher(kind int, m patternMatcher) patternMatcher {
++	return packageMatcher(func(p *patternPackage) bool {
++		for _, r := range p.reverse {
++			if r.kind == kind && m.matchVersion(r.from) {
++				return true
++			}
++		}
++		return false
++	})
++}
++
++// PatternQuery is package query written as apt pattern
++//
++// Pattern selects the packages `apt list --all-versions` would list for it with the queried packages
++// as the only source: every version of each matching package (name and architecture), never source packages
++type PatternQuery struct {
++	Pattern string
++	matcher patternMatcher
++}
++
++// packageSetQuery matches packages from the set
++type packageSetQuery struct {
++	set map[deb.PackageLike]bool
++}
++
++func (q *packageSetQuery) Matches(pkg deb.PackageLike) bool { return q.set[pkg] }
++
++func (q *packageSetQuery) Fast(_ deb.PackageCatalog) bool { return false }
++
++func (q *packageSetQuery) Query(list deb.PackageCatalog) *deb.PackageList { return list.Scan(q) }
++
++func (q *packageSetQuery) String() string { return "" }
++
++// Matches evaluates pattern for the package alone
++func (q *PatternQuery) Matches(pkg deb.PackageLike) bool {
++	return newPatternUniverse([]deb.PackageLike{pkg}).selected(q.matcher)[pkg]
++}
++
++// Fast is always true: pattern is evaluated against the whole list at once, so that it sees all
++// the versions and relationships
++func (q *PatternQuery) Fast(_ deb.PackageCatalog) bool {
++	return true
++}
++
++// Query evaluates pattern against all the packages of the list
++func (q *PatternQuery) Query(list deb.PackageCatalog) *deb.PackageList {
++	all := list.Scan(&deb.MatchAllQuery{})
++
++	packages := make([]deb.PackageLike, 0, all.Len())
++	_ = all.ForEach(func(p *deb.Package) error {
++		packages = append(packages, p)
++		return nil
++	})
++
++	return all.Scan(&packageSetQuery{set: newPatternUniverse(packages).selected(q.matcher)})
++}
++
++// String interface
++func (q *PatternQuery) String() string {
++	return q.Pattern
++}
+diff --git a/query/pattern_regexp.go b/query/pattern_regexp.go
+new file mode 100644
+index 00000000..bf671f47
+--- /dev/null
++++ b/query/pattern_regexp.go
+@@ -0,0 +1,854 @@
++package query
++
++import (
++	"fmt"
++	"regexp"
++	"slices"
++	"strings"
++	"unicode"
++	"unicode/utf8"
++)
++
++// posixDupMax is the largest repeat count regcomp accepts
++const posixDupMax = 0x7fff
++
++type posixKind int
++
++const (
++	posixEmpty posixKind = iota
++	posixChar
++	posixSet
++	posixConcat
++	posixAlt
++	posixGroup
++	posixRepeat
++	posixBackref
++	posixBOL
++	posixEOL
++	posixWordBoundary
++	posixNotWordBoundary
++	posixWordStart
++	posixWordEnd
++)
++
++// posixNode is a node of parsed regular expression, repetitions with max equal to -1 have no upper limit
++type posixNode struct {
++	kind     posixKind
++	char     rune
++	set      *posixCharSet
++	children []*posixNode
++	min, max int
++	group    int
++}
++
++type posixError string
++
++func (e posixError) Error() string { return string(e) }
++
++const (
++	errPosixBadPattern = posixError("Invalid regular expression")
++	errPosixCollate    = posixError("Invalid collation character")
++	errPosixClass      = posixError("Invalid character class name")
++	errPosixEscape     = posixError("Trailing backslash")
++	errPosixSubreg     = posixError("Invalid back reference")
++	errPosixBracket    = posixError("Unmatched [, [^, [:, [., or [=")
++	errPosixParen      = posixError("Unmatched ( or \\(")
++	errPosixBrace      = posixError("Unmatched \\{")
++	errPosixBadBrace   = posixError("Invalid content of \\{\\}")
++	errPosixRange      = posixError("Invalid range end")
++	errPosixBadRepeat  = posixError("Invalid preceding regular expression")
++	errPosixSize       = posixError("Regular expression too big")
++)
++
++// posixByteBase marks a byte that isn't valid UTF-8: glibc reads it as a character of its own, here
++// posixByteBase plus the byte, beyond Unicode
++const posixByteBase = unicode.MaxRune + 1
++
++// posixChars splits s into characters the way glibc reads strings in the C.UTF-8 locale of the image
++func posixChars(s string) (chars []rune, sizes []int) {
++	for i := 0; i < len(s); {
++		c, size := utf8.DecodeRuneInString(s[i:])
++		if c == utf8.RuneError && size == 1 {
++			c = posixByteBase + rune(s[i])
++		}
++		chars = append(chars, c)
++		sizes = append(sizes, size)
++		i += size
++	}
++	return chars, sizes
++}
++
++// posixUpper upper-cases a character of the given size in bytes the way REG_ICASE does, leaving alone the bytes
++// that aren't valid UTF-8
++func posixUpper(c rune, size int) rune {
++	if size == 1 && c >= utf8.RuneSelf {
++		return c
++	}
++	return unicode.ToUpper(c)
++}
++
++// posixByteValue is the code of a one-byte character, the byte itself when it isn't valid UTF-8
++func posixByteValue(c rune) rune {
++	if c >= posixByteBase {
++		return c - posixByteBase
++	}
++	return c
++}
++
++func isPosixAlpha(c rune) bool {
++	// glibc counts the digits of other scripts as alphabetic, they can't be digits
++	return unicode.In(c, unicode.L, unicode.Nl, unicode.Other_Alphabetic) || c >= utf8.RuneSelf && unicode.Is(unicode.Nd, c)
++}
++
++func isPosixDigit(c rune) bool { return c >= '0' && c <= '9' }
++
++func isPosixAlnum(c rune) bool { return isPosixAlpha(c) || isPosixDigit(c) }
++
++func isPosixWordChar(c rune) bool { return c == '_' || isPosixAlnum(c) }
++
++// glibc doesn't count no-break spaces as spaces or blanks
++func isPosixBlank(c rune) bool {
++	return c == '\t' || unicode.Is(unicode.Zs, c) && c != '\u00a0' && c != '\u2007' && c != '\u202f'
++}
++
++func isPosixSpace(c rune) bool {
++	return c >= '\t' && c <= '\r' || isPosixBlank(c) || unicode.In(c, unicode.Zl, unicode.Zp)
++}
++
++func isPosixPrint(c rune) bool {
++	return unicode.In(c, unicode.L, unicode.M, unicode.N, unicode.P, unicode.S, unicode.Zs, unicode.Cf, unicode.Co)
++}
++
++func isPosixGraph(c rune) bool { return isPosixPrint(c) && !isPosixSpace(c) }
++
++// posixClasses are the character classes of the C.UTF-8 locale, defined by Unicode properties
++var posixClasses = map[string]func(c rune) bool{
++	"alnum":  isPosixAlnum,
++	"alpha":  isPosixAlpha,
++	"blank":  isPosixBlank,
++	"cntrl":  func(c rune) bool { return unicode.In(c, unicode.Cc, unicode.Zl, unicode.Zp) },
++	"digit":  isPosixDigit,
++	"graph":  isPosixGraph,
++	"lower":  unicode.IsLower,
++	"print":  isPosixPrint,
++	"punct":  func(c rune) bool { return isPosixGraph(c) && !isPosixAlnum(c) },
++	"space":  isPosixSpace,
++	"upper":  unicode.IsUpper,
++	"xdigit": func(c rune) bool { return isPosixDigit(c) || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F' },
++}
++
++// posixRange is a range of characters, both ends included
++type posixRange struct {
++	lo, hi rune
++}
++
++// posixCharSet is what bracket expression, dot or escape like \w matches: the characters in the ranges and the
++// classes, or every other character when negated
++type posixCharSet struct {
++	ranges  []posixRange
++	classes []func(c rune) bool
++	negate  bool
++}
++
++func (s *posixCharSet) has(c rune) bool {
++	// in glibc, only literal characters match a byte that isn't valid UTF-8
++	if c >= posixByteBase {
++		return false
++	}
++	in := slices.ContainsFunc(s.ranges, func(r posixRange) bool { return r.lo <= c && c <= r.hi }) ||
++		slices.ContainsFunc(s.classes, func(class func(rune) bool) bool { return class(c) })
++	return in != s.negate
++}
++
++// goSyntax writes the set as Go's character class, unless it has character classes: those of Go only cover ASCII
++func (s *posixCharSet) goSyntax() (string, bool) {
++	ranges := slices.DeleteFunc(slices.Clone(s.ranges), func(r posixRange) bool { return r.lo >= posixByteBase })
++	if len(s.classes) > 0 || len(ranges) == 0 {
++		return "", false
++	}
++	var b strings.Builder
++	b.WriteByte('[')
++	if s.negate {
++		b.WriteByte('^')
++	}
++	for _, r := range ranges {
++		fmt.Fprintf(&b, `\x{%x}-\x{%x}`, r.lo, r.hi)
++	}
++	b.WriteByte(']')
++	return b.String(), true
++}
++
++// posixParser parses POSIX extended regular expression the way glibc regcomp does with REG_ICASE in the C.UTF-8
++// locale: the expression is read upper-cased, except for the letters of GNU escapes like \w and character class
++// names
++type posixParser struct {
++	raw, upper []rune
++	sizes      []int
++	pos        int
++	nest       int
++	groups     int
++	completed  uint16
++	referenced uint16
++}
++
++func (p *posixParser) eof() bool { return p.pos >= len(p.raw) }
++
++func (p *posixParser) at(i int) rune {
++	if i < len(p.upper) {
++		return p.upper[i]
++	}
++	return 0
++}
++
++// width is the size in bytes of the upper-cased character at i
++func (p *posixParser) width(i int) int {
++	if p.sizes[i] == 1 {
++		return 1
++	}
++	return utf8.RuneLen(p.upper[i])
++}
++
++func (p *posixParser) parseAlternation() (*posixNode, error) {
++	initial := p.completed
++	branch, err := p.parseBranch()
++	if err != nil {
++		return nil, err
++	}
++	branches := []*posixNode{branch}
++	for !p.eof() && p.raw[p.pos] == '|' {
++		p.pos++
++		// groups of one alternative can't be referred to from another one
++		accumulated := p.completed
++		p.completed = initial
++		if branch, err = p.parseBranch(); err != nil {
++			return nil, err
++		}
++		p.completed |= accumulated
++		branches = append(branches, branch)
++	}
++	if len(branches) == 1 {
++		return branches[0], nil
++	}
++	return &posixNode{kind: posixAlt, children: branches}, nil
++}
++
++func (p *posixParser) parseBranch() (*posixNode, error) {
++	var items []*posixNode
++	// ')' closes a group, outside of one it is an ordinary character as in glibc, so apt accepts ?section(")")
++	for !p.eof() && p.raw[p.pos] != '|' && (p.raw[p.pos] != ')' || p.nest == 0) {
++		item, err := p.parseExpression()
++		if err != nil {
++			return nil, err
++		}
++		items = append(items, item)
++	}
++	switch len(items) {
++	case 0:
++		return &posixNode{kind: posixEmpty}, nil
++	case 1:
++		return items[0], nil
++	}
++	return &posixNode{kind: posixConcat, children: items}, nil
++}
++
++func (p *posixParser) parseExpression() (*posixNode, error) {
++	var atom *posixNode
++
++	switch c := p.raw[p.pos]; c {
++	case '*', '+', '?', '{':
++		return nil, errPosixBadRepeat
++	// as in glibc, ^ and $ are anchors wherever they appear (POSIX: "the ERE a^b is valid, but can never match"),
++	// only \^ and \$ match the characters; anchors can't be repeated, an operator after them starts a new expression
++	case '^':
++		p.pos++
++		return &posixNode{kind: posixBOL}, nil
++	case '$':
++		p.pos++
++		return &posixNode{kind: posixEOL}, nil
++	case '(':
++		var err error
++		if atom, err = p.parseGroup(); err != nil {
++			return nil, err
++		}
++	case '[':
++		var err error
++		if atom, err = p.parseBracket(); err != nil {
++			return nil, err
++		}
++	case '.':
++		p.pos++
++		atom = &posixNode{kind: posixSet, set: &posixCharSet{ranges: []posixRange{{1, unicode.MaxRune}}}}
++	case '\\':
++		if p.pos+1 == len(p.raw) {
++			return nil, errPosixEscape
++		}
++		escaped, upper := p.raw[p.pos+1], p.upper[p.pos+1]
++		p.pos += 2
++		switch escaped {
++		case '<':
++			return &posixNode{kind: posixWordStart}, nil
++		case '>':
++			return &posixNode{kind: posixWordEnd}, nil
++		case 'b':
++			return &posixNode{kind: posixWordBoundary}, nil
++		case 'B':
++			return &posixNode{kind: posixNotWordBoundary}, nil
++		case '`':
++			return &posixNode{kind: posixBOL}, nil
++		case '\'':
++			return &posixNode{kind: posixEOL}, nil
++		case 'w', 'W':
++			atom = &posixNode{kind: posixSet, set: &posixCharSet{classes: []func(rune) bool{isPosixWordChar}, negate: escaped == 'W'}}
++		case 's', 'S':
++			atom = &posixNode{kind: posixSet, set: &posixCharSet{classes: []func(rune) bool{isPosixSpace}, negate: escaped == 'S'}}
++		case '1', '2', '3', '4', '5', '6', '7', '8', '9':
++			group := int(escaped - '0')
++			if p.completed&(1<<group) == 0 {
++				return nil, errPosixSubreg
++			}
++			p.referenced |= 1 << group
++			atom = &posixNode{kind: posixBackref, group: group}
++		default:
++			atom = &posixNode{kind: posixChar, char: upper}
++		}
++	default:
++		atom = &posixNode{kind: posixChar, char: p.upper[p.pos]}
++		p.pos++
++	}
++
++	// as in glibc, an operator right after another repeats the repetition, so apt accepts a** as (a*)*
++	for !p.eof() {
++		lo, hi := 0, -1
++		switch p.raw[p.pos] {
++		case '*':
++			p.pos++
++		case '+':
++			p.pos++
++			lo = 1
++		case '?':
++			p.pos++
++			hi = 1
++		case '{':
++			var err error
++			if lo, hi, err = p.parseInterval(); err != nil {
++				return nil, err
++			}
++		default:
++			return atom, nil
++		}
++		atom = &posixNode{kind: posixRepeat, children: []*posixNode{atom}, min: lo, max: hi}
++	}
++	return atom, nil
++}
++
++func (p *posixParser) parseGroup() (*posixNode, error) {
++	p.pos++
++	p.nest++
++	p.groups++
++	group := p.groups
++
++	inner := &posixNode{kind: posixEmpty}
++	if !p.eof() && p.raw[p.pos] != ')' {
++		var err error
++		if inner, err = p.parseAlternation(); err != nil {
++			return nil, err
++		}
++	}
++	if p.eof() {
++		return nil, errPosixParen
++	}
++	p.pos++
++	p.nest--
++	if group <= 9 {
++		p.completed |= 1 << group
++	}
++	return &posixNode{kind: posixGroup, children: []*posixNode{inner}, group: group}, nil
++}
++
++// fetchNumber reads interval bound token by token up to ',' or '}', returning -1 when there are no digits
++// and -2 when there is anything else; escaped character stands for itself, except \1 to \9, which are
++// back references
++func (p *posixParser) fetchNumber() (num int, terminator rune) {
++	num = -1
++	for !p.eof() {
++		c := p.raw[p.pos]
++		p.pos++
++		closing, digit := c == '}', c >= '0' && c <= '9'
++		if c == '\\' && !p.eof() {
++			c = p.raw[p.pos]
++			p.pos++
++			closing, digit = false, c == '0'
++		}
++		switch {
++		case closing || c == ',':
++			return num, c
++		case !digit || num == -2:
++			num = -2
++		case num == -1:
++			num = int(c - '0')
++		default:
++			num = min(num*10+int(c-'0'), posixDupMax+1)
++		}
++	}
++	return -2, 0
++}
++
++func (p *posixParser) parseInterval() (lo, hi int, err error) {
++	p.pos++
++	lo, terminator := p.fetchNumber()
++	// glibc reads {,n} as {0,n}
++	if lo == -1 {
++		if terminator != ',' {
++			return 0, 0, errPosixBadBrace
++		}
++		lo = 0
++	}
++	hi = -2
++	if lo != -2 {
++		switch terminator {
++		case '}':
++			hi = lo
++		case ',':
++			hi, terminator = p.fetchNumber()
++		}
++	}
++	switch {
++	case (lo == -2 || hi == -2) && terminator == 0:
++		return 0, 0, errPosixBrace
++	case lo == -2 || hi == -2 || hi != -1 && lo > hi || terminator != '}':
++		return 0, 0, errPosixBadBrace
++	case max(lo, hi) > posixDupMax:
++		return 0, 0, errPosixSize
++	}
++	return lo, hi, nil
++}
++
++// posixBracketToken is token inside bracket expression: 'c' for character, '-', ']', '^',
++// '.', '=' and ':' for opening of collating symbol, equivalence class and character class, 0 for end
++type posixBracketToken struct {
++	kind   byte
++	char   rune
++	length int
++}
++
++// posixBracketElement is member of bracket expression: character or symbol named by the token kind, with its
++// size in bytes
++type posixBracketElement struct {
++	kind  byte
++	char  rune
++	name  []rune
++	width int
++}
++
++func (p *posixParser) peekBracket() posixBracketToken {
++	if p.eof() {
++		return posixBracketToken{}
++	}
++	c := p.at(p.pos)
++	if c == '[' {
++		switch next := p.at(p.pos + 1); next {
++		case '.', '=', ':':
++			return posixBracketToken{kind: byte(next), length: 2}
++		}
++	}
++	switch c {
++	case '-', ']', '^':
++		return posixBracketToken{kind: byte(c), char: c, length: 1}
++	}
++	return posixBracketToken{kind: 'c', char: c, length: 1}
++}
++
++func (p *posixParser) parseBracketElement(token posixBracketToken, acceptHyphen bool) (posixBracketElement, error) {
++	width := p.width(p.pos)
++	p.pos += token.length
++	switch token.kind {
++	case '.', '=', ':':
++		name, width, err := p.parseBracketSymbol(token.kind)
++		return posixBracketElement{kind: token.kind, name: name, width: width}, err
++	case '-':
++		if !acceptHyphen && p.peekBracket().kind != ']' {
++			return posixBracketElement{}, errPosixRange
++		}
++	}
++	return posixBracketElement{kind: 'c', char: token.char, width: width}, nil
++}
++
++// parseBracketSymbol reads the name of collating symbol, equivalence class or character class, which glibc
++// limits to 31 bytes
++func (p *posixParser) parseBracketSymbol(delim byte) ([]rune, int, error) {
++	if p.eof() {
++		return nil, 0, errPosixBracket
++	}
++	var name []rune
++	width := 0
++	for {
++		if width >= 32 {
++			return nil, 0, errPosixBracket
++		}
++		c, size := p.at(p.pos), p.width(p.pos)
++		if delim == ':' {
++			c, size = p.raw[p.pos], p.sizes[p.pos]
++		}
++		p.pos++
++		if p.eof() {
++			return nil, 0, errPosixBracket
++		}
++		if c == rune(delim) && p.at(p.pos) == ']' {
++			break
++		}
++		name = append(name, c)
++		width += size
++	}
++	p.pos++
++	return name, width, nil
++}
++
++// single is the character the element stands for; glibc only accepts collating symbols and equivalence classes
++// of one byte
++func (e posixBracketElement) single() (rune, bool) {
++	if e.kind == 'c' {
++		return e.char, true
++	}
++	if len(e.name) != 1 || e.width != 1 {
++		return 0, false
++	}
++	return e.name[0], true
++}
++
++func (e posixBracketElement) addTo(set *posixCharSet) error {
++	if e.kind == ':' {
++		name := string(e.name)
++		// with REG_ICASE glibc reads upper and lower as alpha
++		if name == "upper" || name == "lower" {
++			name = "alpha"
++		}
++		class, ok := posixClasses[name]
++		if !ok {
++			return errPosixClass
++		}
++		set.classes = append(set.classes, class)
++		return nil
++	}
++	c, ok := e.single()
++	if !ok {
++		return errPosixCollate
++	}
++	set.ranges = append(set.ranges, posixRange{c, c})
++	return nil
++}
++
++func addPosixRange(set *posixCharSet, start, end posixBracketElement) error {
++	if start.kind == ':' || start.kind == '=' || end.kind == ':' || end.kind == '=' {
++		return errPosixRange
++	}
++	from, fromOK := start.single()
++	to, toOK := end.single()
++	// in the C.UTF-8 locale only one-byte characters have a collation sequence value, the code of the byte
++	if !fromOK || !toOK || start.width != 1 || end.width != 1 {
++		return errPosixCollate
++	}
++	from, to = posixByteValue(from), posixByteValue(to)
++	if from > to {
++		return errPosixRange
++	}
++	set.ranges = append(set.ranges, posixRange{from, to})
++	return nil
++}
++
++func (p *posixParser) parseBracket() (*posixNode, error) {
++	p.pos++
++	set := &posixCharSet{}
++
++	token := p.peekBracket()
++	if token.kind == 0 {
++		return nil, errPosixBadPattern
++	}
++	set.negate = token.kind == '^'
++	if set.negate {
++		p.pos += token.length
++		if token = p.peekBracket(); token.kind == 0 {
++			return nil, errPosixBadPattern
++		}
++	}
++	if token.kind == ']' {
++		token.kind = 'c'
++	}
++
++	for first := true; ; first = false {
++		start, err := p.parseBracketElement(token, first)
++		if err != nil {
++			return nil, err
++		}
++		token = p.peekBracket()
++
++		var end *posixBracketElement
++		if start.kind != ':' && start.kind != '=' {
++			if token.kind == 0 {
++				return nil, errPosixBracket
++			}
++			if token.kind == '-' {
++				p.pos += token.length
++				switch next := p.peekBracket(); next.kind {
++				case 0:
++					return nil, errPosixBracket
++				case ']':
++					p.pos -= token.length
++					token.kind = 'c'
++				default:
++					element, err := p.parseBracketElement(next, true)
++					if err != nil {
++						return nil, err
++					}
++					end = &element
++					token = p.peekBracket()
++				}
++			}
++		}
++
++		if end != nil {
++			err = addPosixRange(set, start, *end)
++		} else {
++			err = start.addTo(set)
++		}
++		if err != nil {
++			return nil, err
++		}
++		if token.kind == 0 {
++			return nil, errPosixBracket
++		}
++		if token.kind == ']' {
++			break
++		}
++	}
++	p.pos += token.length
++
++	return &posixNode{kind: posixSet, set: set}, nil
++}
++
++// posixRegexp is regular expression compiled the way apt compiles them, with
++// regcomp(REG_EXTENDED | REG_ICASE | REG_NOSUB) in the C.UTF-8 locale of the image: POSIX extended syntax with
++// GNU extensions, matching anywhere in the string
++type posixRegexp struct {
++	root       *posixNode
++	referenced uint16
++	fast       *regexp.Regexp
++}
++
++func compilePosixRegexp(expr string) (*posixRegexp, error) {
++	raw, sizes := posixChars(expr)
++	upper := make([]rune, len(raw))
++	for i, c := range raw {
++		upper[i] = posixUpper(c, sizes[i])
++	}
++	p := &posixParser{raw: raw, upper: upper, sizes: sizes}
++	root, err := p.parseAlternation()
++	if err != nil {
++		return nil, err
++	}
++
++	re := &posixRegexp{root: root, referenced: p.referenced}
++	if syntax, ok := root.goSyntax(); ok {
++		re.fast, _ = regexp.Compile(syntax)
++	}
++	return re, nil
++}
++
++// goSyntax writes the expression for Go's regexp, which matches it the same way unless it has back
++// references, word anchors, character classes or huge repeat counts
++func (n *posixNode) goSyntax() (string, bool) {
++	switch n.kind {
++	case posixEmpty:
++		return "", true
++	case posixChar:
++		return regexp.QuoteMeta(string(n.char)), n.char < posixByteBase
++	case posixSet:
++		return n.set.goSyntax()
++	case posixConcat, posixAlt:
++		parts := make([]string, len(n.children))
++		for i, child := range n.children {
++			part, ok := child.goSyntax()
++			if !ok {
++				return "", false
++			}
++			parts[i] = part
++		}
++		if n.kind == posixAlt {
++			return "(?:" + strings.Join(parts, "|") + ")", true
++		}
++		return strings.Join(parts, ""), true
++	case posixGroup:
++		inner, ok := n.children[0].goSyntax()
++		return "(?:" + inner + ")", ok
++	case posixRepeat:
++		inner, ok := n.children[0].goSyntax()
++		if !ok || n.min > 1000 || n.max > 1000 {
++			return "", false
++		}
++		if n.max == -1 {
++			return fmt.Sprintf("(?:%s){%d,}", inner, n.min), true
++		}
++		return fmt.Sprintf("(?:%s){%d,%d}", inner, n.min, n.max), true
++	case posixBOL:
++		return `\A`, true
++	case posixEOL:
++		return `\z`, true
++	}
++	return "", false
++}
++
++// MatchString reports whether the expression matches anywhere in s
++func (re *posixRegexp) MatchString(s string) bool {
++	subject, sizes := posixChars(s)
++	for i, c := range subject {
++		subject[i] = posixUpper(c, sizes[i])
++	}
++
++	if re.fast != nil && !slices.ContainsFunc(subject, func(c rune) bool { return c >= posixByteBase }) {
++		return re.fast.MatchString(string(subject))
++	}
++
++	m := &posixMatcher{subject: subject, referenced: re.referenced, memo: make(map[posixMemoKey][]posixState)}
++	for start := 0; start <= len(subject); start++ {
++		if len(m.ends(re.root, posixState{pos: start})) > 0 {
++			return true
++		}
++	}
++	return false
++}
++
++type posixCapture struct {
++	start, end int
++	set        bool
++}
++
++// posixState is position in the string with the groups matched so far that back references refer to
++type posixState struct {
++	pos    int
++	groups [10]posixCapture
++}
++
++type posixMemoKey struct {
++	node  *posixNode
++	state posixState
++}
++
++// posixMatcher matches expressions Go's regexp can't match, finding all the states each node can end in
++type posixMatcher struct {
++	subject    []rune
++	referenced uint16
++	memo       map[posixMemoKey][]posixState
++}
++
++func (m *posixMatcher) wordAt(i int) bool {
++	return i >= 0 && i < len(m.subject) && isPosixWordChar(posixByteValue(m.subject[i]))
++}
++
++func (m *posixMatcher) holds(kind posixKind, pos int) bool {
++	switch kind {
++	case posixBOL:
++		return pos == 0
++	case posixEOL:
++		return pos == len(m.subject)
++	case posixWordBoundary:
++		return m.wordAt(pos-1) != m.wordAt(pos)
++	case posixNotWordBoundary:
++		return m.wordAt(pos-1) == m.wordAt(pos)
++	case posixWordStart:
++		return !m.wordAt(pos-1) && m.wordAt(pos)
++	case posixWordEnd:
++		return m.wordAt(pos-1) && !m.wordAt(pos)
++	}
++	return false
++}
++
++func uniqueStates(states []posixState) []posixState {
++	var result []posixState
++	seen := make(map[posixState]bool, len(states))
++	for _, state := range states {
++		if !seen[state] {
++			seen[state] = true
++			result = append(result, state)
++		}
++	}
++	return result
++}
++
++func (m *posixMatcher) endsAll(n *posixNode, states []posixState) []posixState {
++	var result []posixState
++	for _, state := range states {
++		result = append(result, m.ends(n, state)...)
++	}
++	return uniqueStates(result)
++}
++
++func (m *posixMatcher) ends(n *posixNode, state posixState) []posixState {
++	key := posixMemoKey{node: n, state: state}
++	if result, ok := m.memo[key]; ok {
++		return result
++	}
++
++	var result []posixState
++	switch n.kind {
++	case posixEmpty:
++		result = []posixState{state}
++	case posixChar, posixSet:
++		if state.pos < len(m.subject) {
++			if c := m.subject[state.pos]; n.kind == posixChar && c == n.char || n.kind == posixSet && n.set.has(c) {
++				state.pos++
++				result = []posixState{state}
++			}
++		}
++	case posixConcat:
++		result = []posixState{state}
++		for _, child := range n.children {
++			result = m.endsAll(child, result)
++		}
++	case posixAlt:
++		for _, child := range n.children {
++			result = append(result, m.ends(child, state)...)
++		}
++		result = uniqueStates(result)
++	case posixGroup:
++		for _, end := range m.ends(n.children[0], state) {
++			if m.referenced&(1<<n.group) != 0 {
++				end.groups[n.group] = posixCapture{start: state.pos, end: end.pos, set: true}
++			}
++			result = append(result, end)
++		}
++	case posixRepeat:
++		level := []posixState{state}
++		seen := make(map[posixState]bool)
++		for count := 0; len(level) > 0; count++ {
++			if count >= n.min {
++				// states reached before can't lead anywhere new
++				var fresh []posixState
++				for _, s := range level {
++					if !seen[s] {
++						seen[s] = true
++						fresh = append(fresh, s)
++					}
++				}
++				result = append(result, fresh...)
++				level = fresh
++			}
++			if count == n.max {
++				break
++			}
++			level = m.endsAll(n.children[0], level)
++		}
++	case posixBackref:
++		group := state.groups[n.group]
++		end := state.pos + group.end - group.start
++		if group.set && end <= len(m.subject) && slices.Equal(m.subject[state.pos:end], m.subject[group.start:group.end]) {
++			state.pos = end
++			result = []posixState{state}
++		}
++	default:
++		if m.holds(n.kind, state.pos) {
++			result = []posixState{state}
++		}
++	}
++
++	m.memo[key] = result
++	return result
++}
+diff --git a/query/query.go b/query/query.go
+index 21e9188e..b1f253b5 100644
+--- a/query/query.go
++++ b/query/query.go
+@@ -2,6 +2,8 @@
+ package query
+ 
+ import (
++	"strings"
++
+ 	"github.com/aptly-dev/aptly/deb"
+ )
+ 
+@@ -19,10 +21,16 @@ import (
+   condition := '(' <operator> value ')' |
+   arch_condition := '{' arch '}' |
+   operator := | << | < | <= | > | >> | >= | = | % | ~
++
++  Queries starting with '?' or '~' are apt patterns (see apt-patterns(7)).
+ */
+ 
+ // Parse parses input package query into PackageQuery tree ready for evaluation
+ func Parse(query string) (result deb.PackageQuery, err error) {
++	if strings.HasPrefix(query, "?") || strings.HasPrefix(query, "~") {
++		return parsePattern(query)
++	}
++
+ 	l, _ := lex("", query)
+ 	result, err = parse(l)
+ 	return

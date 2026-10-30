@@ -1,0 +1,1038 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..ec972cd
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,96 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      if [ $# -lt 1 ] || [ -z "$1" ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      if [ -z "$OUTPUT_PATH" ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")"
++
++BASE_TESTS=(
++  "tinytag/tests/test_all.py"
++  "tinytag/tests/test_cli.py"
++)
++NEW_TESTS=(
++  "tinytag/tests/test_exact_duration_177b41.py"
++)
++
++ARGS=(-p no:cacheprovider -o junit_family=xunit1)
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  rm -f "$OUTPUT_PATH"
++  ARGS+=("--junitxml=$OUTPUT_PATH")
++fi
++
++LOG="$(mktemp)"
++if [ "$MODE" = "new" ]; then
++  python -m pytest "${NEW_TESTS[@]}" "${ARGS[@]}" 2>&1 | tee "$LOG"
++else
++  python -m pytest "${BASE_TESTS[@]}" "${ARGS[@]}" 2>&1 | tee "$LOG"
++fi
++STATUS=${PIPESTATUS[0]}
++
++if [ -n "$OUTPUT_PATH" ] && ! grep -q "<testcase" "$OUTPUT_PATH" 2>/dev/null; then
++  python - "$OUTPUT_PATH" "$LOG" "$STATUS" "$MODE" <<'PYEOF'
++import sys
++from xml.sax.saxutils import escape, quoteattr
++
++output_path, log_path, status, mode = sys.argv[1:5]
++with open(log_path, encoding="utf-8", errors="replace") as log:
++    lines = log.read().splitlines()
++detail = "\n".join(lines[-200:]) or "pytest printed nothing"
++message = quoteattr(f"pytest exited with status {status} without test results")
++with open(output_path, "w", encoding="utf-8") as report:
++    report.write(
++        '<?xml version="1.0" encoding="utf-8"?>\n'
++        '<testsuites><testsuite name="pytest" errors="1" failures="0" '
++        'tests="1" time="0">\n'
++        f'<testcase classname="pytest.{mode}" name="collection" time="0">\n'
++        f"<error message={message}>{escape(detail)}</error>\n"
++        "</testcase>\n"
++        "</testsuite></testsuites>\n"
++    )
++PYEOF
++  if [ "$STATUS" -eq 0 ]; then
++    STATUS=1
++  fi
++fi
++rm -f "$LOG"
++
++exit "$STATUS"
+diff --git a/tinytag/tests/test_exact_duration_177b41.py b/tinytag/tests/test_exact_duration_177b41.py
+new file mode 100644
+index 0000000..4d74711
+--- /dev/null
++++ b/tinytag/tests/test_exact_duration_177b41.py
+@@ -0,0 +1,930 @@
++# SPDX-FileCopyrightText: 2026 tinytag Contributors
++# SPDX-License-Identifier: MIT
++
++# pylint: disable=missing-class-docstring,missing-function-docstring
++# pylint: disable=missing-module-docstring
++
++from __future__ import annotations
++
++import os
++import os.path
++
++from contextlib import ExitStack
++from io import BytesIO
++from struct import pack
++from typing import NamedTuple
++from unittest import TestCase, mock
++
++from tinytag import TinyTag
++
++TYPE_CHECKING = False
++
++if TYPE_CHECKING:
++    from typing import Callable, Dict, List, Optional, Tuple
++    ImageFields = Dict[
++        str, List[Tuple[str, int, Optional[str], Optional[str], bytes]]]
++
++SAMPLE_FOLDER = os.path.join(os.path.dirname(__file__), 'samples')
++
++_BITRATES = (
++    (
++        (),
++        (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
++        (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
++        (0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224,
++         256),
++    ),
++    (
++        (),
++        (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256,
++         320),
++        (0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
++         384),
++        (0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384,
++         416, 448),
++    ),
++)
++_SAMPLE_RATES = ((11025, 12000, 8000), (), (22050, 24000, 16000),
++                 (44100, 48000, 32000))
++
++
++class Expected(NamedTuple):
++    samples: int
++    samplerate: int
++
++
++class Case(NamedTuple):
++    build: Callable[[], bytes]
++    samples: int
++    samplerate: int
++
++
++def read_sample(name: str) -> bytes:
++    with open(os.path.join(SAMPLE_FOLDER, name), 'rb') as file:
++        return file.read()
++
++
++def id3v2_size(data: bytes) -> int:
++    if not data.startswith(b'ID3'):
++        return 0
++    size = 0
++    for byte in data[6:10]:
++        size = (size << 7) | byte
++    return size + 10
++
++
++def mpeg_frames(data: bytes) -> list[tuple[int, int]]:
++    frames: list[tuple[int, int]] = []
++    offset = id3v2_size(data)
++    while offset + 4 <= len(data):
++        header = data[offset:offset + 4]
++        if header[0] != 0xFF or header[1] & 0xE0 != 0xE0:
++            break
++        version = (header[1] >> 3) & 3
++        layer = (header[1] >> 1) & 3
++        bitrate = _BITRATES[version == 3][layer][header[2] >> 4]
++        samplerate = _SAMPLE_RATES[version][(header[2] >> 2) & 3]
++        padding = (header[2] >> 1) & 1
++        if layer == 3:
++            length = (12000 * bitrate // samplerate + padding) * 4
++        elif layer == 2 or version == 3:
++            length = 144000 * bitrate // samplerate + padding
++        else:
++            length = 72000 * bitrate // samplerate + padding
++        frames.append((offset, length))
++        offset += length
++    return frames
++
++
++def mpeg_stream(name: str) -> tuple[bytes, list[tuple[int, int]]]:
++    data = read_sample(name)
++    frames = mpeg_frames(data)
++    offset, length = frames[-1]
++    return data[:offset + length], frames
++
++
++def drop_frames(name: str, count: int) -> bytes:
++    data, frames = mpeg_stream(name)
++    return data[:frames[-count][0]]
++
++
++def cut_last_frame(name: str, keep: int) -> bytes:
++    data, frames = mpeg_stream(name)
++    return data[:frames[-1][0] + keep]
++
++
++def lame_tag_crc(data: bytes) -> int:
++    crc = 0
++    for byte in data:
++        crc ^= byte
++        for _ in range(8):
++            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
++    return crc
++
++
++def seal_lame_tag(data: bytes, first: int, version: int) -> bytes:
++    crc = lame_tag_crc(data[first:version + 34])
++    return data[:version + 34] + pack('>H', crc) + data[version + 36:]
++
++
++def replace_encoder(name: str, encoder: bytes) -> bytes:
++    data, frames = mpeg_stream(name)
++    first = frames[0][0]
++    for known in (b'LAME', b'Lavf', b'Lavc'):
++        offset = data.find(known, first, first + frames[0][1])
++        if offset != -1:
++            data = data[:offset] + encoder + data[offset + 4:]
++            return seal_lame_tag(data, first, offset)
++    raise AssertionError('no encoder tag')
++
++
++def set_encoder_delay(name: str, delay: int, audio_frames: int) -> bytes:
++    data, frames = mpeg_stream(name)
++    data = data[:frames[audio_frames + 1][0]]
++    version = data.find(b'LAME', frames[0][0], frames[1][0])
++    offset = version + 21
++    padding = int.from_bytes(data[offset:offset + 3], 'big') & 0xFFF
++    delays = ((delay << 12) | padding).to_bytes(3, 'big')
++    data = data[:offset] + delays + data[offset + 3:]
++    return seal_lame_tag(data, frames[0][0], version)
++
++
++def stream_with_tags(name: str, *tags: bytes) -> bytes:
++    return mpeg_stream(name)[0] + b''.join(tags)
++
++
++def id3v1_tag(title: bytes = b'Track') -> bytes:
++    return (b'TAG' + title.ljust(30, b'\x00') + b'Band'.ljust(30, b'\x00')
++            + b'Record'.ljust(30, b'\x00') + b'1999'
++            + b'Comment'.ljust(28, b'\x00') + b'\x00\x05\x0c')
++
++
++def id3v2_tag(size: int, version: int = 3, footer: bool = False) -> bytes:
++    flags = 0x10 if footer else 0
++    synchsafe = bytes(
++        [(size >> 21) & 0x7F, (size >> 14) & 0x7F, (size >> 7) & 0x7F,
++         size & 0x7F])
++    tag = b'ID3' + bytes([version, 0, flags]) + synchsafe
++    tag += b'TIT2' + pack('>I', size - 10) + b'\x00\x00\x00' + b'x' * (
++        size - 11)
++    if footer:
++        tag += b'3DI' + bytes([version, 0, flags]) + synchsafe
++    return tag
++
++
++def flac_crc8(data: bytes) -> int:
++    crc = 0
++    for byte in data:
++        crc ^= byte
++        for _ in range(8):
++            crc = ((crc << 1) ^ 0x07 if crc & 0x80 else crc << 1) & 0xFF
++    return crc
++
++
++def flac_crc16(data: bytes) -> int:
++    crc = 0
++    for byte in data:
++        crc ^= byte << 8
++        for _ in range(8):
++            crc = ((crc << 1) ^ 0x8005 if crc & 0x8000 else crc << 1) & 0xFFFF
++    return crc
++
++
++def flac_number(value: int) -> bytes:
++    if value < 0x80:
++        return bytes([value])
++    length = 2
++    while value >= 1 << (5 * length + 1):
++        length += 1
++    tail: list[int] = []
++    for _ in range(length - 1):
++        tail.append(0x80 | (value & 0x3F))
++        value >>= 6
++    first = ((0xFF << (8 - length)) & 0xFF) | value
++    return bytes([first] + tail[::-1])
++
++
++def flac_frame(number: int,
++               channels: list[list[int]],
++               variable: bool = False) -> bytes:
++    block_size = len(channels[0])
++    codes = {192: 1, 576: 2, 1152: 3, 2304: 4, 4608: 5, 256: 8, 512: 9,
++             1024: 10, 2048: 11, 4096: 12, 8192: 13}
++    code = codes.get(block_size, 6 if block_size <= 256 else 7)
++    header = bytes([0xFF, 0xF9 if variable else 0xF8, code << 4,
++                    ((len(channels) - 1) << 4) | 0x08])
++    header += flac_number(number)
++    if code == 6:
++        header += bytes([block_size - 1])
++    elif code == 7:
++        header += pack('>H', block_size - 1)
++    header += bytes([flac_crc8(header)])
++    body = b''.join(
++        b'\x02' + b''.join(pack('>h', sample) for sample in channel)
++        for channel in channels)
++    frame = header + body
++    return frame + pack('>H', flac_crc16(frame))
++
++
++def flac_stream(blocks: list[list[int]],
++                channels: int = 1,
++                total: int | None = None,
++                variable: bool = False,
++                samplerate: int = 44100) -> bytes:
++    frames = b''
++    position = 0
++    for index, block in enumerate(blocks):
++        number = position if variable else index
++        frames += flac_frame(number, [block] * channels, variable)
++        position += len(block)
++    if total is None:
++        total = position
++    sizes = [len(block) for block in blocks]
++    info = pack('>HH', min(sizes[:-1] or sizes), max(sizes)) + b'\x00' * 6
++    info += pack('>Q', (samplerate << 44) | ((channels - 1) << 41)
++                 | (15 << 36) | total) + b'\x00' * 16
++    return b'fLaC\x80' + len(info).to_bytes(3, 'big') + info + frames
++
++
++def tone(index: int, size: int = 4096) -> list[int]:
++    return [((sample * 13 + index * 7) % 3000) - 1500
++            for sample in range(size)]
++
++
++def with_bytes(index: int, embedded: bytes, size: int = 4096) -> list[int]:
++    block = tone(index, size)
++    values = [int.from_bytes(embedded[pos:pos + 2], 'big', signed=True)
++              for pos in range(0, len(embedded), 2)]
++    middle = size // 2
++    block[middle:middle + len(values)] = values
++    return block
++
++
++def fake_flac_header(number: int) -> bytes:
++    header = bytes([0xFF, 0xF8, 0xC0, 0x08]) + flac_number(number)
++    return header + bytes([flac_crc8(header)])
++
++
++def fake_frame(index: int, *numbers: int) -> list[int]:
++    return with_bytes(
++        index, b''.join(fake_flac_header(number) for number in numbers))
++
++
++def tones(count: int, size: int = 4096) -> list[list[int]]:
++    return [tone(index, size) for index in range(count)]
++
++
++def set_streaminfo_total(name: str, total: int) -> bytes:
++    data = read_sample(name)
++    offset = data.find(b'fLaC') + 8
++    value = int.from_bytes(data[offset + 10:offset + 18], 'big')
++    value = (value & ~((1 << 36) - 1)) | total
++    return data[:offset + 10] + value.to_bytes(8, 'big') + data[offset + 18:]
++
++
++def image_fields(tag: TinyTag) -> ImageFields:
++    return {
++        key: [(image.name, image.size, image.mime_type, image.description,
++               image.data) for image in images]
++        for key, images in tag.images.as_dict().items()}
++
++
++def cut_sample(name: str, size: int) -> bytes:
++    return read_sample(name)[:size]
++
++
++LAME_MPEG1_SAMPLES: dict[str, Expected] = {
++    'cbr.mp3': Expected(19584, 44100),
++    'classical.mp3': Expected(4410, 44100),
++    'detect_mp3_id3v2.x': Expected(19584, 44100),
++    'duplicate_fields.mp3': Expected(4410, 44100),
++    'grouping.mp3': Expected(4410, 44100),
++    'id3_broken_frame_size.mp3': Expected(4410, 44100),
++    'id3_multiple_artists.mp3': Expected(4410, 44100),
++    'mpeg1_32khz_cbr.mp3': Expected(3200, 32000),
++    'mpeg1_32khz_vbr.mp3': Expected(3200, 32000),
++    'mpeg1_44_1khz_cbr.mp3': Expected(4410, 44100),
++    'mpeg1_44_1khz_vbr.mp3': Expected(4410, 44100),
++    'mpeg1_48khz_cbr.mp3': Expected(4800, 48000),
++    'mpeg1_48khz_vbr.mp3': Expected(4800, 48000),
++    'mpeg1_id3v1.mp3': Expected(4410, 44100),
++    'mpeg1_id3v2.mp3': Expected(4410, 44100),
++    'multi_value_utf16.mp3': Expected(4410, 44100),
++    'non_ascii_filename_äää.mp3': Expected(220500, 44100),
++    'synced_lyrics_empty.mp3': Expected(4410, 44100),
++    'synced_lyrics_invalid.mp3': Expected(4410, 44100),
++    'synced_lyrics_milliseconds.mp3': Expected(4410, 44100),
++    'vbr32.mp3': Expected(289280, 32000),
++    'vbr32stereo.mp3': Expected(289280, 32000),
++    'vbr44.mp3': Expected(398664, 44100),
++    'vbr44stereo.mp3': Expected(398664, 44100),
++    'vbr48.mp3': Expected(433920, 48000),
++    'vbr48stereo.mp3': Expected(433920, 48000),
++    'vbr_xing_header.mp3': Expected(172740, 44100),
++    'xmp_data.mp3': Expected(4410, 44100),
++}
++
++LAME_MPEG2_SAMPLES: dict[str, Expected] = {
++    'detect_mp3_mpeg2.x': Expected(1600, 16000),
++    'detect_mp3_mpeg25.x': Expected(800, 8000),
++    'mpeg25_11025hz_vbr.mp3': Expected(1103, 11025),
++    'mpeg25_12khz_vbr.mp3': Expected(1200, 12000),
++    'mpeg25_8khz_vbr.mp3': Expected(800, 8000),
++    'mpeg2_16khz_vbr.mp3': Expected(1600, 16000),
++    'mpeg2_22050hz_vbr.mp3': Expected(2205, 22050),
++    'mpeg2_24khz_vbr.mp3': Expected(2400, 24000),
++    'mpeg2_id3v2.mp3': Expected(2400, 24000),
++    'vbr11.mp3': Expected(99666, 11025),
++    'vbr11stereo.mp3': Expected(99666, 11025),
++    'vbr16.mp3': Expected(144640, 16000),
++    'vbr16stereo.mp3': Expected(144640, 16000),
++    'vbr22.mp3': Expected(199332, 22050),
++    'vbr22stereo.mp3': Expected(199332, 22050),
++    'vbr8.mp3': Expected(72320, 8000),
++    'vbr8stereo.mp3': Expected(72320, 8000),
++}
++
++PLAIN_MPEG_SAMPLES: dict[str, Expected] = {
++    'detect_mp3_id3v1.x': Expected(164736, 44100),
++    'detect_mp3_mpeg1.x': Expected(164736, 44100),
++    'empty_frame.mp3': Expected(5760, 44100),
++    'id3_frames.mp3': Expected(72576, 16000),
++    'image-text-encoding.mp3': Expected(23616, 22050),
++    'silence-22khz-mono-1s.mp3': Expected(23616, 22050),
++    'silence-44-s-v1.mp3': Expected(164736, 44100),
++    'silence-44khz-56k-mono-1s.mp3': Expected(46080, 44100),
++}
++
++LAYER_1_AND_2_SAMPLES: dict[str, Expected] = {
++    'detect_mp1_mpeg1.x': Expected(3072, 32000),
++    'detect_mp2_mpeg1.x': Expected(4608, 44100),
++    'detect_mp2_mpeg2.x': Expected(2304, 16000),
++    'mpeg1_32khz.mp1': Expected(3072, 32000),
++    'mpeg1_32khz.mp2': Expected(3456, 32000),
++    'mpeg1_44_1khz.mp1': Expected(4224, 44100),
++    'mpeg1_44_1khz.mp2': Expected(4608, 44100),
++    'mpeg1_48khz.mp1': Expected(4608, 48000),
++    'mpeg1_48khz.mp2': Expected(5760, 48000),
++    'mpeg1_id3v1.mp2': Expected(4608, 44100),
++    'mpeg1_id3v2.mp2': Expected(4608, 44100),
++    'mpeg2_16khz.mp2': Expected(2304, 16000),
++    'mpeg2_22050hz.mp2': Expected(2304, 22050),
++    'mpeg2_24khz.mp2': Expected(3456, 24000),
++    'mpeg2_id3v1.mp2': Expected(3456, 24000),
++    'mpeg2_id3v2.mp2': Expected(3456, 24000),
++}
++
++CUT_MPEG_SAMPLES: dict[str, Expected] = {
++    'cut_off_titles.mp3': Expected(2304, 44100),
++    'id3_xxx_lang.mp3': Expected(5760, 44100),
++    'id3v22-test.mp3': Expected(6912, 44100),
++    'vbr_xing_header_2channel.mp3': Expected(2927, 22050),
++    'vbri.mp3': Expected(19584, 44100),
++}
++
++FLAC_SAMPLES: dict[str, Expected] = {
++    'flac1.5sStereo.flac': Expected(66129, 44100),
++    'flac1sMono.flac': Expected(44100, 44100),
++    'flac453sStereo.flac': Expected(20000000, 44100),
++    'flac_invalid_track_number.flac': Expected(4410, 44100),
++    'multiple_values_images.flac': Expected(4410, 44100),
++    'no-tags.flac': Expected(162496, 44100),
++    'unsynced_lyrics.flac': Expected(162496, 44100),
++    'with_padded_id3_header.flac': Expected(20000, 44100),
++    'with_padded_id3_header2.flac': Expected(20000, 44100),
++}
++
++MISSING_FRAMES: dict[str, Case] = {
++    'vbr44.mp3 missing its last frame': Case(
++        lambda: drop_frames('vbr44.mp3', 1),
++        398639, 44100),
++    'vbr44.mp3 missing two frames': Case(
++        lambda: drop_frames('vbr44.mp3', 2),
++        397487, 44100),
++    'vbr44.mp3 missing five frames': Case(
++        lambda: drop_frames('vbr44.mp3', 5),
++        394031, 44100),
++    'vbr11.mp3 missing its last frame': Case(
++        lambda: drop_frames('vbr11.mp3', 1),
++        99666, 11025),
++    'vbr11.mp3 missing two frames': Case(
++        lambda: drop_frames('vbr11.mp3', 2),
++        99119, 11025),
++    'vbr8stereo.mp3 missing its last frame': Case(
++        lambda: drop_frames('vbr8stereo.mp3', 1),
++        72047, 8000),
++    'mpeg2_24khz_vbr.mp3 missing its last frame': Case(
++        lambda: drop_frames('mpeg2_24khz_vbr.mp3', 1),
++        2351, 24000),
++    'image-text-encoding.mp3 missing two frames': Case(
++        lambda: drop_frames('image-text-encoding.mp3', 2),
++        22464, 22050),
++    'vbr44.mp3 missing a frame with an ID3v1 tag': Case(
++        lambda: drop_frames('vbr44.mp3', 1) + id3v1_tag(),
++        398639, 44100),
++}
++
++CUT_FRAMES: dict[str, Case] = {
++    'vbr44.mp3 cut after the last frame header': Case(
++        lambda: cut_last_frame('vbr44.mp3', 4),
++        398664, 44100),
++    'vbr16.mp3 cut in the middle of the last frame': Case(
++        lambda: cut_last_frame('vbr16.mp3', 20),
++        144640, 16000),
++    'image-text-encoding.mp3 cut in the last frame': Case(
++        lambda: cut_last_frame('image-text-encoding.mp3', 50),
++        23616, 22050),
++    'mpeg1_44_1khz.mp2 cut in the last frame': Case(
++        lambda: cut_last_frame('mpeg1_44_1khz.mp2', 600),
++        4608, 44100),
++    'mpeg1_48khz.mp1 cut in the last frame': Case(
++        lambda: cut_last_frame('mpeg1_48khz.mp1', 10),
++        4608, 48000),
++}
++
++CUT_HEADERS: dict[str, Case] = {
++    'vbr44.mp3 cut inside the last frame header': Case(
++        lambda: cut_last_frame('vbr44.mp3', 3),
++        398639, 44100),
++    'image-text-encoding.mp3 cut inside the last frame header': Case(
++        lambda: cut_last_frame('image-text-encoding.mp3', 2),
++        23040, 22050),
++}
++
++ENCODERS: dict[str, Case] = {
++    'vbr44.mp3 with a GOGO header': Case(
++        lambda: replace_encoder('vbr44.mp3', b'GOGO'),
++        400896, 44100),
++    'vbr44.mp3 with a Lavc header': Case(
++        lambda: replace_encoder('vbr44.mp3', b'Lavc'),
++        398664, 44100),
++    'vbr44.mp3 with a Lavf header': Case(
++        lambda: replace_encoder('vbr44.mp3', b'Lavf'),
++        398664, 44100),
++    'vbr8.mp3 with a GOGO header': Case(
++        lambda: replace_encoder('vbr8.mp3', b'GOGO'),
++        73728, 8000),
++    'cbr.mp3 with a Lavf header': Case(
++        lambda: replace_encoder('cbr.mp3', b'Lavf'),
++        19584, 44100),
++}
++
++MPEG_TRAILING_TAGS: dict[str, Case] = {
++    'vbr44.mp3 with an ID3v1 tag': Case(
++        lambda: stream_with_tags('vbr44.mp3', id3v1_tag()),
++        398664, 44100),
++    'image-text-encoding.mp3 with an ID3v1 tag': Case(
++        lambda: stream_with_tags('image-text-encoding.mp3', id3v1_tag()),
++        23616, 22050),
++    'silence-44khz-56k-mono-1s.mp3 with an ID3v1 tag': Case(
++        lambda: stream_with_tags('silence-44khz-56k-mono-1s.mp3', id3v1_tag()),
++        46080, 44100),
++    'mpeg1_44_1khz.mp2 with an ID3v1 tag': Case(
++        lambda: stream_with_tags('mpeg1_44_1khz.mp2', id3v1_tag()),
++        4608, 44100),
++    'vbr44.mp3 with a frame header in its ID3v1 tag': Case(
++        lambda: stream_with_tags(
++            'vbr44.mp3', id3v1_tag(b'Track \xff\xfb\x90\x64 two')),
++        398664, 44100),
++    'vbr16.mp3 with a frame header in its ID3v1 tag': Case(
++        lambda: stream_with_tags('vbr16.mp3', id3v1_tag(b'\xff\xe3\x18\xc4')),
++        144640, 16000),
++}
++
++FLAC_STREAMS: dict[str, Case] = {
++    'one frame': Case(
++        lambda: flac_stream(tones(1)),
++        4096, 44100),
++    'six frames': Case(
++        lambda: flac_stream(tones(6)),
++        24576, 44100),
++    'stereo frames': Case(
++        lambda: flac_stream(tones(5, 2048), channels=2),
++        10240, 44100),
++    'frames at 48 kHz': Case(
++        lambda: flac_stream(tones(4), samplerate=48000),
++        16384, 48000),
++    'stereo frames at 22.05 kHz': Case(
++        lambda: flac_stream(tones(3, 1152), channels=2, samplerate=22050),
++        3456, 22050),
++}
++
++STREAMINFO_COUNTS: dict[str, Case] = {
++    'STREAMINFO without a sample count': Case(
++        lambda: flac_stream(tones(6), total=0),
++        24576, 44100),
++    'STREAMINFO with a wrong sample count': Case(
++        lambda: flac_stream(tones(6), total=99999),
++        24576, 44100),
++    'flac1sMono.flac without a sample count': Case(
++        lambda: set_streaminfo_total('flac1sMono.flac', 0),
++        44100, 44100),
++    'flac1.5sStereo.flac with a wrong sample count': Case(
++        lambda: set_streaminfo_total('flac1.5sStereo.flac', 1),
++        66129, 44100),
++}
++
++BLOCK_SIZES: dict[str, Case] = {
++    'short last block': Case(
++        lambda: flac_stream(tones(5) + [tone(5, 1000)]),
++        21480, 44100),
++    'block sizes stored in the header': Case(
++        lambda: flac_stream([tone(0, 100), tone(1, 3000), tone(2, 100)]),
++        3200, 44100),
++    'variable block sizes': Case(
++        lambda: flac_stream(
++            [tone(0, 1000), tone(1, 3000), tone(2, 17), tone(3)],
++            variable=True),
++        8113, 44100),
++}
++
++SYNC_CODES: dict[str, Case] = {
++    'sync code with a valid header inside a frame': Case(
++        lambda: flac_stream(tones(3) + [fake_frame(3, 77)] + tones(2)),
++        24576, 44100),
++    'sync code with frame number zero inside a frame': Case(
++        lambda: flac_stream(tones(2) + [fake_frame(2, 0)] + tones(3)),
++        24576, 44100),
++    'sync code with a valid header inside the last frame': Case(
++        lambda: flac_stream(tones(5) + [fake_frame(5, 77)]),
++        24576, 44100),
++    'several sync codes inside frames': Case(
++        lambda: flac_stream(
++            [fake_frame(0, 40, 41)] + tones(2) + [fake_frame(3, 9)]),
++        16384, 44100),
++}
++
++CUT_FLAC: dict[str, Case] = {
++    'last frame cut short': Case(
++        lambda: flac_stream(tones(6))[:-5000],
++        20480, 44100),
++    'cut in the second frame': Case(
++        lambda: flac_stream(tones(6))[:8300],
++        4096, 44100),
++    'flac1sMono.flac cut short': Case(
++        lambda: cut_sample('flac1sMono.flac', 16000),
++        24576, 44100),
++    'flac1.5sStereo.flac cut short': Case(
++        lambda: cut_sample('flac1.5sStereo.flac', 20000),
++        20480, 44100),
++    'with_padded_id3_header.flac cut short': Case(
++        lambda: cut_sample('with_padded_id3_header.flac', 9000),
++        8192, 44100),
++}
++
++FLAC_CUT_HEADERS: dict[str, Case] = {
++    'with_padded_id3_header2.flac cut inside its second frame header': Case(
++        lambda: cut_sample('with_padded_id3_header2.flac', 7840),
++        4096, 44100),
++    'flac1sMono.flac cut after the sync code of a frame': Case(
++        lambda: cut_sample('flac1sMono.flac', 6178),
++        8192, 44100),
++    'flac1sMono.flac cut one byte into a frame header': Case(
++        lambda: cut_sample('flac1sMono.flac', 21224),
++        36864, 44100),
++    'flac1.5sStereo.flac cut inside a frame header': Case(
++        lambda: cut_sample('flac1.5sStereo.flac', 29902),
++        32768, 44100),
++    'flac1.5sStereo.flac cut inside the last frame header': Case(
++        lambda: cut_sample('flac1.5sStereo.flac', 59133),
++        65536, 44100),
++    'variable-block.flac cut inside a frame header': Case(
++        lambda: cut_sample('variable-block.flac', 8298),
++        16384, 44100),
++    'variable blocks cut inside the last frame header': Case(
++        lambda: flac_stream(tones(3, 100), variable=True)[:-205],
++        200, 44100),
++}
++
++FLAC_TRAILING_TAGS: dict[str, Case] = {
++    'ID3v1 tag': Case(
++        lambda: flac_stream(tones(6)) + id3v1_tag(),
++        24576, 44100),
++    'no-tags.flac with an ID3v1 tag': Case(
++        lambda: read_sample('no-tags.flac') + id3v1_tag(),
++        162496, 44100),
++    'flac1sMono.flac with an ID3v1 tag': Case(
++        lambda: read_sample('flac1sMono.flac') + id3v1_tag(),
++        44100, 44100),
++}
++
++FLAC_ID3V2_TAGS: dict[str, Case] = {
++    'ID3v2 tag before the stream': Case(
++        lambda: id3v2_tag(60) + flac_stream(tones(4)),
++        16384, 44100),
++}
++
++NO_SAMPLES: dict[str, Case] = {
++    'flac_application.flac': Case(
++        lambda: read_sample('flac_application.flac'),
++        0, 44100),
++    'FLAC with its only frame cut short': Case(
++        lambda: flac_stream(tones(1))[:-3000],
++        0, 44100),
++    'vbr8.mp3 with an encoder delay longer than its frames': Case(
++        lambda: set_encoder_delay('vbr8.mp3', 4000, 3),
++        0, 8000),
++}
++
++OTHER_EXTENSIONS: dict[str, tuple[str, ...]] = {
++    'mpeg4_desc_cmt.m4a': ('.m4b', '.m4r', '.m4v', '.mp4', '.aax', '.aaxc'),
++    'aiff_extra_tags.aiff': ('.aif', '.aifc', '.afc'),
++    'grouping.wma': ('.wmv', '.asf'),
++    'test.ogg': ('.oga', '.ogv'),
++}
++
++IMAGE_SAMPLES = ('image-text-encoding.mp3', 'multiple_values_images.flac')
++
++PROCESS_LAUNCHERS = (
++    'subprocess.Popen', 'os.system', 'os.popen', 'os.posix_spawn',
++    'os.posix_spawnp', 'os.spawnv', 'os.spawnve', 'os.execv', 'os.execve',
++    'os.fork',
++)
++
++DEFAULT_DURATIONS: dict[str, float] = {
++    'vbr44.mp3': 9.09061224489796,
++    'cbr.mp3': 0.47020408163265304,
++    'vbri.mp3': 222.19755102040816,
++    'image-text-encoding.mp3': 1.0710204081632653,
++    'mpeg1_44_1khz.mp2': 0.10448979591836735,
++    'variable-block.flac': 261.68,
++    'flac_application.flac': 273.64,
++}
++
++OTHER_FORMATS = (
++    '16bit_pcm.wav', '16bit_pcm_to_als.mp4', '24bit_pcm.wav',
++    '24bit_pcm_extended.wav', '24bit_pcm_extended_to_als.mp4',
++    '24bit_pcm_to_als.mp4', '32bit_float.wav', '32bit_float_to_als.mp4',
++    '32bit_pcm.wav', '32bit_pcm_extended.wav', '32bit_pcm_extended_to_als.mp4',
++    '32bit_pcm_to_als.mp4', '8bit_pcm.wav', '8bit_pcm_lavf.wav',
++    '8bit_pcm_lavf_to_als.mp4', '8bit_pcm_to_als.mp4', '8khz_5s.opus',
++    'M1F1-mulawC-AFsp.afc', 'adpcm.wav', 'adpcm_no_byterate.wav',
++    'aiff_extra_tags.aiff', 'aiff_with_image.aiff', 'alac_file.m4a',
++    'alac_silence.m4a', 'bitrate_present.spx', 'classical.m4a',
++    'classical.ogg', 'composer.ogg', 'corrupt_metadata.ogg',
++    'data_after_eos.ogg', 'detect_aiff.x', 'detect_asf.x', 'detect_mp4_m4a.x',
++    'detect_ogg.x', 'detect_wav.x', 'empty.ogg', 'empty_custom_field.m4a',
++    'empty_file.aiff', 'empty_file.flac', 'empty_file.m4a', 'empty_file.mp3',
++    'empty_file.ogg', 'empty_file.wav', 'empty_file.wma', 'grouping.wma',
++    'gsm_6_10.wav', 'id3_header_with_a_zero_byte.wav',
++    'invalid_object_size.wma', 'invalid_sample_rate.aiff', 'lossless.wma',
++    'magic_bytes_only_aiff.x', 'magic_bytes_only_asf.x',
++    'magic_bytes_only_mp4.x', 'magic_bytes_only_ogg.x',
++    'magic_bytes_only_wav.x', 'mixed_case_atoms.m4a', 'mp3_audio.asf',
++    'mp3_audio.m4a', 'mp3_audio.wav', 'mp3_audio_dec_config_last.m4a',
++    'mp3_audio_no_btrt_atom.m4a', 'mp4_extended_size.m4a',
++    'mp4_extended_size_truncated.m4a', 'mp4_invalid_size_zero.m4a',
++    'mpeg4_desc_cmt.m4a', 'mpeg4_with_image.m4a', 'mpeg4_xa9des.m4a',
++    'multi_stream.ogv', 'multi_value.m4a', 'multipage-setup.ogg',
++    'multipagecomment.ogg', 'multiple_values_images.wma', 'mvhd_version_1.m4a',
++    'negative_bitrate.ogg', 'no_audio.aiff', 'no_audio.ogg',
++    'no_audio_data_compressed.wav', 'no_audio_data_uncompressed.wav',
++    'no_bitrate.spx', 'ogg_with_image.ogg', 'pluck-pcm8.aiff',
++    'riff_extra_zero.wav', 'riff_extra_zero_2.wav',
++    'silence-22khz-mono-1s.wav', 'silence.opus', 'silence.wma',
++    'test-riff-tags.wav', 'test-tagged.aiff', 'test-tagged.wav', 'test.aiff',
++    'test.m4a', 'test.ogg', 'test.opus', 'test.wav', 'test2.m4a', 'test2.wma',
++    'test3sMono.wav', 'test_flac.oga', 'wav_invalid_track_number.wav',
++    'wav_with_image.wav', 'wma_invalid_track_number.wma', 'xmp_data.aiff',
++    'xmp_data.m4a', 'xmp_data.wav', 'xmp_data.wma', 'xmp_empty.m4a',
++    'zero_value_properties.aiff', 'zero_value_properties.m4a',
++    'zero_value_properties.ogg', 'zero_value_properties.opus',
++    'zero_value_properties.spx', 'zero_value_properties.wav',
++    'zero_value_properties.wma', 'zero_value_properties_alac.m4a',
++)
++
++
++class TestExactDuration(TestCase):
++
++    def assert_samples(self,
++                       tag: TinyTag,
++                       samples: int,
++                       samplerate: int) -> None:
++        self.assertEqual(tag.samplerate, samplerate)
++        assert tag.duration is not None
++        self.assertAlmostEqual(tag.duration, samples / samplerate, places=9)
++
++    def check_samples(self, samples: dict[str, Expected]) -> None:
++        for name, (count, samplerate) in samples.items():
++            with self.subTest(sample=name):
++                tag = TinyTag.get(os.path.join(SAMPLE_FOLDER, name),
++                                  exact_duration=True)
++                self.assert_samples(tag, count, samplerate)
++
++    def check_cases(self, cases: dict[str, Case]) -> None:
++        for name, (build, count, samplerate) in cases.items():
++            with self.subTest(case=name):
++                tag = TinyTag.get(file_obj=BytesIO(build()),
++                                  exact_duration=True)
++                self.assert_samples(tag, count, samplerate)
++
++    def check_unchanged(self, names: list[str], keep_duration: bool) -> None:
++        for name in names:
++            with self.subTest(sample=name):
++                path = os.path.join(SAMPLE_FOLDER, name)
++                expected = TinyTag.get(path, image=True).as_dict()
++                result = TinyTag.get(
++                    path, image=True, exact_duration=True).as_dict()
++                if not keep_duration:
++                    expected.pop('duration', None)
++                    result.pop('duration', None)
++                self.assertEqual(result, expected)
++
++    def test_lame_mpeg1_samples(self) -> None:
++        self.check_samples(LAME_MPEG1_SAMPLES)
++
++    def test_lame_mpeg2_samples(self) -> None:
++        self.check_samples(LAME_MPEG2_SAMPLES)
++
++    def test_mpeg_samples_without_lame_header(self) -> None:
++        self.check_samples(PLAIN_MPEG_SAMPLES)
++
++    def test_layer_1_and_2_samples(self) -> None:
++        self.check_samples(LAYER_1_AND_2_SAMPLES)
++
++    def test_mpeg_samples_cut_inside_last_frame(self) -> None:
++        self.check_samples(CUT_MPEG_SAMPLES)
++
++    def test_lame_stream_missing_frames(self) -> None:
++        self.check_cases(MISSING_FRAMES)
++
++    def test_last_frame_cut_after_its_header(self) -> None:
++        self.check_cases(CUT_FRAMES)
++
++    def test_last_frame_cut_inside_its_header(self) -> None:
++        self.check_cases(CUT_HEADERS)
++
++    def test_encoder_of_gapless_header(self) -> None:
++        self.check_cases(ENCODERS)
++
++    def test_mpeg_trailing_tags(self) -> None:
++        self.check_cases(MPEG_TRAILING_TAGS)
++
++    def test_flac_samples(self) -> None:
++        self.check_samples(FLAC_SAMPLES)
++
++    def test_flac_sample_cut_inside_last_frame(self) -> None:
++        tag = TinyTag.get(os.path.join(SAMPLE_FOLDER, 'variable-block.flac'),
++                          exact_duration=True)
++        self.assert_samples(tag, 39936, 44100)
++
++    def test_flac_streams(self) -> None:
++        self.check_cases(FLAC_STREAMS)
++
++    def test_flac_streaminfo_sample_count_ignored(self) -> None:
++        self.check_cases(STREAMINFO_COUNTS)
++
++    def test_flac_block_sizes(self) -> None:
++        self.check_cases(BLOCK_SIZES)
++
++    def test_flac_sync_codes_inside_frames(self) -> None:
++        self.check_cases(SYNC_CODES)
++
++    def test_flac_cut_short(self) -> None:
++        self.check_cases(CUT_FLAC)
++
++    def test_flac_cut_inside_frame_header(self) -> None:
++        self.check_cases(FLAC_CUT_HEADERS)
++
++    def test_flac_trailing_tags(self) -> None:
++        self.check_cases(FLAC_TRAILING_TAGS)
++
++    def test_flac_after_id3v2_tag(self) -> None:
++        self.check_cases(FLAC_ID3V2_TAGS)
++
++    def test_no_decoded_samples(self) -> None:
++        for name, (build, _count, samplerate) in NO_SAMPLES.items():
++            with self.subTest(case=name):
++                tag = TinyTag.get(file_obj=BytesIO(build()),
++                                  exact_duration=True)
++                self.assertIsNone(tag.duration)
++                self.assertEqual(tag.samplerate, samplerate)
++
++    def test_mpeg_attributes_other_than_duration_unchanged(self) -> None:
++        self.check_unchanged(
++            [*LAME_MPEG1_SAMPLES, *LAME_MPEG2_SAMPLES, *PLAIN_MPEG_SAMPLES,
++             *LAYER_1_AND_2_SAMPLES, *CUT_MPEG_SAMPLES], False)
++
++    def test_flac_attributes_other_than_duration_unchanged(self) -> None:
++        self.check_unchanged(
++            [*FLAC_SAMPLES, 'variable-block.flac', 'flac_application.flac'],
++            False)
++
++    def test_images_unchanged(self) -> None:
++        for name in IMAGE_SAMPLES:
++            with self.subTest(sample=name):
++                path = os.path.join(SAMPLE_FOLDER, name)
++                expected = image_fields(TinyTag.get(path, image=True))
++                result = image_fields(
++                    TinyTag.get(path, image=True, exact_duration=True))
++                self.assertTrue(expected)
++                self.assertEqual(result, expected)
++
++    def test_other_formats_unchanged(self) -> None:
++        self.check_unchanged(list(OTHER_FORMATS), True)
++
++    def test_other_extensions_unchanged(self) -> None:
++        for name, extensions in OTHER_EXTENSIONS.items():
++            data = read_sample(name)
++            for extension in extensions:
++                with self.subTest(sample=name, extension=extension):
++                    filename = 'audio' + extension
++                    expected = TinyTag.get(
++                        filename, file_obj=BytesIO(data), image=True)
++                    result = TinyTag.get(
++                        filename, file_obj=BytesIO(data), image=True,
++                        exact_duration=True)
++                    self.assertEqual(result.as_dict(), expected.as_dict())
++
++    def test_edited_stream_attributes_unchanged(self) -> None:
++        cases = {**MISSING_FRAMES, **CUT_FRAMES, **CUT_HEADERS, **ENCODERS,
++                 **MPEG_TRAILING_TAGS, **FLAC_STREAMS, **STREAMINFO_COUNTS,
++                 **BLOCK_SIZES, **SYNC_CODES, **CUT_FLAC, **FLAC_CUT_HEADERS,
++                 **FLAC_TRAILING_TAGS, **FLAC_ID3V2_TAGS, **NO_SAMPLES}
++        for name, (build, _count, _samplerate) in cases.items():
++            with self.subTest(case=name):
++                data = build()
++                expected = TinyTag.get(file_obj=BytesIO(data)).as_dict()
++                result = TinyTag.get(file_obj=BytesIO(data),
++                                     exact_duration=True).as_dict()
++                expected.pop('duration', None)
++                result.pop('duration', None)
++                self.assertEqual(result, expected)
++
++    def test_disabled_by_default(self) -> None:
++        names = [*LAME_MPEG1_SAMPLES, *PLAIN_MPEG_SAMPLES, *FLAC_SAMPLES]
++        for name in names:
++            with self.subTest(sample=name):
++                path = os.path.join(SAMPLE_FOLDER, name)
++                self.assertEqual(
++                    TinyTag.get(path, exact_duration=False).as_dict(),
++                    TinyTag.get(path).as_dict())
++
++    def test_default_keeps_estimates(self) -> None:
++        for name, duration in DEFAULT_DURATIONS.items():
++            with self.subTest(sample=name):
++                path = os.path.join(SAMPLE_FOLDER, name)
++                for tag in (TinyTag.get(path),
++                            TinyTag.get(path, exact_duration=False)):
++                    assert tag.duration is not None
++                    self.assertAlmostEqual(tag.duration, duration, places=9)
++
++    def test_duration_disabled(self) -> None:
++        names = ('vbr44.mp3', 'mpeg1_44_1khz.mp2', 'flac1sMono.flac',
++                 'variable-block.flac', 'with_padded_id3_header.flac')
++        for name in names:
++            with self.subTest(sample=name):
++                path = os.path.join(SAMPLE_FOLDER, name)
++                tag = TinyTag.get(path, duration=False, exact_duration=True)
++                self.assertIsNone(tag.duration)
++                self.assertEqual(tag.as_dict(),
++                                 TinyTag.get(path, duration=False).as_dict())
++
++    def test_without_tags(self) -> None:
++        samples = {**LAME_MPEG1_SAMPLES, **LAYER_1_AND_2_SAMPLES,
++                   **FLAC_SAMPLES}
++        names = ('vbr44.mp3', 'mpeg1_44_1khz.mp2', 'flac1sMono.flac',
++                 'with_padded_id3_header.flac')
++        for name in names:
++            with self.subTest(sample=name):
++                path = os.path.join(SAMPLE_FOLDER, name)
++                tag = TinyTag.get(path, tags=False, exact_duration=True)
++                self.assert_samples(tag, *samples[name])
++                expected = TinyTag.get(path, tags=False).as_dict()
++                result = tag.as_dict()
++                expected.pop('duration', None)
++                result.pop('duration', None)
++                self.assertEqual(result, expected)
++
++    def test_path_and_file_object_agree(self) -> None:
++        for name in ('vbr44.mp3', 'mpeg1_id3v2.mp2', 'variable-block.flac'):
++            with self.subTest(sample=name):
++                path = os.path.join(SAMPLE_FOLDER, name)
++                with open(path, 'rb') as file:
++                    from_file = TinyTag.get(file_obj=file,
++                                            exact_duration=True)
++                from_path = TinyTag.get(path, exact_duration=True)
++                self.assertEqual(from_file.duration, from_path.duration)
++
++    def test_without_magic_byte_detection(self) -> None:
++        for name in ('vbr16.mp3', 'flac1.5sStereo.flac'):
++            with self.subTest(sample=name):
++                expected = {**LAME_MPEG1_SAMPLES, **LAME_MPEG2_SAMPLES,
++                            **FLAC_SAMPLES}[name]
++                tag = TinyTag.get(os.path.join(SAMPLE_FOLDER, name),
++                                  check_magic_bytes=False,
++                                  exact_duration=True)
++                self.assert_samples(tag, *expected)
++
++    def test_no_external_program(self) -> None:
++        with ExitStack() as stack:
++            for launcher in PROCESS_LAUNCHERS:
++                stack.enter_context(mock.patch(
++                    launcher, side_effect=AssertionError, create=True))
++            stack.enter_context(mock.patch.dict(os.environ, {'PATH': ''}))
++            mpeg = TinyTag.get(os.path.join(SAMPLE_FOLDER, 'vbr44.mp3'),
++                               exact_duration=True)
++            flac = TinyTag.get(file_obj=BytesIO(flac_stream(tones(3))),
++                               exact_duration=True)
++        self.assert_samples(mpeg, 398664, 44100)
++        self.assert_samples(flac, 12288, 44100)

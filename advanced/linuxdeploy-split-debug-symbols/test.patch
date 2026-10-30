@@ -1,0 +1,2315 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..4724a3b
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,228 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++    echo "usage: $0 [--output_path <path>] base|new" >&2
++    exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++
++while [ $# -gt 0 ]; do
++    case "$1" in
++        base|new)
++            MODE="$1"
++            MODE_COUNT=$((MODE_COUNT + 1))
++            shift
++            ;;
++        --output_path)
++            shift
++            if [ $# -lt 1 ] || [ -z "$1" ]; then
++                echo "missing value for --output_path" >&2
++                usage
++            fi
++            OUTPUT_PATH="$1"
++            shift
++            ;;
++        --output_path=*)
++            OUTPUT_PATH="${1#--output_path=}"
++            if [ -z "$OUTPUT_PATH" ]; then
++                echo "missing value for --output_path" >&2
++                usage
++            fi
++            shift
++            ;;
++        *)
++            echo "unknown argument: $1" >&2
++            usage
++            ;;
++    esac
++done
++
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++case "$OUTPUT_PATH" in
++    ""|/*) ;;
++    *) OUTPUT_PATH="$(pwd)/$OUTPUT_PATH" ;;
++esac
++
++REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/linuxdeploy-tests.XXXXXX" 2>/dev/null || mktemp -d /tmp/linuxdeploy-tests.XXXXXX)" || exit 1
++trap 'rm -rf "$WORK_DIR"' EXIT
++
++if [ -z "$OUTPUT_PATH" ]; then
++    OUTPUT_PATH="$WORK_DIR/results.xml"
++else
++    mkdir -p "$(dirname "$OUTPUT_PATH")"
++fi
++
++mkdir -p "$WORK_DIR/tmp"
++export TMPDIR="$WORK_DIR/tmp"
++export LC_ALL=C
++export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
++unset LD_LIBRARY_PATH LD_PRELOAD
++
++JOBS="$(nproc 2>/dev/null || echo 2)"
++[ "$JOBS" -gt 8 ] && JOBS=8
++
++CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DUSE_CCACHE=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
++
++if [ "$MODE" = base ]; then
++    SOURCE_DIR="$REPO_DIR"
++    CMAKE_ARGS+=(-DBUILD_TESTING=ON)
++    TARGETS=(test_appdir test_linuxdeploy test_elf_file)
++    SOURCES=(tests/core/test_appdir.cpp tests/core/test_linuxdeploy.cpp tests/core/test_elf_file.cpp)
++else
++    SOURCE_DIR="$REPO_DIR/tests/debug_symbols_93009f"
++    TARGETS=(test_debug_symbols_93009f)
++    SOURCES=(tests/debug_symbols_93009f/test_debug_symbols_93009f.cpp)
++fi
++
++SOURCE_PATHS=()
++for source in "${SOURCES[@]}"; do
++    SOURCE_PATHS+=("$REPO_DIR/$source")
++done
++
++cat > "$WORK_DIR/junit.py" <<'PYEOF'
++import os
++import re
++import sys
++import xml.etree.ElementTree as ET
++
++
++def tests_in(source):
++    try:
++        with open(source, errors="replace") as f:
++            text = f.read()
++    except OSError:
++        return []
++    return re.findall(r"^\s*TEST(?:_F)?\(\s*(\w+)\s*,\s*(\w+)\s*\)", text, re.M)
++
++
++def tail(path, lines=120):
++    try:
++        with open(path, errors="replace") as f:
++            return "".join(f.readlines()[-lines:])
++    except OSError:
++        return ""
++
++
++def failing_cases(tests, message, detail):
++    suites = {}
++    for suite_name, test_name in tests:
++        suite = suites.get(suite_name)
++        if suite is None:
++            suite = suites[suite_name] = ET.Element("testsuite", {"name": suite_name})
++        case = ET.SubElement(suite, "testcase", {"name": test_name, "classname": suite_name, "status": "run", "time": "0"})
++        failure = ET.SubElement(case, "failure", {"message": message})
++        failure.text = detail
++    return list(suites.values())
++
++
++def write(path, suites):
++    root = ET.Element("testsuites", {"name": "AllTests"})
++    total = failed = 0
++    for suite in suites:
++        cases = suite.findall("testcase")
++        failures = sum(1 for case in cases if case.find("failure") is not None or case.find("error") is not None)
++        suite.set("tests", str(len(cases)))
++        suite.set("failures", str(failures))
++        suite.set("errors", "0")
++        total += len(cases)
++        failed += failures
++        root.append(suite)
++    root.set("tests", str(total))
++    root.set("failures", str(failed))
++    root.set("errors", "0")
++    ET.ElementTree(root).write(path, encoding="UTF-8", xml_declaration=True)
++
++
++def main():
++    output, action = sys.argv[1], sys.argv[2]
++
++    if action == "build-failed":
++        log, sources = sys.argv[3], sys.argv[4:]
++        tests = [test for source in sources for test in tests_in(source)]
++        write(output, failing_cases(tests, "the tests did not build", "The test binaries did not build.\n\n" + tail(log)))
++        return 1
++
++    suites = []
++    synthesized = False
++    entries = sys.argv[3:]
++    for i in range(0, len(entries), 4):
++        report, log, status, source = entries[i:i + 4]
++        expected = tests_in(source)
++        try:
++            found = ET.parse(report).getroot().iter("testsuite")
++            found = [suite for suite in found if suite.findall("testcase")]
++        except Exception:
++            found = None
++
++        if found is None:
++            detail = "The test binary exited with status %s without writing a report.\n\n%s" % (status, tail(log))
++            suites.extend(failing_cases(expected, "the test binary did not report", detail))
++            synthesized = True
++            continue
++
++        reported = {(case.get("classname"), case.get("name")) for suite in found for case in suite.findall("testcase")}
++        suites.extend(found)
++        missing = [test for test in expected if test not in reported]
++        if missing:
++            detail = "The test binary exited with status %s before reporting this test.\n\n%s" % (status, tail(log))
++            suites.extend(failing_cases(missing, "the test did not report", detail))
++            synthesized = True
++            continue
++
++        failed = any(case.find("failure") is not None or case.find("error") is not None
++                     for suite in found for case in suite.findall("testcase"))
++        if status != "0" and not failed:
++            binary = os.path.splitext(os.path.basename(report))[0]
++            detail = "The test binary exited with status %s after reporting every test as passed.\n\n%s" % (status, tail(log))
++            suites.extend(failing_cases([(binary, "exitStatus")], "the test binary exited with status " + status, detail))
++            synthesized = True
++
++    write(output, suites)
++    return 1 if synthesized else 0
++
++
++sys.exit(main())
++PYEOF
++
++echo "configuring and building ${TARGETS[*]}"
++cmake -S "$SOURCE_DIR" -B "$WORK_DIR/build" "${CMAKE_ARGS[@]}" > "$WORK_DIR/build.log" 2>&1 &&
++    cmake --build "$WORK_DIR/build" -j"$JOBS" --target "${TARGETS[@]}" >> "$WORK_DIR/build.log" 2>&1
++BUILD_STATUS=$?
++
++if [ "$BUILD_STATUS" -ne 0 ]; then
++    tail -n 80 "$WORK_DIR/build.log"
++    python3 "$WORK_DIR/junit.py" "$OUTPUT_PATH" build-failed "$WORK_DIR/build.log" "${SOURCE_PATHS[@]}"
++    exit 1
++fi
++
++STATUS=0
++MERGE_ARGS=()
++
++for i in "${!TARGETS[@]}"; do
++    target="${TARGETS[$i]}"
++    binary="$(find "$WORK_DIR/build" -type f -name "$target" -perm -u+x | head -n 1)"
++    report="$WORK_DIR/$target.xml"
++    log="$WORK_DIR/$target.log"
++    status=127
++
++    if [ -n "$binary" ]; then
++        (cd "$(dirname "$binary")" && timeout -k 10 1800 "$binary" --gtest_output="xml:$report") 2>&1 | tee "$log"
++        status=${PIPESTATUS[0]}
++    else
++        echo "$target was not built" | tee "$log"
++    fi
++
++    [ "$status" -ne 0 ] && STATUS=1
++    MERGE_ARGS+=("$report" "$log" "$status" "${SOURCE_PATHS[$i]}")
++done
++
++python3 "$WORK_DIR/junit.py" "$OUTPUT_PATH" merge "${MERGE_ARGS[@]}" || STATUS=1
++
++exit "$STATUS"
+diff --git a/tests/debug_symbols_93009f/CMakeLists.txt b/tests/debug_symbols_93009f/CMakeLists.txt
+new file mode 100644
+index 0000000..b3fd693
+--- /dev/null
++++ b/tests/debug_symbols_93009f/CMakeLists.txt
+@@ -0,0 +1,51 @@
++cmake_minimum_required(VERSION 3.13)
++
++project(linuxdeploy_debug_symbols_test C CXX)
++
++set(CMAKE_CXX_STANDARD 17)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++
++set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
++set(USE_CCACHE OFF CACHE BOOL "" FORCE)
++add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../.. linuxdeploy)
++
++find_package(GTest REQUIRED)
++
++# the tests build their fixtures with gcc, binutils and dwz and compare what GDB finds for each original and deployed
++# file; two of them also read the C library's debug symbols under /usr/lib/debug, which libc6-dbg installs on Debian
++foreach(tool gcc objcopy strip readelf dwz gdb)
++    find_program(DEBUG_SYMBOLS_TEST_${tool} ${tool})
++
++    if(NOT DEBUG_SYMBOLS_TEST_${tool})
++        message(FATAL_ERROR "The debug symbols tests need ${tool}")
++    endif()
++endforeach()
++
++# the description asks for what GDB 13 finds, so the GDB the tests compare with has to be that version
++execute_process(COMMAND ${DEBUG_SYMBOLS_TEST_gdb} --version OUTPUT_VARIABLE GDB_VERSION_TEXT)
++
++if(NOT GDB_VERSION_TEXT MATCHES "^GNU gdb [^\n]* 13\\.[0-9]")
++    message(FATAL_ERROR "The debug symbols tests need GDB 13, ${DEBUG_SYMBOLS_TEST_gdb} is another version")
++endif()
++
++execute_process(COMMAND ${DEBUG_SYMBOLS_TEST_gcc} -print-file-name=libm.so.6 OUTPUT_VARIABLE LIBM_PATH OUTPUT_STRIP_TRAILING_WHITESPACE)
++get_filename_component(LIBM_PATH "${LIBM_PATH}" REALPATH)
++execute_process(COMMAND ${DEBUG_SYMBOLS_TEST_readelf} -n "${LIBM_PATH}" OUTPUT_VARIABLE LIBM_NOTES)
++string(REGEX MATCH "Build ID: ([0-9a-f]+)" LIBM_BUILD_ID_NOTE "${LIBM_NOTES}")
++set(LIBM_BUILD_ID "${CMAKE_MATCH_1}")
++
++if(LIBM_BUILD_ID STREQUAL "")
++    message(FATAL_ERROR "The debug symbols tests could not read the build ID of ${LIBM_PATH}")
++endif()
++
++string(SUBSTRING "${LIBM_BUILD_ID}" 0 2 LIBM_BUILD_ID_HEAD)
++string(SUBSTRING "${LIBM_BUILD_ID}" 2 -1 LIBM_BUILD_ID_REST)
++
++if(NOT EXISTS "/usr/lib/debug/.build-id/${LIBM_BUILD_ID_HEAD}/${LIBM_BUILD_ID_REST}.debug")
++    message(FATAL_ERROR "The debug symbols tests need the debug symbols of ${LIBM_PATH} under /usr/lib/debug (libc6-dbg)")
++endif()
++
++add_executable(test_debug_symbols_93009f test_debug_symbols_93009f.cpp)
++target_link_libraries(test_debug_symbols_93009f PRIVATE GTest::gtest GTest::gtest_main)
++target_compile_definitions(test_debug_symbols_93009f PRIVATE LINUXDEPLOY_PATH="$<TARGET_FILE:linuxdeploy>")
++add_dependencies(test_debug_symbols_93009f linuxdeploy)
+diff --git a/tests/debug_symbols_93009f/test_debug_symbols_93009f.cpp b/tests/debug_symbols_93009f/test_debug_symbols_93009f.cpp
+new file mode 100644
+index 0000000..97132df
+--- /dev/null
++++ b/tests/debug_symbols_93009f/test_debug_symbols_93009f.cpp
+@@ -0,0 +1,2018 @@
++#include <algorithm>
++#include <array>
++#include <cctype>
++#include <cerrno>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <elf.h>
++#include <filesystem>
++#include <fstream>
++#include <iomanip>
++#include <map>
++#include <optional>
++#include <poll.h>
++#include <set>
++#include <signal.h>
++#include <sstream>
++#include <string>
++#include <sys/wait.h>
++#include <unistd.h>
++#include <vector>
++
++#include "gtest/gtest.h"
++
++namespace fs = std::filesystem;
++
++namespace {
++    using Environment = std::map<std::string, std::string>;
++
++    struct ProcessResult {
++        int status = -1;
++        bool timedOut = false;
++        std::string out;
++        std::string err;
++
++        bool succeeded() const {
++            return !timedOut && WIFEXITED(status) && WEXITSTATUS(status) == 0;
++        }
++
++        std::string describe() const {
++            std::ostringstream oss;
++            oss << "status " << status << (timedOut ? " (timed out)" : "") << "\nstdout:\n" << out << "\nstderr:\n" << err;
++            return oss.str();
++        }
++    };
++
++    ProcessResult runProcess(const std::vector<std::string>& args, const Environment& changes = {},
++                             const std::vector<std::string>& unset = {}, const fs::path& cwd = {}, int timeoutSeconds = 300) {
++        ProcessResult result;
++
++        int outPipe[2];
++        int errPipe[2];
++
++        if (pipe(outPipe) != 0 || pipe(errPipe) != 0) {
++            result.err = std::string("pipe failed: ") + strerror(errno);
++            return result;
++        }
++
++        const auto pid = fork();
++
++        if (pid < 0) {
++            result.err = std::string("fork failed: ") + strerror(errno);
++            return result;
++        }
++
++        if (pid == 0) {
++            setpgid(0, 0);
++
++            dup2(outPipe[1], STDOUT_FILENO);
++            dup2(errPipe[1], STDERR_FILENO);
++            close(outPipe[0]);
++            close(outPipe[1]);
++            close(errPipe[0]);
++            close(errPipe[1]);
++
++            for (const auto& name : unset)
++                unsetenv(name.c_str());
++
++            for (const auto& change : changes)
++                setenv(change.first.c_str(), change.second.c_str(), 1);
++
++            if (!cwd.empty() && chdir(cwd.c_str()) != 0)
++                _exit(126);
++
++            std::vector<char*> argv;
++            for (const auto& arg : args)
++                argv.push_back(const_cast<char*>(arg.c_str()));
++            argv.push_back(nullptr);
++
++            execvp(argv[0], argv.data());
++            _exit(127);
++        }
++
++        close(outPipe[1]);
++        close(errPipe[1]);
++
++        std::array<pollfd, 2> fds{{{outPipe[0], POLLIN, 0}, {errPipe[0], POLLIN, 0}}};
++        std::array<std::string*, 2> buffers{&result.out, &result.err};
++        int open = 2;
++
++        const auto deadline = time(nullptr) + timeoutSeconds;
++
++        while (open > 0) {
++            const auto remaining = deadline - time(nullptr);
++
++            if (remaining <= 0) {
++                result.timedOut = true;
++                kill(-pid, SIGKILL);
++                break;
++            }
++
++            if (poll(fds.data(), fds.size(), static_cast<int>(std::min<time_t>(remaining, 1)) * 1000) < 0) {
++                if (errno == EINTR)
++                    continue;
++                break;
++            }
++
++            for (size_t i = 0; i < fds.size(); ++i) {
++                if (fds[i].fd < 0 || (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) == 0)
++                    continue;
++
++                char buffer[8192];
++                const auto count = read(fds[i].fd, buffer, sizeof(buffer));
++
++                if (count > 0) {
++                    buffers[i]->append(buffer, static_cast<size_t>(count));
++                } else if (count == 0 || errno != EINTR) {
++                    close(fds[i].fd);
++                    fds[i].fd = -1;
++                    --open;
++                }
++            }
++        }
++
++        for (auto& fd : fds) {
++            if (fd.fd >= 0)
++                close(fd.fd);
++        }
++
++        waitpid(pid, &result.status, 0);
++        return result;
++    }
++
++    fs::path makeTemporaryDirectory() {
++        const auto* tmpdir = getenv("TMPDIR");
++        std::string pattern = std::string(tmpdir != nullptr && *tmpdir != '\0' ? tmpdir : "/tmp") + "/debug-symbols-XXXXXX";
++
++        std::vector<char> buffer(pattern.begin(), pattern.end());
++        buffer.push_back('\0');
++
++        if (mkdtemp(buffer.data()) == nullptr)
++            throw std::runtime_error("mkdtemp failed");
++
++        return fs::canonical(buffer.data());
++    }
++
++    void writeFile(const fs::path& path, const std::string& contents) {
++        fs::create_directories(path.parent_path());
++        std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
++        ofs << contents;
++    }
++
++    std::string readFile(const fs::path& path) {
++        std::ifstream ifs(path, std::ios::binary);
++        return std::string((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
++    }
++
++    bool startsWith(const std::string& value, const std::string& prefix) {
++        return value.compare(0, prefix.size(), prefix) == 0;
++    }
++
++    struct Section {
++        uint32_t type = 0;
++        std::string contents;
++    };
++
++    std::map<std::string, Section> readSections(const fs::path& path) {
++        std::map<std::string, Section> sections;
++
++        const auto data = readFile(path);
++
++        if (data.size() < sizeof(Elf64_Ehdr) || data.compare(0, SELFMAG, ELFMAG) != 0 || data[EI_CLASS] != ELFCLASS64)
++            return sections;
++
++        Elf64_Ehdr ehdr{};
++        std::memcpy(&ehdr, data.data(), sizeof(ehdr));
++
++        if (ehdr.e_shoff == 0 || ehdr.e_shoff + uint64_t(ehdr.e_shnum) * sizeof(Elf64_Shdr) > data.size())
++            return sections;
++
++        std::vector<Elf64_Shdr> headers(ehdr.e_shnum);
++        std::memcpy(headers.data(), data.data() + ehdr.e_shoff, headers.size() * sizeof(Elf64_Shdr));
++
++        if (ehdr.e_shstrndx >= headers.size())
++            return sections;
++
++        const auto& names = headers[ehdr.e_shstrndx];
++
++        for (const auto& header : headers) {
++            if (names.sh_offset + header.sh_name >= data.size())
++                continue;
++
++            Section section;
++            section.type = header.sh_type;
++
++            if (header.sh_type != SHT_NOBITS && header.sh_offset + header.sh_size <= data.size())
++                section.contents = data.substr(header.sh_offset, header.sh_size);
++
++            sections[std::string(data.c_str() + names.sh_offset + header.sh_name)] = section;
++        }
++
++        return sections;
++    }
++
++    bool hasSectionWithContents(const fs::path& path, const std::string& name) {
++        const auto sections = readSections(path);
++        const auto it = sections.find(name);
++        return it != sections.end() && !it->second.contents.empty();
++    }
++
++    std::string toHex(const std::string& bytes) {
++        std::ostringstream oss;
++        for (const auto byte : bytes)
++            oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned int>(static_cast<uint8_t>(byte));
++        return oss.str();
++    }
++
++    std::string buildIdOf(const fs::path& path) {
++        const auto sections = readSections(path);
++        const auto it = sections.find(".note.gnu.build-id");
++
++        if (it == sections.end() || it->second.contents.size() < sizeof(Elf64_Nhdr))
++            return {};
++
++        Elf64_Nhdr header{};
++        std::memcpy(&header, it->second.contents.data(), sizeof(header));
++
++        const auto descOffset = sizeof(header) + ((header.n_namesz + 3) / 4 * 4);
++
++        if (descOffset + header.n_descsz > it->second.contents.size())
++            return {};
++
++        return toHex(it->second.contents.substr(descOffset, header.n_descsz));
++    }
++
++    std::set<std::string> symbolNamesOf(const fs::path& path) {
++        std::set<std::string> names;
++
++        const auto sections = readSections(path);
++        const auto symbols = sections.find(".symtab");
++        const auto strings = sections.find(".strtab");
++
++        if (symbols == sections.end() || strings == sections.end())
++            return names;
++
++        const auto& table = symbols->second.contents;
++        const auto& text = strings->second.contents;
++
++        for (size_t offset = 0; offset + sizeof(Elf64_Sym) <= table.size(); offset += sizeof(Elf64_Sym)) {
++            Elf64_Sym symbol{};
++            std::memcpy(&symbol, table.data() + offset, sizeof(symbol));
++
++            if (symbol.st_name != 0 && symbol.st_name < text.size())
++                names.insert(std::string(text.c_str() + symbol.st_name));
++        }
++
++        return names;
++    }
++
++    struct DebugLink {
++        bool present = false;
++        std::string name;
++        uint32_t crc = 0;
++    };
++
++    DebugLink debugLinkOf(const fs::path& path) {
++        DebugLink link;
++
++        const auto sections = readSections(path);
++        const auto it = sections.find(".gnu_debuglink");
++
++        if (it == sections.end())
++            return link;
++
++        const auto& data = it->second.contents;
++        const auto nameLength = data.find('\0');
++
++        if (nameLength == std::string::npos)
++            return link;
++
++        const auto crcOffset = (nameLength + 4) / 4 * 4;
++
++        if (crcOffset + 4 > data.size())
++            return link;
++
++        link.present = true;
++        link.name = data.substr(0, nameLength);
++        std::memcpy(&link.crc, data.data() + crcOffset, 4);
++        return link;
++    }
++
++    struct AltLink {
++        bool present = false;
++        std::string name;
++        std::string buildId;
++    };
++
++    AltLink altLinkOf(const fs::path& path) {
++        AltLink link;
++
++        const auto sections = readSections(path);
++        const auto it = sections.find(".gnu_debugaltlink");
++
++        if (it == sections.end())
++            return link;
++
++        const auto& data = it->second.contents;
++        const auto nameLength = data.find('\0');
++
++        if (nameLength == std::string::npos)
++            return link;
++
++        link.present = true;
++        link.name = data.substr(0, nameLength);
++        link.buildId = toHex(data.substr(nameLength + 1));
++        return link;
++    }
++
++    uint32_t crc32Of(const fs::path& path) {
++        static const auto table = []() {
++            std::array<uint32_t, 256> values{};
++
++            for (uint32_t i = 0; i < values.size(); ++i) {
++                auto value = i;
++                for (int bit = 0; bit < 8; ++bit)
++                    value = (value & 1) ? 0xedb88320u ^ (value >> 1) : value >> 1;
++                values[i] = value;
++            }
++
++            return values;
++        }();
++
++        uint32_t crc = 0xffffffffu;
++
++        for (const auto byte : readFile(path))
++            crc = table[(crc ^ static_cast<uint8_t>(byte)) & 0xffu] ^ (crc >> 8);
++
++        return crc ^ 0xffffffffu;
++    }
++
++    fs::path buildIdLinkIn(const fs::path& directory, const std::string& buildIdHex) {
++        return directory / ".build-id" / buildIdHex.substr(0, 2) / (buildIdHex.substr(2) + ".debug");
++    }
++
++    std::vector<fs::path> regularFilesIn(const fs::path& directory) {
++        std::vector<fs::path> files;
++
++        if (!fs::is_directory(directory))
++            return files;
++
++        for (const auto& entry : fs::recursive_directory_iterator(directory)) {
++            if (entry.is_regular_file() && !entry.is_symlink())
++                files.push_back(entry.path().lexically_relative(directory));
++        }
++
++        std::sort(files.begin(), files.end());
++        return files;
++    }
++
++    std::vector<fs::path> entriesIn(const fs::path& directory) {
++        std::vector<fs::path> entries;
++
++        if (!fs::is_directory(directory))
++            return entries;
++
++        for (const auto& entry : fs::recursive_directory_iterator(directory))
++            entries.push_back(entry.path().lexically_relative(directory));
++
++        std::sort(entries.begin(), entries.end());
++        return entries;
++    }
++
++    struct Probe {
++        fs::path original;
++        fs::path inAppDir;
++        std::vector<std::string> commands;
++        std::vector<std::string> expected;
++    };
++
++    std::vector<std::string> librarySymbols(const std::string& name) {
++        return {
++            "info line " + name + "_func",
++            "info address " + name + "_helper",
++            "ptype struct " + name + "_point",
++            "info scope " + name + "_func",
++            "ptype " + name + "_helper",
++            "info functions -n ^" + name + "_",
++            "info types ^" + name + "_",
++        };
++    }
++
++    std::vector<std::string> dwzLibrarySymbols(const std::string& name) {
++        return {
++            "info line " + name + "_func",
++            "info address " + name + "_helper",
++            "ptype struct " + name + "_local",
++            "ptype struct shared_point",
++            "info scope " + name + "_func",
++            "info functions -n ^" + name + "_",
++            "info types ^" + name + "_",
++        };
++    }
++
++    std::vector<std::string> executableSymbols(const std::string& name) {
++        return {
++            "info line main",
++            "info address " + name + "_helper",
++            "info scope main",
++            "ptype " + name + "_helper",
++            "info functions -n ^" + name + "_",
++        };
++    }
++
++    class DebugSymbolsTest : public ::testing::Test {
++    protected:
++        fs::path root;
++        fs::path fixtures;
++        fs::path globalDebugDir;
++        fs::path appDir;
++        fs::path tree;
++        fs::path linuxdeployBinary = LINUXDEPLOY_PATH;
++        std::string triplet;
++
++        void SetUp() override {
++            root = makeTemporaryDirectory();
++            fixtures = root / "fx";
++            globalDebugDir = fixtures / "global";
++            appDir = root / "AppDir";
++            tree = root / "debug-tree";
++
++            fs::create_directories(fixtures / "src");
++            fs::create_directories(fixtures / "lib");
++            fs::create_directories(fixtures / "bin");
++            fs::create_directories(globalDebugDir);
++
++            const auto machine = run({"gcc", "-dumpmachine"});
++            triplet = machine.out.substr(0, machine.out.find('\n'));
++        }
++
++        void TearDown() override {
++            std::error_code ec;
++            fs::remove_all(root, ec);
++        }
++
++        ProcessResult run(const std::vector<std::string>& args, const fs::path& cwd = {}) {
++            return runProcess(args, {}, {}, cwd.empty() ? fixtures : cwd);
++        }
++
++        void mustRun(const std::vector<std::string>& args, const fs::path& cwd = {}) {
++            const auto result = run(args, cwd);
++            ASSERT_TRUE(result.succeeded()) << args[0] << " failed: " << result.describe();
++        }
++
++        static std::string librarySource(const std::string& name, int padding = 0) {
++            std::ostringstream oss;
++            for (int i = 0; i < padding; ++i)
++                oss << "\n";
++            oss << "struct " << name << "_point { int x; int y; };\n"
++                << "static int " << name << "_helper(int v) { return v * 3; }\n"
++                << "int " << name << "_func(int v) {\n"
++                << "    struct " << name << "_point p = { v, v + 1 };\n"
++                << "    return " << name << "_helper(p.x) + p.y;\n"
++                << "}\n";
++            return oss.str();
++        }
++
++        static std::string dwzLibrarySource(const std::string& name, const std::string& header = "shared.h") {
++            std::ostringstream oss;
++            oss << "#include \"" << header << "\"\n"
++                << "struct " << name << "_local { struct shared_point p; char name[8]; };\n"
++                << "static int " << name << "_helper(struct shared_point* p) { return p->x + p->y; }\n"
++                << "int " << name << "_func(int v) {\n"
++                << "    struct " << name << "_local l = { { v, v + 1, 7 }, \"x\" };\n"
++                << "    return " << name << "_helper(&l.p);\n"
++                << "}\n";
++            return oss.str();
++        }
++
++        static std::string executableSource(const std::string& name, const std::vector<std::string>& libraries, int padding = 0) {
++            std::ostringstream oss;
++            for (int i = 0; i < padding; ++i)
++                oss << "\n";
++            oss << "#include <stdio.h>\n";
++            for (const auto& library : libraries)
++                oss << "int " << library << "_func(int);\n";
++            oss << "static int " << name << "_helper(int v) { return v - 1; }\n"
++                << "int main(void) {\n"
++                << "    int total = 0;\n";
++            for (const auto& library : libraries)
++                oss << "    total += " << library << "_func(" << library.size() << ");\n";
++            oss << "    printf(\"%d\\n\", " << name << "_helper(total));\n"
++                << "    return 0;\n"
++                << "}\n";
++            return oss.str();
++        }
++
++        fs::path buildLibrary(const std::string& name, const fs::path& directory, const std::vector<std::string>& flags = {"-g"},
++                              int padding = 0, const std::string& source = "") {
++            const auto sourcePath = fixtures / "src" / (name + std::to_string(padding) + ".c");
++            writeFile(sourcePath, source.empty() ? librarySource(name, padding) : source);
++
++            fs::create_directories(directory);
++            const auto output = directory / ("lib" + name + ".so.1");
++
++            std::vector<std::string> args{"gcc", "-O0", "-fPIC", "-shared", "-Wl,-soname,lib" + name + ".so.1"};
++            args.insert(args.end(), flags.begin(), flags.end());
++            args.insert(args.end(), {"-o", output.string(), fs::relative(sourcePath, fixtures).string()});
++
++            const auto result = run(args);
++            EXPECT_TRUE(result.succeeded()) << result.describe();
++            return output;
++        }
++
++        fs::path buildExecutable(const std::string& name, const std::vector<std::pair<std::string, fs::path>>& libraries,
++                                 const std::vector<std::string>& flags = {"-g"}, const std::string& rpath = "", int padding = 0) {
++            std::vector<std::string> names;
++            for (const auto& library : libraries)
++                names.push_back(library.first);
++
++            const auto sourcePath = fixtures / "src" / (name + (padding == 0 ? "" : std::to_string(padding)) + ".c");
++            writeFile(sourcePath, executableSource(name, names, padding));
++
++            const auto output = fixtures / "bin" / name;
++
++            std::vector<std::string> args{"gcc", "-O0"};
++            args.insert(args.end(), flags.begin(), flags.end());
++            args.insert(args.end(), {"-o", output.string(), fs::relative(sourcePath, fixtures).string()});
++
++            std::set<fs::path> directories;
++            for (const auto& library : libraries) {
++                args.push_back(library.second.string());
++                directories.insert(library.second.parent_path());
++            }
++
++            if (!rpath.empty()) {
++                args.push_back("-Wl,-rpath," + rpath);
++            } else {
++                for (const auto& directory : directories)
++                    args.push_back("-Wl,-rpath," + directory.string());
++            }
++
++            const auto result = run(args);
++            EXPECT_TRUE(result.succeeded()) << result.describe();
++            return output;
++        }
++
++        // the layout Debian uses: the debug file under <global>/.build-id, the library stripped and linked to it
++        fs::path splitLikeDebian(const fs::path& library, const fs::path& global, bool compress = true) {
++            const auto buildId = buildIdOf(library);
++            EXPECT_FALSE(buildId.empty()) << library;
++
++            const auto debugFile = buildIdLinkIn(global, buildId);
++            fs::create_directories(debugFile.parent_path());
++
++            std::vector<std::string> extract{"objcopy", "--only-keep-debug"};
++            if (compress)
++                extract.push_back("--compress-debug-sections");
++            extract.insert(extract.end(), {library.string(), debugFile.string()});
++
++            mustRun(extract);
++            mustRun({"strip", "--remove-section=.comment", "--remove-section=.note", "--strip-unneeded", library.string()});
++            mustRun({"objcopy", "--add-gnu-debuglink=" + debugFile.string(), library.string()});
++            return debugFile;
++        }
++
++        // the debug file is created as <name>.debug, the library stripped and linked to it, then the debug file moves
++        fs::path splitWithDebugLink(const fs::path& library, const fs::path& debugFileDirectory) {
++            const auto debugFile = library.parent_path() / (library.filename().string() + ".debug");
++
++            mustRun({"objcopy", "--only-keep-debug", library.string(), debugFile.string()});
++            mustRun({"strip", "--strip-unneeded", library.string()});
++            mustRun({"objcopy", "--add-gnu-debuglink=" + debugFile.string(), library.string()});
++
++            const auto target = debugFileDirectory / debugFile.filename();
++
++            if (target != debugFile) {
++                fs::create_directories(debugFileDirectory);
++                fs::rename(debugFile, target);
++            }
++
++            return target;
++        }
++
++        std::vector<std::string> gdb(const fs::path& file, const std::string& debugFileDirectory, const std::vector<std::string>& commands) {
++            std::vector<std::string> args{
++                "gdb", "-nx", "-batch",
++                "-iex", "set debuginfod enabled off",
++                "-iex", "set auto-load no",
++                "-iex", "set pagination off",
++                "-iex", "set width 0",
++                "-iex", "set debug-file-directory " + debugFileDirectory,
++            };
++
++            for (size_t i = 0; i < commands.size(); ++i) {
++                args.push_back("-ex");
++                args.push_back("echo @@probe " + std::to_string(i) + "@@\\n");
++                args.push_back("-ex");
++                args.push_back(commands[i]);
++            }
++
++            args.push_back(file.string());
++
++            const auto result = runProcess(args, {{"HOME", root.string()}}, {"DEBUGINFOD_URLS"}, root, 300);
++            EXPECT_FALSE(result.timedOut) << result.describe();
++
++            std::vector<std::string> outputs(commands.size());
++            long current = -1;
++
++            std::istringstream lines(result.out);
++            std::string line;
++
++            while (std::getline(lines, line)) {
++                if (startsWith(line, "@@probe ")) {
++                    current = std::stol(line.substr(8));
++                    continue;
++                }
++
++                while (!line.empty() && (line.back() == ' ' || line.back() == '\r'))
++                    line.pop_back();
++
++                if (current >= 0 && current < static_cast<long>(outputs.size()) && !line.empty())
++                    outputs[current] += line + "\n";
++            }
++
++            return outputs;
++        }
++
++        std::string globalDirectories() const {
++            return globalDebugDir.string();
++        }
++
++        Probe probe(const fs::path& original, const fs::path& inAppDir, const std::vector<std::string>& commands,
++                    const std::string& debugDirectories = "") {
++            Probe result{original, inAppDir, commands, {}};
++            result.expected = gdb(original, debugDirectories.empty() ? globalDirectories() : debugDirectories, commands);
++            return result;
++        }
++
++        static void expectLineInformation(const Probe& probe) {
++            ASSERT_FALSE(probe.expected.empty());
++            ASSERT_TRUE(startsWith(probe.expected[0], "Line ")) << "fixture without line information: " << probe.original
++                                                                << "\n" << probe.expected[0];
++        }
++
++        ProcessResult deploy(const std::vector<std::string>& args, Environment environment = {}, std::vector<std::string> unset = {},
++                             const fs::path& cwd = {}) {
++            std::vector<std::string> command{linuxdeployBinary.string()};
++            command.insert(command.end(), args.begin(), args.end());
++
++            environment.emplace("DISABLE_COPYRIGHT_FILES_DEPLOYMENT", "1");
++            environment.emplace("LINUXDEPLOY_DEBUG_FILE_DIRECTORY", globalDirectories());
++
++            for (const auto& name : unset)
++                environment.erase(name);
++
++            unset.insert(unset.end(), {"NO_STRIP", "LD_LIBRARY_PATH", "LINUXDEPLOY_PLUGIN_MODE"});
++
++            for (const auto& name : environment)
++                unset.erase(std::remove(unset.begin(), unset.end(), name.first), unset.end());
++
++            return runProcess(command, environment, unset, cwd.empty() ? root : cwd, 600);
++        }
++
++        void mustDeploy(const std::vector<std::string>& args, const Environment& environment = {}, const std::vector<std::string>& unset = {}) {
++            std::vector<std::string> fullArgs{"--appdir", appDir.string(), "--debug-symbols-dir", tree.string()};
++            fullArgs.insert(fullArgs.end(), args.begin(), args.end());
++
++            const auto result = deploy(fullArgs, environment, unset);
++            ASSERT_TRUE(result.succeeded()) << result.describe();
++        }
++
++        fs::path savedDwzFile(const std::string& buildIdHex) const {
++            const auto expected = buildIdHex + ".debug";
++
++            if (fs::is_directory(tree / ".dwz")) {
++                for (const auto& entry : fs::directory_iterator(tree / ".dwz")) {
++                    auto name = entry.path().filename().string();
++                    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++
++                    if (name == expected)
++                        return entry.path();
++                }
++            }
++
++            return tree / ".dwz" / expected;
++        }
++
++        // a copy of linuxdeploy with the given script as the strip next to it
++        void useStrip(const std::string& script) {
++            const auto tools = root / "tools";
++            fs::create_directories(tools);
++            fs::copy_file(LINUXDEPLOY_PATH, tools / "linuxdeploy", fs::copy_options::overwrite_existing);
++            writeFile(tools / "strip", script);
++
++            const auto executablePermissions = fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
++                                               fs::perms::others_read | fs::perms::others_exec;
++            fs::permissions(tools / "linuxdeploy", executablePermissions);
++            fs::permissions(tools / "strip", executablePermissions);
++
++            linuxdeployBinary = tools / "linuxdeploy";
++        }
++
++        // a strip next to a copy of linuxdeploy that refuses the libraries with the given sonames, under whatever path it is
++        // given them, with the error linuxdeploy tolerates
++        void useStripThatRefuses(const std::vector<std::string>& sonames) {
++            std::ostringstream script;
++            script << "#!/bin/sh\n"
++                   << "for file in \"$@\"; do\n"
++                   << "    [ -f \"$file\" ] || continue\n"
++                   << "    case \"$(readelf -d \"$file\" 2>/dev/null | sed -n 's/.*Library soname: \\[\\(.*\\)\\].*/\\1/p')\" in\n";
++            for (const auto& soname : sonames)
++                script << "        " << soname << ") echo \"strip: $file: Not enough room for program headers, try linking with -N\" >&2; exit 1 ;;\n";
++            script << "    esac\n"
++                   << "done\n"
++                   << "exec /usr/bin/strip \"$@\"\n";
++            useStrip(script.str());
++        }
++
++        // a strip next to a copy of linuxdeploy that notes what it is given and, after each call, every deployed file that
++        // has lost its DWARF while its debug file is not in the tree
++        fs::path useStripThatNotesUnsavedFiles(const std::vector<std::pair<fs::path, fs::path>>& files) {
++            const auto notes = root / "strip-notes";
++
++            std::ostringstream script;
++            script << "#!/bin/sh\n"
++                   << "for file in \"$@\"; do echo \"stripped $file\" >> '" << notes.string() << "'; done\n"
++                   << "/usr/bin/strip \"$@\"\n"
++                   << "status=$?\n";
++            for (const auto& file : files) {
++                script << "if [ -f '" << file.first.string() << "' ] && ! readelf -S -W '" << file.first.string()
++                       << "' | grep -q ' \\.debug_info ' && ! readelf -S -W '" << file.second.string()
++                       << "' 2>/dev/null | grep -q ' \\.debug_info '; then\n"
++                       << "    echo \"unsaved " << file.first.string() << "\" >> '" << notes.string() << "'\n"
++                       << "fi\n";
++            }
++            script << "exit $status\n";
++            useStrip(script.str());
++
++            return notes;
++        }
++
++        // nothing may point back to the fixtures or to where linuxdeploy wrote the AppDir and the tree
++        void freezeOutputs() {
++            if (fs::exists(fixtures))
++                fs::rename(fixtures, root / "fx.hidden");
++
++            const auto frozen = root / "frozen";
++
++            if (!fs::exists(frozen)) {
++                fs::create_directories(frozen);
++                fs::rename(appDir, frozen / "AppDir");
++
++                if (fs::exists(tree))
++                    fs::rename(tree, frozen / "debug-tree");
++            }
++        }
++
++        // the tree unpacked over a copy of the AppDir, with a debug-file-directory GDB cannot use
++        void expectSameWhenUnpacked(const std::vector<Probe>& probes) {
++            freezeOutputs();
++
++            const auto unpacked = root / "unpacked" / "squashfs-root";
++            fs::remove_all(unpacked);
++            fs::create_directories(unpacked);
++            fs::copy(root / "frozen" / "AppDir", unpacked, fs::copy_options::recursive | fs::copy_options::copy_symlinks);
++
++            if (fs::exists(root / "frozen" / "debug-tree"))
++                fs::copy(root / "frozen" / "debug-tree", unpacked,
++                         fs::copy_options::recursive | fs::copy_options::copy_symlinks | fs::copy_options::overwrite_existing);
++
++            for (const auto& probe : probes) {
++                const auto actual = gdb(unpacked / probe.inAppDir, (root / "no-such-debug-dir").string(), probe.commands);
++
++                for (size_t i = 0; i < probe.commands.size(); ++i) {
++                    EXPECT_EQ(probe.expected[i], actual[i]) << "tree unpacked over the AppDir, " << probe.inAppDir.string() << ": " << probe.commands[i];
++                }
++            }
++        }
++
++        // the AppDir and the tree moved elsewhere, GDB's debug-file-directory set to the tree
++        void expectSameThroughDebugFileDirectory(const std::vector<Probe>& probes) {
++            freezeOutputs();
++
++            const auto mountedAppDir = root / "mnt" / ".mount_app" / "AppDir";
++            const auto movedTree = root / "downloads" / "app-debug";
++
++            fs::remove_all(root / "mnt");
++            fs::remove_all(root / "downloads");
++            fs::create_directories(mountedAppDir.parent_path());
++            fs::create_directories(movedTree.parent_path());
++            fs::copy(root / "frozen" / "AppDir", mountedAppDir, fs::copy_options::recursive | fs::copy_options::copy_symlinks);
++
++            if (fs::exists(root / "frozen" / "debug-tree"))
++                fs::copy(root / "frozen" / "debug-tree", movedTree, fs::copy_options::recursive | fs::copy_options::copy_symlinks);
++
++            for (const auto& probe : probes) {
++                const auto actual = gdb(mountedAppDir / probe.inAppDir, movedTree.string(), probe.commands);
++
++                for (size_t i = 0; i < probe.commands.size(); ++i) {
++                    EXPECT_EQ(probe.expected[i], actual[i]) << "debug-file-directory set to the tree, " << probe.inAppDir.string() << ": " << probe.commands[i];
++                }
++            }
++        }
++
++        // two libraries from one package, processed with dwz the way Debian does, with the multifile named by its
++        // absolute path in the global directory
++        std::pair<fs::path, fs::path> buildDebianDwzPair(const std::string& first, const std::string& second, std::string& altBuildId) {
++            writeFile(fixtures / "src" / "shared.h", "struct shared_point { int x; int y; long tag; };\n");
++
++            const auto firstLibrary = buildLibrary(first, fixtures / "lib", {"-g"}, 0, dwzLibrarySource(first));
++            const auto secondLibrary = buildLibrary(second, fixtures / "lib", {"-g"}, 0, dwzLibrarySource(second));
++
++            const auto multifile = globalDebugDir / ".dwz" / triplet / "libfixture1.debug";
++            fs::create_directories(multifile.parent_path());
++
++            mustRun({"dwz", "-m", multifile.string(), "-M", multifile.string(), firstLibrary.string(), secondLibrary.string()});
++
++            altBuildId = buildIdOf(multifile);
++            EXPECT_FALSE(altBuildId.empty());
++
++            splitLikeDebian(firstLibrary, globalDebugDir);
++            splitLikeDebian(secondLibrary, globalDebugDir);
++
++            return {firstLibrary, secondLibrary};
++        }
++    };
++
++    TEST_F(DebugSymbolsTest, savesDebugFilesUnderDotDebugMirroringTheAppDir) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        mustDeploy({"-e", executable.string()});
++
++        const auto executableDebugFile = tree / "usr/bin/.debug/app.debug";
++        const auto libraryDebugFile = tree / "usr/lib/.debug/libalpha.so.1.debug";
++
++        ASSERT_TRUE(fs::is_regular_file(executableDebugFile));
++        ASSERT_TRUE(fs::is_regular_file(libraryDebugFile));
++        EXPECT_TRUE(hasSectionWithContents(executableDebugFile, ".debug_info"));
++        EXPECT_TRUE(hasSectionWithContents(libraryDebugFile, ".debug_info"));
++        EXPECT_TRUE(hasSectionWithContents(executableDebugFile, ".symtab"));
++        EXPECT_TRUE(hasSectionWithContents(libraryDebugFile, ".symtab"));
++        EXPECT_TRUE(symbolNamesOf(executableDebugFile).count("app_helper")) << executableDebugFile;
++        EXPECT_TRUE(symbolNamesOf(libraryDebugFile).count("alpha_helper")) << libraryDebugFile;
++        EXPECT_EQ(symbolNamesOf(executable), symbolNamesOf(executableDebugFile));
++        EXPECT_EQ(symbolNamesOf(library), symbolNamesOf(libraryDebugFile));
++    }
++
++    TEST_F(DebugSymbolsTest, strippedFilesLinkToTheirDebugFileByName) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        mustDeploy({"-e", executable.string()});
++
++        for (const auto& file : {appDir / "usr/bin/app", appDir / "usr/lib/libalpha.so.1"}) {
++            EXPECT_FALSE(hasSectionWithContents(file, ".debug_info")) << file;
++            EXPECT_FALSE(hasSectionWithContents(file, ".symtab")) << file;
++
++            const auto link = debugLinkOf(file);
++            EXPECT_TRUE(link.present) << file;
++            EXPECT_EQ(file.filename().string() + ".debug", link.name);
++        }
++    }
++
++    TEST_F(DebugSymbolsTest, olderDebugLinkIsReplaced) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto other = fixtures / "lib" / "other.debug";
++        writeFile(other, "not the debug information of libalpha\n");
++        mustRun({"objcopy", "--add-gnu-debuglink=" + other.string(), library.string()});
++
++        const auto oldLink = debugLinkOf(library);
++        ASSERT_EQ("other.debug", oldLink.name);
++        ASSERT_TRUE(hasSectionWithContents(library, ".debug_info"));
++
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++        std::vector<Probe> probes{probe(library, "usr/lib/libalpha.so.1", librarySymbols("alpha"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", executable.string()});
++
++        const auto debugFile = tree / "usr/lib/.debug/libalpha.so.1.debug";
++        ASSERT_TRUE(fs::is_regular_file(debugFile));
++
++        const auto link = debugLinkOf(appDir / "usr/lib/libalpha.so.1");
++        EXPECT_EQ("libalpha.so.1.debug", link.name);
++        EXPECT_EQ(crc32Of(debugFile), link.crc);
++        EXPECT_NE(oldLink.crc, link.crc);
++
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, debugLinkCrcMatchesTheSavedFile) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_EQ(crc32Of(tree / "usr/bin/.debug/app.debug"), debugLinkOf(appDir / "usr/bin/app").crc);
++        EXPECT_EQ(crc32Of(tree / "usr/lib/.debug/libalpha.so.1.debug"), debugLinkOf(appDir / "usr/lib/libalpha.so.1").crc);
++    }
++
++    TEST_F(DebugSymbolsTest, buildIdLinksAreRelativeSymlinks) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        mustDeploy({"-e", executable.string()});
++
++        for (const auto& pair : {std::make_pair(appDir / "usr/bin/app", tree / "usr/bin/.debug/app.debug"),
++                                 std::make_pair(appDir / "usr/lib/libalpha.so.1", tree / "usr/lib/.debug/libalpha.so.1.debug")}) {
++            const auto buildId = buildIdOf(pair.first);
++            ASSERT_FALSE(buildId.empty());
++
++            const auto link = buildIdLinkIn(tree, buildId);
++            ASSERT_TRUE(fs::is_symlink(link)) << link;
++            EXPECT_TRUE(fs::read_symlink(link).is_relative()) << fs::read_symlink(link);
++            EXPECT_EQ(fs::canonical(pair.second), fs::canonical(link));
++        }
++    }
++
++    TEST_F(DebugSymbolsTest, unpackedTreeGivesGdbTheSameInformation) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        std::vector<Probe> probes{
++            probe(executable, "usr/bin/app", executableSymbols("app")),
++            probe(library, "usr/lib/libalpha.so.1", librarySymbols("alpha")),
++        };
++        for (const auto& p : probes)
++            expectLineInformation(p);
++
++        mustDeploy({"-e", executable.string()});
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, debugFileDirectoryGivesGdbTheSameInformation) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        std::vector<Probe> probes{
++            probe(executable, "usr/bin/app", executableSymbols("app")),
++            probe(library, "usr/lib/libalpha.so.1", librarySymbols("alpha")),
++        };
++        for (const auto& p : probes)
++            expectLineInformation(p);
++
++        mustDeploy({"-e", executable.string()});
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, libraryOptionSavesDebugInformation) {
++        const auto library = buildLibrary("beta", fixtures / "lib");
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libbeta.so.1", librarySymbols("beta"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-l", library.string()});
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libbeta.so.1.debug"));
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, relativePathsAreTakenFromTheWorkingDirectory) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        std::vector<Probe> probes{
++            probe(executable, "usr/bin/app", executableSymbols("app")),
++            probe(library, "usr/lib/libalpha.so.1", librarySymbols("alpha")),
++        };
++
++        const auto result = deploy({"--appdir", "AppDir", "--debug-symbols-dir", "debug-tree", "-e", "fx/bin/app"}, {}, {}, root);
++        ASSERT_TRUE(result.succeeded()) << result.describe();
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/bin/.debug/app.debug"));
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libalpha.so.1.debug"));
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, filesWithoutBuildIdWorkBothWays) {
++        const auto library = buildLibrary("nobid", fixtures / "lib", {"-g", "-Wl,--build-id=none"});
++        const auto executable = buildExecutable("app", {{"nobid", library}});
++
++        ASSERT_TRUE(buildIdOf(library).empty());
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libnobid.so.1", librarySymbols("nobid"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libnobid.so.1.debug"));
++        EXPECT_EQ("libnobid.so.1.debug", debugLinkOf(appDir / "usr/lib/libnobid.so.1").name);
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, symbolTableOnlyFileKeepsItsSymbols) {
++        const auto library = buildLibrary("rho", fixtures / "lib", {"-g0"});
++
++        ASSERT_FALSE(hasSectionWithContents(library, ".debug_info"));
++        ASSERT_TRUE(hasSectionWithContents(library, ".symtab"));
++
++        std::vector<Probe> probes{probe(library, "usr/lib/librho.so.1", librarySymbols("rho"))};
++        ASSERT_TRUE(startsWith(probes[0].expected[1], "Symbol \"rho_helper\" is at ")) << probes[0].expected[1];
++
++        mustDeploy({"-l", library.string()});
++
++        const auto debugFile = tree / "usr/lib/.debug/librho.so.1.debug";
++        ASSERT_TRUE(fs::is_regular_file(debugFile));
++        EXPECT_TRUE(hasSectionWithContents(debugFile, ".symtab"));
++        EXPECT_EQ(symbolNamesOf(library), symbolNamesOf(debugFile));
++        EXPECT_EQ("librho.so.1.debug", debugLinkOf(appDir / "usr/lib/librho.so.1").name);
++
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, fileWithoutDebugInformationGetsNothing) {
++        const auto library = buildLibrary("gamma", fixtures / "lib", {"-g0"});
++        mustRun({"strip", "--strip-all", library.string()});
++
++        const auto buildId = buildIdOf(library);
++        ASSERT_FALSE(buildId.empty());
++        ASSERT_FALSE(hasSectionWithContents(library, ".symtab"));
++
++        const auto other = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"gamma", library}, {"alpha", other}});
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libalpha.so.1.debug"));
++        EXPECT_FALSE(fs::exists(tree / "usr/lib/.debug/libgamma.so.1.debug"));
++        EXPECT_FALSE(fs::is_symlink(buildIdLinkIn(tree, buildId)));
++        EXPECT_FALSE(debugLinkOf(appDir / "usr/lib/libgamma.so.1").present);
++    }
++
++    TEST_F(DebugSymbolsTest, fileWithStaleLinkGetsNoDebugFile) {
++        const auto library = buildLibrary("pi", fixtures / "lib");
++        const auto debugFile = splitLikeDebian(library, globalDebugDir);
++        const auto buildId = buildIdOf(library);
++        fs::remove(debugFile);
++
++        const auto other = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"pi", library}, {"alpha", other}});
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libalpha.so.1.debug"));
++        EXPECT_FALSE(fs::exists(tree / "usr/lib/.debug/libpi.so.1.debug"));
++        EXPECT_FALSE(fs::is_symlink(buildIdLinkIn(tree, buildId)));
++    }
++
++    TEST_F(DebugSymbolsTest, buildIdDebugFileOfSplitLibraryIsUsed) {
++        const auto library = buildLibrary("delta", fixtures / "lib");
++        splitLikeDebian(library, globalDebugDir);
++
++        const auto executable = buildExecutable("app", {{"delta", library}});
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libdelta.so.1", librarySymbols("delta"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libdelta.so.1.debug"));
++        EXPECT_EQ("libdelta.so.1.debug", debugLinkOf(appDir / "usr/lib/libdelta.so.1").name);
++
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, buildIdDebugFileWorksThroughDebugFileDirectory) {
++        const auto library = buildLibrary("delta", fixtures / "lib");
++        splitLikeDebian(library, globalDebugDir);
++
++        const auto executable = buildExecutable("app", {{"delta", library}});
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libdelta.so.1", librarySymbols("delta"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", executable.string()});
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, debugLinkNextToTheFileIsUsed) {
++        const auto library = buildLibrary("epsilon", fixtures / "lib", {"-g", "-Wl,--build-id=none"});
++        splitWithDebugLink(library, fixtures / "lib");
++
++        const auto executable = buildExecutable("app", {{"epsilon", library}});
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libepsilon.so.1", librarySymbols("epsilon"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", executable.string()});
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, debugLinkTargetWithAnotherBuildIdWorksBothWays) {
++        const auto library = buildLibrary("theta", fixtures / "lib", {"-g", "-Wl,--build-id=0x1111111111111111111111111111111111111111"});
++        const auto twin = buildLibrary("theta", fixtures / "twin", {"-g", "-Wl,--build-id=0x2222222222222222222222222222222222222222"});
++
++        const auto debugFile = fixtures / "lib" / "libtheta.so.1.debug";
++        mustRun({"objcopy", "--only-keep-debug", twin.string(), debugFile.string()});
++        mustRun({"strip", "--strip-unneeded", library.string()});
++        mustRun({"objcopy", "--add-gnu-debuglink=" + debugFile.string(), library.string()});
++        ASSERT_NE(buildIdOf(library), buildIdOf(debugFile));
++
++        const auto executable = buildExecutable("app", {{"theta", library}});
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libtheta.so.1", librarySymbols("theta"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", executable.string()});
++
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, debugLinkInDotDebugDirectoryIsUsed) {
++        const auto library = buildLibrary("zeta", fixtures / "lib");
++        splitWithDebugLink(library, fixtures / "lib" / ".debug");
++
++        const auto executable = buildExecutable("app", {{"zeta", library}});
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libzeta.so.1", librarySymbols("zeta"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_EQ(crc32Of(tree / "usr/lib/.debug/libzeta.so.1.debug"), debugLinkOf(appDir / "usr/lib/libzeta.so.1").crc);
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, debugLinkUnderGlobalDirectoryIsUsed) {
++        const auto library = buildLibrary("eta", fixtures / "lib");
++        splitWithDebugLink(library, globalDebugDir / (fixtures / "lib").relative_path());
++
++        const auto executable = buildExecutable("app", {{"eta", library}});
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libeta.so.1", librarySymbols("eta"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", executable.string()});
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, symlinkedLibraryIsLookedUpByItsRealPath) {
++        const auto realDirectory = fixtures / "real";
++        const auto real = buildLibrary("sigma", realDirectory);
++        fs::rename(real, realDirectory / "libsigma.so.1.0");
++        fs::create_symlink("../real/libsigma.so.1.0", fixtures / "lib" / "libsigma.so.1");
++
++        splitWithDebugLink(realDirectory / "libsigma.so.1.0", realDirectory / ".debug");
++
++        const auto executable = buildExecutable("app", {{"sigma", fixtures / "lib" / "libsigma.so.1"}}, {"-g"},
++                                                (fixtures / "bin" / ".." / "lib").string());
++
++        const auto lddPath = fixtures / "bin" / ".." / "lib" / "libsigma.so.1";
++
++        std::vector<Probe> probes{probe(lddPath, "usr/lib/libsigma.so.1", librarySymbols("sigma"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libsigma.so.1.debug"));
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, symlinkedLibraryIsNotLookedUpByItsLinkPath) {
++        const auto realDirectory = fixtures / "real";
++        const auto real = buildLibrary("tau", realDirectory);
++        fs::rename(real, realDirectory / "libtau.so.1.0");
++        fs::create_symlink("../real/libtau.so.1.0", fixtures / "lib" / "libtau.so.1");
++
++        const auto debugFile = splitWithDebugLink(realDirectory / "libtau.so.1.0", fixtures / "lib");
++        const auto mirrored = globalDebugDir / (fixtures / "lib").relative_path() / debugFile.filename();
++        fs::create_directories(fixtures / "lib" / ".debug");
++        fs::create_directories(mirrored.parent_path());
++        fs::copy_file(debugFile, fixtures / "lib" / ".debug" / debugFile.filename());
++        fs::copy_file(debugFile, mirrored);
++
++        const auto other = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"tau", fixtures / "lib" / "libtau.so.1"}, {"alpha", other}});
++
++        std::vector<Probe> probes{probe(fixtures / "lib" / "libtau.so.1", "usr/lib/libtau.so.1", librarySymbols("tau"))};
++        ASSERT_FALSE(startsWith(probes[0].expected[0], "Line ")) << probes[0].expected[0];
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libalpha.so.1.debug"));
++        EXPECT_FALSE(fs::exists(tree / "usr/lib/.debug/libtau.so.1.debug"));
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, debugLinkCandidateWithWrongCrcIsSkipped) {
++        const auto decoySource = buildLibrary("omicron", fixtures / "decoy");
++        const auto library = buildLibrary("xi", fixtures / "lib");
++
++        splitWithDebugLink(library, fixtures / "lib" / ".debug");
++        mustRun({"objcopy", "--only-keep-debug", decoySource.string(), (fixtures / "lib" / "libxi.so.1.debug").string()});
++
++        const auto executable = buildExecutable("app", {{"xi", library}});
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libxi.so.1", librarySymbols("xi"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", executable.string()});
++
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, buildIdCandidateWithOtherBuildIdIsSkipped) {
++        const auto other = buildLibrary("nu", fixtures / "decoy");
++        const auto library = buildLibrary("mu", fixtures / "lib");
++
++        const auto debugFile = splitLikeDebian(library, globalDebugDir);
++        const auto link = debugLinkOf(library);
++
++        fs::create_directories(fixtures / "lib" / ".debug");
++        fs::rename(debugFile, fixtures / "lib" / ".debug" / link.name);
++        mustRun({"objcopy", "--only-keep-debug", other.string(), debugFile.string()});
++
++        const auto executable = buildExecutable("app", {{"mu", library}});
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libmu.so.1", librarySymbols("mu"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", executable.string()});
++
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, buildIdIsTriedBeforeDebugLink) {
++        const std::string buildId = "0x5d0c1e2f3a4b5c6d7e8f90a1b2c3d4e5f6071829";
++
++        const auto variant = buildLibrary("iota", fixtures / "variant", {"-g", "-Wl,--build-id=" + buildId}, 6);
++        const auto library = buildLibrary("iota", fixtures / "lib", {"-g", "-Wl,--build-id=" + buildId});
++
++        const auto variantLines = gdb(variant, "/nonexistent", librarySymbols("iota"));
++        ASSERT_NE(gdb(library, "/nonexistent", librarySymbols("iota"))[0], variantLines[0]);
++
++        splitWithDebugLink(library, fixtures / "lib" / ".debug");
++
++        const auto buildIdFile = buildIdLinkIn(globalDebugDir, buildId.substr(2));
++        fs::create_directories(buildIdFile.parent_path());
++        mustRun({"objcopy", "--only-keep-debug", variant.string(), buildIdFile.string()});
++
++        const auto executable = buildExecutable("app", {{"iota", library}});
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libiota.so.1", librarySymbols("iota"))};
++        expectLineInformation(probes[0]);
++        ASSERT_EQ(variantLines[0], probes[0].expected[0]);
++
++        mustDeploy({"-e", executable.string()});
++
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, globalDirectoriesAreSearchedInOrder) {
++        const std::string buildId = "0x7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b";
++
++        const auto first = fixtures / "first-debug";
++        const auto second = fixtures / "second-debug";
++
++        const auto variant = buildLibrary("kappa", fixtures / "variant", {"-g", "-Wl,--build-id=" + buildId}, 4);
++        const auto library = buildLibrary("kappa", fixtures / "lib", {"-g", "-Wl,--build-id=" + buildId});
++        const auto onlyInSecond = buildLibrary("lambda", fixtures / "lib");
++
++        const auto firstFile = buildIdLinkIn(first, buildId.substr(2));
++        const auto secondFile = buildIdLinkIn(second, buildId.substr(2));
++        fs::create_directories(firstFile.parent_path());
++        fs::create_directories(secondFile.parent_path());
++
++        mustRun({"objcopy", "--only-keep-debug", library.string(), firstFile.string()});
++        mustRun({"objcopy", "--only-keep-debug", variant.string(), secondFile.string()});
++        mustRun({"strip", "--strip-unneeded", library.string()});
++        splitLikeDebian(onlyInSecond, second);
++
++        const auto executable = buildExecutable("app", {{"kappa", library}, {"lambda", onlyInSecond}});
++
++        const auto directories = first.string() + ":" + second.string();
++
++        std::vector<Probe> probes{
++            probe(library, "usr/lib/libkappa.so.1", librarySymbols("kappa"), directories),
++            probe(onlyInSecond, "usr/lib/liblambda.so.1", librarySymbols("lambda"), directories),
++        };
++        for (const auto& p : probes)
++            expectLineInformation(p);
++
++        mustDeploy({"-e", executable.string()}, {{"LINUXDEPLOY_DEBUG_FILE_DIRECTORY", directories}});
++
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, dwzFileIsSavedOnceUnderItsBuildId) {
++        std::string altBuildId;
++        const auto libraries = buildDebianDwzPair("phi", "chi", altBuildId);
++        const auto executable = buildExecutable("app", {{"phi", libraries.first}, {"chi", libraries.second}});
++
++        mustDeploy({"-e", executable.string()});
++
++        const auto saved = savedDwzFile(altBuildId);
++        ASSERT_TRUE(fs::is_regular_file(saved));
++        EXPECT_EQ(altBuildId, buildIdOf(saved));
++        EXPECT_EQ(std::vector<fs::path>{saved.filename()}, regularFilesIn(tree / ".dwz"));
++    }
++
++    TEST_F(DebugSymbolsTest, dwzReferenceIsRelativeToTheDebugFile) {
++        std::string altBuildId;
++        const auto libraries = buildDebianDwzPair("phi", "chi", altBuildId);
++        const auto executable = buildExecutable("app", {{"phi", libraries.first}, {"chi", libraries.second}});
++
++        mustDeploy({"-e", executable.string()});
++
++        for (const auto& name : {"libphi.so.1", "libchi.so.1"}) {
++            const auto debugFile = tree / "usr/lib/.debug" / (std::string(name) + ".debug");
++            ASSERT_TRUE(fs::is_regular_file(debugFile)) << debugFile;
++
++            const auto altLink = altLinkOf(debugFile);
++            ASSERT_TRUE(altLink.present) << debugFile;
++            EXPECT_TRUE(fs::path(altLink.name).is_relative()) << altLink.name;
++            EXPECT_EQ(altBuildId, altLink.buildId);
++            EXPECT_EQ(fs::canonical(savedDwzFile(altBuildId)), fs::weakly_canonical(debugFile.parent_path() / altLink.name));
++            EXPECT_EQ(crc32Of(debugFile), debugLinkOf(appDir / "usr/lib" / name).crc);
++        }
++    }
++
++    TEST_F(DebugSymbolsTest, dwzTypesResolveWithTheTreeUnpacked) {
++        std::string altBuildId;
++        const auto libraries = buildDebianDwzPair("phi", "chi", altBuildId);
++        const auto executable = buildExecutable("app", {{"phi", libraries.first}, {"chi", libraries.second}});
++
++        std::vector<Probe> probes{
++            probe(libraries.first, "usr/lib/libphi.so.1", dwzLibrarySymbols("phi")),
++            probe(libraries.second, "usr/lib/libchi.so.1", dwzLibrarySymbols("chi")),
++        };
++        for (const auto& p : probes) {
++            expectLineInformation(p);
++            ASSERT_TRUE(startsWith(p.expected[3], "type = struct shared_point {")) << p.expected[3];
++        }
++
++        mustDeploy({"-e", executable.string()});
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, dwzTypesResolveThroughDebugFileDirectory) {
++        std::string altBuildId;
++        const auto libraries = buildDebianDwzPair("phi", "chi", altBuildId);
++        const auto executable = buildExecutable("app", {{"phi", libraries.first}, {"chi", libraries.second}});
++
++        std::vector<Probe> probes{
++            probe(libraries.first, "usr/lib/libphi.so.1", dwzLibrarySymbols("phi")),
++            probe(libraries.second, "usr/lib/libchi.so.1", dwzLibrarySymbols("chi")),
++        };
++        for (const auto& p : probes)
++            expectLineInformation(p);
++
++        mustDeploy({"-e", executable.string()});
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, dwzRelativeNameOfUnstrippedLibrariesIsFollowed) {
++        writeFile(fixtures / "src" / "shared.h", "struct shared_point { int x; int y; long tag; };\n");
++
++        const auto first = buildLibrary("psi", fixtures / "lib", {"-g"}, 0, dwzLibrarySource("psi"));
++        const auto second = buildLibrary("omega", fixtures / "lib", {"-g"}, 0, dwzLibrarySource("omega"));
++
++        fs::create_directories(fixtures / "lib" / ".dwz");
++        mustRun({"dwz", "-r", "-m", ".dwz/common.debug", first.filename().string(), second.filename().string()}, fixtures / "lib");
++
++        const auto altLink = altLinkOf(first);
++        ASSERT_TRUE(altLink.present);
++        ASSERT_TRUE(fs::path(altLink.name).is_relative()) << altLink.name;
++
++        const auto executable = buildExecutable("app", {{"psi", first}, {"omega", second}});
++
++        std::vector<Probe> probes{
++            probe(first, "usr/lib/libpsi.so.1", dwzLibrarySymbols("psi")),
++            probe(second, "usr/lib/libomega.so.1", dwzLibrarySymbols("omega")),
++        };
++        for (const auto& p : probes)
++            expectLineInformation(p);
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_TRUE(fs::is_regular_file(savedDwzFile(altLink.buildId)));
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, dwzFileIsFoundByBuildIdWhenItsNameIsGone) {
++        writeFile(fixtures / "src" / "shared.h", "struct shared_point { int x; int y; long tag; };\n");
++
++        const auto first = buildLibrary("upsilon", fixtures / "lib", {"-g"}, 0, dwzLibrarySource("upsilon"));
++        const auto second = buildLibrary("tau", fixtures / "lib", {"-g"}, 0, dwzLibrarySource("tau"));
++
++        const auto multifile = fixtures / "staging" / "fixture2.debug";
++        fs::create_directories(multifile.parent_path());
++        mustRun({"dwz", "-m", multifile.string(), "-M", "/nonexistent-dwz-location/fixture2.debug", first.string(), second.string()});
++
++        const auto altBuildId = buildIdOf(multifile);
++        const auto indexed = buildIdLinkIn(globalDebugDir, altBuildId);
++        fs::create_directories(indexed.parent_path());
++        fs::rename(multifile, indexed);
++
++        splitLikeDebian(first, globalDebugDir, false);
++        splitLikeDebian(second, globalDebugDir, false);
++
++        const auto executable = buildExecutable("app", {{"upsilon", first}, {"tau", second}});
++
++        std::vector<Probe> probes{
++            probe(first, "usr/lib/libupsilon.so.1", dwzLibrarySymbols("upsilon")),
++            probe(second, "usr/lib/libtau.so.1", dwzLibrarySymbols("tau")),
++        };
++        for (const auto& p : probes)
++            expectLineInformation(p);
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_TRUE(fs::is_regular_file(savedDwzFile(altBuildId)));
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, dwzFileWithOtherBuildIdIsSkipped) {
++        writeFile(fixtures / "src" / "shared.h", "struct shared_point { int x; int y; long tag; };\n");
++
++        const auto first = buildLibrary("beth", fixtures / "lib", {"-g"}, 0, dwzLibrarySource("beth"));
++        const auto second = buildLibrary("gimel", fixtures / "lib", {"-g"}, 0, dwzLibrarySource("gimel"));
++        writeFile(fixtures / "src" / "other_shared.h", "struct shared_point { int x; int y; double weight; char label[4]; };\n");
++        const auto decoyFirst = buildLibrary("daleth", fixtures / "decoy", {"-g"}, 0, dwzLibrarySource("daleth", "other_shared.h"));
++        const auto decoySecond = buildLibrary("he", fixtures / "decoy", {"-g"}, 0, dwzLibrarySource("he", "other_shared.h"));
++
++        const auto named = fixtures / "named" / "fixture3.debug";
++        fs::create_directories(named.parent_path());
++        mustRun({"dwz", "-m", named.string(), first.string(), second.string()});
++
++        const auto altBuildId = buildIdOf(named);
++        const auto indexed = buildIdLinkIn(globalDebugDir, altBuildId);
++        fs::create_directories(indexed.parent_path());
++        fs::rename(named, indexed);
++
++        mustRun({"dwz", "-m", named.string(), decoyFirst.string(), decoySecond.string()});
++        ASSERT_NE(altBuildId, buildIdOf(named));
++
++        splitLikeDebian(first, globalDebugDir, false);
++        splitLikeDebian(second, globalDebugDir, false);
++
++        const auto executable = buildExecutable("app", {{"beth", first}, {"gimel", second}});
++
++        std::vector<Probe> probes{
++            probe(first, "usr/lib/libbeth.so.1", dwzLibrarySymbols("beth")),
++            probe(second, "usr/lib/libgimel.so.1", dwzLibrarySymbols("gimel")),
++        };
++        for (const auto& p : probes)
++            expectLineInformation(p);
++
++        mustDeploy({"-e", executable.string()});
++
++        const auto saved = savedDwzFile(altBuildId);
++        ASSERT_TRUE(fs::is_regular_file(saved));
++        EXPECT_EQ(altBuildId, buildIdOf(saved));
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, dwzNameIsTakenFromTheRealDirectoryOfTheDebugFile) {
++        writeFile(fixtures / "src" / "shared.h", "struct shared_point { int x; int y; long tag; };\n");
++
++        const auto first = buildLibrary("res", fixtures / "lib", {"-g"}, 0, dwzLibrarySource("res"));
++        const auto second = buildLibrary("shin", fixtures / "lib", {"-g"}, 0, dwzLibrarySource("shin"));
++
++        const auto packageDirectory = globalDebugDir / "usr" / "lib64" / "pkg";
++        const auto multifile = globalDebugDir / "usr" / "lib64" / ".dwz" / "pkg.debug";
++        fs::create_directories(packageDirectory);
++        fs::create_directories(multifile.parent_path());
++
++        mustRun({"dwz", "-m", multifile.string(), "-M", "../.dwz/pkg.debug", first.string(), second.string()});
++
++        for (const auto& library : {first, second}) {
++            const auto debugFile = packageDirectory / (library.filename().string() + ".debug");
++            mustRun({"objcopy", "--only-keep-debug", library.string(), debugFile.string()});
++            mustRun({"strip", "--strip-unneeded", library.string()});
++            mustRun({"objcopy", "--add-gnu-debuglink=" + debugFile.string(), library.string()});
++
++            const auto link = buildIdLinkIn(globalDebugDir, buildIdOf(library));
++            fs::create_directories(link.parent_path());
++            fs::create_symlink(debugFile.lexically_relative(link.parent_path()), link);
++        }
++
++        const auto executable = buildExecutable("app", {{"res", first}, {"shin", second}});
++
++        std::vector<Probe> probes{
++            probe(first, "usr/lib/libres.so.1", dwzLibrarySymbols("res")),
++            probe(second, "usr/lib/libshin.so.1", dwzLibrarySymbols("shin")),
++        };
++        for (const auto& p : probes)
++            expectLineInformation(p);
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_TRUE(fs::is_regular_file(savedDwzFile(buildIdOf(multifile))));
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, noStripLeavesFilesAndTreeAlone) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        mustDeploy({"-e", executable.string()}, {{"NO_STRIP", "1"}});
++
++        for (const auto& entry : entriesIn(tree))
++            EXPECT_TRUE(fs::is_directory(tree / entry) && !fs::is_symlink(tree / entry)) << entry;
++
++        for (const auto& file : {appDir / "usr/bin/app", appDir / "usr/lib/libalpha.so.1"}) {
++            EXPECT_TRUE(hasSectionWithContents(file, ".debug_info")) << file;
++            EXPECT_FALSE(debugLinkOf(file).present) << file;
++        }
++    }
++
++    TEST_F(DebugSymbolsTest, fileKeptUnstrippedByItsRpathGetsNothing) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}}, {"-g"}, "$ORIGIN/../lib");
++        const auto tool = buildExecutable("tool", {{"alpha", library}}, {"-g"}, "${ORIGIN}/../lib");
++
++        std::vector<Probe> probes{
++            probe(executable, "usr/bin/app", executableSymbols("app")),
++            probe(tool, "usr/bin/tool", executableSymbols("tool")),
++            probe(library, "usr/lib/libalpha.so.1", librarySymbols("alpha")),
++        };
++
++        mustDeploy({"-e", executable.string(), "-e", tool.string()});
++
++        for (const std::string name : {"app", "tool"}) {
++            EXPECT_FALSE(fs::exists(tree / "usr/bin/.debug" / (name + ".debug"))) << name;
++            EXPECT_TRUE(hasSectionWithContents(appDir / "usr/bin" / name, ".debug_info")) << name;
++            EXPECT_FALSE(debugLinkOf(appDir / "usr/bin" / name).present) << name;
++        }
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libalpha.so.1.debug"));
++        EXPECT_FALSE(hasSectionWithContents(appDir / "usr/lib/libalpha.so.1", ".debug_info"));
++
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, fileStripCannotProcessGetsNothing) {
++        const auto refused = buildLibrary("beta", fixtures / "lib");
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}, {"beta", refused}});
++
++        useStripThatRefuses({"libbeta.so.1"});
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_TRUE(hasSectionWithContents(appDir / "usr/lib/libbeta.so.1", ".debug_info"));
++        EXPECT_FALSE(fs::exists(tree / "usr/lib/.debug/libbeta.so.1.debug"));
++        EXPECT_FALSE(debugLinkOf(appDir / "usr/lib/libbeta.so.1").present);
++        EXPECT_FALSE(fs::is_symlink(buildIdLinkIn(tree, buildIdOf(refused))));
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libalpha.so.1.debug"));
++        EXPECT_EQ("libalpha.so.1.debug", debugLinkOf(appDir / "usr/lib/libalpha.so.1").name);
++    }
++
++    TEST_F(DebugSymbolsTest, dwzFileOfRefusedLibrariesIsNotSaved) {
++        std::string altBuildId;
++        const auto libraries = buildDebianDwzPair("phi", "chi", altBuildId);
++        const auto plain = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"phi", libraries.first}, {"chi", libraries.second}, {"alpha", plain}});
++
++        useStripThatRefuses({"libphi.so.1", "libchi.so.1"});
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_FALSE(fs::exists(savedDwzFile(altBuildId)));
++        EXPECT_EQ(std::vector<fs::path>{}, regularFilesIn(tree / ".dwz"));
++        EXPECT_FALSE(fs::exists(tree / "usr/lib/.debug/libphi.so.1.debug"));
++        EXPECT_FALSE(fs::exists(tree / "usr/lib/.debug/libchi.so.1.debug"));
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libalpha.so.1.debug"));
++    }
++
++    TEST_F(DebugSymbolsTest, dwzFileStaysForTheLibraryThatWasStripped) {
++        std::string altBuildId;
++        const auto libraries = buildDebianDwzPair("phi", "chi", altBuildId);
++        const auto executable = buildExecutable("app", {{"phi", libraries.first}, {"chi", libraries.second}});
++
++        std::vector<Probe> probes{probe(libraries.second, "usr/lib/libchi.so.1", dwzLibrarySymbols("chi"))};
++        expectLineInformation(probes[0]);
++
++        useStripThatRefuses({"libphi.so.1"});
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_FALSE(fs::exists(tree / "usr/lib/.debug/libphi.so.1.debug"));
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libchi.so.1.debug"));
++        EXPECT_TRUE(fs::is_regular_file(savedDwzFile(altBuildId)));
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, dwzFileStaysWhenTheFirstLibraryUsingItIsRefused) {
++        std::string altBuildId;
++        const auto libraries = buildDebianDwzPair("phi", "chi", altBuildId);
++        const auto executable = buildExecutable("app", {{"phi", libraries.first}, {"chi", libraries.second}});
++
++        std::vector<Probe> probes{probe(libraries.first, "usr/lib/libphi.so.1", dwzLibrarySymbols("phi"))};
++        expectLineInformation(probes[0]);
++
++        useStripThatRefuses({"libchi.so.1"});
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_FALSE(fs::exists(tree / "usr/lib/.debug/libchi.so.1.debug"));
++        EXPECT_NE("libchi.so.1.debug", debugLinkOf(appDir / "usr/lib/libchi.so.1").name);
++        EXPECT_FALSE(fs::is_symlink(buildIdLinkIn(tree, buildIdOf(libraries.second))));
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libphi.so.1.debug"));
++        EXPECT_TRUE(fs::is_regular_file(savedDwzFile(altBuildId)));
++        EXPECT_EQ(std::vector<fs::path>{savedDwzFile(altBuildId).filename()}, regularFilesIn(tree / ".dwz"));
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, fileStripCannotProcessGetsNothingInAReusedTree) {
++        const auto refused = buildLibrary("beta", fixtures / "lib");
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}, {"beta", refused}});
++
++        const auto buildId = buildIdOf(refused);
++        ASSERT_FALSE(buildId.empty());
++
++        const auto earlierDebugFile = tree / "usr/lib/.debug/libbeta.so.1.debug";
++        const auto otherDebugFile = tree / "opt/lib/.debug/libbeta.so.1.debug";
++        writeFile(earlierDebugFile, "debug information of an earlier libbeta\n");
++        writeFile(otherDebugFile, "debug information of a libbeta deployed elsewhere\n");
++
++        const auto link = buildIdLinkIn(tree, buildId);
++        fs::create_directories(link.parent_path());
++        fs::create_symlink(otherDebugFile.lexically_relative(link.parent_path()), link);
++
++        useStripThatRefuses({"libbeta.so.1"});
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_TRUE(hasSectionWithContents(appDir / "usr/lib/libbeta.so.1", ".debug_info"));
++        EXPECT_FALSE(debugLinkOf(appDir / "usr/lib/libbeta.so.1").present);
++
++        for (const auto& file : regularFilesIn(tree))
++            EXPECT_FALSE(symbolNamesOf(tree / file).count("beta_helper")) << file << " holds the symbols of the library strip refused";
++        EXPECT_FALSE(symbolNamesOf(link).count("beta_helper")) << link << " leads to the symbols of the library strip refused";
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libalpha.so.1.debug"));
++        EXPECT_EQ("libalpha.so.1.debug", debugLinkOf(appDir / "usr/lib/libalpha.so.1").name);
++    }
++
++    TEST_F(DebugSymbolsTest, trailingSlashesNameTheSameDirectories) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        std::vector<Probe> probes{
++            probe(executable, "usr/bin/app", executableSymbols("app")),
++            probe(library, "usr/lib/libalpha.so.1", librarySymbols("alpha")),
++        };
++
++        const auto result = deploy({"--appdir", appDir.string() + "/", "--debug-symbols-dir", tree.string() + "/", "-e", executable.string()});
++        ASSERT_TRUE(result.succeeded()) << result.describe();
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/bin/.debug/app.debug"));
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libalpha.so.1.debug"));
++        EXPECT_FALSE(fs::exists(root / "usr"));
++        EXPECT_FALSE(fs::exists(tree / "AppDir"));
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, dotAppDirIsTheWorkingDirectory) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        std::vector<Probe> probes{
++            probe(executable, "usr/bin/app", executableSymbols("app")),
++            probe(library, "usr/lib/libalpha.so.1", librarySymbols("alpha")),
++        };
++
++        fs::create_directories(appDir);
++        const auto result = deploy({"--appdir", ".", "--debug-symbols-dir", "../debug-tree/.", "-e", executable.string()}, {}, {}, appDir);
++        ASSERT_TRUE(result.succeeded()) << result.describe();
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/bin/.debug/app.debug"));
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libalpha.so.1.debug"));
++        EXPECT_FALSE(fs::exists(tree / "AppDir"));
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, fileAlreadyInTheAppDirIsSavedBeforeItIsStripped) {
++        const auto library = buildLibrary("alpha", appDir / "usr" / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}}, {"-g"}, "$ORIGIN/../lib");
++        fs::create_directories(appDir / "usr" / "bin");
++        fs::copy_file(executable, appDir / "usr" / "bin" / "app");
++
++        std::vector<Probe> probes{probe(library, "usr/lib/libalpha.so.1", librarySymbols("alpha"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({});
++
++        const auto debugFile = tree / "usr/lib/.debug/libalpha.so.1.debug";
++        EXPECT_FALSE(hasSectionWithContents(appDir / "usr/lib/libalpha.so.1", ".debug_info"));
++        ASSERT_TRUE(fs::is_regular_file(debugFile));
++        EXPECT_TRUE(hasSectionWithContents(debugFile, ".debug_info"));
++        EXPECT_FALSE(fs::exists(tree / "usr/bin/.debug/app.debug"));
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, fileIsStrippedOnlyAfterItsDebugInformationIsSaved) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        const std::vector<std::pair<fs::path, fs::path>> files{
++            {"usr/bin/app", "usr/bin/.debug/app.debug"},
++            {"usr/lib/libalpha.so.1", "usr/lib/.debug/libalpha.so.1.debug"},
++        };
++
++        mustDeploy({"-e", executable.string()});
++
++        for (const auto& file : files) {
++            EXPECT_FALSE(hasSectionWithContents(appDir / file.first, ".debug_info")) << file.first;
++            EXPECT_TRUE(hasSectionWithContents(tree / file.second, ".debug_info")) << file.second;
++        }
++
++        const auto blockedAppDir = root / "BlockedAppDir";
++        const auto blockedTree = root / "blocked-tree";
++
++        fs::create_directories(blockedTree / "usr" / "lib");
++        writeFile(blockedTree / "usr" / "lib" / ".debug", "");
++        fs::create_directories(blockedTree / "usr" / "bin" / ".debug" / "app.debug");
++
++        deploy({"--appdir", blockedAppDir.string(), "--debug-symbols-dir", blockedTree.string(), "-e", executable.string()});
++
++        for (const auto& file : files) {
++            const auto deployed = blockedAppDir / file.first;
++            const auto debugFile = blockedTree / file.second;
++
++            if (fs::is_regular_file(deployed) && !hasSectionWithContents(deployed, ".debug_info"))
++                EXPECT_TRUE(fs::is_regular_file(debugFile) && hasSectionWithContents(debugFile, ".debug_info")) << deployed;
++        }
++    }
++
++    TEST_F(DebugSymbolsTest, debugFileIsInPlaceBeforeTheFileLosesItsSymbols) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", library}});
++
++        const auto notes = useStripThatNotesUnsavedFiles({
++            {appDir / "usr/bin/app", tree / "usr/bin/.debug/app.debug"},
++            {appDir / "usr/lib/libalpha.so.1", tree / "usr/lib/.debug/libalpha.so.1.debug"},
++        });
++
++        mustDeploy({"-e", executable.string()});
++
++        std::vector<std::string> stripped;
++        std::vector<std::string> unsaved;
++        std::istringstream lines(readFile(notes));
++        for (std::string line; std::getline(lines, line);) {
++            if (startsWith(line, "stripped "))
++                stripped.push_back(line.substr(9));
++            else if (startsWith(line, "unsaved "))
++                unsaved.push_back(line.substr(8));
++        }
++
++        EXPECT_GE(stripped.size(), 2u);
++        EXPECT_EQ(std::vector<std::string>{}, unsaved) << "files without their DWARF while their debug file was not in the tree yet";
++
++        for (const auto& file : {appDir / "usr/bin/app", appDir / "usr/lib/libalpha.so.1"})
++            EXPECT_FALSE(hasSectionWithContents(file, ".debug_info")) << file;
++        EXPECT_TRUE(hasSectionWithContents(tree / "usr/bin/.debug/app.debug", ".debug_info"));
++        EXPECT_TRUE(hasSectionWithContents(tree / "usr/lib/.debug/libalpha.so.1.debug", ".debug_info"));
++    }
++
++    TEST_F(DebugSymbolsTest, fileKeptAtTheDestinationIsTheOneSaved) {
++        const auto existing = buildLibrary("alpha", appDir / "usr" / "lib", {"-g"}, 5);
++        const auto incoming = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"alpha", incoming}});
++
++        const auto existingBuildId = buildIdOf(existing);
++        ASSERT_NE(existingBuildId, buildIdOf(incoming));
++
++        std::vector<Probe> probes{probe(existing, "usr/lib/libalpha.so.1", librarySymbols("alpha"))};
++        expectLineInformation(probes[0]);
++        ASSERT_NE(probes[0].expected[0], gdb(incoming, globalDirectories(), librarySymbols("alpha"))[0]);
++
++        mustDeploy({"-e", executable.string()});
++
++        ASSERT_EQ(existingBuildId, buildIdOf(appDir / "usr/lib/libalpha.so.1"));
++        EXPECT_FALSE(hasSectionWithContents(appDir / "usr/lib/libalpha.so.1", ".debug_info"));
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, keptFileWithTheSameBuildIdIsTheOneSaved) {
++        const std::string buildId = "0x3333333333333333333333333333333333333333";
++        const auto existing = buildLibrary("alpha", appDir / "usr" / "lib", {"-g", "-Wl,--build-id=" + buildId}, 5);
++        const auto incoming = buildLibrary("alpha", fixtures / "lib", {"-g", "-Wl,--build-id=" + buildId});
++        const auto executable = buildExecutable("app", {{"alpha", incoming}});
++
++        ASSERT_EQ(buildIdOf(existing), buildIdOf(incoming));
++
++        std::vector<Probe> probes{probe(existing, "usr/lib/libalpha.so.1", librarySymbols("alpha"))};
++        expectLineInformation(probes[0]);
++        ASSERT_NE(probes[0].expected[0], gdb(incoming, globalDirectories(), librarySymbols("alpha"))[0]);
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_FALSE(hasSectionWithContents(appDir / "usr/lib/libalpha.so.1", ".debug_info"));
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, executableKeptAtTheDestinationIsTheOneSaved) {
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++        const auto existing = appDir / "usr" / "bin" / "app";
++        fs::create_directories(existing.parent_path());
++        fs::rename(buildExecutable("app", {{"alpha", library}}, {"-g"}, "", 5), existing);
++        const auto incoming = buildExecutable("app", {{"alpha", library}});
++
++        const auto existingBuildId = buildIdOf(existing);
++        ASSERT_NE(existingBuildId, buildIdOf(incoming));
++
++        std::vector<Probe> probes{probe(existing, "usr/bin/app", executableSymbols("app"))};
++        expectLineInformation(probes[0]);
++        ASSERT_NE(probes[0].expected[0], gdb(incoming, globalDirectories(), executableSymbols("app"))[0]);
++
++        mustDeploy({"-e", incoming.string()});
++
++        ASSERT_EQ(existingBuildId, buildIdOf(appDir / "usr/bin/app"));
++        EXPECT_FALSE(hasSectionWithContents(appDir / "usr/bin/app", ".debug_info"));
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, collidingLibrariesSaveTheOneThatWasCopied) {
++        const auto first = buildLibrary("dup", fixtures / "first");
++        const auto second = buildLibrary("dup", fixtures / "second", {"-g"}, 7);
++
++        const auto firstBuildId = buildIdOf(first);
++        const auto secondBuildId = buildIdOf(second);
++        ASSERT_NE(firstBuildId, secondBuildId);
++
++        std::map<std::string, Probe> probesByBuildId{
++            {firstBuildId, probe(first, "usr/lib/libdup.so.1", librarySymbols("dup"))},
++            {secondBuildId, probe(second, "usr/lib/libdup.so.1", librarySymbols("dup"))},
++        };
++        ASSERT_NE(probesByBuildId.at(firstBuildId).expected[0], probesByBuildId.at(secondBuildId).expected[0]);
++
++        mustDeploy({"-l", first.string(), "-l", second.string()});
++
++        const auto deployedBuildId = buildIdOf(appDir / "usr/lib/libdup.so.1");
++        ASSERT_TRUE(probesByBuildId.count(deployedBuildId)) << deployedBuildId;
++
++        std::vector<Probe> probes{probesByBuildId.at(deployedBuildId)};
++        expectLineInformation(probes[0]);
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, secondRunKeepsEverythingWorking) {
++        std::string altBuildId;
++        const auto libraries = buildDebianDwzPair("phi", "chi", altBuildId);
++        const auto plain = buildLibrary("alpha", fixtures / "lib");
++        const auto executable = buildExecutable("app", {{"phi", libraries.first}, {"chi", libraries.second}, {"alpha", plain}});
++
++        const auto toolSource = fixtures / "src" / "tool.c";
++        writeFile(toolSource, executableSource("tool", {}));
++        const auto tool = fixtures / "bin" / "tool";
++        mustRun({"gcc", "-static", "-g", "-O0", "-o", tool.string(), "src/tool.c"});
++
++        std::vector<Probe> probes{
++            probe(executable, "usr/bin/app", executableSymbols("app")),
++            probe(tool, "usr/bin/tool", executableSymbols("tool")),
++            probe(libraries.first, "usr/lib/libphi.so.1", dwzLibrarySymbols("phi")),
++            probe(libraries.second, "usr/lib/libchi.so.1", dwzLibrarySymbols("chi")),
++            probe(plain, "usr/lib/libalpha.so.1", librarySymbols("alpha")),
++        };
++        for (const auto& p : probes)
++            expectLineInformation(p);
++
++        mustDeploy({"-e", executable.string(), "-e", tool.string()});
++        mustDeploy({"-e", executable.string(), "-e", tool.string()});
++
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, secondRunKeepsStaticExecutableLinked) {
++        const auto toolSource = fixtures / "src" / "tool.c";
++        writeFile(toolSource, executableSource("tool", {}));
++        const auto tool = fixtures / "bin" / "tool";
++        mustRun({"gcc", "-static", "-g", "-O0", "-o", tool.string(), "src/tool.c"});
++
++        std::vector<Probe> probes{probe(tool, "usr/bin/tool", executableSymbols("tool"))};
++        expectLineInformation(probes[0]);
++
++        mustDeploy({"-e", tool.string()});
++        mustDeploy({"-e", tool.string()});
++
++        const auto debugFile = tree / "usr/bin/.debug/tool.debug";
++        ASSERT_TRUE(fs::is_regular_file(debugFile));
++        EXPECT_TRUE(hasSectionWithContents(debugFile, ".debug_info"));
++
++        const auto link = debugLinkOf(appDir / "usr/bin/tool");
++        EXPECT_EQ("tool.debug", link.name);
++        EXPECT_EQ(crc32Of(debugFile), link.crc);
++
++        expectSameWhenUnpacked(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, secondRunKeepsFilesWithoutBuildIdWorking) {
++        const auto library = buildLibrary("nobid", fixtures / "lib", {"-g", "-Wl,--build-id=none"});
++        const auto executable = buildExecutable("app", {{"nobid", library}}, {"-g", "-Wl,--build-id=none"});
++
++        const auto toolSource = fixtures / "src" / "tool.c";
++        writeFile(toolSource, executableSource("tool", {}));
++        const auto tool = fixtures / "bin" / "tool";
++        mustRun({"gcc", "-static", "-g", "-O0", "-Wl,--build-id=none", "-o", tool.string(), "src/tool.c"});
++
++        ASSERT_TRUE(buildIdOf(tool).empty());
++
++        std::vector<Probe> probes{
++            probe(executable, "usr/bin/app", executableSymbols("app")),
++            probe(tool, "usr/bin/tool", executableSymbols("tool")),
++            probe(library, "usr/lib/libnobid.so.1", librarySymbols("nobid")),
++        };
++        for (const auto& p : probes)
++            expectLineInformation(p);
++
++        mustDeploy({"-e", executable.string(), "-e", tool.string()});
++        mustDeploy({"-e", executable.string(), "-e", tool.string()});
++
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, defaultDirectoryIsUsrLibDebug) {
++        fs::path libm;
++        for (const auto& candidate : {"/lib/" + triplet + "/libm.so.6", "/usr/lib/" + triplet + "/libm.so.6"}) {
++            if (fs::exists(candidate)) {
++                libm = candidate;
++                break;
++            }
++        }
++        ASSERT_FALSE(libm.empty());
++
++        const auto buildId = buildIdOf(fs::canonical(libm));
++        ASSERT_TRUE(fs::exists(buildIdLinkIn("/usr/lib/debug", buildId))) << "libc6-dbg is not installed";
++
++        std::vector<Probe> probes{probe(libm, "usr/lib/libm.so.6", {"info line sincosf", "info line cosf", "info line exp", "info line ldexp", "info line frexp"}, "/usr/lib/debug")};
++        ASSERT_TRUE(std::any_of(probes[0].expected.begin(), probes[0].expected.end(), [](const std::string& output) {
++            return startsWith(output, "Line ");
++        })) << "GDB found no line information for " << libm;
++
++        mustDeploy({"-l", libm.string()}, {}, {"LINUXDEPLOY_DEBUG_FILE_DIRECTORY"});
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libm.so.6.debug"));
++        EXPECT_EQ("libm.so.6.debug", debugLinkOf(appDir / "usr/lib/libm.so.6").name);
++
++        expectSameWhenUnpacked(probes);
++        expectSameThroughDebugFileDirectory(probes);
++    }
++
++    TEST_F(DebugSymbolsTest, variableReplacesTheDefaultDirectory) {
++        fs::path libm;
++        for (const auto& candidate : {"/lib/" + triplet + "/libm.so.6", "/usr/lib/" + triplet + "/libm.so.6"}) {
++            if (fs::exists(candidate)) {
++                libm = candidate;
++                break;
++            }
++        }
++        ASSERT_FALSE(libm.empty());
++
++        const auto buildId = buildIdOf(fs::canonical(libm));
++        const auto defaultCandidate = buildIdLinkIn("/usr/lib/debug", buildId);
++        ASSERT_TRUE(fs::exists(defaultCandidate)) << "libc6-dbg is not installed";
++        ASSERT_EQ(buildId, buildIdOf(fs::canonical(defaultCandidate)));
++        ASSERT_FALSE(fs::exists(buildIdLinkIn(globalDebugDir, buildId)));
++
++        const auto library = buildLibrary("alpha", fixtures / "lib");
++
++        mustDeploy({"-l", libm.string(), "-l", library.string()});
++
++        EXPECT_TRUE(fs::is_regular_file(tree / "usr/lib/.debug/libalpha.so.1.debug"));
++        EXPECT_FALSE(fs::exists(tree / "usr/lib/.debug/libm.so.6.debug"));
++        EXPECT_FALSE(fs::is_symlink(buildIdLinkIn(tree, buildId)));
++    }
++
++    TEST_F(DebugSymbolsTest, withoutTheOptionNothingIsSaved) {
++        const auto library = buildLibrary("delta", fixtures / "lib");
++        splitLikeDebian(library, globalDebugDir);
++        const auto original = debugLinkOf(library);
++
++        const auto executable = buildExecutable("app", {{"delta", library}});
++
++        const auto plain = deploy({"--appdir", (root / "PlainAppDir").string(), "-e", executable.string()});
++        ASSERT_TRUE(plain.succeeded()) << plain.describe();
++
++        EXPECT_EQ(original.name, debugLinkOf(root / "PlainAppDir/usr/lib/libdelta.so.1").name);
++        EXPECT_FALSE(debugLinkOf(root / "PlainAppDir/usr/bin/app").present);
++        EXPECT_FALSE(hasSectionWithContents(root / "PlainAppDir/usr/bin/app", ".debug_info"));
++        EXPECT_FALSE(fs::exists(root / "PlainAppDir/usr/bin/.debug"));
++
++        mustDeploy({"-e", executable.string()});
++
++        EXPECT_EQ("libdelta.so.1.debug", debugLinkOf(appDir / "usr/lib/libdelta.so.1").name);
++        EXPECT_EQ("app.debug", debugLinkOf(appDir / "usr/bin/app").name);
++    }
++}

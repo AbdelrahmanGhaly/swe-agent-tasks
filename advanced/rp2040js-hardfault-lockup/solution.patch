@@ -1,0 +1,477 @@
+diff --git a/src/cortex-m0-core.ts b/src/cortex-m0-core.ts
+index d7cab56..22ff899 100644
+--- a/src/cortex-m0-core.ts
++++ b/src/cortex-m0-core.ts
+@@ -26,6 +26,11 @@ export const SYSM_CONTROL = 20;
+ // Lowest possible exception priority
+ const LOWEST_PRIORITY = 4;
+ 
++// The PC value of a locked up core
++const LOCKUP_ADDRESS = 0xfffffffe;
++
++class InstructionFault extends Error {}
++
+ enum ExecutionMode {
+   Mode_Thread,
+   Mode_Handler,
+@@ -39,6 +44,14 @@ function signExtend16(value: number) {
+   return (value << 16) >> 16;
+ }
+ 
++function bitCount(value: number) {
++  let count = 0;
++  for (; value; value &= value - 1) {
++    count++;
++  }
++  return count;
++}
++
+ const spRegister = 13;
+ const pcRegister = 15;
+ 
+@@ -56,6 +69,7 @@ export class CortexM0Core {
+ 
+   eventRegistered = false;
+   waiting = false;
++  lockup = false;
+ 
+   // APSR fields
+   public N: boolean = false;
+@@ -107,6 +121,7 @@ export class CortexM0Core {
+     this.SP = this.rp2040.readUint32(this.VTOR);
+     this.PC = this.rp2040.readUint32(this.VTOR + 4) & 0xfffffffe;
+     this.cycles = 0;
++    this.lockup = false;
+   }
+ 
+   get SP() {
+@@ -214,6 +229,44 @@ export class CortexM0Core {
+     this.rp2040.writeUint8(address, value);
+   }
+ 
++  private checkAccess(address: number, size: number) {
++    address = address >>> 0;
++    if (!this.rp2040.isPopulated(address) || !this.rp2040.isPopulated(address + size - 1)) {
++      throw new InstructionFault();
++    }
++    return address;
++  }
++
++  private loadUint32(address: number) {
++    return this.readUint32(this.checkAccess(address, 4));
++  }
++
++  private loadUint16(address: number) {
++    return this.readUint16(this.checkAccess(address, 2));
++  }
++
++  private loadUint8(address: number) {
++    return this.readUint8(this.checkAccess(address, 1));
++  }
++
++  private storeUint32(address: number, value: number) {
++    this.writeUint32(this.checkAccess(address, 4), value);
++  }
++
++  private storeUint16(address: number, value: number) {
++    this.writeUint16(this.checkAccess(address, 2), value);
++  }
++
++  private storeUint8(address: number, value: number) {
++    this.writeUint8(this.checkAccess(address, 1), value);
++  }
++
++  private checkWords(address: number, count: number) {
++    for (let i = 0; i < count; i++) {
++      this.checkAccess(address + 4 * i, 4);
++    }
++  }
++
+   switchStack(stack: StackPointerBank) {
+     if (this.SPSEL !== stack) {
+       const temp = this.SP;
+@@ -384,6 +437,27 @@ export class CortexM0Core {
+     }
+   }
+ 
++  private canStackFrame() {
++    const threadPSP = this.SPSEL && this.currentMode === ExecutionMode.Mode_Thread;
++    const framePtr = ((threadPSP ? this.SPprocess : this.SPmain) - 0x20) & ~0b100;
++    for (let i = 0; i < 8; i++) {
++      if (!this.rp2040.isPopulated(framePtr + 4 * i)) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  raiseFault(returnAddress: number) {
++    if (this.exceptionPriority(this.IPSR) < 0 || !this.canStackFrame()) {
++      this.lockup = true;
++      this.PC = LOCKUP_ADDRESS;
++      return;
++    }
++    this.PC = returnAddress;
++    this.exceptionEntry(EXC_HARDFAULT);
++  }
++
+   get vectPending() {
+     if (this.pendingNMI) {
+       return EXC_NMI;
+@@ -586,6 +660,10 @@ export class CortexM0Core {
+   }
+ 
+   executeInstruction() {
++    if (this.lockup) {
++      this.cycles++;
++      return 1;
++    }
+     if (this.interruptsUpdated) {
+       if (this.checkForInterrupts()) {
+         this.waiting = false;
+@@ -593,10 +671,35 @@ export class CortexM0Core {
+     }
+     // ARM Thumb instruction encoding - 16 bits / 2 bytes
+     const opcodePC = this.PC & ~1; //ensure no LSB set PC are executed
++    if (!this.rp2040.isExecutable(opcodePC)) {
++      this.raiseFault(opcodePC);
++      this.cycles++;
++      return 1;
++    }
+     const opcode = this.readUint16(opcodePC);
+     const wideInstruction = opcode >> 12 === 0b1111 || opcode >> 11 === 0b11101;
++    if (wideInstruction && !this.rp2040.isExecutable(opcodePC + 2)) {
++      this.raiseFault(opcodePC);
++      this.cycles++;
++      return 1;
++    }
+     const opcode2 = wideInstruction ? this.readUint16(opcodePC + 2) : 0;
+     this.PC += 2;
++    let deltaCycles: number;
++    try {
++      deltaCycles = this.executeOpcode(opcodePC, opcode, opcode2);
++    } catch (e) {
++      if (!(e instanceof InstructionFault)) {
++        throw e;
++      }
++      this.raiseFault(opcodePC);
++      deltaCycles = 1;
++    }
++    this.cycles += deltaCycles;
++    return deltaCycles;
++  }
++
++  private executeOpcode(opcodePC: number, opcode: number, opcode2: number) {
+     let deltaCycles = 1;
+     // ADCS
+     if (opcode >> 6 === 0b0100000101) {
+@@ -759,6 +862,16 @@ export class CortexM0Core {
+       this.BXWritePC(this.registers[Rm]);
+       deltaCycles++;
+     }
++    // CBZ, CBNZ
++    else if ((opcode & 0xf500) === 0xb100) {
++      const nonZero = (opcode >> 11) & 1;
++      const imm6 = (((opcode >> 9) & 1) << 6) | (((opcode >> 3) & 0x1f) << 1);
++      const Rn = opcode & 0x7;
++      if ((this.registers[Rn] !== 0) === !!nonZero) {
++        this.PC += imm6 + 2;
++        deltaCycles++;
++      }
++    }
+     // CMN (register)
+     else if (opcode >> 6 === 0b0100001011) {
+       const Rm = (opcode >> 3) & 0x7;
+@@ -821,6 +934,7 @@ export class CortexM0Core {
+       const Rn = (opcode >> 8) & 0x7;
+       const registers = opcode & 0xff;
+       let address = this.registers[Rn];
++      this.checkWords(address, bitCount(registers));
+       for (let i = 0; i < 8; i++) {
+         if (registers & (1 << i)) {
+           this.registers[i] = this.readUint32(address);
+@@ -840,7 +954,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const addr = this.registers[Rn] + imm5;
+       deltaCycles += this.cyclesIO(addr);
+-      this.registers[Rt] = this.readUint32(addr);
++      this.registers[Rt] = this.loadUint32(addr);
+     }
+     // LDR (sp + immediate)
+     else if (opcode >> 11 === 0b10011) {
+@@ -848,7 +962,7 @@ export class CortexM0Core {
+       const imm8 = opcode & 0xff;
+       const addr = this.SP + (imm8 << 2);
+       deltaCycles += this.cyclesIO(addr);
+-      this.registers[Rt] = this.readUint32(addr);
++      this.registers[Rt] = this.loadUint32(addr);
+     }
+     // LDR (literal)
+     else if (opcode >> 11 === 0b01001) {
+@@ -857,7 +971,7 @@ export class CortexM0Core {
+       const nextPC = this.PC + 2;
+       const addr = (nextPC & 0xfffffffc) + imm8;
+       deltaCycles += this.cyclesIO(addr);
+-      this.registers[Rt] = this.readUint32(addr);
++      this.registers[Rt] = this.loadUint32(addr);
+     }
+     // LDR (register)
+     else if (opcode >> 9 === 0b0101100) {
+@@ -866,7 +980,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const addr = this.registers[Rm] + this.registers[Rn];
+       deltaCycles += this.cyclesIO(addr);
+-      this.registers[Rt] = this.readUint32(addr);
++      this.registers[Rt] = this.loadUint32(addr);
+     }
+     // LDRB (immediate)
+     else if (opcode >> 11 === 0b01111) {
+@@ -875,7 +989,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const addr = this.registers[Rn] + imm5;
+       deltaCycles += this.cyclesIO(addr);
+-      this.registers[Rt] = this.readUint8(addr);
++      this.registers[Rt] = this.loadUint8(addr);
+     }
+     // LDRB (register)
+     else if (opcode >> 9 === 0b0101110) {
+@@ -884,7 +998,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const addr = this.registers[Rm] + this.registers[Rn];
+       deltaCycles += this.cyclesIO(addr);
+-      this.registers[Rt] = this.readUint8(addr);
++      this.registers[Rt] = this.loadUint8(addr);
+     }
+     // LDRH (immediate)
+     else if (opcode >> 11 === 0b10001) {
+@@ -893,7 +1007,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const addr = this.registers[Rn] + (imm5 << 1);
+       deltaCycles += this.cyclesIO(addr);
+-      this.registers[Rt] = this.readUint16(addr);
++      this.registers[Rt] = this.loadUint16(addr);
+     }
+     // LDRH (register)
+     else if (opcode >> 9 === 0b0101101) {
+@@ -902,7 +1016,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const addr = this.registers[Rm] + this.registers[Rn];
+       deltaCycles += this.cyclesIO(addr);
+-      this.registers[Rt] = this.readUint16(addr);
++      this.registers[Rt] = this.loadUint16(addr);
+     }
+     // LDRSB
+     else if (opcode >> 9 === 0b0101011) {
+@@ -911,7 +1025,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const addr = this.registers[Rm] + this.registers[Rn];
+       deltaCycles += this.cyclesIO(addr);
+-      this.registers[Rt] = signExtend8(this.readUint8(addr));
++      this.registers[Rt] = signExtend8(this.loadUint8(addr));
+     }
+     // LDRSH
+     else if (opcode >> 9 === 0b0101111) {
+@@ -920,7 +1034,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const addr = this.registers[Rm] + this.registers[Rn];
+       deltaCycles += this.cyclesIO(addr);
+-      this.registers[Rt] = signExtend16(this.readUint16(addr));
++      this.registers[Rt] = signExtend16(this.loadUint16(addr));
+     }
+     // LSLS (immediate)
+     else if (opcode >> 11 === 0b00000) {
+@@ -1038,6 +1152,7 @@ export class CortexM0Core {
+     else if (opcode >> 9 === 0b1011110) {
+       const P = (opcode >> 8) & 1;
+       let address = this.SP;
++      this.checkWords(address, bitCount(opcode & 0x1ff));
+       for (let i = 0; i <= 7; i++) {
+         if (opcode & (1 << i)) {
+           this.registers[i] = this.readUint32(address);
+@@ -1055,13 +1170,9 @@ export class CortexM0Core {
+     }
+     // PUSH
+     else if (opcode >> 9 === 0b1011010) {
+-      let bitCount = 0;
+-      for (let i = 0; i <= 8; i++) {
+-        if (opcode & (1 << i)) {
+-          bitCount++;
+-        }
+-      }
+-      let address = this.SP - 4 * bitCount;
++      const count = bitCount(opcode & 0x1ff);
++      let address = this.SP - 4 * count;
++      this.checkWords(address, count);
+       for (let i = 0; i <= 7; i++) {
+         if (opcode & (1 << i)) {
+           this.writeUint32(address, this.registers[i]);
+@@ -1072,7 +1183,7 @@ export class CortexM0Core {
+       if (opcode & (1 << 8)) {
+         this.writeUint32(address, this.registers[14]);
+       }
+-      this.SP -= 4 * bitCount;
++      this.SP -= 4 * count;
+     }
+     // REV
+     else if (opcode >> 6 === 0b1011101000) {
+@@ -1143,6 +1254,7 @@ export class CortexM0Core {
+       const Rn = (opcode >> 8) & 0x7;
+       const registers = opcode & 0xff;
+       let address = this.registers[Rn];
++      this.checkWords(address, bitCount(registers));
+       for (let i = 0; i < 8; i++) {
+         if (registers & (1 << i)) {
+           this.writeUint32(address, this.registers[i]);
+@@ -1162,7 +1274,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const address = this.registers[Rn] + imm5;
+       deltaCycles += this.cyclesIO(address, true);
+-      this.writeUint32(address, this.registers[Rt]);
++      this.storeUint32(address, this.registers[Rt]);
+     }
+     // STR (sp + immediate)
+     else if (opcode >> 11 === 0b10010) {
+@@ -1170,7 +1282,7 @@ export class CortexM0Core {
+       const imm8 = opcode & 0xff;
+       const address = this.SP + (imm8 << 2);
+       deltaCycles += this.cyclesIO(address, true);
+-      this.writeUint32(address, this.registers[Rt]);
++      this.storeUint32(address, this.registers[Rt]);
+     }
+     // STR (register)
+     else if (opcode >> 9 === 0b0101000) {
+@@ -1179,7 +1291,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const address = this.registers[Rm] + this.registers[Rn];
+       deltaCycles += this.cyclesIO(address, true);
+-      this.writeUint32(address, this.registers[Rt]);
++      this.storeUint32(address, this.registers[Rt]);
+     }
+     // STRB (immediate)
+     else if (opcode >> 11 === 0b01110) {
+@@ -1188,7 +1300,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const address = this.registers[Rn] + imm5;
+       deltaCycles += this.cyclesIO(address, true);
+-      this.writeUint8(address, this.registers[Rt]);
++      this.storeUint8(address, this.registers[Rt]);
+     }
+     // STRB (register)
+     else if (opcode >> 9 === 0b0101010) {
+@@ -1197,7 +1309,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const address = this.registers[Rm] + this.registers[Rn];
+       deltaCycles += this.cyclesIO(address, true);
+-      this.writeUint8(address, this.registers[Rt]);
++      this.storeUint8(address, this.registers[Rt]);
+     }
+     // STRH (immediate)
+     else if (opcode >> 11 === 0b10000) {
+@@ -1206,7 +1318,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const address = this.registers[Rn] + imm5;
+       deltaCycles += this.cyclesIO(address, true);
+-      this.writeUint16(address, this.registers[Rt]);
++      this.storeUint16(address, this.registers[Rt]);
+     }
+     // STRH (register)
+     else if (opcode >> 9 === 0b0101001) {
+@@ -1215,7 +1327,7 @@ export class CortexM0Core {
+       const Rt = opcode & 0x7;
+       const address = this.registers[Rm] + this.registers[Rn];
+       deltaCycles += this.cyclesIO(address, true);
+-      this.writeUint16(address, this.registers[Rt]);
++      this.storeUint16(address, this.registers[Rt]);
+     }
+     // SUB (SP minus immediate)
+     else if (opcode >> 7 === 0b101100001) {
+@@ -1277,9 +1389,9 @@ export class CortexM0Core {
+     else if (opcode >> 4 === 0b111101111111 && opcode2 >> 12 === 0b1010) {
+       const imm4 = opcode & 0xf;
+       const imm12 = opcode2 & 0xfff;
++      this.PC += 2;
+       this.breakRewind = 4;
+       this.rp2040.onBreak((imm4 << 12) | imm12);
+-      this.PC += 2;
+     }
+     // UXTB
+     else if (opcode >> 6 == 0b1011001011) {
+@@ -1311,15 +1423,14 @@ export class CortexM0Core {
+     else if (opcode === 0b1011111100010000) {
+       // do nothing for now. Wait for event!
+       this.logger.info(LOG_NAME, 'Yield');
++    }
++    // Unallocated hints execute as NOP
++    else if ((opcode & 0xff0f) === 0xbf00) {
++      // Do nothing!
+     } else {
+-      this.logger.warn(
+-        LOG_NAME,
+-        `Warning: Instruction at ${opcodePC.toString(16)} is not implemented yet!`,
+-      );
+-      this.logger.warn(LOG_NAME, `Opcode: 0x${opcode.toString(16)} (0x${opcode2.toString(16)})`);
++      throw new InstructionFault();
+     }
+ 
+-    this.cycles += deltaCycles;
+     return deltaCycles;
+   }
+ }
+diff --git a/src/rp2040.ts b/src/rp2040.ts
+index 4f0ec4e..83e9b68 100644
+--- a/src/rp2040.ts
++++ b/src/rp2040.ts
+@@ -38,6 +38,12 @@ export const APB_START_ADDRESS = 0x40000000;
+ export const DPRAM_START_ADDRESS = 0x50100000;
+ export const SIO_START_ADDRESS = 0xd0000000;
+ 
++const SRAM_BANKS_START_ADDRESS = 0x21000000;
++const SRAM_BANKS_END_ADDRESS = 0x21040000;
++const PERIPHERALS_END_ADDRESS = 0x60000000;
++const PPB_START_ADDRESS = 0xe0000000;
++const PPB_END_ADDRESS = 0xe0100000;
++
+ const LOG_NAME = 'RP2040';
+ 
+ /**
+@@ -193,8 +199,7 @@ export class RP2040 {
+   // Debugging
+   // eslint-disable-next-line @typescript-eslint/no-unused-vars
+   public onBreak = (code: number) => {
+-    // TODO: raise HardFault exception
+-    // console.error('Breakpoint!', code);
++    this.core.raiseFault(this.core.PC - this.core.breakRewind);
+   };
+ 
+   constructor(readonly clock: IClock = new SimulationClock()) {
+@@ -302,6 +307,30 @@ export class RP2040 {
+     return this.peripherals[(address >>> 14) << 2];
+   }
+ 
++  /** Whether the RP2040 address map has memory or peripherals at the given address */
++  isPopulated(address: number) {
++    address = address >>> 0;
++    return (
++      address < this.bootrom.length * 4 ||
++      (address >= FLASH_START_ADDRESS && address < RAM_START_ADDRESS) ||
++      (address >= RAM_START_ADDRESS && address < RAM_START_ADDRESS + this.sram.length) ||
++      (address >= SRAM_BANKS_START_ADDRESS && address < SRAM_BANKS_END_ADDRESS) ||
++      (address >= APB_START_ADDRESS && address < PERIPHERALS_END_ADDRESS) ||
++      (address >= SIO_START_ADDRESS && address < PPB_START_ADDRESS) ||
++      (address >= PPB_START_ADDRESS && address < PPB_END_ADDRESS)
++    );
++  }
++
++  /** Whether the core can fetch instructions from the given address: ROM, XIP flash or SRAM */
++  isExecutable(address: number) {
++    address = address >>> 0;
++    return (
++      address < this.bootrom.length * 4 ||
++      (address >= FLASH_START_ADDRESS && address < FLASH_END_ADDRESS) ||
++      (address >= RAM_START_ADDRESS && address < RAM_START_ADDRESS + this.sram.length)
++    );
++  }
++
+   /** We assume the address is 16-bit aligned */
+   readUint16(address: number) {
+     if (address >= FLASH_START_ADDRESS && address < FLASH_START_ADDRESS + this.flash.length) {

@@ -1,0 +1,6116 @@
+diff --git a/cmds/exp/ed/address.go b/cmds/exp/ed/address.go
+index b3bca20a8..cac8989a5 100644
+--- a/cmds/exp/ed/address.go
++++ b/cmds/exp/ed/address.go
+@@ -2,294 +2,205 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-// address.go - contains methods for FileBuffer for line address resolution
++// address.go - line address parsing and checking
+ package main
+ 
+ import (
+-	"fmt"
+-	"regexp"
++	"math"
+ 	"strconv"
+-	"strings"
+ )
+ 
+-// regex helpers
+-func reGroup(s string) string {
+-	return "(" + s + ")"
++// isBlank reports whether c is white space other than a newline.
++func isBlank(c byte) bool {
++	return c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == '\r'
+ }
+ 
+-func reOr(s ...string) string {
+-	return strings.Join(s, "|")
+-}
+-
+-func reOpt(s string) string {
+-	return s + "?"
+-}
+-
+-func reStart(s string) string {
+-	return "^" + s
+-}
+-
+-// addr regex strings
+-var (
+-	reWhitespace   = "(\\s)"
+-	reSingleSymbol = "([.$])"
+-	reNumber       = "([0-9]+)"
+-	reOffset       = reGroup("([-+])" + reOpt(reNumber))
+-	reMark         = "'([a-z])"
+-	reRE           = "(\\/((?:\\\\/|[^\\/])*)\\/|\\?((?:\\\\?|[^\\?])*)\\?)"
+-	reSingle       = reGroup(reOr(reSingleSymbol, reNumber, reOffset, reMark, reRE))
+-	reOff          = "(?:\\s+" + reGroup(reOr(reNumber, reOffset)) + ")"
+-)
++func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+ 
+-// addr compiled regexes
+-var (
+-	rxWhitespace   = regexp.MustCompile(reStart(reWhitespace))
+-	rxSingleSymbol = regexp.MustCompile(reStart(reSingleSymbol))
+-	rxNumber       = regexp.MustCompile(reStart(reNumber))
+-	rxOffset       = regexp.MustCompile(reStart(reOffset))
+-	rxMark         = regexp.MustCompile(reStart(reMark))
+-	rxRE           = regexp.MustCompile(reStart(reRE))
+-	rxSingle       = regexp.MustCompile(reStart(reSingle))
+-	rxOff          = regexp.MustCompile(reStart(reOff))
+-)
+-
+-// ResolveOffset resolves an offset to an addr
+-func (f *FileBuffer) ResolveOffset(cmd string) (offset, cmdOffset int, e error) {
+-	ms := rxOff.FindStringSubmatch(cmd)
+-	// 0: full
+-	// 1: without whitespace
+-	// 2: num
+-	// 3: offset full
+-	// 4: offset +/-
+-	// 5: offset num
+-	if len(ms) == 0 {
+-		return
+-	}
+-	n := 1
+-	cmdOffset = len(ms[0])
+-	switch {
+-	case len(ms[2]) > 0:
+-		// num
+-		if n, e = strconv.Atoi(ms[2]); e != nil {
+-			return
+-		}
+-		offset = n
+-	case len(ms[3]) > 0:
+-		// offset
+-		if len(ms[5]) > 0 {
+-			if n, e = strconv.Atoi(ms[5]); e != nil {
+-				return
+-			}
+-		}
+-		switch ms[4][0] {
+-		case '+':
+-			offset = n
+-		case '-':
+-			offset = -n
+-		}
++func (c *cmdbuf) skipBlanks() {
++	for isBlank(c.peek()) {
++		c.pos++
+ 	}
+-	return
+ }
+ 
+-// ResolveAddr resolves a command address from a cmd string
+-// - makes no attempt to verify that the resulting addr is valid
+-func (f *FileBuffer) ResolveAddr(cmd string) (line, cmdOffset int, e error) {
+-	line = f.GetAddr()
+-	cmdOffset = 0
+-	m := rxSingle.FindString(cmd)
+-	if len(m) == 0 {
+-		// no match
+-		return
++// number reads an optionally signed decimal number.
++func (c *cmdbuf) number() (int, error) {
++	start := c.pos
++	if p := c.peek(); p == '+' || p == '-' {
++		c.pos++
+ 	}
+-	cmdOffset = len(m)
+-	switch {
+-	case rxSingleSymbol.MatchString(m):
+-		// no need to rematch; these are all single char
+-		switch m[0] {
+-		case '.':
+-			// current
+-		case '$':
+-			// last
+-			line = f.Len() - 1
+-		}
+-	case rxNumber.MatchString(m):
+-		var n int
+-		ns := rxNumber.FindString(m)
+-		if n, e = strconv.Atoi(ns); e != nil {
+-			return
+-		}
+-		line = n - 1
+-	case rxOffset.MatchString(m):
+-		n := 1
+-		ns := rxOffset.FindStringSubmatch(m)
+-		if len(ns[3]) > 0 {
+-			if n, e = strconv.Atoi(ns[3]); e != nil {
+-				return
+-			}
+-		}
+-		switch ns[2][0] {
+-		case '+':
+-			line = f.GetAddr() + n
+-		case '-':
+-			line = f.GetAddr() - n
+-		}
+-	case rxMark.MatchString(m):
+-		c := m[1] // len should already be verified by regexp
+-		line, e = buffer.GetMark(c)
+-	case rxRE.MatchString(m):
+-		r := rxRE.FindAllStringSubmatch(m, -1)
+-		// 0: full
+-		// 1: regexp w/ delim
+-		// 2: regexp
+-		if len(r) < 1 || len(r[0]) < 3 {
+-			e = fmt.Errorf("invalid regexp: %s", m)
+-			return
+-		}
+-		restr := r[0][2]
+-		sign := 1
+-		if r[0][0][0] == '?' {
+-			sign = -1
+-			restr = r[0][3]
+-		}
+-		var re *regexp.Regexp
+-		if re, e = regexp.Compile(restr); e != nil {
+-			e = fmt.Errorf("invalid regexp: %w", e)
+-			return
+-		}
+-		var c int
+-		for i := 0; i < f.Len(); i++ {
+-			c = (sign*i + f.GetAddr() + f.Len()) % f.Len()
+-			if re.MatchString(f.GetMust(c, false)) {
+-				line = c
+-				return
+-			}
+-		}
+-		e = fmt.Errorf("regexp not found: %s", restr)
++	digits := c.pos
++	for isDigit(c.peek()) {
++		c.pos++
+ 	}
+-	if e != nil {
+-		return
++	if c.pos == digits {
++		c.pos = start
++		return 0, errInvalidNumber
+ 	}
+-
+-	for {
+-		var off, cmdoff int
+-		if off, cmdoff, e = f.ResolveOffset(cmd[cmdOffset:]); e != nil {
+-			return
+-		}
+-		if cmdoff > 0 {
+-			// we got an offset
+-			line += off
+-			cmdOffset += cmdoff
+-		} else {
+-			// no more offsets
+-			break
+-		}
++	n, err := strconv.ParseInt(c.s[start:c.pos], 10, 64)
++	if err != nil || n > math.MaxInt32 || n < -math.MaxInt32 {
++		return 0, errNumberRange
+ 	}
+-	return
++	return int(n), nil
+ }
+ 
+-// ResolveAddrs resolves all addrs at the begining of a line
+-// - makes no attempt to verify that the resulting addrs are valid
+-// - will always return at least one addr as long as there isn't an error
+-// - if an error is reached, return value behavior is undefined
+-func (f *FileBuffer) ResolveAddrs(cmd string) (lines []int, cmdOffset int, e error) {
+-	var line, off int
+-
+-Loop:
+-	for cmdOffset < len(cmd) {
+-		cmdOffset += wsOffset(cmd[cmdOffset:])
+-		if line, off, e = f.ResolveAddr(cmd[cmdOffset:]); e != nil {
+-			return
+-		}
+-		lines = append(lines, line)
+-		cmdOffset += off
+-		cmdOffset += wsOffset(cmd[cmdOffset:])
+-		if len(cmd)-1 <= cmdOffset {
+-			return
+-		}
+-		switch cmd[cmdOffset] { // do we have more addrs?
+-		case ',':
+-			cmdOffset++
+-		case ';':
+-			// we're  the left side of a ; set the current addr
+-			if e = f.SetAddr(line); e != nil {
+-				return
++// addresses reads the addresses in front of a command. It returns how many
++// were given (at most two); first and second are set to the range they
++// name, both the current line when none was given. An address outside 0
++// through the last line is an error before any command sees it.
++func (e *editor) addresses(c *cmdbuf) (int, error) {
++	first := true
++	e.first, e.second = -1, -1
++	c.skipBlanks()
++	for {
++		ch := c.peek()
++		switch {
++		case isDigit(ch):
++			n, err := c.number()
++			if err != nil {
++				return -1, err
++			}
++			if first {
++				first = false
++				e.second = n
++			} else {
++				e.second += n
++			}
++		case ch == ' ' || ch == '\t':
++			c.pos++
++			c.skipBlanks()
++		case ch == '+' || ch == '-':
++			if first {
++				first = false
++				e.second = e.buf.cur
++			}
++			if c.pos+1 < len(c.s) && isDigit(c.s[c.pos+1]) {
++				n, err := c.number()
++				if err != nil {
++					return -1, err
++				}
++				e.second += n
++			} else {
++				c.pos++
++				if ch == '+' {
++					e.second++
++				} else {
++					e.second--
++				}
++			}
++		case ch == '.' || ch == '$':
++			if !first {
++				return -1, errInvalidAddress
++			}
++			first = false
++			c.pos++
++			if ch == '.' {
++				e.second = e.buf.cur
++			} else {
++				e.second = e.buf.last()
++			}
++		case ch == '/' || ch == '?':
++			if !first {
++				return -1, errInvalidAddress
++			}
++			a, err := e.search(c)
++			if err != nil {
++				return -1, err
++			}
++			e.second = a
++			first = false
++		case ch == '\'':
++			if !first {
++				return -1, errInvalidAddress
++			}
++			first = false
++			c.pos++
++			a, err := e.buf.markAddr(c.next())
++			if err != nil {
++				return -1, err
+ 			}
+-			cmdOffset++
+-		case '%':
+-			lines = append(lines, 0, f.Len()-1)
+-			cmdOffset++
+-			cmdOffset += wsOffset(cmd[cmdOffset:])
+-			return
++			e.second = a
++		// GNU ed reads % exactly as it reads a comma: alone it stands for
++		// 1,$, and after an address it separates, so 1%p prints line 1 and
++		// 1%2p prints lines 1 and 2.
++		case ch == '%' || ch == ',' || ch == ';':
++			if first {
++				if e.first < 0 {
++					e.first = 1
++					if ch == ';' {
++						e.first = e.buf.cur
++					}
++					e.second = e.buf.last()
++				} else {
++					e.first = e.second
++				}
++			} else {
++				if e.second < 0 || e.second > e.buf.last() {
++					return -1, errInvalidAddress
++				}
++				if ch == ';' {
++					e.buf.cur = e.second
++				}
++				e.first = e.second
++				first = true
++			}
++			c.pos++
+ 		default:
+-			break Loop
++			if !first && (e.second < 0 || e.second > e.buf.last()) {
++				return -1, errInvalidAddress
++			}
++			n := 0
++			if e.second >= 0 {
++				n = 1
++				if e.first >= 0 {
++					n = 2
++				}
++			}
++			if n == 0 {
++				e.second = e.buf.cur
++			}
++			if n <= 1 {
++				e.first = e.second
++			}
++			return n, nil
+ 		}
+ 	}
+-	return
+ }
+ 
+-// wsOffset is a helper to find the offset to skip whitespace
+-func wsOffset(cmd string) (o int) {
+-	o = 0
+-	ws := rxWhitespace.FindStringIndex(cmd)
+-	if ws != nil {
+-		o = ws[1]
++// thirdAddress reads the destination of m and t. Like GNU ed, it takes the
++// last of several addresses, so 1m2,3 moves line 1 after line 3.
++func (e *editor) thirdAddress(c *cmdbuf) (int, error) {
++	first, second := e.first, e.second
++	if _, err := e.addresses(c); err != nil {
++		return -1, err
+ 	}
+-	return
+-}
+-
+-/*
+- * The following three functions, AddrValue, AddrRange, AddrRangeOrLine all get the specified
+- * type of address from an already parsed address.
+- */
+-
+-// AddrValue gets the resolved single-line address
+-func (f *FileBuffer) AddrValue(addrs []int) (r int, e error) {
+-	if len(addrs) == 0 {
+-		e = ErrINV
+-		return
+-	}
+-	r = addrs[len(addrs)-1]
+-	if f.OOB(r) {
+-		e = ErrOOB
++	addr := e.second
++	e.first, e.second = first, second
++	if addr < 0 || addr > e.buf.last() {
++		return -1, errInvalidAddress
+ 	}
+-	return
++	return addr, nil
+ }
+ 
+-// AddrRange gets and address range, fails if we don't have a range specified
+-func (f *FileBuffer) AddrRange(addrs []int) (r [2]int, e error) {
+-	switch len(addrs) {
+-	case 0:
+-		e = ErrINV
+-		return
+-	case 1:
+-		r[0] = f.GetAddr()
+-		r[1] = addrs[0]
+-	default:
+-		r[0] = addrs[len(addrs)-2]
+-		r[1] = addrs[len(addrs)-1]
+-	}
+-	if f.OOB(r[0]) || f.OOB(r[1]) {
+-		e = ErrOOB
++// checkRange applies the default range [from, to] when no address was given
++// and checks that the range lies in the buffer.
++func (e *editor) checkRange(from, to, n int) error {
++	if n == 0 {
++		e.first, e.second = from, to
+ 	}
+-	if r[0] > r[1] {
+-		e = fmt.Errorf("address out of order")
++	if e.first < 1 || e.first > e.second || e.second > e.buf.last() {
++		return errInvalidAddress
+ 	}
+-	return
++	return nil
+ }
+ 
+-// AddrRangeOrLine returns a range or single line if no range could be resolved
+-func (f *FileBuffer) AddrRangeOrLine(addrs []int) (r [2]int, e error) {
+-	if len(addrs) > 1 {
+-		// delete a range
+-		if r, e = buffer.AddrRange(addrs); e != nil {
+-			return
+-		}
+-	} else {
+-		// delete a line
+-		if r[0], e = buffer.AddrValue(addrs); e != nil {
+-			return
+-		}
+-		r[1] = r[0]
++// checkSecond applies the default address when none was given and checks it.
++func (e *editor) checkSecond(addr, n int) error {
++	if n == 0 {
++		e.second = addr
++	}
++	if e.second < 1 || e.second > e.buf.last() {
++		return errInvalidAddress
+ 	}
+-	return
++	return nil
+ }
+diff --git a/cmds/exp/ed/address_test.go b/cmds/exp/ed/address_test.go
+deleted file mode 100644
+index 175a6ac23..000000000
+--- a/cmds/exp/ed/address_test.go
++++ /dev/null
+@@ -1,311 +0,0 @@
+-// Copyright 2015-2018 the u-root Authors. All rights reserved
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-
+-package main
+-
+-import (
+-	"fmt"
+-	"testing"
+-)
+-
+-func TestResolveOffset(t *testing.T) {
+-	for _, tt := range []struct {
+-		name          string
+-		input         string
+-		wantOffset    int
+-		wantOffsetCmd int
+-		want          string
+-	}{
+-		{
+-			name:          "len(ms) == 0",
+-			input:         "",
+-			wantOffset:    0,
+-			wantOffsetCmd: 0,
+-		},
+-		{
+-			name:  "case len(ms[2]) > 0 with err in atoi",
+-			input: " 11111111111111111111",
+-			want:  "strconv.Atoi: parsing \"11111111111111111111\": value out of range",
+-		},
+-		{
+-			name:          "case len(ms[2]) > 0",
+-			input:         " 1",
+-			wantOffset:    1,
+-			wantOffsetCmd: 2,
+-		},
+-		{
+-			name:  "case len(ms[3]) > 0 with err in atoi",
+-			input: " -11111111111111111111",
+-			want:  "strconv.Atoi: parsing \"11111111111111111111\": value out of range",
+-		},
+-		{
+-			name:          "case len(ms[3]) > 0 case -",
+-			input:         " -1",
+-			wantOffset:    -1,
+-			wantOffsetCmd: 3,
+-		},
+-		{
+-			name:          "case len(ms[3]) > 0 case +",
+-			input:         " +1",
+-			wantOffset:    1,
+-			wantOffsetCmd: 3,
+-		},
+-	} {
+-		t.Run(tt.name, func(t *testing.T) {
+-			gotOffset, gotOffsetCmd, err := buffer.ResolveOffset(tt.input)
+-			buffer = &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}, addr: 2}
+-			if err != nil {
+-				if err.Error() != tt.want {
+-					t.Errorf("ResolveAddr() = %q, want: %q", err.Error(), tt.want)
+-				}
+-			} else {
+-				if gotOffset != tt.wantOffset || gotOffsetCmd != tt.wantOffsetCmd {
+-					t.Errorf("ResolveAddrs() = %d %d, want: %d %d", gotOffset, gotOffsetCmd, tt.wantOffset, tt.wantOffsetCmd)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-func TestResolveAddr(t *testing.T) {
+-	for _, tt := range []struct {
+-		name       string
+-		input      string
+-		wantLine   int
+-		wantOffset int
+-		want       string
+-	}{
+-		{
+-			name:       "case single symbol $",
+-			input:      "$",
+-			wantLine:   3,
+-			wantOffset: 1,
+-		},
+-		{
+-			name:       "case single symbol .",
+-			input:      ".",
+-			wantLine:   2,
+-			wantOffset: 1,
+-		},
+-		{
+-			name:       "case number",
+-			input:      "1",
+-			wantLine:   0,
+-			wantOffset: 1,
+-		},
+-		{
+-			name:  "case number with err",
+-			input: "11111111111111111111",
+-			want:  "strconv.Atoi: parsing \"11111111111111111111\": value out of range",
+-		},
+-		{
+-			name:       "case offset with case +",
+-			input:      "+",
+-			wantLine:   3,
+-			wantOffset: 1,
+-		},
+-		{
+-			name:       "case offset with case -",
+-			input:      "-",
+-			wantLine:   1,
+-			wantOffset: 1,
+-		},
+-		{
+-			name:  "case mark",
+-			input: "'t",
+-			want:  "mark was cleared: t",
+-		},
+-		{
+-			name:       "test7",
+-			input:      "//",
+-			wantLine:   2,
+-			wantOffset: 2,
+-		},
+-	} {
+-		t.Run(tt.name, func(t *testing.T) {
+-			buffer = &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}, addr: 2, marks: map[byte]int{'t': 5}}
+-			gotLine, gotOffset, err := buffer.ResolveAddr(tt.input)
+-			if err != nil {
+-				if err.Error() != tt.want {
+-					t.Errorf("ResolveAddr() = %q, want: %q", err.Error(), tt.want)
+-				}
+-			} else {
+-				if gotLine != tt.wantLine || gotOffset != tt.wantOffset {
+-					t.Errorf("ResolveAddrs() = %d %d, want: %d %d", gotLine, gotOffset, tt.wantLine, tt.wantOffset)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-func TestResolveAddrs(t *testing.T) {
+-	for _, tt := range []struct {
+-		name  string
+-		input string
+-		want1 int
+-		want2 int
+-		want  string
+-	}{
+-		{
+-			name:  "test1",
+-			input: ",,",
+-			want1: 2,
+-			want2: 1,
+-		},
+-		{
+-			name:  "test2",
+-			input: ";;",
+-			want1: 2,
+-			want2: 1,
+-		},
+-		{
+-			name:  "test3",
+-			input: "% %",
+-			want1: 3,
+-			want2: 2,
+-		},
+-		{
+-			name:  "test4",
+-			input: "abc",
+-			want1: 1,
+-			want2: 0,
+-		},
+-	} {
+-		t.Run(tt.name, func(t *testing.T) {
+-			buffer = &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}}
+-			got1, got2, err := buffer.ResolveAddrs(tt.input)
+-			if err != nil {
+-				if err.Error() != tt.want {
+-					t.Errorf("ResolveAddrs() = %q, want: %q", err.Error(), tt.want)
+-				}
+-			} else {
+-				if len(got1) != tt.want1 || got2 != tt.want2 {
+-					t.Errorf("ResolveAddrs() = %d %d, want: %d %d", len(got1), got2, tt.want1, tt.want2)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-func TestAddrValue(t *testing.T) {
+-	for _, tt := range []struct {
+-		name  string
+-		input []int
+-		want  int
+-		err   error
+-	}{
+-		{
+-			name:  "without err",
+-			input: []int{2},
+-			want:  2,
+-		},
+-		{
+-			name:  "len(addr) == 0",
+-			input: []int{},
+-			err:   ErrINV,
+-		},
+-		{
+-			name:  "OOB",
+-			input: []int{5},
+-			err:   ErrOOB,
+-		},
+-	} {
+-		t.Run(tt.name, func(t *testing.T) {
+-			buffer = &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}}
+-			got, err := buffer.AddrValue(tt.input)
+-			if err != nil {
+-				if err != tt.err {
+-					t.Errorf("ResolveAddrs() = %q, want: %d", err.Error(), tt.want)
+-				}
+-			} else {
+-				if got != tt.want {
+-					t.Errorf("ResolveAddrs() = %d, want: %d", got, tt.want)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-func TestAddrRange(t *testing.T) {
+-	for _, tt := range []struct {
+-		name  string
+-		input []int
+-		want  [2]int
+-		err   error
+-	}{
+-		{
+-			name:  "address out of order",
+-			input: []int{2, 0},
+-			err:   fmt.Errorf("address out of order"),
+-		},
+-		{
+-			name:  "case 0",
+-			input: []int{},
+-			err:   ErrINV,
+-		},
+-		{
+-			name:  "case 1",
+-			input: []int{0},
+-			want:  [2]int{0, 0},
+-		},
+-		{
+-			name:  "OOB",
+-			input: []int{5},
+-			err:   ErrOOB,
+-		},
+-	} {
+-		t.Run(tt.name, func(t *testing.T) {
+-			buffer = &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}}
+-			got, err := buffer.AddrRange(tt.input)
+-			if err != nil {
+-				if err.Error() != tt.err.Error() {
+-					t.Errorf("ResolveAddrs() = %q, want: %q", err.Error(), tt.err.Error())
+-				}
+-			} else {
+-				if got != tt.want {
+-					t.Errorf("ResolveAddrs() = %d, want: %d", got, tt.want)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-func TestAddrRangeOrLine(t *testing.T) {
+-	for _, tt := range []struct {
+-		name  string
+-		input []int
+-		want  [2]int
+-		err   error
+-	}{
+-		{
+-			name:  "len(addrs) > 1",
+-			input: []int{2, 0},
+-			err:   fmt.Errorf("address out of order"),
+-		},
+-		{
+-			name:  "else",
+-			input: []int{5},
+-			err:   ErrOOB,
+-		},
+-		{
+-			name:  "r[1] = r[0]",
+-			input: []int{0},
+-			want:  [2]int{0, 0},
+-		},
+-	} {
+-		t.Run(tt.name, func(t *testing.T) {
+-			buffer = &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}}
+-			got, err := buffer.AddrRangeOrLine(tt.input)
+-			if err != nil {
+-				if err.Error() != tt.err.Error() {
+-					t.Errorf("ResolveAddrs() = %q, want: %q", err.Error(), tt.err.Error())
+-				}
+-			} else {
+-				if got != tt.want {
+-					t.Errorf("ResolveAddrs() = %d, want: %d", got, tt.want)
+-				}
+-			}
+-		})
+-	}
+-}
+diff --git a/cmds/exp/ed/buffer.go b/cmds/exp/ed/buffer.go
+new file mode 100644
+index 000000000..40e70f09d
+--- /dev/null
++++ b/cmds/exp/ed/buffer.go
+@@ -0,0 +1,239 @@
++// Copyright 2019 the u-root Authors. All rights reserved
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// buffer.go - the editor buffer: lines, undo, marks, the cut buffer and the
++// lines a global command still has to visit
++package main
++
++import "slices"
++
++// A line is one line of text. Lines are compared by identity: marks and
++// global commands follow a line wherever it moves, and undo brings the same
++// lines back.
++type line struct {
++	text string
++}
++
++// A buffer holds the lines being edited, addressed from 1.
++type buffer struct {
++	lines    []*line
++	cur      int
++	modified bool
++
++	// The state undo returns to, and whether anything changed since it was
++	// recorded. A negative uCur disables undo until the next change.
++	uLines    []*line
++	uCur      int
++	uModified bool
++	uChanged  bool
++
++	marks  [26]*line
++	yanked []string
++	// The lines a global command selected, in order, and those of them it
++	// still has to visit.
++	active  []*line
++	pending map[*line]bool
++}
++
++func newBuffer() *buffer {
++	b := &buffer{}
++	b.resetUndo()
++	return b
++}
++
++func (b *buffer) last() int { return len(b.lines) }
++
++func (b *buffer) text(addr int) string { return b.lines[addr-1].text }
++
++// addrOf returns the address of l, or -1 if l is not in the buffer.
++func (b *buffer) addrOf(l *line) int {
++	return b.addrNear(l, 0)
++}
++
++// addrNear is addrOf for a line that is probably at or after addr, as the
++// next line a global command visits usually is: it looks there first.
++func (b *buffer) addrNear(l *line, addr int) int {
++	from := min(max(addr-1, 0), len(b.lines))
++	if i := slices.Index(b.lines[from:], l); i >= 0 {
++		return from + i + 1
++	}
++	if i := slices.Index(b.lines[:from], l); i >= 0 {
++		return i + 1
++	}
++	return -1
++}
++
++// clearUndo records the current state as the one undo returns to. Lines
++// that left the buffer since the last record are gone for good, so their
++// marks go with them.
++func (b *buffer) clearUndo() {
++	for i, m := range b.marks {
++		if m != nil && b.addrOf(m) < 0 {
++			b.marks[i] = nil
++		}
++	}
++	b.uLines = slices.Clone(b.lines)
++	b.uCur = b.cur
++	b.uModified = b.modified
++	b.uChanged = false
++}
++
++// resetUndo forgets the undo state entirely, as after reading a new file.
++func (b *buffer) resetUndo() {
++	b.clearUndo()
++	b.uCur = -1
++	b.uModified = false
++}
++
++// undo swaps the buffer with the recorded state, so a second undo redoes.
++func (b *buffer) undo() error {
++	if !b.uChanged || b.uCur < 0 {
++		return errNothingToUndo
++	}
++	b.lines, b.uLines = b.uLines, b.lines
++	b.cur, b.uCur = b.uCur, b.cur
++	b.modified, b.uModified = b.uModified, b.modified
++	b.active, b.pending = nil, nil
++	return nil
++}
++
++func (b *buffer) changed() {
++	b.uChanged = true
++	b.modified = true
++}
++
++// insert adds texts after addr and makes the last of them current.
++func (b *buffer) insert(addr int, texts []string) {
++	if len(texts) > 0 {
++		b.add(addr, texts)
++		b.modified = true
++	}
++}
++
++// add inserts texts after addr without counting it as a modification, as
++// when a file is read.
++func (b *buffer) add(addr int, texts []string) {
++	nl := make([]*line, len(texts))
++	for i, t := range texts {
++		nl[i] = &line{text: t}
++	}
++	b.lines = slices.Insert(b.lines, addr, nl...)
++	b.cur = addr + len(texts)
++	if len(texts) > 0 {
++		b.uChanged = true
++	}
++}
++
++// remove deletes lines from through to, puts them in the cut buffer, and
++// makes the line after them current.
++func (b *buffer) remove(from, to int, global bool) {
++	b.yank(from, to)
++	gone := b.lines[from-1 : to]
++	if global {
++		b.deactivate(gone)
++	}
++	b.lines = slices.Delete(b.lines, from-1, to)
++	b.cur = min(from, b.last())
++	b.changed()
++}
++
++// yank copies lines from through to into the cut buffer. Like GNU ed's y, it
++// leaves the current address unchanged.
++func (b *buffer) yank(from, to int) {
++	b.yanked = b.yanked[:0]
++	for a := from; a <= to; a++ {
++		b.yanked = append(b.yanked, b.text(a))
++	}
++}
++
++// move moves lines from through to after addr. Only the lines between the
++// moved ones and addr shift.
++func (b *buffer) move(from, to, addr int, global bool) {
++	if addr == from-1 || addr == to {
++		b.cur = to
++		b.modified = true
++		if global {
++			b.deactivate(b.lines[from-1 : to])
++		}
++		return
++	}
++	moved := slices.Clone(b.lines[from-1 : to])
++	n := len(moved)
++	dest := addr
++	if addr < from {
++		copy(b.lines[addr+n:to], b.lines[addr:from-1])
++	} else {
++		dest = addr - n
++		copy(b.lines[from-1:dest], b.lines[to:addr])
++	}
++	copy(b.lines[dest:dest+n], moved)
++	b.cur = dest + n
++	if global {
++		b.deactivate(moved)
++	}
++	b.changed()
++}
++
++// copyLines copies lines from through to after addr.
++func (b *buffer) copyLines(from, to, addr int) {
++	var texts []string
++	for a := from; a <= to; a++ {
++		texts = append(texts, b.text(a))
++	}
++	b.insert(addr, texts)
++}
++
++// setMark marks the line at addr. As in GNU ed, the mark is lost when the line
++// is deleted or modified, since a modified line is a new line; undo brings the
++// old line back with its mark.
++func (b *buffer) setMark(c byte, addr int) error {
++	if c < 'a' || c > 'z' {
++		return errInvalidMark
++	}
++	b.marks[c-'a'] = b.lines[addr-1]
++	return nil
++}
++
++// markAddr returns the address of the line marked c. In an empty buffer
++// every mark stands for address 0, whatever line it was set on.
++func (b *buffer) markAddr(c byte) (int, error) {
++	if c < 'a' || c > 'z' {
++		return -1, errInvalidMark
++	}
++	if b.last() == 0 {
++		return 0, nil
++	}
++	if a := b.addrOf(b.marks[c-'a']); a >= 0 {
++		return a, nil
++	}
++	return -1, errInvalidAddress
++}
++
++// activate selects the lines a global command visits.
++func (b *buffer) activate(lines []*line) {
++	b.active = lines
++	b.pending = make(map[*line]bool, len(lines))
++	for _, l := range lines {
++		b.pending[l] = true
++	}
++}
++
++func (b *buffer) deactivate(lines []*line) {
++	for _, l := range lines {
++		delete(b.pending, l)
++	}
++}
++
++// nextActive returns the next line a global command has to visit.
++func (b *buffer) nextActive() *line {
++	for len(b.active) > 0 {
++		l := b.active[0]
++		b.active = b.active[1:]
++		if b.pending[l] {
++			delete(b.pending, l)
++			return l
++		}
++	}
++	return nil
++}
+diff --git a/cmds/exp/ed/commands.go b/cmds/exp/ed/commands.go
+index bda82f3b1..658fedfc3 100644
+--- a/cmds/exp/ed/commands.go
++++ b/cmds/exp/ed/commands.go
+@@ -6,636 +6,518 @@
+ package main
+ 
+ import (
+-	"bufio"
+-	"bytes"
+ 	"fmt"
+-	"io"
+-	"os"
+-	"regexp"
+-	"strconv"
+ 	"strings"
+ )
+ 
+-var errExit = fmt.Errorf("exit")
+-
+-// A Context is passed to an invoked command
+-type Context struct {
+-	cmd       string // full command string
+-	cmdOffset int    // start of the command after address resolution
+-	addrs     []int  // resolved addresses
+-	out       io.Writer
+-}
+-
+-// A Command can be run with a Context and returns an error
+-type Command func(*Context) error
+-
+-// The cmds map maps single byte commands to their handler functions.
+-// This is also a good way to check what commands are implemented.
+-var cmds = map[byte]Command{
+-	'q': cmdQuit,
+-	'Q': cmdQuit,
+-	'd': cmdDelete,
+-	'l': cmdPrint,
+-	'p': cmdPrint,
+-	'n': cmdPrint,
+-	'h': cmdErr,
+-	'H': cmdErr,
+-	'a': cmdInput,
+-	'i': cmdInput,
+-	'c': cmdInput,
+-	'w': cmdWrite,
+-	'W': cmdWrite,
+-	'k': cmdMark,
+-	'e': cmdEdit,
+-	'E': cmdEdit,
+-	'r': cmdEdit,
+-	'f': cmdFile,
+-	'=': cmdLine,
+-	'j': cmdJoin,
+-	'm': cmdMove,
+-	't': cmdMove,
+-	'y': cmdCopy,
+-	'x': cmdPaste,
+-	'P': cmdPrompt,
+-	's': cmdSub,
+-	'u': cmdUndo,
+-	'D': cmdDump, // var dump the buffer for debug
+-	'z': cmdScroll,
+-	'!': cmdCommand,
+-	'#': func(*Context) (e error) { return },
+-}
+-
+-//////////////////////
+-// Command handlers /
+-////////////////////
+-
+-func cmdDelete(ctx *Context) (e error) {
+-	var r [2]int
+-	if r, e = buffer.AddrRangeOrLine(ctx.addrs); e != nil {
+-		return
+-	}
+-	e = buffer.Delete(r)
+-	return
+-}
+-
+-func cmdQuit(ctx *Context) (e error) {
+-	if ctx.cmd[ctx.cmdOffset] == 'q' && buffer.Dirty() {
+-		return fmt.Errorf("warning: file modified")
+-	}
+-	return errExit
+-}
+-
+-func cmdPrint(ctx *Context) (e error) {
+-	var r [2]int
+-	if r, e = buffer.AddrRangeOrLine(ctx.addrs); e != nil {
+-		return
+-	}
+-	for l := r[0]; l <= r[1]; l++ {
+-		if ctx.cmd[ctx.cmdOffset] == 'n' {
+-			fmt.Fprintf(ctx.out, "%d\t", l+1)
++func isSpace(c byte) bool { return c == '\n' || isBlank(c) }
++
++// suffix reads the print suffixes l, n and p, which must end the command.
++func (e *editor) suffix(c *cmdbuf, pflags *int) error {
++	for {
++		var f int
++		switch c.peek() {
++		case 'l':
++			f = pfList
++		case 'n':
++			f = pfNumber
++		case 'p':
++			f = pfPrint
+ 		}
+-		line := buffer.GetMust(l, true)
+-		if ctx.cmd[ctx.cmdOffset] == 'l' {
+-			line += "$" // TODO: the man pages describes more escaping, but it's not clear what GNU ed actually does.
++		if f == 0 || *pflags&f != 0 {
++			break
+ 		}
+-		fmt.Fprintf(ctx.out, "%s\n", line)
+-	}
+-	return
+-}
+-
+-func cmdScroll(ctx *Context) (e error) {
+-	start, e := buffer.AddrValue(ctx.addrs)
+-	if e != nil {
+-		return
++		*pflags |= f
++		c.pos++
+ 	}
+-	// parse win size (if there)
+-	winStr := ctx.cmd[ctx.cmdOffset+1:]
+-	if len(winStr) > 0 {
+-		var win int
+-		if win, e = strconv.Atoi(winStr); e != nil {
+-			return fmt.Errorf("invalid window size: %s", winStr)
+-		}
+-		state.winSize = win
++	if c.next() != '\n' {
++		return errBadSuffix
+ 	}
+-	end := min(start+state.winSize-1, buffer.Len()-1)
+-	var ls []string
+-	if ls, e = buffer.Get([2]int{start, end}); e != nil {
+-		return
+-	}
+-	for _, l := range ls {
+-		fmt.Fprintf(ctx.out, "%s\n", l)
+-	}
+-	return
++	return nil
+ }
+ 
+-func cmdErr(ctx *Context) (e error) {
+-	if ctx.cmd[ctx.cmdOffset] == 'h' {
+-		if state.lastErr != nil {
+-			fmt.Fprintf(ctx.out, "%s\n", state.lastErr)
+-			return
+-		}
++func (e *editor) unexpected(n int, c *cmdbuf) error {
++	if n > 0 {
++		return errUnexpectedAddr
+ 	}
+-	if ctx.cmd[ctx.cmdOffset] == 'H' {
+-		if state.printErr {
+-			state.printErr = false
+-			return
+-		}
+-		state.printErr = true
++	if !isSpace(c.peek()) {
++		return errUnexpectedSufx
+ 	}
+-	return
++	return nil
+ }
+ 
+-func cmdInput(ctx *Context) (e error) {
+-	scan := bufio.NewScanner(os.Stdin)
+-	nbuf := []string{}
+-	if len(ctx.cmd[ctx.cmdOffset+1:]) != 0 && ctx.cmd[ctx.cmdOffset] != 'c' {
+-		return fmt.Errorf("%c only takes a single line addres", ctx.cmd[ctx.cmdOffset])
+-	}
+-	for scan.Scan() {
+-		line := scan.Text()
+-		if line == "." {
+-			break
++// exec runs the next command in c. prev is the status of the command before
++// it, which lets q and e go ahead after their warning.
++func (e *editor) exec(c *cmdbuf, prev int, global bool) int {
++	n, err := e.addresses(c)
++	if err != nil {
++		return e.fail(err)
++	}
++	c.skipBlanks()
++	cmd := c.next()
++	pflags := 0
++	b := e.buf
++	switch cmd {
++	case 'a', 'i':
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
+ 		}
+-		nbuf = append(nbuf, line)
+-	}
+-	if len(nbuf) == 0 {
+-		return
+-	}
+-	switch ctx.cmd[ctx.cmdOffset] {
+-	case 'i':
+-		var line int
+-		if line, e = buffer.AddrValue(ctx.addrs); e != nil {
+-			return
+-		}
+-		e = buffer.Insert(line, nbuf)
+-	case 'a':
+-		var line int
+-		if line, e = buffer.AddrValue(ctx.addrs); e != nil {
+-			return
+-		}
+-		e = buffer.Insert(line+1, nbuf)
++		if !global {
++			b.clearUndo()
++		}
++		e.appendText(c, e.second, cmd == 'i', global)
+ 	case 'c':
+-		var r [2]int
+-		if r, e = buffer.AddrRange(ctx.addrs); e != nil {
+-			return
++		if err := e.checkRange(b.cur, b.cur, n); err != nil {
++			return e.fail(err)
+ 		}
+-		if e = buffer.Delete(r); e != nil {
+-			return
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
+ 		}
+-		e = buffer.Insert(r[0], nbuf)
+-	}
+-	return
+-}
+-
+-var rxWrite = regexp.MustCompile(`^(q)?(?: )?(!)?(.*)`)
+-
+-func cmdWrite(ctx *Context) (e error) {
+-	file := state.fileName
+-	quit := false
+-	run := false
+-	var r [2]int
+-	if ctx.cmdOffset == 0 {
+-		r[0] = 0
+-		r[1] = buffer.Len() - 1
+-	} else {
+-		if r, e = buffer.AddrRange(ctx.addrs); e != nil {
+-			return
++		if !global {
++			b.clearUndo()
+ 		}
+-	}
+-	m := rxWrite.FindAllStringSubmatch(ctx.cmd[ctx.cmdOffset+1:], -1)
+-	if m[0][1] == "q" {
+-		quit = true
+-	}
+-	if m[0][2] == "!" {
+-		run = true
+-	}
+-	if len(m[0][3]) > 0 {
+-		file = m[0][3]
+-	}
+-	var lstr []string
+-	lstr, e = buffer.Get(r)
+-	if e != nil {
+-		return
+-	}
+-	if run {
+-		s := System{
+-			Cmd:    m[0][3],
+-			Stdin:  bytes.NewBuffer(nil),
+-			Stdout: os.Stdout,
+-			Stderr: os.Stderr,
+-		}
+-		go func() {
+-			for _, str := range lstr {
+-				if _, e = fmt.Fprintf(s.Stdin.(*bytes.Buffer), "%s\n", str); e != nil {
+-					return
+-				}
+-			}
+-		}()
+-		return s.Run()
+-	}
+-
+-	var f *os.File
+-	oFlag := os.O_TRUNC
+-	if ctx.cmd[ctx.cmdOffset] == 'W' {
+-		oFlag = os.O_APPEND
+-	}
+-	if f, e = os.OpenFile(file, os.O_WRONLY|os.O_CREATE|oFlag, 0o666); e != nil {
+-		return e
+-	}
+-	defer f.Close()
+-
+-	for _, s := range lstr {
+-		_, e = fmt.Fprintf(f, "%s\n", s)
+-		if e != nil {
+-			return
++		b.remove(e.first, e.second, global)
++		e.appendText(c, b.cur, b.cur >= e.first, global)
++	case 'd':
++		if err := e.checkRange(b.cur, b.cur, n); err != nil {
++			return e.fail(err)
+ 		}
+-	}
+-	if quit {
+-		if e = cmdQuit(ctx); e != nil {
+-			return
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
+ 		}
+-	}
+-	buffer.Clean()
+-	return
+-}
+-
+-func cmdMark(ctx *Context) (e error) {
+-	if len(ctx.cmd)-1 <= ctx.cmdOffset {
+-		e = fmt.Errorf("no mark character supplied")
+-		return
+-	}
+-	c := ctx.cmd[ctx.cmdOffset+1]
+-	var l int
+-	if l, e = buffer.AddrValue(ctx.addrs); e != nil {
+-		return
+-	}
+-	e = buffer.SetMark(c, l)
+-	return
+-}
+-
+-func cmdEdit(ctx *Context) (e error) {
+-	var addr int
+-	// we do this manually because we allow addr 0
+-	if len(ctx.addrs) == 0 {
+-		return ErrINV
+-	}
+-	addr = ctx.addrs[len(ctx.addrs)-1]
+-	if addr != 0 && buffer.OOB(addr) {
+-		return ErrOOB
+-	}
+-	// cmd or filename?
+-	cmd := ctx.cmd[ctx.cmdOffset]
+-	force := false
+-	if cmd == 'E' || cmd == 'r' {
+-		force = true
+-	} // else == 'e'
+-	if buffer.Dirty() && !force {
+-		return fmt.Errorf("warning: file modified")
+-	}
+-	filename := ctx.cmd[ctx.cmdOffset+1:]
+-	filename = filename[wsOffset(filename):]
+-	var fh io.Reader
+-	if len(filename) == 0 {
+-		filename = state.fileName
+-	}
+-	if filename[0] == '!' { // command, not filename
+-		s := System{
+-			Cmd:    filename[1:],
+-			Stdout: bytes.NewBuffer(nil),
+-			Stdin:  os.Stdin,
+-			Stderr: os.Stderr,
+-		}
+-		if e = s.Run(); e != nil {
+-			return
+-		}
+-		fh = s.Stdout.(io.Reader)
+-	} else { // filename
+-		if _, e = os.Stat(filename); os.IsNotExist(e) && !fsuppress {
+-			return fmt.Errorf("%s: No such file or directory", filename)
+-			// this is not fatal, we just start with an empty buffer
+-		}
+-		if fh, e = os.Open(filename); e != nil {
+-			e = fmt.Errorf("could not read file: %w", e)
+-			return
+-		}
+-		state.fileName = filename
+-	}
+-
+-	if cmd != 'r' { // other commands replace
+-		buffer = NewFileBuffer(nil)
+-		if e = buffer.Read(0, fh); e != nil {
+-			return
++		if !global {
++			b.clearUndo()
+ 		}
+-	} else {
+-		e = buffer.Read(addr, fh)
+-	}
+-	if !fsuppress {
+-		fmt.Fprintf(ctx.out, "%d\n", buffer.Size())
+-	}
+-	return
+-}
+-
+-func cmdFile(ctx *Context) (e error) {
+-	newFile := ctx.cmd[ctx.cmdOffset:]
+-	newFile = newFile[wsOffset(newFile):]
+-	if len(newFile) > 0 {
+-		state.fileName = newFile
+-		return
+-	}
+-	fmt.Fprintf(ctx.out, "%s\n", state.fileName)
+-	return
+-}
+-
+-func cmdLine(ctx *Context) (e error) {
+-	addr, e := buffer.AddrValue(ctx.addrs)
+-	if e == nil {
+-		fmt.Fprintf(ctx.out, "%d\n", addr+1)
+-	}
+-	return
+-}
+-
+-func cmdJoin(ctx *Context) (e error) {
+-	var r [2]int
+-	if r, e = buffer.AddrRangeOrLine(ctx.addrs); e != nil {
+-		return
+-	}
+-	// Technically only a range works, but a line isn't an error
+-	if r[0] == r[1] {
+-		return
+-	}
+-
+-	var joined strings.Builder
+-	for l := r[0]; l <= r[1]; l++ {
+-		joined.WriteString(buffer.GetMust(l, false))
+-	}
+-	if e = buffer.Delete(r); e != nil {
+-		return
+-	}
+-	e = buffer.Insert(r[0], []string{joined.String()})
+-	return
+-}
+-
+-func cmdMove(ctx *Context) (e error) {
+-	var r [2]int
+-	var dest int
+-	var lines []string
+-	cmd := ctx.cmd[ctx.cmdOffset]
+-	if r, e = buffer.AddrRangeOrLine(ctx.addrs); e != nil {
+-		return
+-	}
+-	// must parse the destination
+-	destStr := ctx.cmd[ctx.cmdOffset+1:]
+-	var nctx Context
+-	if nctx.addrs, nctx.cmdOffset, e = buffer.ResolveAddrs(destStr); e != nil {
+-		return
+-	}
+-	// this is a bit hacky, but we're supposed to allow 0
+-	offset := 1
+-	last := len(nctx.addrs) - 1
+-	if nctx.addrs[last] == -1 {
+-		nctx.addrs[last] = 0
+-		offset = 0
+-	}
+-	if dest, e = buffer.AddrValue(nctx.addrs); e != nil {
+-		return
+-	}
+-
+-	if lines, e = buffer.Get(r); e != nil {
+-		return
+-	}
+-	delt := r[1] - r[0] + 1
+-	if dest < r[0] {
+-		r[0] += delt
+-		r[1] += delt
+-	} else if dest > r[1] {
+-		// NOP
+-	} else {
+-		return fmt.Errorf("cannot move lines to within their own range")
+-	}
+-
+-	// Should we throw an error if there's trailing stuff?
+-	if e = buffer.Insert(dest+offset, lines); e != nil {
+-		return
+-	}
+-	if cmd == 'm' {
+-		e = buffer.Delete(r)
+-	} // else 't'
+-	return
+-}
+-
+-func cmdCopy(ctx *Context) (e error) {
+-	var r [2]int
+-	if r, e = buffer.AddrRangeOrLine(ctx.addrs); e != nil {
+-		return
+-	}
+-	return buffer.Copy(r)
+-}
+-
+-func cmdPaste(ctx *Context) (e error) {
+-	var addr int
+-	// this is a bit hacky, but we're supposed to allow 0
+-	offset := 1
+-	last := len(ctx.addrs) - 1
+-	if ctx.addrs[last] == -1 {
+-		ctx.addrs[last] = 0
+-		offset = 0
+-	}
+-	if addr, e = buffer.AddrValue(ctx.addrs); e != nil {
+-		return
+-	}
+-	return buffer.Paste(addr + offset)
+-}
+-
+-func cmdPrompt(ctx *Context) (e error) {
+-	if state.prompt {
+-		state.prompt = false
+-	} else if len(fprompt) > 0 {
+-		state.prompt = true
+-	}
+-	return
+-}
+-
+-var (
+-	rxSanitize        = regexp.MustCompile(`\\.`)
+-	rxBackrefSanitize = regexp.MustCompile(`\\\\`)
+-	rxBackref         = regexp.MustCompile(`\\([0-9]+)|&`)
+-	rxSubArgs         = regexp.MustCompile(`g|l|n|p|\d+`)
+-)
+-
+-// FIXME: this is probably more convoluted than it needs to be
+-func cmdSub(ctx *Context) (e error) {
+-	cmd := ctx.cmd[ctx.cmdOffset+1:]
+-	if len(cmd) == 0 {
+-		if len(state.lastSub) == 0 {
+-			return fmt.Errorf("invalid substitution")
+-		}
+-		cmd = state.lastSub
+-	}
+-	state.lastSub = cmd
+-	del := cmd[0]
+-	switch del {
+-	case ' ':
+-		fallthrough
+-	case '\n':
+-		fallthrough
+-	case 'm':
+-		fallthrough
+-	case 'g':
+-		return fmt.Errorf("invalid pattern delimiter")
+-	}
+-	// we replace escapes and their escaped characters with spaces to keep indexing
+-	sane := rxSanitize.ReplaceAllString(cmd, "  ")
+-
+-	idx := [2]int{-1, -1}
+-	idx[0] = strings.Index(sane[1:], string(del)) + 1
+-	if idx[0] != -1 {
+-		idx[1] = strings.Index(sane[idx[0]+1:], string(del)) + idx[0] + 1
+-	}
+-	if idx[1] == -1 {
+-		idx[1] = len(cmd) - 1
+-	}
+-
+-	mat := cmd[1:idx[0]]
+-	rep := cmd[idx[0]+1 : idx[1]]
+-	if rep == "%" {
+-		rep = state.lastRep
+-	}
+-	state.lastRep = rep
+-	arg := cmd[idx[1]+1:]
+-
+-	// arg processing
+-	count := 1
+-	var printP, printL, printN, global bool
+-
+-	parsedArgs := rxSubArgs.FindAllStringSubmatch(arg, -1)
+-	for _, m := range parsedArgs {
+-		switch m[0] {
+-		case "g":
+-			global = true
+-		case "p":
+-			printP = true
+-		case "l":
+-			printL = true
+-		case "n":
+-			printN = true
+-		default:
+-			if count, e = strconv.Atoi(m[0]); e != nil || count < 1 {
+-				return fmt.Errorf("invalid substitution argument")
++		b.remove(e.first, e.second, global)
++	case 'e', 'E':
++		// As in GNU ed, the modified-buffer warning comes before the check
++		// that rejects an address.
++		if cmd == 'e' && b.modified && prev != statusEMod {
++			return statusEMod
++		}
++		if err := e.unexpected(n, c); err != nil {
++			return e.fail(err)
++		}
++		name, err := e.filename(c)
++		if err != nil {
++			return e.fail(err)
++		}
++		if b.last() > 0 {
++			b.remove(1, b.last(), global)
++		}
++		b.clearUndo()
++		b.yanked = nil
++		b.modified = false
++		if name != "" {
++			e.defFile = name
++		}
++		if name == "" {
++			name = e.defFile
++		}
++		if _, err := e.readFile(name, 0); err != nil {
++			return e.fail(err)
++		}
++		b.resetUndo()
++	case 'f':
++		if err := e.unexpected(n, c); err != nil {
++			return e.fail(err)
++		}
++		name, err := e.filename(c)
++		if err != nil {
++			return e.fail(err)
++		}
++		if name != "" {
++			e.defFile = name
++		}
++		fmt.Fprintln(e.out, e.defFile)
++	case 'g', 'v', 'G', 'V':
++		if global {
++			return e.fail(errCannotNest)
++		}
++		if err := e.checkRange(1, b.last(), n); err != nil {
++			return e.fail(err)
++		}
++		if err := e.activate(c, e.first, e.second, cmd == 'g' || cmd == 'G'); err != nil {
++			return e.fail(err)
++		}
++		interactive := cmd == 'G' || cmd == 'V'
++		if interactive {
++			if err := e.suffix(c, &pflags); err != nil {
++				return e.fail(err)
+ 			}
+ 		}
+-	}
+-
+-	repSane := rxBackrefSanitize.ReplaceAllString(rep, "  ")
+-	refs := rxBackref.FindAllStringSubmatchIndex(repSane, -1)
+-
+-	var r [2]int
+-	if r, e = buffer.AddrRangeOrLine(ctx.addrs); e != nil {
+-		return
+-	}
+-
+-	var rx *regexp.Regexp
+-	if rx, e = regexp.Compile(mat); e != nil {
+-		return
+-	}
+-
+-	last := ""
+-	lastN := 0
+-	nMatch := 0
+-	b, _ := buffer.Get(r)
+-	// we have to do things a bit manually because we we only have ReplaceAll, and we don't necessarily want that
+-	for ln, l := range b {
+-		matches := rx.FindAllStringSubmatchIndex(l, -1)
+-		if !(len(matches) > 0) {
+-			continue // skip the rest if we don't have matches
++		if st := e.global(c, pflags, interactive); st != statusOK {
++			return st
++		}
++	case 'h', 'H':
++		if n > 0 {
++			return e.fail(errUnexpectedAddr)
++		}
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
++		}
++		if cmd == 'H' {
++			e.verbose = !e.verbose
++		}
++		// GNU ed's H, when it turns help mode on, also prints the reason for
++		// the most recent ?, as h does.
++		if (cmd == 'h' || e.verbose) && e.errMsg != "" {
++			fmt.Fprintln(e.out, e.errMsg)
++		}
++	case 'j':
++		if err := e.checkRange(b.cur, b.cur+1, n); err != nil {
++			return e.fail(err)
++		}
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
+ 		}
+ 		if !global {
+-			if len(matches) >= count {
+-				matches = [][]int{matches[count-1]}
+-			} else {
+-				matches = [][]int{}
++			b.clearUndo()
++		}
++		if e.first < e.second {
++			var joined strings.Builder
++			for a := e.first; a <= e.second; a++ {
++				joined.WriteString(b.text(a))
+ 			}
++			b.remove(e.first, e.second, global)
++			b.insert(e.first-1, []string{joined.String()})
+ 		}
+-		// we have matches, deal with them
+-		var fLin strings.Builder
+-		oLin := 0
+-		for _, m := range matches {
+-			nMatch++
+-			// fRep := rep
+-			// offset := 0
+-
+-			// Fill backrefs
+-			oRep := 0
+-			var fRep strings.Builder
+-			for _, r := range refs {
+-				if rep[r[0]:r[1]] == "&" {
+-					fRep.WriteString(rep[oRep:r[0]])
+-					fRep.WriteString(l[m[0]:m[1]])
+-					oRep = r[1]
+-				} else {
+-					i, _ := strconv.Atoi(rep[r[2]:r[3]])
+-					if i > len(m)/2-1 { // not enough submatches for backref
+-						return fmt.Errorf("invalid backref")
+-					}
+-					fRep.WriteString(rep[oRep:r[0]])
+-					fRep.WriteString(l[m[2*i]:m[2*i+1]])
+-					oRep = r[1]
+-				}
++	case 'k':
++		// GNU ed reads the mark character, then checks the command suffix
++		// before the mark, so k with no mark character is an invalid suffix.
++		mark := c.next()
++		if e.second == 0 {
++			return e.fail(errInvalidAddress)
++		}
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
++		}
++		if err := b.setMark(mark, e.second); err != nil {
++			return e.fail(err)
++		}
++	case 'l', 'n', 'p':
++		if err := e.checkRange(b.cur, b.cur, n); err != nil {
++			return e.fail(err)
++		}
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
++		}
++		f := pfPrint
++		switch cmd {
++		case 'l':
++			f = pfList
++		case 'n':
++			f = pfNumber
++		}
++		if err := e.printLines(e.first, e.second, pflags|f); err != nil {
++			return e.fail(err)
++		}
++		pflags = 0
++	case 'm', 't':
++		if err := e.checkRange(b.cur, b.cur, n); err != nil {
++			return e.fail(err)
++		}
++		dest, err := e.thirdAddress(c)
++		if err != nil {
++			return e.fail(err)
++		}
++		if cmd == 'm' && dest >= e.first && dest < e.second {
++			return e.fail(errBadDestination)
++		}
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
++		}
++		if !global {
++			b.clearUndo()
++		}
++		if cmd == 'm' {
++			b.move(e.first, e.second, dest, global)
++		} else {
++			b.copyLines(e.first, e.second, dest)
++		}
++	case 'P', 'q', 'Q':
++		if n > 0 {
++			return e.fail(errUnexpectedAddr)
++		}
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
++		}
++		switch {
++		case cmd == 'P':
++			e.promptOn = !e.promptOn
++		case cmd == 'q' && b.modified && prev != statusEMod:
++			return statusEMod
++		default:
++			return statusQuit
++		}
++	case 'r':
++		if !isSpace(c.peek()) {
++			return e.fail(errUnexpectedSufx)
++		}
++		if n == 0 {
++			e.second = b.last()
++		}
++		name, err := e.filename(c)
++		if err != nil {
++			return e.fail(err)
++		}
++		if e.defFile == "" {
++			e.defFile = name
++		}
++		if !global {
++			b.clearUndo()
++		}
++		if name == "" {
++			name = e.defFile
++		}
++		count, err := e.readFile(name, e.second)
++		if err != nil {
++			return e.fail(err)
++		}
++		if count > 0 {
++			b.modified = true
++		}
++	case 's':
++		if err := e.substitute(c, &pflags, n, global); err != nil {
++			return e.fail(err)
++		}
++	case 'u':
++		if n > 0 {
++			return e.fail(errUnexpectedAddr)
++		}
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
++		}
++		if err := b.undo(); err != nil {
++			return e.fail(err)
++		}
++	case 'w', 'W':
++		q := c.peek()
++		if q == 'q' || q == 'Q' {
++			c.pos++
++		}
++		if !isSpace(c.peek()) {
++			return e.fail(errUnexpectedSufx)
++		}
++		name, err := e.filename(c)
++		if err != nil {
++			return e.fail(err)
++		}
++		if n == 0 && b.last() == 0 {
++			e.first, e.second = 0, 0
++		} else if err := e.checkRange(1, b.last(), n); err != nil {
++			return e.fail(err)
++		}
++		if e.defFile == "" {
++			e.defFile = name
++		}
++		if name == "" {
++			name = e.defFile
++		}
++		count, err := e.writeFile(name, cmd == 'W', e.first, e.second)
++		if err != nil {
++			return e.fail(err)
++		}
++		if count == b.last() {
++			b.modified = false
++		} else if q == 'q' && b.modified && prev != statusEMod {
++			return statusEMod
++		}
++		if q == 'q' || q == 'Q' {
++			return statusQuit
++		}
++	case 'x':
++		if e.second < 0 || e.second > b.last() {
++			return e.fail(errInvalidAddress)
++		}
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
++		}
++		if !global {
++			b.clearUndo()
++		}
++		if len(b.yanked) == 0 {
++			return e.fail(errNothingToPut)
++		}
++		b.insert(e.second, b.yanked)
++	case 'y':
++		if err := e.checkRange(b.cur, b.cur, n); err != nil {
++			return e.fail(err)
++		}
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
++		}
++		b.yank(e.first, e.second)
++	case 'z':
++		next := b.cur + 1
++		if global {
++			next = b.cur
++		}
++		if err := e.checkSecond(next, n); err != nil {
++			return e.fail(err)
++		}
++		// GNU ed's z takes only a window size: z+, z- and z. are invalid
++		// suffixes, and so is a size that starts with 0, as in z02.
++		if p := c.peek(); p > '0' && p <= '9' {
++			w, err := c.number()
++			if err != nil {
++				return e.fail(err)
+ 			}
+-			fRep.WriteString(rep[oRep:])
+-
+-			fLin.WriteString(l[oLin:m[0]])
+-			fLin.WriteString(fRep.String())
+-			oLin = m[1]
++			e.window = w
+ 		}
+-		fLin.WriteString(l[oLin:])
+-		if e = buffer.Delete([2]int{ln, ln}); e != nil {
+-			return
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
+ 		}
+-		if e = buffer.Insert(ln, []string{fLin.String()}); e != nil {
+-			return
++		if err := e.printLines(e.second, min(b.last(), e.second+e.window-1), pflags); err != nil {
++			return e.fail(err)
+ 		}
+-		last = fLin.String()
+-		lastN = ln
+-	}
+-	if nMatch == 0 {
+-		e = fmt.Errorf("no match")
+-	} else {
+-		if printP {
+-			fmt.Fprintf(ctx.out, "%s\n", last)
++		pflags = 0
++	case '=':
++		if err := e.suffix(c, &pflags); err != nil {
++			return e.fail(err)
++		}
++		if n > 0 {
++			fmt.Fprintln(e.out, e.second)
++		} else {
++			fmt.Fprintln(e.out, b.last())
+ 		}
+-		if printL {
+-			fmt.Fprintf(ctx.out, "%s$\n", last)
++	case '!':
++		if n > 0 {
++			return e.fail(errUnexpectedAddr)
+ 		}
+-		if printN {
+-			fmt.Fprintf(ctx.out, "%d\t%s\n", lastN+1, last)
++		return e.fail(errRestricted)
++	case '\n':
++		next := b.cur + 1
++		if global {
++			next = b.cur
++		}
++		if err := e.checkSecond(next, n); err != nil {
++			return e.fail(err)
++		}
++		if err := e.printLines(e.second, e.second, 0); err != nil {
++			return e.fail(err)
++		}
++	case '#':
++		for c.pos < len(c.s) && c.next() != '\n' {
++		}
++	default:
++		// GNU ed has no & command: & repeats a command list only inside G
++		// and V, and a bare s repeats the last substitution.
++		return e.fail(errUnknownCommand)
++	}
++	if pflags != 0 {
++		if err := e.printLines(b.cur, b.cur, pflags); err != nil {
++			return e.fail(err)
+ 		}
+ 	}
+-	return
++	return statusOK
+ }
+ 
+-func cmdUndo(ctx *Context) (e error) {
+-	buffer.Rewind()
+-	return
++// appendText reads lines up to a line holding only a period and adds them
++// after addr, or before it with insert set. In a global command the lines
++// come from the command list.
++func (e *editor) appendText(c *cmdbuf, addr int, insert, global bool) {
++	var texts []string
++	for {
++		var l string
++		if global {
++			if c.pos >= len(c.s) {
++				break
++			}
++			end := strings.IndexByte(c.s[c.pos:], '\n')
++			l = c.s[c.pos : c.pos+end+1]
++			c.pos += end + 1
++		} else {
++			var ok bool
++			if l, ok = e.readLine(); !ok {
++				break
++			}
++		}
++		if l == ".\n" {
++			break
++		}
++		texts = append(texts, l[:len(l)-1])
++	}
++	if insert && addr > 0 && len(texts) > 0 {
++		addr--
++	}
++	e.buf.cur = addr
++	e.buf.insert(addr, texts)
+ }
+ 
+-func cmdDump(ctx *Context) (e error) {
+-	fmt.Fprintf(ctx.out, "%v\n", buffer)
+-	return
++// activate marks the lines in [from, to] that match (or, without match, do
++// not match) the regular expression in c for a global command.
++func (e *editor) activate(c *cmdbuf, from, to int, match bool) error {
++	re, err := e.regexp(c)
++	if err != nil {
++		return err
++	}
++	b := e.buf
++	var lines []*line
++	for a := from; a <= to; a++ {
++		if re.MatchString(b.text(a)) == match {
++			lines = append(lines, b.lines[a-1])
++		}
++	}
++	b.activate(lines)
++	return nil
+ }
+ 
+-var rxCmdSub = regexp.MustCompile(`%`)
+-
+-func cmdCommand(ctx *Context) (e error) {
+-	s := System{
+-		Cmd:    ctx.cmd[ctx.cmdOffset+1:],
+-		Stdin:  os.Stdin,
+-		Stdout: ctx.out,
+-		Stderr: os.Stderr,
+-	}
+-	e = s.Run()
+-	if e != nil {
+-		return
++// global runs a command list on each line a global command selected. The
++// interactive forms print each line and read its command list.
++func (e *editor) global(c *cmdbuf, pflags int, interactive bool) int {
++	var list *string
++	if !interactive {
++		if err := e.extendLine(c, false); err != nil {
++			return e.fail(err)
++		}
++		s := c.s[c.pos:]
++		list = &s
++	}
++	b := e.buf
++	// GNU ed starts a new undo record before the command list runs, even
++	// when the list changes nothing, so u after it has nothing to undo.
++	b.clearUndo()
++	addr := 0
++	for {
++		l := b.nextActive()
++		if l == nil {
++			return statusOK
++		}
++		if addr = b.addrNear(l, addr); addr < 0 {
++			return e.fail(errInvalidAddress)
++		}
++		b.cur = addr
++		if interactive {
++			if err := e.printLines(b.cur, b.cur, pflags); err != nil {
++				return e.fail(err)
++			}
++			e.out.Flush()
++			in, ok := e.readLine()
++			if !ok {
++				return statusError
++			}
++			switch in {
++			case "\n":
++				continue
++			case "&\n":
++				if list == nil {
++					return e.fail(errNoPrevCommand)
++				}
++			default:
++				lc := &cmdbuf{s: in}
++				if err := e.extendLine(lc, false); err != nil {
++					return e.fail(err)
++				}
++				s := lc.s[lc.pos:]
++				list = &s
++			}
++		}
++		lc := &cmdbuf{s: *list}
++		for lc.pos < len(lc.s) {
++			if st := e.exec(lc, statusOK, true); st != statusOK {
++				return st
++			}
++		}
+ 	}
+-	fmt.Fprintf(ctx.out, "!")
+-	return
+ }
+diff --git a/cmds/exp/ed/ed.go b/cmds/exp/ed/ed.go
+index ad2c395c4..fd7ae2437 100644
+--- a/cmds/exp/ed/ed.go
++++ b/cmds/exp/ed/ed.go
+@@ -2,34 +2,27 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-// This `ed` is intended to be a feature-complete mimick of [GNU Ed](https://www.gnu.org/software/ed//).  It is a close enough mimick that the [GNU Ed Man Page](https://www.gnu.org/software/ed/manual/ed_manual.html) should be a reliable source of documentation.  Divergence from the man page is generally considered a bug (unless it's an added feature).
++// This `ed` mimics [GNU Ed](https://www.gnu.org/software/ed/): run on the same
++// file and script, it prints the same output, writes the same files and exits
++// with the same status. The [GNU Ed Manual](https://www.gnu.org/software/ed/manual/ed_manual.html)
++// documents its commands, addresses and regular expressions.
+ //
+-// There are a few known differences:
++// Regular expressions are POSIX basic regular expressions with the GNU
++// operators, matched as the GNU C library matches them.
+ //
+-// - `ed` uses `go`'s `regexp` package, and as such may have a somewhat different regular expression syntax.  Note, however, that backreferences follow the `ed` syntax of `\<ref>`, not the `go` syntax of `$<ref>`.
+-// - there has been little/no attempt to make particulars like error messages match `GNU Ed`.
+-// - rather than being an error, the 'g' option for 's' simply overrides any specified count.
+-// - does not support "traditional" mode
+-//
+-// The following has been implemented:
+-// - Full line address parsing (including RE and markings)
+-// - Implmented commands: !, #, =, E, H, P, Q, W, a, c, d, e, f, h, i, j, k, l, m, n, p, q, r, s, t, u, w, x, y, z
+-//
+-// The following has *not* yet been implemented, but will be eventually:
+-// - Unimplemented commands: g, G, v, V
+-// - does not (yet) support "loose" mode
+-// - does not (yet) support "restricted" mod
++// The GNU options other than -s and -p are not supported, and neither are shell
++// escapes: the ! command and file names that start with ! fail as they do in
++// GNU ed's restricted mode.
+ package main
+ 
+ import (
+ 	"bufio"
+-	"errors"
+ 	"flag"
+ 	"fmt"
+ 	"io"
+-	"log"
+ 	"os"
+ 
++	"github.com/u-root/u-root/pkg/bre"
+ 	"github.com/u-root/u-root/pkg/uroot/util"
+ )
+ 
+@@ -41,113 +34,290 @@ var (
+ )
+ 
+ func init() {
+-	flag.BoolVar(&fsuppress, "s", false, "suppress counts")
+-	flag.StringVar(&fprompt, "p", "*", "specify a command prompt")
++	flag.BoolVar(&fsuppress, "s", false, "suppress byte counts (script mode)")
++	flag.StringVar(&fprompt, "p", "", "use the given command prompt")
+ 	flag.Usage = util.Usage(flag.Usage, usage)
+ }
+ 
+-// current FileBuffer
+-var buffer *FileBuffer
+-
+-// current ed state
+-var state struct {
+-	fileName string // current filename
+-	lastErr  error
+-	printErr bool
+-	prompt   bool
+-	winSize  int
+-	lastRep  string
+-	lastSub  string
++// An edError is an error ed reports by printing `?`; `h` shows its text.
++type edError string
++
++func (e edError) Error() string { return string(e) }
++
++const (
++	errBadSuffix       edError = "Invalid command suffix"
++	errBadDelimiter    edError = "Invalid pattern delimiter"
++	errBadDestination  edError = "Invalid destination"
++	errCannotNest      edError = "Cannot nest global commands"
++	errEOF             edError = "Unexpected end-of-file"
++	errInfiniteLoop    edError = "Infinite substitution loop"
++	errInvalidAddress  edError = "Invalid address"
++	errInvalidMark     edError = "Invalid mark character"
++	errInvalidNumber   edError = "Invalid number"
++	errMissingDelim    edError = "Missing pattern delimiter"
++	errModified        edError = "Warning: buffer modified"
++	errNoCurrentFile   edError = "No current filename"
++	errNoMatch         edError = "No match"
++	errNoPrevCommand   edError = "No previous command"
++	errNoPrevPattern   edError = "No previous pattern"
++	errNoPrevSubst     edError = "No previous substitution"
++	errNothingToPut    edError = "Nothing to put"
++	errNothingToUndo   edError = "Nothing to undo"
++	errNumberRange     edError = "Number out of range"
++	errOpenInput       edError = "Cannot open input file"
++	errOpenOutput      edError = "Cannot open output file"
++	errReadInput       edError = "Cannot read input file"
++	errWriteOutput     edError = "Cannot write file"
++	errRestricted      edError = "Shell access restricted"
++	errSuffixI         edError = "Suffix 'I' not allowed on empty regexp"
++	errTrailingSlash   edError = "Trailing backslash (\\)"
++	errUnbalanced      edError = "Unbalanced brackets ([])"
++	errUnexpectedAddr  edError = "Unexpected address"
++	errUnexpectedSufx  edError = "Unexpected command suffix"
++	errUnknownCommand  edError = "Unknown command"
++	errFilenameTooLong edError = "Filename too long"
++)
++
++// Command statuses. A command that worked returns statusOK.
++const (
++	statusOK    = 0
++	statusQuit  = -1
++	statusError = -2
++	statusEMod  = -3
++)
++
++// Print suffixes.
++const (
++	pfList = 1 << iota
++	pfNumber
++	pfPrint
++)
++
++// A cmdbuf is the text of a command, or of a global command list, being
++// parsed.
++type cmdbuf struct {
++	s   string
++	pos int
+ }
+ 
+-// Parse input and execute command
+-func execute(cmd string, output io.Writer) (e error) {
+-	ctx := &Context{
+-		cmd: cmd,
+-		out: output,
++// peek returns the next byte, or 0 at the end.
++func (c *cmdbuf) peek() byte {
++	if c.pos < len(c.s) {
++		return c.s[c.pos]
+ 	}
+-	if ctx.addrs, ctx.cmdOffset, e = buffer.ResolveAddrs(cmd); e != nil {
+-		return
++	return 0
++}
++
++func (c *cmdbuf) next() byte {
++	b := c.peek()
++	if c.pos < len(c.s) {
++		c.pos++
+ 	}
+-	if len(cmd) <= ctx.cmdOffset {
+-		// no command, default to print
+-		ctx.cmd += "p"
++	return b
++}
++
++type editor struct {
++	in          *bufio.Reader
++	out         *bufio.Writer
++	errOut      io.Writer
++	scripted    bool
++	interactive bool
++	buf         *buffer
++
++	first, second int
++	defFile       string
++	errMsg        string
++	prompt        string
++	promptOn      bool
++	verbose       bool
++	lineNum       int
++	window        int
++
++	lastRE  *bre.Regexp
++	substRE *bre.Regexp
++	repl    *string
++	sPflags int
++	sPmask  int
++	sNum    int
++}
++
++// runEd edits file with the commands read from in and returns the exit
++// status: 0 when no command failed, 1 after an error, 2 when the input ended
++// with unsaved changes.
++func runEd(in io.Reader, out, errOut io.Writer, scripted bool, prompt, file string) int {
++	e := &editor{
++		in:          bufio.NewReader(in),
++		out:         bufio.NewWriter(out),
++		errOut:      errOut,
++		scripted:    scripted,
++		interactive: true,
++		buf:         newBuffer(),
++		prompt:      "*",
++		window:      22,
++		sPmask:      pfPrint,
++		sNum:        1,
+ 	}
+-	if exe, ok := cmds[ctx.cmd[ctx.cmdOffset]]; ok {
+-		buffer.Start()
+-		if e = exe(ctx); e != nil {
+-			return
++	defer e.out.Flush()
++	// GNU ed goes on after an error when its commands come through a pipe or
++	// a terminal, and stops at the first error when they come from a regular
++	// file.
++	if f, ok := in.(*os.File); ok {
++		if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
++			e.interactive = false
+ 		}
+-		buffer.End()
+-	} else {
+-		return fmt.Errorf("invalid command: %v", cmd[ctx.cmdOffset])
+ 	}
+-	return
+-}
+-
+-func runEd(in io.Reader, out io.Writer, suppress bool, prompt, file string) error {
+-	var e error
+-	if len(prompt) > 0 {
+-		state.prompt = true
+-	}
+-	buffer = NewFileBuffer(nil)
+-	if file != "" { // we were given a file name
+-		state.fileName = file
+-		// try to read in the file
+-		if _, e = os.Stat(state.fileName); os.IsNotExist(e) && !suppress {
+-			fmt.Fprintf(os.Stderr, "%s: No such file or directory", state.fileName)
+-			// this is not fatal, we just start with an empty buffer
+-		} else {
+-			if buffer, e = FileToBuffer(state.fileName); e != nil {
+-				return e
+-			}
+-			if !suppress {
+-				fmt.Println(buffer.Size())
++	if prompt != "" {
++		e.prompt, e.promptOn = prompt, true
++	}
++	if isShell(file) {
++		e.errMsg = errRestricted.Error()
++		if !e.interactive {
++			return 2
++		}
++	} else if file != "" {
++		if _, err := e.readFile(file, 0); err != nil {
++			e.errMsg = err.Error()
++			if !e.interactive {
++				return 2
+ 			}
+ 		}
++		e.defFile = file
++		e.buf.resetUndo()
+ 	}
+-	state.winSize = 22 // we don't actually support getting the real window size
+-	inScan := bufio.NewScanner(in)
+-	if state.prompt {
+-		fmt.Fprintf(out, "%s", prompt)
+-	}
+-	for inScan.Scan() {
+-		cmd := inScan.Text()
+-		e = execute(cmd, out)
+-		if e != nil {
+-			state.lastErr = e
+-			if !suppress && state.printErr {
+-				fmt.Fprintf(out, "%s\n", e)
++	return e.loop()
++}
++
++func (e *editor) loop() int {
++	exit := 0
++	status := statusOK
++	for {
++		if status < 0 && e.verbose {
++			fmt.Fprintln(e.out, e.errMsg)
++		}
++		if e.promptOn {
++			fmt.Fprint(e.out, e.prompt)
++		}
++		e.out.Flush()
++		line, ok := e.readLine()
++		if !ok {
++			if !e.buf.modified || status == statusEMod {
++				status = statusQuit
+ 			} else {
+-				fmt.Fprintf(out, "?\n")
++				status = statusEMod
++				exit = 2
+ 			}
+-			if errors.Is(e, errExit) {
+-				return nil
++		} else {
++			status = e.exec(&cmdbuf{s: line}, status, false)
++		}
++		switch status {
++		case statusOK:
++			continue
++		case statusQuit:
++			return exit
++		}
++		fmt.Fprintln(e.out, "?")
++		if exit == 0 {
++			exit = 1
++		}
++		if status == statusEMod {
++			e.errMsg = errModified.Error()
++		}
++		if !e.interactive {
++			if e.verbose {
++				fmt.Fprintf(e.out, "script, line %d: %s\n", e.lineNum, e.errMsg)
+ 			}
++			return exit
+ 		}
+-		if state.prompt {
+-			fmt.Printf("%s", prompt)
++	}
++}
++
++// readLine reads one line of input, newline included. A last line without a
++// newline is dropped and counts as the end of the input.
++func (e *editor) readLine() (string, bool) {
++	s, err := e.in.ReadString('\n')
++	if err != nil {
++		if s != "" {
++			e.lineNum++
++		}
++		e.errMsg = errEOF.Error()
++		return "", false
++	}
++	e.lineNum++
++	return s, true
++}
++
++// fail records err as the last error and returns the error status.
++func (e *editor) fail(err error) int {
++	e.errMsg = err.Error()
++	if len(e.errMsg) > 79 {
++		e.errMsg = e.errMsg[:79]
++	}
++	return statusError
++}
++
++// extendLine joins the lines that continue the rest of c with a trailing
++// backslash. The backslash goes; with strip set, so does the newline.
++func (e *editor) extendLine(c *cmdbuf, strip bool) error {
++	rest := c.s[c.pos:]
++	end := 0
++	for end < len(rest) && rest[end] != '\n' {
++		end++
++	}
++	if end < len(rest) {
++		end++
++	}
++	cur := rest[:end]
++	if !trailingEscape(cur) {
++		return nil
++	}
++	var b []byte
++	appendLine := func(l string) {
++		b = append(b, l[:len(l)-2]...)
++		if !strip {
++			b = append(b, '\n')
+ 		}
+ 	}
+-	if inScan.Err() != nil {
+-		return fmt.Errorf("error reading stdin: %w", inScan.Err())
++	appendLine(cur)
++	for {
++		l, ok := e.readLine()
++		if !ok {
++			return errEOF
++		}
++		if !trailingEscape(l) {
++			b = append(b, l...)
++			break
++		}
++		appendLine(l)
+ 	}
++	c.s = string(b)
++	c.pos = 0
+ 	return nil
+ }
+ 
++// trailingEscape reports whether line, which ends in a newline, ends with an
++// odd number of backslashes before it.
++func trailingEscape(line string) bool {
++	if len(line) < 2 || line[len(line)-1] != '\n' {
++		return false
++	}
++	odd := false
++	for i := len(line) - 2; i >= 0 && line[i] == '\\'; i-- {
++		odd = !odd
++	}
++	return odd
++}
++
+ // Entry point
+ func main() {
+ 	flag.Parse()
+ 	file := ""
+-	switch len(flag.Args()) {
++	switch flag.NArg() {
+ 	case 0:
+ 	case 1:
+-		file = flag.Args()[0]
++		file = flag.Arg(0)
+ 	default:
+ 		flag.Usage()
+ 		os.Exit(1)
+ 	}
+-	if err := runEd(os.Stdin, os.Stdout, fsuppress, fprompt, file); err != nil {
+-		log.Fatal(err)
+-	}
++	os.Exit(runEd(os.Stdin, os.Stdout, os.Stderr, fsuppress, fprompt, file))
+ }
+diff --git a/cmds/exp/ed/ed_test.go b/cmds/exp/ed/ed_test.go
+index 7e3291876..2bcbda1df 100644
+--- a/cmds/exp/ed/ed_test.go
++++ b/cmds/exp/ed/ed_test.go
+@@ -7,202 +7,421 @@ package main
+ import (
+ 	"bytes"
+ 	"os"
++	"strings"
+ 	"testing"
+ )
+ 
+ var testdata = `To be fair, this is just random weirdo stuff going on.
+ We learn something new every day.`
+ 
+-// TestEDCOmmandsNonInput tests ed without commands which invoke input mode.
+-// Input mode requires a different, more complex test setup to work.
+-func TestEdCommandsNonInput(t *testing.T) {
++const header = "Newline appended\n89\n"
++
++func TestEdCommands(t *testing.T) {
+ 	for _, tt := range []struct {
+-		name     string
+-		cmd      string
+-		prompt   string
+-		suppress bool
+-		wantOut  string
++		name       string
++		cmd        string
++		prompt     string
++		suppress   bool
++		wantOut    string
++		wantStatus int
++		wantFile   string
+ 	}{
+ 		{
+ 			name:    "CmdErr_Only_On",
+ 			cmd:     "H\nq\n",
+-			wantOut: "exit\n",
++			wantOut: header,
+ 		},
+ 		{
+ 			name:    "CmdErr_On_Off",
+ 			cmd:     "H\nH\nq\n",
+-			wantOut: "exit\n",
++			wantOut: header,
++		},
++		{
++			name:       "CmdErr_printErr",
++			cmd:        "4p\nh\nq\n",
++			wantOut:    header + "?\nInvalid address\n",
++			wantStatus: 1,
+ 		},
+ 		{
+-			name:    "CmdErr_printErr",
+-			cmd:     "h\nq\n",
+-			wantOut: "exit\nexit\n",
++			name:       "CmdErr_H_after_an_error_prints_it",
++			cmd:        "4p\nH\nq\n",
++			wantOut:    header + "?\nInvalid address\n",
++			wantStatus: 1,
+ 		},
+ 		{
+ 			name:    "cmdDelete_undo",
+ 			cmd:     "-1 d\nu\nq\n",
+-			wantOut: "exit\n",
++			wantOut: header,
+ 		},
+ 		{
+-			name:    "cmdDelete_invalidAddr",
+-			cmd:     "4 d\nu\nq\n",
+-			wantOut: "line is out of bounds\nexit\n",
++			name:       "cmdDelete_invalidAddr",
++			cmd:        "4 d\nu\nq\n",
++			wantOut:    header + "?\n?\n",
++			wantStatus: 1,
+ 		},
+ 		{
+ 			name:    "CmdPrint_List",
+ 			cmd:     "-1 l\nq\n",
+-			wantOut: "To be fair, this is just random weirdo stuff going on.$\nexit\n",
++			wantOut: header + "To be fair, this is just random weirdo stuff going on.$\n",
+ 		},
+ 		{
+ 			name:    "CmdPrint_Print_previous_line",
+ 			cmd:     "-1 p\nq\n",
+-			wantOut: "To be fair, this is just random weirdo stuff going on.\nexit\n",
++			wantOut: header + "To be fair, this is just random weirdo stuff going on.\n",
+ 		},
+ 		{
+-			name:    "CmdPrint_Print_addressed line",
++			name:    "CmdPrint_Print_addressed_line",
+ 			cmd:     "-1 n\nq\n",
+-			wantOut: "1\tTo be fair, this is just random weirdo stuff going on.\nexit\n",
++			wantOut: header + "1\tTo be fair, this is just random weirdo stuff going on.\n",
++		},
++		{
++			name:       "CmdPrint_InvalidAddr",
++			cmd:        "4 l\nq\n",
++			wantOut:    header + "?\n",
++			wantStatus: 1,
+ 		},
+ 		{
+-			name:    "CmdPrint_InvalidAddr",
+-			cmd:     "4 l\nq\n",
+-			wantOut: "line is out of bounds\nexit\n",
++			name:     "CmdWrite_simple",
++			cmd:      "w\nq\n",
++			wantOut:  header + "89\n",
++			wantFile: testdata + "\n",
+ 		},
+ 		{
+-			name:    "CmdWrite_simple",
+-			cmd:     "w\nq\n",
+-			wantOut: "exit\n",
++			name:       "CmdWrite_simple_invalidAddr",
++			cmd:        "4 w\nq\n",
++			wantOut:    header + "?\n",
++			wantStatus: 1,
+ 		},
+ 		{
+-			name:    "CmdWrite_simple_invalidAddr",
+-			cmd:     "4 w\nq\n",
+-			wantOut: "line is out of bounds\nexit\n",
++			name:     "CmdWrite_Quit",
++			cmd:      "wq\nq\n",
++			wantOut:  header + "89\n",
++			wantFile: testdata + "\n",
+ 		},
+ 		{
+-			name:    "CmdWrite_Quit",
+-			cmd:     "wq\nq\n",
+-			wantOut: "exit\n",
++			name:     "CmdWrite_W",
++			cmd:      "W\nq\n",
++			wantOut:  header + "89\n",
++			wantFile: "To be fair, this is just random weirdo stuff going on.\nWe learn something new every day.To be fair, this is just random weirdo stuff going on.\nWe learn something new every day.\n",
+ 		},
+ 		{
+-			name:    "CmdWrite_W",
+-			cmd:     "W\nq\n",
+-			wantOut: "exit\n",
++			name:       "CmdMark_simple",
++			cmd:        "k 0\nq\n",
++			wantOut:    header + "?\n",
++			wantStatus: 1,
+ 		},
+ 		{
+-			name:    "CmdMark_simple",
+-			cmd:     "k 0\nq\n",
+-			wantOut: "exit\n",
++			name:       "CmdMark_No_mark_character_supplied",
++			cmd:        "-1 k\nh\nq\n",
++			wantOut:    header + "?\nInvalid command suffix\n",
++			wantStatus: 1,
+ 		},
+ 		{
+-			name:    "CmdMark_No_mark_character_supplied",
+-			cmd:     "-1 k\nq\n",
+-			wantOut: "no mark character supplied\nexit\n",
++			name:       "CmdMark_suffix_is_checked_before_the_mark",
++			cmd:        "1kAb\nh\n1kAp\nh\nq\n",
++			wantOut:    header + "?\nInvalid command suffix\n?\nInvalid mark character\n",
++			wantStatus: 1,
++		},
++		{
++			name:    "CmdMark_address",
++			cmd:     "1ka\n'ap\nq\n",
++			wantOut: header + "To be fair, this is just random weirdo stuff going on.\n",
++		},
++		{
++			name:       "CmdMark_lost_when_line_is_substituted",
++			cmd:        "1ka\n1s/be/BE/\n'ap\nu\n'ap\nQ\n",
++			wantOut:    header + "?\nTo be fair, this is just random weirdo stuff going on.\n",
++			wantStatus: 1,
+ 		},
+ 		{
+ 			name:    "cmdLine_PrintLine",
+-			cmd:     "- =\np\nq\n", // This equals to the input of `- =`[Enter press] `p` [Enter press]
+-			wantOut: "1\nWe learn something new every day.\nexit\n",
++			cmd:     "- =\np\nq\n",
++			wantOut: header + "1\nWe learn something new every day.\n",
+ 		},
+ 		{
+ 			name:    "cmdFile_setFile_default",
+ 			cmd:     "f\nq\n",
+-			wantOut: "exit\n",
++			wantOut: header + "testfile\n",
+ 		},
+ 		{
+ 			name:    "CmdMove_Move_simple",
+-			cmd:     "1 m 2\nu\nq\n",
+-			wantOut: "exit\n",
++			cmd:     "1 m 2\n,p\nu\n,p\nQ\n",
++			wantOut: header + "We learn something new every day.\nTo be fair, this is just random weirdo stuff going on.\nTo be fair, this is just random weirdo stuff going on.\nWe learn something new every day.\n",
++		},
++		{
++			name:    "CmdMove_destination_range_uses_last_address",
++			cmd:     "1m1,2\n,p\nQ\n",
++			wantOut: header + "We learn something new every day.\nTo be fair, this is just random weirdo stuff going on.\n",
+ 		},
+ 		{
+ 			name:    "CmdCopy_Cut",
+ 			cmd:     "y\nq\n",
+-			wantOut: "exit\n",
++			wantOut: header,
++		},
++		{
++			name:    "CmdCopy_Paste",
++			cmd:     "1y\nx\n,p\nQ\n",
++			wantOut: header + "To be fair, this is just random weirdo stuff going on.\nWe learn something new every day.\nTo be fair, this is just random weirdo stuff going on.\n",
++		},
++		{
++			name:    "CmdCopy_Cut_keeps_current_address",
++			cmd:     "1p\n1,2y\n.=\nQ\n",
++			wantOut: header + "To be fair, this is just random weirdo stuff going on.\n1\n",
++		},
++		{
++			name:       "CmdScroll",
++			cmd:        "-1 z\nu\nq\n",
++			wantOut:    header + "To be fair, this is just random weirdo stuff going on.\nWe learn something new every day.\n?\n",
++			wantStatus: 1,
++		},
++		{
++			name:       "CmdScroll_invalidAddr",
++			cmd:        "4 z\nu\nq\n",
++			wantOut:    header + "?\n?\n",
++			wantStatus: 1,
+ 		},
+ 		{
+-			name:    "CmdScroll",
+-			cmd:     "-1 z\nu\nq\n",
+-			wantOut: "To be fair, this is just random weirdo stuff going on.\nWe learn something new every day.\nexit\n",
++			name:       "CmdScroll_invalid_windowsize",
++			cmd:        "-1 z 0\nu\nq\n",
++			wantOut:    header + "?\n?\n",
++			wantStatus: 1,
+ 		},
+ 		{
+-			name:    "CmdScroll_invalidAddr",
+-			cmd:     "4 z\nu\nq\n",
+-			wantOut: "line is out of bounds\nexit\n",
++			name:       "CmdScroll_direction_is_an_invalid_suffix",
++			cmd:        "1z+1\nh\nQ\n",
++			wantOut:    header + "?\nInvalid command suffix\n",
++			wantStatus: 1,
+ 		},
+ 		{
+-			name:    "CmdScroll_invalid_windowsize",
+-			cmd:     "-1 z 0\nu\nq\n",
+-			wantOut: "invalid window size:  0\nexit\n",
++			name:    "CmdList_escape_starting_in_the_last_column_is_not_folded",
++			cmd:     "1c\n" + strings.Repeat("a", 71) + "$\n.\n1l\nQ\n",
++			wantOut: header + strings.Repeat("a", 71) + "\\$$\n",
++		},
++		{
++			name:    "CmdPrint_percent_after_an_address_separates_like_a_comma",
++			cmd:     "1%p\n1%2n\n%p\nQ\n",
++			wantOut: header + "To be fair, this is just random weirdo stuff going on.\n1\tTo be fair, this is just random weirdo stuff going on.\n2\tWe learn something new every day.\nTo be fair, this is just random weirdo stuff going on.\nWe learn something new every day.\n",
++		},
++		{
++			name:       "CmdSub_g_p_r_and_counts_after_s_are_repeat_suffixes",
++			cmd:        "1sgagXg\nh\n1s1a1X1\nh\n1sxaxXx\n,p\nQ\n",
++			wantOut:    header + "?\nInvalid command suffix\n?\nInvalid command suffix\nTo be fXir, this is just random weirdo stuff going on.\nWe learn something new every day.\n",
++			wantStatus: 1,
++		},
++		{
++			name:       "CmdScroll_leading_zero_is_an_invalid_suffix",
++			cmd:        "1z02\nh\nQ\n",
++			wantOut:    header + "?\nInvalid command suffix\n",
++			wantStatus: 1,
++		},
++		{
++			name:       "CmdSub_literal_parentheses",
++			cmd:        "2 s/(We)/You/p\nu\nq\n",
++			wantOut:    header + "?\n?\n",
++			wantStatus: 1,
+ 		},
+ 		{
+ 			name:    "CmdSub_You_We_in_line2_1_p",
+-			cmd:     "2 s/(We)/You/p\nu\nq\n",
+-			wantOut: "You learn something new every day.\nexit\n",
++			cmd:     "2 s/\\(We\\)/You/p\nu\nq\n",
++			wantOut: header + "You learn something new every day.\n",
+ 		},
+ 		{
+ 			name:    "CmdSub_You_We_in_line2_2_l",
+-			cmd:     "2 s/(We)/You/l\nu\nq\n",
+-			wantOut: "You learn something new every day.$\nexit\n",
++			cmd:     "2 s/\\(We\\)/You/l\nu\nq\n",
++			wantOut: header + "You learn something new every day.$\n",
+ 		},
+ 		{
+ 			name:    "CmdSub_You_We_in_line2_3_n",
+-			cmd:     "2 s/(We)/You/n\nu\nq\n",
+-			wantOut: "1\tYou learn something new every day.\nexit\n",
++			cmd:     "2 s/\\(We\\)/You/n\nu\nq\n",
++			wantOut: header + "2\tYou learn something new every day.\n",
+ 		},
+ 		{
+ 			name:    "CmdSub_You_We_in_line2_3_g",
+-			cmd:     "2 s/(We)/You/g\np\nu\nq\n",
+-			wantOut: "You learn something new every day.\nexit\n",
++			cmd:     "2 s/\\(We\\)/You/g\np\nu\nq\n",
++			wantOut: header + "You learn something new every day.\n",
++		},
++		{
++			name:    "CmdSub_backreference",
++			cmd:     "1s/\\(fair\\), \\(this\\)/\\2, \\1/p\nQ\n",
++			wantOut: header + "To be this, fair is just random weirdo stuff going on.\n",
+ 		},
+ 		{
+-			name:    "CmdSub_invalidAddr",
+-			cmd:     "4 s/(We)/You/n\nu\nq\n",
+-			wantOut: "line is out of bounds\nexit\n",
++			name:       "CmdSub_back_reference_before_end_anchor",
++			cmd:        "1c\nabab\n.\n2c\nababx\n.\n1s/\\(ab\\)\\1$/X/p\n2s/\\(ab\\)\\1$/X/\n,p\nQ\n",
++			wantOut:    header + "X\n?\nX\nababx\n",
++			wantStatus: 1,
+ 		},
+ 		{
+-			name:    "CmdQuit_Buffer_dirty",
+-			cmd:     "2 s/(We)/You/n\nq\nu\nq",
+-			wantOut: "1\tYou learn something new every day.\nwarning: file modified\nexit\n",
++			name:       "CmdSub_repeat_is_s_not_ampersand",
++			cmd:        "1s/e/E/\n2&\nh\n2s\n,p\nQ\n",
++			wantOut:    header + "?\nUnknown command\nTo bE fair, this is just random weirdo stuff going on.\nWE learn something new every day.\n",
++			wantStatus: 1,
+ 		},
+ 		{
+-			name:    "CmdEdit_undo",
+-			cmd:     "e\nu\nq\n",
+-			wantOut: "87\nexit\n",
++			name:    "CmdSub_newline_in_global_list_is_part_of_replacement",
++			cmd:     "g/fair/s/fair/X\\\np\n,p\nQ\n",
++			wantOut: header + "p, this is just random weirdo stuff going on.\np, this is just random weirdo stuff going on.\nTo be X\np, this is just random weirdo stuff going on.\nWe learn something new every day.\n",
+ 		},
+ 		{
+-			name:    "CmdPaste",
+-			cmd:     "x\nq\n",
+-			wantOut: "exit\n",
++			name:    "CmdSub_percent_before_more_of_global_list_is_literal",
++			cmd:     "2s/We/Y/\ng/fair/s/fair/%\\\np\n,p\nQ\n",
++			wantOut: header + "p, this is just random weirdo stuff going on.\np, this is just random weirdo stuff going on.\nTo be %\np, this is just random weirdo stuff going on.\nY learn something new every day.\n",
++		},
++		{
++			name:       "CmdSub_invalidAddr",
++			cmd:        "4 s/(We)/You/n\nu\nq\n",
++			wantOut:    header + "?\n?\n",
++			wantStatus: 1,
++		},
++		{
++			name:       "CmdQuit_Buffer_dirty",
++			cmd:        "2 s/\\(We\\)/You/n\nq\nu\nq",
++			wantOut:    header + "2\tYou learn something new every day.\n?\n",
++			wantStatus: 1,
++		},
++		{
++			name:       "CmdEdit_undo",
++			cmd:        "e\nu\nq\n",
++			wantOut:    header + "Newline appended\n89\n?\n",
++			wantStatus: 1,
++		},
++		{
++			name:       "CmdEdit_with_address_is_an_error",
++			cmd:        "1e testfile\nh\nQ\n",
++			wantOut:    header + "?\nUnexpected address\n",
++			wantStatus: 1,
++		},
++		{
++			name:       "CmdPaste",
++			cmd:        "x\nq\n",
++			wantOut:    header + "?\n",
++			wantStatus: 1,
+ 		},
+ 		{
+ 			name:    "CmdJoin",
+ 			cmd:     "-1,2 j\np\nu\nq\n",
+-			wantOut: "To be fair, this is just random weirdo stuff going on.We learn something new every day.\nexit\n",
++			wantOut: header + "To be fair, this is just random weirdo stuff going on.We learn something new every day.\n",
++		},
++		{
++			name:       "CmdJoin_invalidAddr",
++			cmd:        "-3 j\nu\nq\n",
++			wantOut:    header + "?\n?\n",
++			wantStatus: 1,
++		},
++		{
++			name:       "CmdDump",
++			cmd:        "D\nq\n",
++			wantOut:    header + "?\n",
++			wantStatus: 1,
++		},
++		{
++			name:    "CmdGlobal",
++			cmd:     "g/e/s/e/E/\\\np\nQ\n",
++			wantOut: header + "To bE fair, this is just random weirdo stuff going on.\nWE learn something new every day.\n",
++		},
++		{
++			name:       "CmdUndo_after_global_that_changes_nothing",
++			cmd:        "1d\ng/learn/p\nu\n,p\nQ\n",
++			wantOut:    header + "We learn something new every day.\n?\nWe learn something new every day.\n",
++			wantStatus: 1,
++		},
++		{
++			name:    "CmdAppend",
++			cmd:     "1a\nnew line\n.\n,n\nQ\n",
++			wantOut: header + "1\tTo be fair, this is just random weirdo stuff going on.\n2\tnew line\n3\tWe learn something new every day.\n",
++		},
++		{
++			name:     "Suppressed_write",
++			cmd:      "w\nq\n",
++			suppress: true,
++			wantOut:  "Newline appended\n",
++			wantFile: testdata + "\n",
++		},
++		{
++			name:    "Prompt",
++			cmd:     "p\nq\n",
++			prompt:  ":",
++			wantOut: header + ":We learn something new every day.\n:",
++		},
++		{
++			name:    "CmdMark_deleted_line_in_empty_buffer",
++			cmd:     "1ka\n,d\n'a=\nQ\n",
++			wantOut: header + "0\n",
++		},
++		{
++			name:    "CmdInsert_range_uses_second_address",
++			cmd:     "1,2i\nnew line\n.\n,n\nQ\n",
++			wantOut: header + "1\tTo be fair, this is just random weirdo stuff going on.\n2\tnew line\n3\tWe learn something new every day.\n",
+ 		},
+ 		{
+-			name:    "CmdJoin_invalidAddr",
+-			cmd:     "-3 j\nu\nq\n",
+-			wantOut: "line is out of bounds\nexit\n",
++			name:    "CmdSub_every_line_then_undo",
++			cmd:     ",s/e/E/g\n,p\nu\n,p\nQ\n",
++			wantOut: header + "To bE fair, this is just random wEirdo stuff going on.\nWE lEarn somEthing nEw EvEry day.\nTo be fair, this is just random weirdo stuff going on.\nWe learn something new every day.\n",
+ 		},
+ 		{
+-			name:    "CmdDump",
+-			cmd:     "D\nq\n",
+-			wantOut: "&{[] [To be fair, this is just random weirdo stuff going on. We learn something new every day.] [0 1] [] [0 1] false false false false 1 0 1 map[]}\nexit\n",
++			name:       "CmdSub_escaped_letters_ignoring_case",
++			cmd:        "1s/\\t/x/I\n1s/\\T/x/I\np\nQ\n",
++			wantOut:    header + "?\nxo be fair, this is just random weirdo stuff going on.\n",
++			wantStatus: 1,
++		},
++		{
++			name:       "CmdSub_global_without_match_is_not_an_error",
++			cmd:        "g/e/s/zzz/Z/\nh\n2s/zzz/Z/\nh\nQ\n",
++			wantOut:    header + "?\nNo match\n",
++			wantStatus: 1,
++		},
++		{
++			name:       "CmdSub_unknown_class_name_is_an_error",
++			cmd:        "1s/[[:word:]]/X/g\nh\n2s/[[:alnum:]_]*/X/\np\nQ\n",
++			wantOut:    header + "?\nInvalid character class name\nX learn something new every day.\n",
++			wantStatus: 1,
+ 		},
+ 	} {
+-		t.Run("Command:"+tt.cmd, func(t *testing.T) {
+-			tmpDir := t.TempDir()
+-			tmpFile, err := os.CreateTemp(tmpDir, "testfile-")
++		t.Run(tt.name, func(t *testing.T) {
++			t.Chdir(t.TempDir())
++			if err := os.WriteFile("testfile", []byte(testdata), 0o644); err != nil {
++				t.Fatal(err)
++			}
++			var out, errOut bytes.Buffer
++			status := runEd(strings.NewReader(tt.cmd), &out, &errOut, tt.suppress, tt.prompt, "testfile")
++			if out.String() != tt.wantOut {
++				t.Errorf("runEd(%q) printed %q, want %q", tt.cmd, out.String(), tt.wantOut)
++			}
++			if status != tt.wantStatus {
++				t.Errorf("runEd(%q) = %d, want %d", tt.cmd, status, tt.wantStatus)
++			}
++			want := tt.wantFile
++			if want == "" {
++				want = testdata
++			}
++			got, err := os.ReadFile("testfile")
+ 			if err != nil {
+-				t.Errorf("os.CreateTemp(tmpdir, `testfile-`)=file, %q, want file, nil", err)
++				t.Fatal(err)
+ 			}
+-			var in, out bytes.Buffer
+-			in.WriteString(tt.cmd)
+-			tmpFile.WriteString(testdata)
+-			if err := runEd(&in, &out, tt.suppress, tt.prompt, tmpFile.Name()); err != nil {
+-				t.Errorf(`runEd(&in, &out, tt.suppress, tt.prompt, "")=%q, want nil`, err)
++			if string(got) != want {
++				t.Errorf("after %q the file holds %q, want %q", tt.cmd, got, want)
+ 			}
+-			if out.String() != tt.wantOut {
+-				t.Errorf("%s failed. Got: %s, Want: %s", tt.cmd, out.String(), tt.wantOut)
++		})
++	}
++}
++
++func TestLongLineWithoutMatch(t *testing.T) {
++	line := strings.Repeat("x", 100000) + "\n"
++	for _, tt := range []struct {
++		name, cmd, wantOut string
++	}{
++		{name: "star_then_missing_letter", cmd: "s/x*z/y/\nh\ns/x*$/y/\np\nQ\n", wantOut: "?\nNo match\ny\n"},
++		{name: "back_reference_after_missing_letter", cmd: "/\\(x*\\)z\\1/\nh\nQ\n", wantOut: "?\nNo match\n"},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			t.Chdir(t.TempDir())
++			if err := os.WriteFile("testfile", []byte(line), 0o644); err != nil {
++				t.Fatal(err)
++			}
++			var out, errOut bytes.Buffer
++			status := runEd(strings.NewReader(tt.cmd), &out, &errOut, true, "", "testfile")
++			if out.String() != tt.wantOut || status != 1 {
++				t.Errorf("runEd(%q) on a line of 100000 x printed %q and returned %d, want %q and 1", tt.cmd, out.String(), status, tt.wantOut)
+ 			}
+ 		})
+ 	}
+diff --git a/cmds/exp/ed/filebuffer.go b/cmds/exp/ed/filebuffer.go
+deleted file mode 100644
+index abdfeb809..000000000
+--- a/cmds/exp/ed/filebuffer.go
++++ /dev/null
+@@ -1,281 +0,0 @@
+-// Copyright 2019 the u-root Authors. All rights reserved
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-
+-// filebuffer.go - defines the FileBuffer object
+-package main
+-
+-import (
+-	"bufio"
+-	"fmt"
+-	"io"
+-	"os"
+-)
+-
+-// A FileBuffer manages a file being edited.
+-// A FileBuffer never deletes/modifies anything directly until it is replaced.
+-// It keeps a map of known lines to the current buffer.
+-// Note: FileBuffer is 0-addressed lines, so off-by-one from what `ed` expects.
+-type FileBuffer struct {
+-	cbuf      []string // cut buffer
+-	buffer    []string // all lines we know about, they never get delited
+-	file      []int    // sequence of buffer lines
+-	lastFile  []int    // used for undo capability
+-	tmpFile   []int    // used for undo capability
+-	dirty     bool     // tracks if the file has been modifed
+-	lastDirty bool     // used for undo capability
+-	tmpDirty  bool     // used for undo capability
+-	mod       bool     // mod is like dirty, but can be reset for transactions
+-	addr      int      // current file address
+-	lastAddr  int      // last address (for undo)
+-	tmpAddr   int      // last address (for undo)
+-	marks     map[byte]int
+-}
+-
+-// NewFileBuffer creats a new FileBuffer object
+-func NewFileBuffer(in []string) *FileBuffer {
+-	f := &FileBuffer{
+-		buffer: in,
+-		file:   []int{},
+-		dirty:  false,
+-		mod:    false,
+-		addr:   0,
+-		marks:  make(map[byte]int),
+-	}
+-	for i := range f.buffer {
+-		f.file = append(f.file, i)
+-	}
+-	return f
+-}
+-
+-// ErrOOB line is out of bounds
+-var ErrOOB = fmt.Errorf("line is out of bounds")
+-
+-// ErrINV address is invalid
+-var ErrINV = fmt.Errorf("invalid address")
+-
+-// OOB checks if a line is out of bounds
+-func (f *FileBuffer) OOB(l int) bool {
+-	if l < 0 || l >= f.Len() {
+-		return true
+-	}
+-	return false
+-}
+-
+-// GetMust gets a specified line, to be used when we know it's safe (no error return)
+-// if "set" is true, sets the current line pointer
+-func (f *FileBuffer) GetMust(line int, set bool) string {
+-	if set {
+-		f.addr = line
+-	}
+-	return f.buffer[f.file[line]]
+-}
+-
+-// Get a specified line range
+-// this updates the current line pointer
+-func (f *FileBuffer) Get(r [2]int) (lines []string, e error) {
+-	if f.OOB(r[0]) || f.OOB(r[1]) {
+-		e = ErrOOB
+-		return
+-	}
+-	for l := r[0]; l <= r[1]; l++ {
+-		lines = append(lines, f.buffer[f.file[l]])
+-		f.addr = l
+-	}
+-	return
+-}
+-
+-// Copy lines into the cut buffer
+-func (f *FileBuffer) Copy(r [2]int) (e error) {
+-	var lines []string
+-	if lines, e = f.Get(r); e != nil {
+-		return
+-	}
+-	f.cbuf = lines
+-	return
+-}
+-
+-// Paste lines from cut buffer insert at line
+-func (f *FileBuffer) Paste(line int) (e error) {
+-	e = f.Insert(line, f.cbuf)
+-	return
+-}
+-
+-// Delete unmaps lines from the file
+-func (f *FileBuffer) Delete(r [2]int) (e error) {
+-	blines := []int{}
+-	for l := r[0]; l <= r[1]; l++ {
+-		if f.OOB(l) {
+-			return ErrOOB
+-		}
+-		blines = append(blines, f.file[l])
+-	}
+-	f.cbuf, _ = f.Get(r) // this shouldn't fail here, if it does we've got a bigger problem
+-	for _, b := range blines {
+-		for i, l := range f.file {
+-			if l == b {
+-				f.file = append(f.file[:i], f.file[i+1:]...)
+-				break
+-			}
+-		}
+-	}
+-	f.Touch()
+-	f.addr = r[0] + 1
+-	if f.OOB(f.addr) {
+-		f.addr = 0
+-	}
+-	return
+-}
+-
+-// Insert adds nlines to buffer and inserts them at line
+-func (f *FileBuffer) Insert(line int, nlines []string) (e error) {
+-	if line != f.Len() && f.OOB(line) { // if line == f.Len() we append to the end
+-		return ErrOOB
+-	}
+-	if len(nlines) == 0 {
+-		return
+-	}
+-	first := len(f.buffer)
+-	f.buffer = append(f.buffer, nlines...)
+-	nf := []int{}
+-	for i := first; i < len(f.buffer); i++ {
+-		nf = append(nf, i)
+-	}
+-	f.file = append(f.file[:line], append(nf, f.file[line:]...)...)
+-	f.Touch()
+-	f.addr = line + len(nlines) - 1
+-	return
+-}
+-
+-// Len returns the current file length
+-func (f *FileBuffer) Len() int {
+-	return len(f.file)
+-}
+-
+-// Dirty returns whether the file has changed
+-func (f *FileBuffer) Dirty() bool {
+-	return f.dirty
+-}
+-
+-// GetAddr gets the current file addr
+-func (f *FileBuffer) GetAddr() int {
+-	return f.addr
+-}
+-
+-// SetAddr sets the current addr, errors if OOB
+-func (f *FileBuffer) SetAddr(i int) (e error) {
+-	if f.OOB(i) {
+-		return ErrOOB
+-	}
+-	f.addr = i
+-	return
+-}
+-
+-// Clean resets the dirty flag
+-func (f *FileBuffer) Clean() {
+-	f.dirty = false
+-	f.lastDirty = false
+-	f.lastFile = []int{}
+-	f.lastAddr = 0
+-}
+-
+-// FileToBuffer reads a file and creates a new FileBuffer from it
+-func FileToBuffer(file string) (fb *FileBuffer, e error) {
+-	fb = NewFileBuffer(nil)
+-	e = fb.ReadFile(0, file)
+-	if e == nil {
+-		fb.dirty = false
+-	}
+-	return
+-}
+-
+-// SetMark sets a mark (by byte name) in the FileBuffer for later use
+-func (f *FileBuffer) SetMark(c byte, l int) (e error) {
+-	if f.OOB(l) {
+-		e = ErrOOB
+-		return
+-	}
+-	f.marks[c] = f.file[l]
+-	return
+-}
+-
+-// GetMark gets a mark from the FileBuffer (by byte name)
+-func (f *FileBuffer) GetMark(c byte) (l int, e error) {
+-	bl, ok := f.marks[c]
+-	if !ok {
+-		return -1, fmt.Errorf("no such mark: %c", c)
+-	}
+-	for i := 0; i < f.Len(); i++ {
+-		if f.file[i] == bl {
+-			l = i
+-			return
+-		}
+-	}
+-	return -1, fmt.Errorf("mark was cleared: %c", c)
+-}
+-
+-// Size return the size (in bytes) of the current file buffer
+-func (f *FileBuffer) Size() (s int) {
+-	for _, i := range f.file {
+-		s += len(f.buffer[i])
+-	}
+-	return
+-}
+-
+-// Read reads in from an io.Reader interface and inserts at the current line address
+-func (f *FileBuffer) Read(line int, r io.Reader) (e error) {
+-	b := []string{}
+-	s := bufio.NewScanner(r)
+-	for s.Scan() {
+-		b = append(b, s.Text())
+-	}
+-	e = f.Insert(line, b)
+-	return
+-}
+-
+-// ReadFile reads in a file and inserts it at the current line address
+-func (f *FileBuffer) ReadFile(line int, file string) (e error) {
+-	var fh *os.File
+-	if fh, e = os.Open(file); e != nil {
+-		e = fmt.Errorf("could not read file: %w", e)
+-		return
+-	}
+-	defer fh.Close()
+-
+-	e = f.Read(line, fh)
+-	return
+-}
+-
+-// Start a transaction
+-func (f *FileBuffer) Start() {
+-	f.mod = false
+-	f.tmpFile = make([]int, len(f.file))
+-	copy(f.tmpFile, f.file)
+-	f.tmpAddr = f.addr
+-	f.tmpDirty = f.dirty
+-}
+-
+-// End a transaction
+-func (f *FileBuffer) End() {
+-	if f.mod {
+-		f.lastFile = f.tmpFile
+-		f.lastAddr = f.tmpAddr
+-		f.lastDirty = f.tmpDirty
+-	}
+-}
+-
+-// Rewind restores the previous file
+-func (f *FileBuffer) Rewind() {
+-	if f.Dirty() || f.lastDirty {
+-		f.addr = f.lastAddr
+-		f.file = f.lastFile
+-		f.dirty = f.lastDirty
+-		f.mod = true
+-	}
+-}
+-
+-// Touch is the correct way (even internally) to set the dirty & modified bits
+-func (f *FileBuffer) Touch() {
+-	f.dirty = true
+-	f.mod = true
+-}
+diff --git a/cmds/exp/ed/filebuffer_test.go b/cmds/exp/ed/filebuffer_test.go
+deleted file mode 100644
+index 96eac89c5..000000000
+--- a/cmds/exp/ed/filebuffer_test.go
++++ /dev/null
+@@ -1,634 +0,0 @@
+-// Copyright 2015-2018 the u-root Authors. All rights reserved
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-
+-package main
+-
+-import (
+-	"bytes"
+-	"fmt"
+-	"io"
+-	"os"
+-	"reflect"
+-	"testing"
+-
+-	"github.com/google/go-cmp/cmp"
+-)
+-
+-// Test all functions with func() int signatur
+-var testTableInt = []struct {
+-	name   string
+-	in     *FileBuffer
+-	exp    any
+-	method func(f *FileBuffer) int
+-}{
+-	{
+-		name:   "Test Len: Len()=0",
+-		in:     &FileBuffer{file: []int{}},
+-		exp:    0,
+-		method: (*FileBuffer).Len,
+-	},
+-	{
+-		name:   "Test Len: Len()=4",
+-		in:     &FileBuffer{file: []int{0, 1, 2, 3}},
+-		exp:    4,
+-		method: (*FileBuffer).Len,
+-	},
+-	{
+-		name:   "Test GetAddr: GetAddr()=0",
+-		in:     &FileBuffer{addr: 0},
+-		exp:    0,
+-		method: (*FileBuffer).GetAddr,
+-	},
+-	{
+-		name:   "Test GetAddr: GetAddr()=4",
+-		in:     &FileBuffer{addr: 4},
+-		exp:    4,
+-		method: (*FileBuffer).GetAddr,
+-	},
+-	{
+-		name:   "Test Size: Size()=4",
+-		in:     &FileBuffer{file: []int{0, 1, 2, 3}, buffer: []string{"0", "1", "2", "3"}},
+-		exp:    4,
+-		method: (*FileBuffer).Size,
+-	},
+-}
+-
+-func TestBasicFuncsInt(t *testing.T) {
+-	for _, tt := range testTableInt {
+-		t.Run(tt.name, func(t *testing.T) {
+-			got := tt.method(tt.in)
+-			if got != tt.exp {
+-				t.Errorf("Expected value: %v, got: %v", tt.exp, got)
+-			}
+-		})
+-	}
+-}
+-
+-// Test Dirty
+-var testTableDirty = []struct {
+-	name   string
+-	in     *FileBuffer
+-	exp    any
+-	method func(f *FileBuffer) bool
+-}{
+-	{
+-		name:   "Test Dirty: dirty = false",
+-		in:     &FileBuffer{dirty: false},
+-		exp:    false,
+-		method: (*FileBuffer).Dirty,
+-	},
+-	{
+-		name:   "Test Dirty: dirty = true",
+-		in:     &FileBuffer{dirty: true},
+-		exp:    true,
+-		method: (*FileBuffer).Dirty,
+-	},
+-}
+-
+-func TestDirty(t *testing.T) {
+-	for _, tt := range testTableDirty {
+-		t.Run(tt.name, func(t *testing.T) {
+-			got := tt.method(tt.in)
+-			if got != tt.exp {
+-				t.Errorf("Expected value: %v, got: %v", tt.exp, got)
+-			}
+-		})
+-	}
+-}
+-
+-// Test all functions with func() signatur
+-var testTable = []struct {
+-	name   string
+-	in     *FileBuffer
+-	exp    any
+-	method func(f *FileBuffer)
+-}{
+-	{
+-		name:   "Test Touch",
+-		in:     &FileBuffer{dirty: false, mod: false},
+-		exp:    &FileBuffer{dirty: true, mod: true},
+-		method: (*FileBuffer).Touch,
+-	},
+-	{
+-		name:   "Test Start",
+-		in:     &FileBuffer{mod: true, tmpFile: []int{}, file: []int{0, 1, 2, 3}, tmpAddr: 0, addr: 10, tmpDirty: false, dirty: true},
+-		exp:    &FileBuffer{mod: false, tmpFile: []int{0, 1, 2, 3}, file: []int{0, 1, 2, 3}, tmpAddr: 10, addr: 10, tmpDirty: true, dirty: true},
+-		method: (*FileBuffer).Start,
+-	},
+-	{
+-		name:   "Test End",
+-		in:     &FileBuffer{mod: true, lastFile: []int{}, tmpFile: []int{0, 1, 2, 3}, lastAddr: 0, tmpAddr: 10, lastDirty: false, tmpDirty: true},
+-		exp:    &FileBuffer{mod: true, lastFile: []int{0, 1, 2, 3}, tmpFile: []int{0, 1, 2, 3}, lastAddr: 10, tmpAddr: 10, lastDirty: true, tmpDirty: true},
+-		method: (*FileBuffer).End,
+-	},
+-	{
+-		name:   "Test Rewind",
+-		in:     &FileBuffer{mod: false, file: []int{}, lastFile: []int{0, 1, 2, 3}, addr: 0, lastAddr: 10, dirty: true, lastDirty: false},
+-		exp:    &FileBuffer{mod: true, file: []int{0, 1, 2, 3}, lastFile: []int{0, 1, 2, 3}, addr: 10, lastAddr: 10, dirty: false, lastDirty: false},
+-		method: (*FileBuffer).Rewind,
+-	},
+-	{
+-		name:   "Test Clean",
+-		in:     &FileBuffer{dirty: true, lastDirty: true, lastFile: []int{0, 1, 2, 3}, lastAddr: 10},
+-		exp:    &FileBuffer{dirty: false, lastDirty: false, lastFile: []int{}, lastAddr: 0},
+-		method: (*FileBuffer).Clean,
+-	},
+-}
+-
+-func TestBasicFuncs(t *testing.T) {
+-	for _, tt := range testTable {
+-		t.Run(tt.name, func(t *testing.T) {
+-			tt.method(tt.in)
+-			if !reflect.DeepEqual(tt.in, tt.exp) {
+-				t.Errorf("Expected value: %v, got: %v", tt.exp, tt.in)
+-			}
+-		})
+-	}
+-}
+-
+-// Test NewFileBuffer
+-var testTableNewFileBuffer = []struct {
+-	name string
+-	in   []string
+-	exp  *FileBuffer
+-}{
+-	{
+-		name: "Test NewFileBuffer",
+-		in:   []string{"0", "1", "2", "3"},
+-		exp:  &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}, dirty: false, mod: false, addr: 0, marks: make(map[byte]int)},
+-	},
+-}
+-
+-func TestNewFileBuffer(t *testing.T) {
+-	for _, tt := range testTableNewFileBuffer {
+-		t.Run(tt.name, func(t *testing.T) {
+-			got := NewFileBuffer(tt.in)
+-			if !reflect.DeepEqual(got, tt.exp) {
+-				t.Errorf("Expected value: %v, got: %v", tt.exp, got)
+-			}
+-		})
+-	}
+-}
+-
+-// Test OOB
+-var testTableOOB = []struct {
+-	name     string
+-	in       *FileBuffer
+-	exp      any
+-	methodin int
+-}{
+-	{
+-		name:     "Test OOB: return true",
+-		in:       &FileBuffer{},
+-		exp:      true,
+-		methodin: 4,
+-	},
+-	{
+-		name:     "Test OOB: return false",
+-		in:       &FileBuffer{file: []int{0, 1, 2, 3}},
+-		exp:      false,
+-		methodin: 2,
+-	},
+-}
+-
+-func TestOOB(t *testing.T) {
+-	for _, tt := range testTableOOB {
+-		t.Run(tt.name, func(t *testing.T) {
+-			got := tt.in.OOB(tt.methodin)
+-			if got != tt.exp {
+-				t.Errorf("Expected value: %v, got: %v", tt.exp, got)
+-			}
+-		})
+-	}
+-}
+-
+-// Test GetMust
+-var testTableGetMust = []struct {
+-	name      string
+-	in        *FileBuffer
+-	exp       string
+-	methodin1 int
+-	methodin2 bool
+-}{
+-	{
+-		name:      "Test GetMust",
+-		in:        &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}},
+-		exp:       "3",
+-		methodin1: 3,
+-		methodin2: true,
+-	},
+-}
+-
+-func TestGetMust(t *testing.T) {
+-	for _, tt := range testTableGetMust {
+-		t.Run(tt.name, func(t *testing.T) {
+-			got := tt.in.GetMust(tt.methodin1, tt.methodin2)
+-			if got != tt.exp {
+-				t.Errorf("Expected value: %v, got: %v", tt.exp, got)
+-			}
+-		})
+-	}
+-}
+-
+-// Test Get
+-var testTableGet = []struct {
+-	name     string
+-	in       *FileBuffer
+-	exp1     []string
+-	exp2     error
+-	methodin [2]int
+-}{
+-	{
+-		name:     "Test Get: with OOB error",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}},
+-		exp1:     []string{},
+-		exp2:     ErrOOB,
+-		methodin: [2]int{0, 4},
+-	},
+-	{
+-		name:     "Test Get: without OOB error",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}},
+-		exp1:     []string{"0", "1"},
+-		exp2:     fmt.Errorf(""),
+-		methodin: [2]int{0, 1},
+-	},
+-}
+-
+-func TestGet(t *testing.T) {
+-	for _, tt := range testTableGet {
+-		t.Run(tt.name, func(t *testing.T) {
+-			got, err := tt.in.Get(tt.methodin)
+-			if err != nil {
+-				// Using cmp pkf with weird opt because reflect.DeepEqual does not work for empty string arrays
+-				alwaysEqual := cmp.Comparer(func(_, _ any) bool { return true })
+-				opt := cmp.FilterValues(func(x, y any) bool {
+-					vx, vy := reflect.ValueOf(x), reflect.ValueOf(y)
+-					return (vx.IsValid() && vy.IsValid() && vx.Type() == vy.Type()) &&
+-						(vx.Kind() == reflect.Slice || vx.Kind() == reflect.Map) &&
+-						(vx.Len() == 0 && vy.Len() == 0)
+-				}, alwaysEqual)
+-				if !cmp.Equal(got, tt.exp1, opt) || err.Error() != tt.exp2.Error() {
+-					t.Errorf("Expected values: %v, %v, got: %v, %v", tt.exp1, tt.exp2, got, err)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-// Test Copy
+-var testTableCopy = []struct {
+-	name     string
+-	in       *FileBuffer
+-	exp      error
+-	methodin [2]int
+-}{
+-	{
+-		name:     "Test Copy: with OOB error",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}},
+-		exp:      ErrOOB,
+-		methodin: [2]int{0, 4},
+-	},
+-	{
+-		name:     "Test Copy: without OOB error",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}},
+-		exp:      nil,
+-		methodin: [2]int{0, 1},
+-	},
+-}
+-
+-func TestCopy(t *testing.T) {
+-	for _, tt := range testTableCopy {
+-		t.Run(tt.name, func(t *testing.T) {
+-			err := tt.in.Copy(tt.methodin)
+-			if err != nil {
+-				if err.Error() != tt.exp.Error() {
+-					t.Errorf("Expected value: %v, got: %v", tt.exp, err)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-// Test Paste & Insert
+-var testTablePasteInsert = []struct {
+-	name     string
+-	in       *FileBuffer
+-	exp      error
+-	methodin int
+-}{
+-	{
+-		name:     "Test Paste & Insert: with OOB error",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}},
+-		exp:      ErrOOB,
+-		methodin: 5,
+-	},
+-	{
+-		name:     "Test Paste & Insert: without OOB error and nlines == 0",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}},
+-		exp:      nil,
+-		methodin: 1,
+-	},
+-	{
+-		name:     "Test Paste & Insert: without OOB error and nlines != 0",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}, cbuf: []string{"0", "1", "2", "3"}},
+-		exp:      nil,
+-		methodin: 1,
+-	},
+-}
+-
+-func TestPasteInsert(t *testing.T) {
+-	for _, tt := range testTablePasteInsert {
+-		t.Run(tt.name, func(t *testing.T) {
+-			err := tt.in.Paste(tt.methodin)
+-			if err != nil {
+-				if err.Error() != tt.exp.Error() {
+-					t.Errorf("Expected value: %v, got: %v", tt.exp, err)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-// Test Delete
+-var testTableDelete = []struct {
+-	name     string
+-	in       *FileBuffer
+-	exp      error
+-	methodin [2]int
+-}{
+-	{
+-		name:     "Test Delete: with OOB error",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}},
+-		exp:      ErrOOB,
+-		methodin: [2]int{0, 4},
+-	},
+-	{
+-		name:     "Test Delete: without OOB error and addr OOB edge case",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}},
+-		exp:      nil,
+-		methodin: [2]int{0, 3},
+-	},
+-}
+-
+-func TestDelete(t *testing.T) {
+-	for _, tt := range testTableDelete {
+-		t.Run(tt.name, func(t *testing.T) {
+-			err := tt.in.Delete(tt.methodin)
+-			if err != nil {
+-				if err.Error() != tt.exp.Error() {
+-					t.Errorf("Expected value: %v, got: %v", tt.exp, err)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-// Test SetAddr
+-var testTableSetAddr = []struct {
+-	name     string
+-	in       *FileBuffer
+-	exp      error
+-	methodin int
+-}{
+-	{
+-		name:     "Test SetAddr: with OOB error",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}},
+-		exp:      ErrOOB,
+-		methodin: 4,
+-	},
+-	{
+-		name:     "Test SetAddr: without OOB error and addr OOB edge case",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}},
+-		exp:      nil,
+-		methodin: 0,
+-	},
+-}
+-
+-func TestSetAddr(t *testing.T) {
+-	for _, tt := range testTableSetAddr {
+-		t.Run(tt.name, func(t *testing.T) {
+-			err := tt.in.SetAddr(tt.methodin)
+-			if err != nil {
+-				if err.Error() != tt.exp.Error() {
+-					t.Errorf("Expected value: %v, got: %v", tt.exp, err)
+-				}
+-			} else {
+-				if tt.methodin != tt.in.addr {
+-					t.Errorf("Expected value: %v, got: %v", tt.methodin, tt.in.addr)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-// Test SetMark
+-var testTableSetMark = []struct {
+-	name      string
+-	in        *FileBuffer
+-	exp       int
+-	err       error
+-	methodin1 byte
+-	methodin2 int
+-}{
+-	{
+-		name:      "Test SetMark: with OOB error",
+-		in:        &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}, marks: make(map[byte]int)},
+-		exp:       0,
+-		err:       ErrOOB,
+-		methodin1: 0,
+-		methodin2: 5,
+-	},
+-	{
+-		name:      "Test SetMark: without OOB error",
+-		in:        &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}, marks: make(map[byte]int)},
+-		exp:       3,
+-		err:       ErrOOB,
+-		methodin1: 0,
+-		methodin2: 3,
+-	},
+-}
+-
+-func TestSetMark(t *testing.T) {
+-	for _, tt := range testTableSetMark {
+-		t.Run(tt.name, func(t *testing.T) {
+-			err := tt.in.SetMark(tt.methodin1, tt.methodin2)
+-			if err != nil {
+-				if err.Error() != tt.err.Error() {
+-					t.Errorf("Expected value: %v, got: %v", tt.exp, err)
+-				}
+-			} else {
+-				if tt.exp != tt.in.marks[0] {
+-					t.Errorf("Expected value: %v, got: %v", tt.exp, tt.in.marks[0])
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-// Test GetMark
+-var testTableGetMark = []struct {
+-	name     string
+-	in       *FileBuffer
+-	exp      int
+-	err      int
+-	methodin byte
+-}{
+-	{
+-		name:     "Test GetMark: with error",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}, marks: make(map[byte]int)},
+-		exp:      0,
+-		err:      -1,
+-		methodin: 0x00,
+-	},
+-	{
+-		name:     "Test GetMark: without error",
+-		in:       &FileBuffer{buffer: []string{"0", "1", "2", "3"}, file: []int{0, 1, 2, 3}, marks: make(map[byte]int)},
+-		exp:      1,
+-		err:      0,
+-		methodin: 0x01,
+-	},
+-	{
+-		name:     "Test GetMark: without second error",
+-		in:       &FileBuffer{marks: make(map[byte]int)},
+-		exp:      1,
+-		err:      -1,
+-		methodin: 0x01,
+-	},
+-}
+-
+-func TestGetMark(t *testing.T) {
+-	for _, tt := range testTableGetMark {
+-		t.Run(tt.name, func(t *testing.T) {
+-			tt.in.marks[1] = 1
+-			got, err := tt.in.GetMark(tt.methodin)
+-			if err != nil {
+-				if got != tt.err {
+-					t.Errorf("Expected value: %v, got: %v", tt.err, err)
+-				}
+-			} else {
+-				if got == tt.in.marks[0] {
+-					t.Errorf("Expected value: %v, got: %v", tt.exp, got)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-// Test Read
+-var testTableRead = []struct {
+-	name      string
+-	in        *FileBuffer
+-	err       error
+-	methodin1 int
+-	methodin2 io.Reader
+-}{
+-	{
+-		name:      "Test Read",
+-		in:        &FileBuffer{},
+-		err:       nil,
+-		methodin1: 0,
+-		methodin2: &bytes.Buffer{},
+-	},
+-}
+-
+-func TestRead(t *testing.T) {
+-	for _, tt := range testTableRead {
+-		t.Run(tt.name, func(t *testing.T) {
+-			err := tt.in.Read(tt.methodin1, tt.methodin2)
+-			if err != nil {
+-				if err != tt.err {
+-					t.Errorf("Expected value: %v, got: %v", tt.err, err)
+-				}
+-			}
+-		})
+-	}
+-}
+-
+-// Test ReadFile
+-func CreateFile(name string) string {
+-	f, err := os.Create(name)
+-	if err != nil {
+-		return ""
+-	}
+-	defer f.Close()
+-	f.Write([]byte{0x01})
+-	return f.Name()
+-}
+-
+-var testTableReadFile = []struct {
+-	name      string
+-	in        *FileBuffer
+-	err       error
+-	methodin1 int
+-	methodin2 string
+-}{
+-	{
+-		name:      "Test ReadFile: file exists",
+-		in:        &FileBuffer{},
+-		err:       nil,
+-		methodin1: 0,
+-		methodin2: CreateFile("readfile"),
+-	},
+-	{
+-		name:      "Test ReadFile: file does not exist",
+-		in:        &FileBuffer{},
+-		err:       fmt.Errorf("could not read file: open dir: no such file or directory"),
+-		methodin1: 0,
+-		methodin2: "dir",
+-	},
+-}
+-
+-func TestReadFile(t *testing.T) {
+-	for _, tt := range testTableReadFile {
+-		t.Run(tt.name, func(t *testing.T) {
+-			err := tt.in.ReadFile(tt.methodin1, tt.methodin2)
+-			if err != nil {
+-				if err.Error() != tt.err.Error() {
+-					t.Errorf("Expected value: %v, got: %v", tt.err, err)
+-				}
+-			}
+-			os.Remove(tt.methodin2)
+-		})
+-	}
+-}
+-
+-// Test FileToBuffer
+-var testTableFileToBuffer = []struct {
+-	name     string
+-	in       *FileBuffer
+-	exp      *FileBuffer
+-	err      error
+-	methodin string
+-}{
+-	{
+-		name:     "Test FileToBuffer: file exists",
+-		in:       &FileBuffer{},
+-		exp:      &FileBuffer{mod: true, file: []int{0}},
+-		err:      fmt.Errorf(""),
+-		methodin: CreateFile("filetobuffer"),
+-	},
+-	{
+-		name:     "Test FileToBuffer: file does not exist",
+-		in:       &FileBuffer{},
+-		exp:      NewFileBuffer(nil),
+-		err:      fmt.Errorf("could not read file: open %s: no such file or directory", "dir"),
+-		methodin: "dir",
+-	},
+-}
+-
+-func TestFileToBuffer(t *testing.T) {
+-	for _, tt := range testTableFileToBuffer {
+-		t.Run(tt.name, func(t *testing.T) {
+-			got, err := FileToBuffer(tt.methodin)
+-			if err != nil {
+-				if err.Error() != tt.err.Error() {
+-					t.Errorf("Expected value: %v, got: %v", tt.err, err)
+-				}
+-			} else if reflect.DeepEqual(tt.exp, got) {
+-				t.Errorf("Expected value: %v, got: %v", tt.exp, got)
+-			}
+-			os.Remove(tt.methodin)
+-		})
+-	}
+-}
+diff --git a/cmds/exp/ed/io.go b/cmds/exp/ed/io.go
+new file mode 100644
+index 000000000..6765df25a
+--- /dev/null
++++ b/cmds/exp/ed/io.go
+@@ -0,0 +1,198 @@
++// Copyright 2026 the u-root Authors. All rights reserved
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// io.go - printing lines, and reading and writing files
++package main
++
++import (
++	"bufio"
++	"bytes"
++	"errors"
++	"fmt"
++	"os"
++	"strings"
++)
++
++// columns is the width at which l folds long lines.
++const columns = 72
++
++// pathMax is the longest file name accepted.
++const pathMax = 4096
++
++func isShell(name string) bool { return name != "" && name[0] == '!' }
++
++func (e *editor) printLines(from, to, pflags int) error {
++	if from == 0 {
++		return errInvalidAddress
++	}
++	for a := from; a <= to; a++ {
++		e.buf.cur = a
++		e.printLine(e.buf.text(a), pflags)
++	}
++	return nil
++}
++
++// printLine prints s. With pfNumber it is preceded by its address; with
++// pfList it is written unambiguously, folded at columns and ended with $.
++func (e *editor) printLine(s string, pflags int) {
++	col := 0
++	if pflags&pfNumber != 0 {
++		fmt.Fprintf(e.out, "%d\t", e.buf.cur)
++		col = 8
++	}
++	if pflags&pfList == 0 {
++		e.out.WriteString(s)
++		e.out.WriteByte('\n')
++		return
++	}
++	for i := 0; i < len(s); i++ {
++		ch := s[i]
++		// As in GNU ed, the fold is decided one column per byte, before an
++		// escape adds its width, so an escape that starts in the last column
++		// ends past it: 71 a's and a $ print as one row ending in \$$.
++		if col++; col > columns {
++			col = 1
++			e.out.WriteString("\\\n")
++		}
++		if ch >= 32 && ch <= 126 {
++			if ch == '$' || ch == '\\' {
++				col++
++				e.out.WriteByte('\\')
++			}
++			e.out.WriteByte(ch)
++			continue
++		}
++		col++
++		e.out.WriteByte('\\')
++		if j := strings.IndexByte("\a\b\f\n\r\t\v", ch); ch != 0 && j >= 0 {
++			e.out.WriteByte("abfnrtv"[j])
++			continue
++		}
++		col += 2
++		e.out.WriteByte('0' + ch>>6&7)
++		e.out.WriteByte('0' + ch>>3&7)
++		e.out.WriteByte('0' + ch&7)
++	}
++	e.out.WriteString("$\n")
++}
++
++// filename reads the file name argument of e, E, f, r, w and W. An empty
++// name stands for the default file name; a name that starts with ! would be a
++// shell command, which is refused.
++func (e *editor) filename(c *cmdbuf) (string, error) {
++	c.skipBlanks()
++	if c.peek() != '\n' {
++		if err := e.extendLine(c, true); err != nil {
++			return "", err
++		}
++		if c.peek() == '!' {
++			return "", errRestricted
++		}
++		if strings.IndexByte(c.s[c.pos:], '\n') > pathMax {
++			return "", errFilenameTooLong
++		}
++	} else if e.defFile == "" {
++		return "", errNoCurrentFile
++	}
++	start := c.pos
++	for c.pos < len(c.s) && c.s[c.pos] != '\n' {
++		c.pos++
++	}
++	name := c.s[start:c.pos]
++	for c.peek() == '\n' {
++		c.pos++
++	}
++	return name, nil
++}
++
++// showError reports a failed file operation on standard error. GNU ed
++// prints these in script mode too: -s only suppresses byte counts.
++func (e *editor) showError(name string, err error) {
++	var pe *os.PathError
++	if errors.As(err, &pe) {
++		err = pe.Err
++	}
++	msg := err.Error()
++	if msg != "" {
++		msg = strings.ToUpper(msg[:1]) + msg[1:]
++	}
++	fmt.Fprintf(e.errOut, "%s: %s\n", name, msg)
++}
++
++// readFile reads name into the buffer after addr and returns the number of
++// lines read.
++func (e *editor) readFile(name string, addr int) (int, error) {
++	data, err := os.ReadFile(name)
++	if err != nil {
++		e.showError(name, err)
++		var pe *os.PathError
++		if errors.As(err, &pe) && pe.Op == "open" {
++			return -1, errOpenInput
++		}
++		return -1, errReadInput
++	}
++	var texts []string
++	appended := false
++	for s := string(data); s != ""; {
++		i := strings.IndexByte(s, '\n')
++		if i < 0 {
++			texts = append(texts, s)
++			appended = true
++			break
++		}
++		texts = append(texts, s[:i])
++		s = s[i+1:]
++	}
++	e.buf.add(addr, texts)
++	if appended {
++		// GNU ed prints this notice on standard output even with -s.
++		fmt.Fprintln(e.out, "Newline appended")
++	}
++	if !e.scripted {
++		size := len(data)
++		if appended {
++			size++
++		}
++		fmt.Fprintln(e.out, size)
++	}
++	return len(texts), nil
++}
++
++// writeFile writes lines from through to to name, appending with appendTo,
++// and returns the number of lines written.
++func (e *editor) writeFile(name string, appendTo bool, from, to int) (int, error) {
++	var w bytes.Buffer
++	for a := from; a > 0 && a <= to; a++ {
++		w.WriteString(e.buf.text(a))
++		w.WriteByte('\n')
++	}
++	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
++	if appendTo {
++		flags = os.O_WRONLY | os.O_CREATE | os.O_APPEND
++	}
++	f, err := os.OpenFile(name, flags, 0o666)
++	if err != nil {
++		e.showError(name, err)
++		return -1, errOpenOutput
++	}
++	bw := bufio.NewWriter(f)
++	_, err = bw.Write(w.Bytes())
++	if err == nil {
++		err = bw.Flush()
++	}
++	if cerr := f.Close(); err == nil {
++		err = cerr
++	}
++	if err != nil {
++		e.showError(name, err)
++		return -1, errWriteOutput
++	}
++	if !e.scripted {
++		fmt.Fprintln(e.out, w.Len())
++	}
++	if from > 0 && from <= to {
++		return to - from + 1, nil
++	}
++	return 0, nil
++}
+diff --git a/cmds/exp/ed/subst.go b/cmds/exp/ed/subst.go
+new file mode 100644
+index 000000000..fb5b94817
+--- /dev/null
++++ b/cmds/exp/ed/subst.go
+@@ -0,0 +1,492 @@
++// Copyright 2026 the u-root Authors. All rights reserved
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// subst.go - regular expressions in commands, searches and the s command
++package main
++
++import (
++	"slices"
++	"strings"
++
++	"github.com/u-root/u-root/pkg/bre"
++)
++
++func byteAt(s string, i int) byte {
++	if i < len(s) {
++		return s[i]
++	}
++	return 0
++}
++
++// closeBracket returns the index of the ] that ends the bracket expression
++// whose contents start at i, or -1 if the line ends first.
++func closeBracket(s string, i int) int {
++	if byteAt(s, i) == '^' {
++		i++
++	}
++	if byteAt(s, i) == ']' {
++		i++
++	}
++	for ; byteAt(s, i) != ']'; i++ {
++		ch := byteAt(s, i)
++		if ch == '\n' || ch == 0 {
++			return -1
++		}
++		if d := byteAt(s, i+1); ch == '[' && (d == '.' || d == ':' || d == '=') {
++			i += 2
++			prev := byteAt(s, i)
++			for byteAt(s, i) != ']' || prev != d {
++				prev = byteAt(s, i)
++				if prev == '\n' || prev == 0 {
++					return -1
++				}
++				i++
++			}
++		}
++	}
++	return i
++}
++
++// pattern returns the regular expression in c up to delim or the end of the
++// line, leaving c there.
++func (e *editor) pattern(c *cmdbuf, delim byte) (string, error) {
++	start, i := c.pos, c.pos
++	for i < len(c.s) && c.s[i] != delim && c.s[i] != '\n' {
++		switch c.s[i] {
++		case '[':
++			if i = closeBracket(c.s, i+1); i < 0 {
++				return "", errUnbalanced
++			}
++		case '\\':
++			if i++; byteAt(c.s, i) == '\n' {
++				return "", errTrailingSlash
++			}
++		}
++		i++
++	}
++	c.pos = i
++	return c.s[start:i], nil
++}
++
++func (e *editor) compile(pat string, icase bool) (*bre.Regexp, error) {
++	re, err := bre.Compile(pat, icase)
++	if err != nil {
++		return nil, err
++	}
++	e.lastRE = re
++	return re, nil
++}
++
++// regexp reads a delimited regular expression with an optional I suffix.
++// An empty one stands for the last regular expression used.
++func (e *editor) regexp(c *cmdbuf) (*bre.Regexp, error) {
++	delim := c.peek()
++	if delim == ' ' || delim == '\n' {
++		return nil, errBadDelimiter
++	}
++	c.pos++
++	if p := c.peek(); p == delim || p == '\n' {
++		if e.lastRE == nil {
++			return nil, errNoPrevPattern
++		}
++		if p == delim {
++			if c.pos++; c.peek() == 'I' {
++				return nil, errSuffixI
++			}
++		}
++		return e.lastRE, nil
++	}
++	pat, err := e.pattern(c, delim)
++	if err != nil {
++		return nil, err
++	}
++	icase := false
++	if c.peek() == delim {
++		if c.pos++; c.peek() == 'I' {
++			icase = true
++			c.pos++
++		}
++	}
++	return e.compile(pat, icase)
++}
++
++// search finds the next line, forward for /re/ and backward for ?re?,
++// that matches, wrapping around the buffer.
++func (e *editor) search(c *cmdbuf) (int, error) {
++	forward := c.peek() == '/'
++	re, err := e.regexp(c)
++	if err != nil {
++		return -1, err
++	}
++	b := e.buf
++	addr := b.cur
++	for {
++		if forward {
++			if addr++; addr > b.last() {
++				addr = 0
++			}
++		} else if addr--; addr < 0 {
++			addr = b.last()
++		}
++		if addr != 0 && re.MatchString(b.text(addr)) {
++			return addr, nil
++		}
++		if addr == b.cur {
++			return -1, errNoMatch
++		}
++	}
++}
++
++// Flags of a repeated substitution.
++const (
++	sfGlobal = 1 << iota
++	sfPrint
++	sfLastSearch
++	sfNone
++)
++
++// substitute runs the s command. Without a pattern it repeats the last
++// substitution, adjusted by the suffixes that follow.
++func (e *editor) substitute(c *cmdbuf, pflags *int, n int, global bool) error {
++	b := e.buf
++	if err := e.checkRange(b.cur, b.cur, n); err != nil {
++		return err
++	}
++	// As in GNU ed, a digit 1-9, g, p or r right after s starts the
++	// suffixes of the repeat form, so none of them can open a new pattern:
++	// 1sgagXg is an invalid suffix, while 1sxaxXx or 1s0a0X0 substitutes.
++	sflags := 0
++	for {
++		bad := false
++		switch p := c.peek(); {
++		case p >= '1' && p <= '9':
++			num, err := c.number()
++			if sflags&sfGlobal != 0 || err != nil || num <= 0 {
++				bad = true
++			} else {
++				sflags |= sfGlobal
++				e.sNum = num
++			}
++		case p == '\n':
++			sflags |= sfNone
++		case p == 'g' || p == 'p' || p == 'r':
++			f := sfGlobal
++			switch p {
++			case 'p':
++				f = sfPrint
++			case 'r':
++				f = sfLastSearch
++			}
++			if sflags&f != 0 {
++				bad = true
++				break
++			}
++			sflags |= f
++			if p == 'g' {
++				if e.sNum == 0 {
++					e.sNum = 1
++				} else {
++					e.sNum = 0
++				}
++			}
++			c.pos++
++		default:
++			bad = sflags != 0
++		}
++		if bad {
++			return errBadSuffix
++		}
++		if sflags == 0 || c.peek() == '\n' {
++			break
++		}
++	}
++	if sflags != 0 {
++		if e.substRE == nil {
++			return errNoPrevSubst
++		}
++		if sflags&sfLastSearch != 0 {
++			if e.lastRE == nil {
++				return errNoPrevPattern
++			}
++			e.substRE = e.lastRE
++		}
++		if sflags&sfPrint != 0 {
++			e.sPflags ^= e.sPmask
++		}
++	} else {
++		pat, err := e.substPattern(c)
++		if err != nil {
++			return err
++		}
++		delim := c.peek()
++		if err := e.replacement(c, global); err != nil {
++			return err
++		}
++		e.sPflags, e.sNum = 0, 1
++		icase := false
++		if c.peek() == '\n' {
++			e.sPflags = pfPrint
++		} else {
++			if c.peek() == delim {
++				c.pos++
++			}
++			if err := e.substSuffix(c, &icase); err != nil {
++				return err
++			}
++		}
++		if e.sPmask = e.sPflags & (pfList | pfNumber | pfPrint); e.sPmask == 0 {
++			e.sPmask = pfPrint
++		}
++		if pat == "" && icase {
++			return errSuffixI
++		}
++		re := e.lastRE
++		if pat != "" {
++			if re, err = e.compile(pat, icase); err != nil {
++				return err
++			}
++		}
++		e.substRE = re
++	}
++	*pflags = e.sPflags
++	if !global {
++		b.clearUndo()
++	}
++	return e.replaceLines(e.first, e.second, e.sNum, global)
++}
++
++// substPattern reads the pattern of an s command, leaving c at the
++// delimiter that ends it.
++func (e *editor) substPattern(c *cmdbuf) (string, error) {
++	delim := c.peek()
++	if delim == ' ' || delim == '\n' {
++		return "", errBadDelimiter
++	}
++	if c.pos++; c.peek() == delim {
++		if e.lastRE == nil {
++			return "", errNoPrevPattern
++		}
++		return "", nil
++	}
++	pat, err := e.pattern(c, delim)
++	if err != nil {
++		return "", err
++	}
++	if c.peek() != delim {
++		return "", errMissingDelim
++	}
++	return pat, nil
++}
++
++// replacement reads the replacement of an s command. A lone % stands for
++// the last replacement. Outside a global command, an escaped newline
++// continues the replacement on the next input line. A global command list
++// is already joined, and GNU ed ends a replacement there only at its
++// delimiter or at the end of the list, so g/a/s/a/A\ followed by p
++// replaces a with the two lines A and p, and % before more of the list is
++// a literal %.
++func (e *editor) replacement(c *cmdbuf, global bool) error {
++	delim := c.peek()
++	if delim == '\n' {
++		return errMissingDelim
++	}
++	c.pos++
++	if c.peek() == '%' {
++		if nx := byteAt(c.s, c.pos+1); nx == delim || nx == '\n' && (!global || c.pos+2 >= len(c.s)) {
++			c.pos++
++			if e.repl == nil {
++				return errNoPrevSubst
++			}
++			return nil
++		}
++	}
++	var r []byte
++	for c.pos < len(c.s) && c.peek() != delim {
++		if c.peek() == '\n' && (!global || c.pos+1 >= len(c.s)) {
++			break
++		}
++		ch := c.next()
++		r = append(r, ch)
++		if ch != '\\' {
++			continue
++		}
++		ch = c.next()
++		r = append(r, ch)
++		if ch == '\n' && !global {
++			l, ok := e.readLine()
++			if !ok {
++				return errEOF
++			}
++			c.s, c.pos = l, 0
++		}
++	}
++	s := string(r)
++	e.repl = &s
++	return nil
++}
++
++// substSuffix reads the suffixes after the replacement: a count or g, I,
++// and the print suffixes.
++func (e *editor) substSuffix(c *cmdbuf, icase *bool) error {
++	counted := false
++loop:
++	for {
++		var f int
++		switch ch := c.peek(); {
++		case ch >= '1' && ch <= '9':
++			num, err := c.number()
++			if counted || err != nil || num <= 0 {
++				return errBadSuffix
++			}
++			counted = true
++			e.sNum = num
++			continue
++		case ch == 'g':
++			if counted {
++				break loop
++			}
++			counted = true
++			e.sNum = 0
++		case ch == 'i' || ch == 'I':
++			if *icase {
++				break loop
++			}
++			*icase = true
++		case ch == 'l':
++			f = pfList
++		case ch == 'n':
++			f = pfNumber
++		case ch == 'p':
++			f = pfPrint
++		default:
++			break loop
++		}
++		if f != 0 {
++			if e.sPflags&f != 0 {
++				break loop
++			}
++			e.sPflags |= f
++		}
++		c.pos++
++	}
++	if c.next() != '\n' {
++		return errBadSuffix
++	}
++	return nil
++}
++
++// replaceLines makes the substitution in each line of [from, to]: the
++// snum-th match, or every match when snum is 0. The new lines go into the
++// buffer in one splice, which also keeps the ones replaced before an error;
++// the last line replaced is left in the cut buffer. Marks on a replaced line
++// are lost with it, as GNU ed's manual says of a modified line.
++func (e *editor) replaceLines(from, to, snum int, global bool) error {
++	b := e.buf
++	var out, gone []*line
++	cur := b.cur
++	var err error
++	a := from
++	for ; a <= to; a++ {
++		l := b.lines[a-1]
++		var text string
++		var changed bool
++		if text, changed, err = e.replaceLine(l.text, snum); err != nil {
++			break
++		}
++		if !changed {
++			out = append(out, l)
++			continue
++		}
++		gone = append(gone, l)
++		for _, t := range strings.Split(text, "\n") {
++			out = append(out, &line{text: t})
++		}
++		cur = from - 1 + len(out)
++	}
++	if len(gone) > 0 {
++		if global {
++			b.deactivate(gone)
++		}
++		b.lines = slices.Replace(b.lines, from-1, a-1, out...)
++		b.yanked = []string{gone[len(gone)-1].text}
++		b.cur = cur
++		b.changed()
++	}
++	if err != nil {
++		return err
++	}
++	// Inside a global command GNU ed leaves a line the substitution does not
++	// match alone instead of failing.
++	if len(gone) == 0 && !global {
++		return errNoMatch
++	}
++	return nil
++}
++
++// replaceLine applies the substitution to one line. Each match after the
++// first is searched for in the rest of the line, which does not start a
++// line.
++func (e *editor) replaceLine(text string, snum int) (string, bool, error) {
++	re := e.substRE
++	m := re.FindSubmatchIndex(text, false)
++	if m == nil {
++		return text, false, nil
++	}
++	global := snum <= 0
++	var out []byte
++	pos, matches := 0, 0
++	changed, empty := false, false
++	for {
++		rest := text[pos:]
++		matches++
++		if global || snum == matches {
++			changed = true
++			out = append(out, rest[:m[0]]...)
++			out = e.expand(out, rest, m, re.NumSubexp())
++		} else {
++			out = append(out, rest[:m[1]]...)
++		}
++		pos += m[1]
++		if global && m[1] == 0 {
++			if empty {
++				return "", false, errInfiniteLoop
++			}
++			empty = true
++		}
++		if pos >= len(text) || changed && !global {
++			break
++		}
++		if m = re.FindSubmatchIndex(text[pos:], true); m == nil {
++			break
++		}
++	}
++	out = append(out, text[pos:]...)
++	return string(out), changed, nil
++}
++
++// expand appends the replacement for match m in s: & is the whole match,
++// \1 to \9 the sub-expressions, and a backslash makes any other character
++// literal.
++func (e *editor) expand(out []byte, s string, m []int, nsub int) []byte {
++	r := *e.repl
++	for i := 0; i < len(r); i++ {
++		switch {
++		case r[i] == '&':
++			out = append(out, s[m[0]:m[1]]...)
++		case r[i] == '\\':
++			i++
++			d := byteAt(r, i)
++			if n := int(d - '0'); d >= '1' && d <= '9' && n <= nsub {
++				if m[2*n] >= 0 {
++					out = append(out, s[m[2*n]:m[2*n+1]]...)
++				}
++			} else {
++				out = append(out, d)
++			}
++		default:
++			out = append(out, r[i])
++		}
++	}
++	return out
++}
+diff --git a/cmds/exp/ed/system.go b/cmds/exp/ed/system.go
+deleted file mode 100644
+index 574b1d4ee..000000000
+--- a/cmds/exp/ed/system.go
++++ /dev/null
+@@ -1,48 +0,0 @@
+-// Copyright 2019 the u-root Authors. All rights reserved
+-// Use of this source code is governed by a BSD-style
+-// license that can be found in the LICENSE file.
+-
+-// system.go implements the "System" wrapper class to exec.Cmd
+-
+-package main
+-
+-import (
+-	"io"
+-	"os/exec"
+-	"strings"
+-)
+-
+-const (
+-	shellpath = "/bin/sh"
+-	shellopts = "-c"
+-)
+-
+-// System is a wrapper around exec.Cmd to run things in the Ed way
+-type System struct {
+-	Cmd    string
+-	Stdin  io.Reader
+-	Stdout io.Writer
+-	Stderr io.Writer
+-
+-	cmdSane string
+-}
+-
+-// Run a command (using the shell for arg processing)
+-func (s *System) Run() (e error) {
+-	s.cmdSane = rxSanitize.ReplaceAllString(s.Cmd, "..")
+-	idx := rxCmdSub.FindAllStringIndex(s.cmdSane, -1)
+-	var fCmd strings.Builder
+-	oCmd := 0
+-	for _, m := range idx {
+-		fCmd.WriteString(s.Cmd[oCmd:m[0]])
+-		fCmd.WriteString(state.fileName)
+-		oCmd = m[1]
+-	}
+-	fCmd.WriteString(s.Cmd[oCmd:])
+-
+-	cmd := exec.Command(shellpath, shellopts, fCmd.String())
+-	cmd.Stdin = s.Stdin
+-	cmd.Stdout = s.Stdout
+-	cmd.Stderr = s.Stderr
+-	return cmd.Run()
+-}
+diff --git a/pkg/bre/compile.go b/pkg/bre/compile.go
+new file mode 100644
+index 000000000..b6ad75ad7
+--- /dev/null
++++ b/pkg/bre/compile.go
+@@ -0,0 +1,731 @@
++// Copyright 2026 the u-root Authors. All rights reserved
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// Package bre implements POSIX basic regular expressions the way the GNU C
++// library's regcomp and regexec handle them in the C locale.
++//
++// That includes the GNU operators (\+ \? \| \< \> \b \B \w \W \s \S \` \'),
++// intervals, bracket expressions with classes, back-references, the context
++// rules for *, ^ and $, and the library's choice among equally long matches:
++// the leftmost-longest match, with sub-expressions taken from the first path
++// in the library's preference order that ends there.
++package bre
++
++import "strings"
++
++// Error is a compilation error. Its text is the message the GNU C library
++// reports for the same expression.
++type Error struct {
++	msg string
++}
++
++func (e *Error) Error() string { return e.msg }
++
++// Compilation errors, in the GNU C library's wording.
++var (
++	// ErrCollate reports an invalid collating element (REG_ECOLLATE).
++	ErrCollate = &Error{"Invalid collation character"}
++	// ErrCtype reports an unknown character class name (REG_ECTYPE).
++	ErrCtype = &Error{"Invalid character class name"}
++	// ErrEscape reports a trailing backslash (REG_EESCAPE).
++	ErrEscape = &Error{"Trailing backslash"}
++	// ErrSubreg reports a back-reference to a missing sub-expression (REG_ESUBREG).
++	ErrSubreg = &Error{"Invalid back reference"}
++	// ErrBadPat reports an invalid expression (REG_BADPAT).
++	ErrBadPat = &Error{"Invalid regular expression"}
++	// ErrBrack reports an unmatched bracket expression (REG_EBRACK).
++	ErrBrack = &Error{"Unmatched [, [^, [:, [., or [="}
++	// ErrParen reports an unmatched \( or \) (REG_EPAREN).
++	ErrParen = &Error{"Unmatched ( or \\("}
++	// ErrBrace reports an unmatched \{ (REG_EBRACE).
++	ErrBrace = &Error{"Unmatched \\{"}
++	// ErrBadBR reports invalid interval bounds (REG_BADBR).
++	ErrBadBR = &Error{"Invalid content of \\{\\}"}
++	// ErrRange reports an invalid range end point (REG_ERANGE).
++	ErrRange = &Error{"Invalid range end"}
++	// ErrBadRpt reports a repetition with nothing to repeat (REG_BADRPT).
++	ErrBadRpt = &Error{"Invalid preceding regular expression"}
++	// ErrSize reports an expression too large to compile (REG_ESIZE).
++	ErrSize = &Error{"Regular expression too big"}
++)
++
++const dupMax = 0x7fff
++
++type opcode uint8
++
++const (
++	opChar opcode = iota
++	opAny
++	opSet
++	opBackref
++	opOpen
++	opClose
++	opAnchor
++	opAlt
++	opStar
++	opEnd
++	opConcat
++	opSubexp
++)
++
++// Context constraints carried by anchors.
++const (
++	prevWord = 1 << iota
++	prevNotWord
++	nextWord
++	nextNotWord
++	prevNewline
++	nextNewline
++	prevBegbuf
++	nextEndbuf
++
++	wordFirst    = prevNotWord | nextWord
++	wordLast     = prevWord | nextNotWord
++	insideWord   = prevWord | nextWord
++	insideNoWord = prevNotWord | nextNotWord
++)
++
++// Pseudo-constraints for \b and \B, expanded into alternations when parsed.
++const (
++	wordDelim    = 1 << 16
++	notWordDelim = 1 << 17
++)
++
++type tree struct {
++	op          opcode
++	c           byte
++	set         *[256]bool
++	idx         int
++	constraint  int
++	optional    bool
++	left, right *tree
++	first, next *tree
++	node        int
++}
++
++type tokenKind uint8
++
++const (
++	tChar tokenKind = iota
++	tEnd
++	tBackslash
++	tAny
++	tBracket
++	tStar
++	tPlus
++	tQuestion
++	tOpenDup
++	tCloseDup
++	tOpenGroup
++	tCloseGroup
++	tAlt
++	tBackref
++	tAnchor
++	tWord
++	tNotWord
++	tSpace
++	tNotSpace
++)
++
++type token struct {
++	kind       tokenKind
++	c          byte
++	idx        int
++	constraint int
++}
++
++type parser struct {
++	raw       string // the expression as written
++	pat       string // the expression as matched: upper-cased when ignoring case
++	icase     bool
++	pos       int
++	tok       token
++	nsub      int
++	completed uint
++	backref   bool
++}
++
++// peek reads the token at the current position without consuming it.
++// caretHere makes ^ an anchor, as it is after \( and \|. The byte after a
++// backslash is read as written, as the GNU C library reads it, so \w and \W
++// stay apart when case is ignored; an escaped lower-case letter then matches
++// nothing.
++func (p *parser) peek(at int, caretHere bool) (token, int) {
++	if at >= len(p.pat) {
++		return token{kind: tEnd}, 0
++	}
++	c := p.pat[at]
++	if c == '\\' {
++		if at+1 >= len(p.pat) {
++			return token{kind: tBackslash}, 1
++		}
++		c2 := p.raw[at+1]
++		t := token{kind: tChar, c: c2}
++		switch c2 {
++		case '|':
++			t.kind = tAlt
++		case '1', '2', '3', '4', '5', '6', '7', '8', '9':
++			t.kind, t.idx = tBackref, int(c2-'1')
++		case '<':
++			t.kind, t.constraint = tAnchor, wordFirst
++		case '>':
++			t.kind, t.constraint = tAnchor, wordLast
++		case 'b':
++			t.kind, t.constraint = tAnchor, wordDelim
++		case 'B':
++			t.kind, t.constraint = tAnchor, notWordDelim
++		case 'w':
++			t.kind = tWord
++		case 'W':
++			t.kind = tNotWord
++		case 's':
++			t.kind = tSpace
++		case 'S':
++			t.kind = tNotSpace
++		case '`':
++			t.kind, t.constraint = tAnchor, prevBegbuf
++		case '\'':
++			t.kind, t.constraint = tAnchor, nextEndbuf
++		case '(':
++			t.kind = tOpenGroup
++		case ')':
++			t.kind = tCloseGroup
++		case '+':
++			t.kind = tPlus
++		case '?':
++			t.kind = tQuestion
++		case '{':
++			t.kind = tOpenDup
++		case '}':
++			t.kind = tCloseDup
++		}
++		return t, 2
++	}
++	t := token{kind: tChar, c: c}
++	switch c {
++	case '*':
++		t.kind = tStar
++	case '[':
++		t.kind = tBracket
++	case '.':
++		t.kind = tAny
++	case '^':
++		if caretHere || at == 0 {
++			t.kind, t.constraint = tAnchor, prevNewline
++		}
++	case '$':
++		if at+1 == len(p.pat) {
++			t.kind, t.constraint = tAnchor, nextNewline
++		} else if n, _ := p.peek(at+1, false); n.kind == tAlt || n.kind == tCloseGroup {
++			t.kind, t.constraint = tAnchor, nextNewline
++		}
++	}
++	return t, 1
++}
++
++func (p *parser) fetch(caretHere bool) {
++	var width int
++	p.tok, width = p.peek(p.pos, caretHere)
++	p.pos += width
++}
++
++// Compile parses expr as a basic regular expression. With icase set, letters
++// match without regard to case, as with REG_ICASE.
++func Compile(expr string, icase bool) (*Regexp, error) {
++	p := &parser{raw: expr, pat: expr, icase: icase}
++	if icase {
++		p.pat = upper(expr)
++	}
++	p.fetch(true)
++	t, err := p.regExp(0)
++	if err != nil {
++		return nil, err
++	}
++	root := &tree{op: opEnd}
++	if t != nil {
++		root = &tree{op: opConcat, left: t, right: root}
++	}
++	root = lowerSubexps(root)
++	re := &Regexp{nsub: p.nsub, icase: icase, backref: p.backref}
++	re.build(root)
++	return re, nil
++}
++
++func (p *parser) regExp(nest int) (*tree, error) {
++	initial := p.completed
++	t, err := p.branch(nest)
++	if err != nil {
++		return nil, err
++	}
++	for p.tok.kind == tAlt {
++		p.fetch(true)
++		var b *tree
++		if p.tok.kind != tAlt && p.tok.kind != tEnd && (nest == 0 || p.tok.kind != tCloseGroup) {
++			accumulated := p.completed
++			p.completed = initial
++			if b, err = p.branch(nest); err != nil {
++				return nil, err
++			}
++			p.completed |= accumulated
++		}
++		t = &tree{op: opAlt, left: t, right: b}
++	}
++	return t, nil
++}
++
++func (p *parser) branch(nest int) (*tree, error) {
++	t, err := p.expression(nest)
++	if err != nil {
++		return nil, err
++	}
++	for p.tok.kind != tAlt && p.tok.kind != tEnd && (nest == 0 || p.tok.kind != tCloseGroup) {
++		e, err := p.expression(nest)
++		if err != nil {
++			return nil, err
++		}
++		switch {
++		case t != nil && e != nil:
++			t = &tree{op: opConcat, left: t, right: e}
++		case t == nil:
++			t = e
++		}
++	}
++	return t, nil
++}
++
++func (p *parser) expression(nest int) (*tree, error) {
++	var t *tree
++	switch p.tok.kind {
++	case tChar, tStar, tPlus, tQuestion, tCloseDup:
++		t = &tree{op: opChar, c: p.tok.c}
++	case tOpenGroup:
++		var err error
++		if t, err = p.subExp(nest + 1); err != nil {
++			return nil, err
++		}
++	case tBracket:
++		set, err := p.bracket()
++		if err != nil {
++			return nil, err
++		}
++		t = &tree{op: opSet, set: set}
++	case tBackref:
++		if p.completed&(1<<p.tok.idx) == 0 {
++			return nil, ErrSubreg
++		}
++		p.backref = true
++		t = &tree{op: opBackref, idx: p.tok.idx}
++	case tOpenDup:
++		return nil, ErrBadRpt
++	case tCloseGroup:
++		return nil, ErrParen
++	case tAnchor:
++		switch p.tok.constraint {
++		case wordDelim:
++			t = &tree{op: opAlt, left: &tree{op: opAnchor, constraint: wordFirst}, right: &tree{op: opAnchor, constraint: wordLast}}
++		case notWordDelim:
++			t = &tree{op: opAlt, left: &tree{op: opAnchor, constraint: insideWord}, right: &tree{op: opAnchor, constraint: insideNoWord}}
++		default:
++			t = &tree{op: opAnchor, constraint: p.tok.constraint}
++		}
++		p.fetch(false)
++		return t, nil
++	case tAny:
++		t = &tree{op: opAny}
++	case tWord, tNotWord:
++		t = &tree{op: opSet, set: classSet("alnum", "_", p.tok.kind == tNotWord)}
++	case tSpace, tNotSpace:
++		t = &tree{op: opSet, set: classSet("space", "", p.tok.kind == tNotSpace)}
++	case tAlt, tEnd:
++		return nil, nil
++	case tBackslash:
++		return nil, ErrEscape
++	}
++	p.fetch(false)
++	for p.tok.kind == tStar || p.tok.kind == tPlus || p.tok.kind == tQuestion || p.tok.kind == tOpenDup {
++		var err error
++		if t, err = p.dupOp(t); err != nil {
++			return nil, err
++		}
++		if p.tok.kind == tStar || p.tok.kind == tOpenDup {
++			return nil, ErrBadRpt
++		}
++	}
++	return t, nil
++}
++
++func (p *parser) subExp(nest int) (*tree, error) {
++	cur := p.nsub
++	p.nsub++
++	p.fetch(true)
++	var body *tree
++	if p.tok.kind != tCloseGroup {
++		var err error
++		if body, err = p.regExp(nest); err != nil {
++			return nil, err
++		}
++		if p.tok.kind != tCloseGroup {
++			return nil, ErrParen
++		}
++	}
++	if cur < 9 {
++		p.completed |= 1 << cur
++	}
++	return &tree{op: opSubexp, idx: cur, left: body}, nil
++}
++
++// number reads the digits of an interval bound. It returns -1 when there
++// are none and -2 when the bound is malformed or the expression ends.
++func (p *parser) number() int {
++	num := -1
++	for {
++		p.fetch(false)
++		c := p.tok.c
++		if p.tok.kind == tEnd {
++			return -2
++		}
++		if p.tok.kind == tCloseDup || (p.tok.kind == tChar && c == ',') {
++			return num
++		}
++		switch {
++		case p.tok.kind != tChar || c < '0' || c > '9' || num == -2:
++			num = -2
++		case num == -1:
++			num = int(c - '0')
++		default:
++			num = min(dupMax+1, num*10+int(c-'0'))
++		}
++	}
++}
++
++func (p *parser) dupOp(elem *tree) (*tree, error) {
++	start, end := 0, -1
++	switch p.tok.kind {
++	case tOpenDup:
++		start = p.number()
++		if start == -1 {
++			if p.tok.kind != tChar || p.tok.c != ',' {
++				return nil, ErrBadBR
++			}
++			start = 0
++		}
++		if start != -2 {
++			switch {
++			case p.tok.kind == tCloseDup:
++				end = start
++			case p.tok.kind == tChar && p.tok.c == ',':
++				end = p.number()
++			default:
++				end = -2
++			}
++		}
++		if start == -2 || end == -2 {
++			if p.tok.kind == tEnd {
++				return nil, ErrBrace
++			}
++			return nil, ErrBadBR
++		}
++		if (end != -1 && start > end) || p.tok.kind != tCloseDup {
++			return nil, ErrBadBR
++		}
++		if bound := end; bound == -1 && start > dupMax || bound > dupMax {
++			return nil, ErrSize
++		}
++	case tPlus:
++		start = 1
++	case tQuestion:
++		end = 1
++	}
++	p.fetch(false)
++	if elem == nil || start == 0 && end == 0 {
++		return nil, nil
++	}
++	var old *tree
++	if start > 0 {
++		t := elem
++		for i := 2; i <= start; i++ {
++			elem = duplicate(elem)
++			t = &tree{op: opConcat, left: t, right: elem}
++		}
++		if start == end {
++			return t, nil
++		}
++		elem = duplicate(elem)
++		old = t
++	}
++	if elem.op == opSubexp {
++		elem.optional = true
++	}
++	op := opAlt
++	if end == -1 {
++		op = opStar
++	}
++	t := &tree{op: op, left: elem}
++	for i := start + 2; end != -1 && i <= end; i++ {
++		elem = duplicate(elem)
++		t = &tree{op: opConcat, left: t, right: elem}
++		t = &tree{op: opAlt, left: t}
++	}
++	if old != nil {
++		t = &tree{op: opConcat, left: old, right: t}
++	}
++	return t, nil
++}
++
++func duplicate(t *tree) *tree {
++	if t == nil {
++		return nil
++	}
++	c := *t
++	c.left, c.right = duplicate(t.left), duplicate(t.right)
++	return &c
++}
++
++// bracket parses a bracket expression after its opening [.
++func (p *parser) bracket() (*[256]bool, error) {
++	set := new([256]bool)
++	negate := false
++	if p.pos >= len(p.pat) {
++		return nil, ErrBadPat
++	}
++	if p.pat[p.pos] == '^' {
++		negate = true
++		p.pos++
++		if p.pos >= len(p.pat) {
++			return nil, ErrBadPat
++		}
++	}
++	first := true
++	for {
++		if p.pos >= len(p.pat) {
++			return nil, ErrBrack
++		}
++		start, err := p.bracketElement(first)
++		if err != nil {
++			return nil, err
++		}
++		first = false
++		if p.pos >= len(p.pat) {
++			return nil, ErrBrack
++		}
++		isRange := false
++		if start.kind != elemClass && start.kind != elemEquiv && p.pat[p.pos] == '-' {
++			if p.pos+1 >= len(p.pat) {
++				return nil, ErrBrack
++			}
++			if p.pat[p.pos+1] != ']' {
++				p.pos++
++				isRange = true
++			}
++		}
++		if isRange {
++			end, err := p.bracketElement(true)
++			if err != nil {
++				return nil, err
++			}
++			if err := buildRange(set, start, end); err != nil {
++				return nil, err
++			}
++		} else if err := start.add(set, p.icase); err != nil {
++			return nil, err
++		}
++		if p.pos >= len(p.pat) {
++			return nil, ErrBrack
++		}
++		if p.pat[p.pos] == ']' {
++			p.pos++
++			break
++		}
++	}
++	if negate {
++		for i := range set {
++			set[i] = !set[i]
++		}
++	}
++	return set, nil
++}
++
++type elemKind uint8
++
++const (
++	elemChar elemKind = iota
++	elemColl
++	elemEquiv
++	elemClass
++)
++
++type bracketElem struct {
++	kind elemKind
++	c    byte
++	name string
++}
++
++func (p *parser) bracketElement(acceptHyphen bool) (bracketElem, error) {
++	c := p.pat[p.pos]
++	if c == '[' && p.pos+1 < len(p.pat) {
++		switch d := p.pat[p.pos+1]; d {
++		case '.', '=', ':':
++			p.pos += 2
++			return p.bracketSymbol(d)
++		}
++	}
++	if c == '-' && !acceptHyphen {
++		if p.pos+1 >= len(p.pat) || p.pat[p.pos+1] != ']' {
++			return bracketElem{}, ErrRange
++		}
++	}
++	p.pos++
++	return bracketElem{kind: elemChar, c: c}, nil
++}
++
++func (p *parser) bracketSymbol(delim byte) (bracketElem, error) {
++	if p.pos >= len(p.pat) {
++		return bracketElem{}, ErrBrack
++	}
++	var name []byte
++	for i := 0; ; i++ {
++		if i >= 32 {
++			return bracketElem{}, ErrBrack
++		}
++		ch := p.pat[p.pos]
++		if delim == ':' {
++			ch = p.raw[p.pos]
++		}
++		p.pos++
++		if p.pos >= len(p.pat) {
++			return bracketElem{}, ErrBrack
++		}
++		if ch == delim && p.pat[p.pos] == ']' {
++			break
++		}
++		name = append(name, ch)
++	}
++	p.pos++
++	e := bracketElem{name: string(name)}
++	switch delim {
++	case '.':
++		e.kind = elemColl
++	case '=':
++		e.kind = elemEquiv
++	default:
++		e.kind = elemClass
++	}
++	return e, nil
++}
++
++func (e bracketElem) add(set *[256]bool, icase bool) error {
++	switch e.kind {
++	case elemChar:
++		set[e.c] = true
++	case elemColl, elemEquiv:
++		if len(e.name) != 1 {
++			return ErrCollate
++		}
++		set[e.name[0]] = true
++	case elemClass:
++		name := e.name
++		if icase && (name == "upper" || name == "lower") {
++			name = "alpha"
++		}
++		f, ok := classes[name]
++		if !ok {
++			return ErrCtype
++		}
++		for i := range 256 {
++			if f(byte(i)) {
++				set[i] = true
++			}
++		}
++	}
++	return nil
++}
++
++func buildRange(set *[256]bool, start, end bracketElem) error {
++	if start.kind == elemEquiv || start.kind == elemClass || end.kind == elemEquiv || end.kind == elemClass {
++		return ErrRange
++	}
++	if start.kind == elemColl && len(start.name) != 1 || end.kind == elemColl && len(end.name) != 1 {
++		return ErrCollate
++	}
++	lo, hi := start.c, end.c
++	if start.kind == elemColl {
++		lo = start.name[0]
++	}
++	if end.kind == elemColl {
++		hi = end.name[0]
++	}
++	if lo > hi {
++		return ErrRange
++	}
++	for c := int(lo); c <= int(hi); c++ {
++		set[c] = true
++	}
++	return nil
++}
++
++// classes are the character classes the GNU C library knows in the C locale.
++// Any other name, such as [:word:], is an invalid class name there too.
++var classes = map[string]func(byte) bool{
++	"alnum":  func(c byte) bool { return isAlpha(c) || isDigit(c) },
++	"alpha":  isAlpha,
++	"blank":  func(c byte) bool { return c == ' ' || c == '\t' },
++	"cntrl":  func(c byte) bool { return c < 0x20 || c == 0x7f },
++	"digit":  isDigit,
++	"graph":  func(c byte) bool { return c > 0x20 && c < 0x7f },
++	"lower":  func(c byte) bool { return c >= 'a' && c <= 'z' },
++	"print":  func(c byte) bool { return c >= 0x20 && c < 0x7f },
++	"punct":  func(c byte) bool { return c > 0x20 && c < 0x7f && !isAlpha(c) && !isDigit(c) },
++	"space":  func(c byte) bool { return c == ' ' || c >= '\t' && c <= '\r' },
++	"upper":  func(c byte) bool { return c >= 'A' && c <= 'Z' },
++	"xdigit": func(c byte) bool { return isDigit(c) || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F' },
++}
++
++func isAlpha(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
++
++func isDigit(c byte) bool { return c >= '0' && c <= '9' }
++
++func isWord(c byte) bool { return isAlpha(c) || isDigit(c) || c == '_' }
++
++func classSet(class, extra string, negate bool) *[256]bool {
++	set := new([256]bool)
++	f := classes[class]
++	for i := range 256 {
++		set[i] = f(byte(i)) || strings.IndexByte(extra, byte(i)) >= 0
++		if negate {
++			set[i] = !set[i]
++		}
++	}
++	return set
++}
++
++// upper folds the ASCII letters of s to upper case and leaves every other
++// byte as it is, so offsets in the result are offsets in s.
++func upper(s string) string {
++	b := []byte(s)
++	for i, c := range b {
++		if c >= 'a' && c <= 'z' {
++			b[i] = c - 'a' + 'A'
++		}
++	}
++	return string(b)
++}
++
++// lowerSubexps replaces each sub-expression node by an open node, its body
++// and a close node.
++func lowerSubexps(t *tree) *tree {
++	if t == nil {
++		return nil
++	}
++	t.left, t.right = lowerSubexps(t.left), lowerSubexps(t.right)
++	if t.op != opSubexp {
++		return t
++	}
++	open := &tree{op: opOpen, idx: t.idx, optional: t.optional}
++	cls := &tree{op: opClose, idx: t.idx, optional: t.optional}
++	rest := cls
++	if t.left != nil {
++		rest = &tree{op: opConcat, left: t.left, right: cls}
++	}
++	return &tree{op: opConcat, left: open, right: rest}
++}
+diff --git a/pkg/bre/exec.go b/pkg/bre/exec.go
+new file mode 100644
+index 000000000..22f2c62b7
+--- /dev/null
++++ b/pkg/bre/exec.go
+@@ -0,0 +1,612 @@
++// Copyright 2026 the u-root Authors. All rights reserved
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package bre
++
++import (
++	"maps"
++	"slices"
++	"strconv"
++	"strings"
++)
++
++// Regexp is a compiled basic regular expression.
++type Regexp struct {
++	nodes   []node
++	init    int
++	end     int
++	nsub    int
++	icase   bool
++	backref bool
++	plural  bool
++}
++
++type node struct {
++	op         opcode
++	c          byte
++	set        *[256]bool
++	idx        int
++	constraint int
++	optional   bool
++	next       int
++	edests     []int
++}
++
++// NumSubexp returns the number of parenthesized sub-expressions.
++func (re *Regexp) NumSubexp() int { return re.nsub }
++
++// build numbers the nodes in post-order, as the GNU C library does, and links
++// each node to its successors. The numbering decides which of two branches
++// is preferred.
++func (re *Regexp) build(root *tree) {
++	re.number(root)
++	calcNext(root)
++	re.link(root)
++	re.init = root.first.node
++}
++
++func (re *Regexp) number(t *tree) {
++	if t == nil {
++		return
++	}
++	re.number(t.left)
++	re.number(t.right)
++	if t.op == opConcat {
++		t.first, t.node = t.left.first, t.left.node
++		return
++	}
++	t.first, t.node = t, len(re.nodes)
++	re.nodes = append(re.nodes, node{op: t.op, c: t.c, set: t.set, idx: t.idx, constraint: t.constraint, optional: t.optional, next: -1})
++	if t.op == opEnd {
++		re.end = t.node
++	}
++}
++
++func calcNext(t *tree) {
++	if t == nil {
++		return
++	}
++	switch t.op {
++	case opStar:
++		t.left.next = t
++	case opConcat:
++		t.left.next = t.right.first
++		t.right.next = t.next
++	default:
++		if t.left != nil {
++			t.left.next = t.next
++		}
++		if t.right != nil {
++			t.right.next = t.next
++		}
++	}
++	calcNext(t.left)
++	calcNext(t.right)
++}
++
++func (re *Regexp) link(t *tree) {
++	if t == nil {
++		return
++	}
++	re.link(t.left)
++	re.link(t.right)
++	n := &re.nodes[t.node]
++	switch t.op {
++	case opConcat, opEnd:
++	case opStar, opAlt:
++		re.plural = true
++		l, r := t.next, t.next
++		if t.left != nil {
++			l = t.left.first
++		}
++		if t.right != nil {
++			r = t.right.first
++		}
++		n.edests = []int{l.node}
++		if r.node != l.node {
++			n.edests = append(n.edests, r.node)
++		}
++		slices.Sort(n.edests)
++	case opAnchor, opOpen, opClose:
++		n.edests = []int{t.next.node}
++	case opBackref:
++		n.next = t.next.node
++		n.edests = []int{t.next.node}
++	default:
++		n.next = t.next.node
++	}
++}
++
++func isEpsilon(op opcode) bool {
++	switch op {
++	case opOpen, opClose, opAnchor, opAlt, opStar:
++		return true
++	}
++	return false
++}
++
++// Context of a position, as seen by anchors.
++const (
++	ctxWord = 1 << iota
++	ctxNewline
++	ctxBegbuf
++	ctxEndbuf
++)
++
++type matcher struct {
++	re     *Regexp
++	in     string
++	notBOL bool
++	end    int
++	start  int
++	sifted [][]bool
++	reachB map[string]bool
++	seen   map[string]bool
++	stack  []int
++}
++
++func (re *Regexp) matcher(s string, notBOL bool) *matcher {
++	if re.icase {
++		s = upper(s)
++	}
++	return &matcher{re: re, in: s, notBOL: notBOL}
++}
++
++// MatchString reports whether s contains a match.
++func (re *Regexp) MatchString(s string) bool {
++	m := re.matcher(s, false)
++	start, _ := m.search(!re.backref)
++	if start < 0 || !re.backref {
++		return start >= 0
++	}
++	for ; start <= len(m.in); start++ {
++		if m.longest(start) >= 0 {
++			return true
++		}
++	}
++	return false
++}
++
++// FindSubmatchIndex returns the leftmost-longest match in s as pairs of
++// offsets: the whole match, then each sub-expression, with -1 for a
++// sub-expression that took no part. notBOL says that the start of s is not
++// the start of a line, as with REG_NOTBOL. It returns nil if there is no
++// match.
++func (re *Regexp) FindSubmatchIndex(s string, notBOL bool) []int {
++	m := re.matcher(s, notBOL)
++	start, end := m.search(false)
++	if start < 0 {
++		return nil
++	}
++	if !re.backref {
++		return m.registers(start, end)
++	}
++	for ; start <= len(m.in); start++ {
++		if end := m.longest(start); end >= 0 {
++			return m.registers(start, end)
++		}
++	}
++	return nil
++}
++
++// context returns what the anchors see at position i. GNU ed hands the C
++// library one line at a time, so \` and \' match at the start and end of the
++// line being matched.
++func (m *matcher) context(i int) int {
++	switch {
++	case i < 0:
++		if m.notBOL {
++			return ctxBegbuf
++		}
++		return ctxBegbuf | ctxNewline
++	case i == len(m.in):
++		return ctxEndbuf | ctxNewline
++	case isWord(m.in[i]):
++		return ctxWord
++	}
++	return 0
++}
++
++func (m *matcher) satisfies(constraint, pos int) bool {
++	prev, next := m.context(pos-1), m.context(pos)
++	switch {
++	case constraint&prevWord != 0 && prev&ctxWord == 0,
++		constraint&prevNotWord != 0 && prev&ctxWord != 0,
++		constraint&prevNewline != 0 && prev&ctxNewline == 0,
++		constraint&prevBegbuf != 0 && prev&ctxBegbuf == 0,
++		constraint&nextWord != 0 && next&ctxWord == 0,
++		constraint&nextNotWord != 0 && next&ctxWord != 0,
++		constraint&nextNewline != 0 && next&ctxNewline == 0,
++		constraint&nextEndbuf != 0 && next&ctxEndbuf == 0:
++		return false
++	}
++	return true
++}
++
++func (m *matcher) accepts(n *node, pos int) bool {
++	if pos >= len(m.in) {
++		return false
++	}
++	c := m.in[pos]
++	switch n.op {
++	case opChar:
++		return c == n.c
++	case opAny:
++		return c != 0
++	case opSet:
++		return n.set[c]
++	}
++	return false
++}
++
++// visited returns an empty set of explored states. Without a star or an
++// alternation there is only one path from each node, so no state comes back
++// and no set is needed.
++func (m *matcher) visited() map[string]bool {
++	if !m.re.plural {
++		return nil
++	}
++	if m.seen == nil {
++		m.seen = map[string]bool{}
++	}
++	clear(m.seen)
++	return m.seen
++}
++
++// longest returns the end of the longest match starting at start, or -1,
++// for an expression with back-references.
++func (m *matcher) longest(start int) int {
++	best := -1
++	m.explore(m.re.init, start, m.initialRegs(start, -1), nil, m.visited(), &best)
++	return best
++}
++
++type thread struct {
++	node, start int
++}
++
++// search runs the automaton from every start position at once, in one pass
++// over the input, and returns the leftmost match with its longest end, or
++// -1, -1. A state keeps only the earliest start that reached it: what can
++// follow a state does not depend on where the match began. With first set,
++// it returns the first match it finds.
++//
++// A back-reference is taken to match any text, of any length: a thread on
++// it may go past it at once or stay on it while it consumes a byte. So for
++// an expression with back-references the result is only a lower bound for
++// where a real match can start, and the exact search starts from there.
++func (m *matcher) search(first bool) (int, int) {
++	nodes := m.re.nodes
++	seen := make([]int, len(nodes))
++	var cur, next []thread
++	start, end := -1, -1
++	for pos := 0; ; pos++ {
++		if start < 0 {
++			cur = m.closure(cur, seen, m.re.init, pos, pos)
++		}
++		for _, t := range cur {
++			if t.node == m.re.end && (start < 0 || t.start < start || t.start == start && pos > end) {
++				start, end = t.start, pos
++			}
++		}
++		if start >= 0 && first || pos == len(m.in) {
++			return start, end
++		}
++		next = next[:0]
++		for _, t := range cur {
++			if start >= 0 && t.start > start {
++				break
++			}
++			nd := &nodes[t.node]
++			switch {
++			case nd.op == opBackref:
++				next = m.closure(next, seen, t.node, t.start, pos+1)
++			case t.node != m.re.end && !isEpsilon(nd.op) && m.accepts(nd, pos):
++				next = m.closure(next, seen, nd.next, t.start, pos+1)
++			}
++		}
++		cur, next = next, cur
++		if len(cur) == 0 && start >= 0 {
++			return start, end
++		}
++	}
++}
++
++// closure adds n and the nodes reachable from it at pos without consuming
++// input to list, as threads of start. Nodes already in the list stay with
++// the start they have, which is never later, since the threads are added in
++// order of their starts.
++func (m *matcher) closure(list []thread, seen []int, n, start, pos int) []thread {
++	m.stack = append(m.stack[:0], n)
++	for len(m.stack) > 0 {
++		n := m.stack[len(m.stack)-1]
++		m.stack = m.stack[:len(m.stack)-1]
++		if seen[n] == pos+1 {
++			continue
++		}
++		seen[n] = pos + 1
++		nd := &m.re.nodes[n]
++		if nd.op == opAnchor && !m.satisfies(nd.constraint, pos) {
++			continue
++		}
++		list = append(list, thread{n, start})
++		if isEpsilon(nd.op) || nd.op == opBackref {
++			m.stack = append(m.stack, nd.edests...)
++		}
++	}
++	return list
++}
++
++func (m *matcher) initialRegs(start, end int) []int {
++	regs := make([]int, 4*(m.re.nsub+1))
++	for i := range regs {
++		regs[i] = -1
++	}
++	n := 2 * (m.re.nsub + 1)
++	regs[0], regs[1] = start, end
++	regs[n], regs[n+1] = start, end
++	return regs
++}
++
++// updateRegs records the effect of reaching an open or close node, keeping
++// the GNU C library's handling of an empty pass through an optional
++// sub-expression. regs holds the current registers followed by the ones
++// saved at the last non-empty close.
++func (m *matcher) updateRegs(regs []int, n, pos int) {
++	nd := &m.re.nodes[n]
++	half := len(regs) / 2
++	r := 2 * (nd.idx + 1)
++	switch nd.op {
++	case opOpen:
++		regs[r], regs[r+1] = pos, -1
++	case opClose:
++		switch {
++		case regs[r] < pos:
++			regs[r+1] = pos
++			copy(regs[half:], regs[:half])
++		case nd.optional && regs[half+r] != -1:
++			copy(regs[:half], regs[half:])
++		default:
++			regs[r+1] = pos
++		}
++	}
++}
++
++// explore walks every path from n at pos for an expression with
++// back-references. With target unset it records the longest end reached;
++// otherwise it reports whether the end at target can be reached.
++func (m *matcher) explore(n, pos int, regs []int, target *int, seen map[string]bool, best *int) bool {
++	nd := &m.re.nodes[n]
++	if nd.op == opOpen || nd.op == opClose {
++		regs = slices.Clone(regs)
++		m.updateRegs(regs, n, pos)
++	}
++	if seen != nil {
++		key := m.key(n, pos, regs)
++		if seen[key] {
++			return false
++		}
++		seen[key] = true
++	}
++	switch {
++	case n == m.re.end:
++		if target != nil {
++			return pos == *target
++		}
++		if pos > *best {
++			*best = pos
++		}
++		return false
++	case nd.op == opAnchor:
++		if !m.satisfies(nd.constraint, pos) {
++			return false
++		}
++		return m.explore(nd.edests[0], pos, regs, target, seen, best)
++	case isEpsilon(nd.op):
++		found := false
++		for _, d := range nd.edests {
++			if m.explore(d, pos, regs, target, seen, best) {
++				found = true
++				if target != nil {
++					return true
++				}
++			}
++		}
++		return found
++	case nd.op == opBackref:
++		r := 2 * (nd.idx + 1)
++		so, eo := regs[r], regs[r+1]
++		if so < 0 || eo < 0 || pos+eo-so > len(m.in) || m.in[so:eo] != m.in[pos:pos+eo-so] {
++			return false
++		}
++		return m.explore(nd.next, pos+eo-so, regs, target, seen, best)
++	case m.accepts(nd, pos):
++		return m.explore(nd.next, pos+1, regs, target, seen, best)
++	}
++	return false
++}
++
++func (m *matcher) key(n, pos int, regs []int) string {
++	var b strings.Builder
++	b.WriteString(strconv.Itoa(n))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(pos))
++	for _, r := range regs {
++		b.WriteByte(',')
++		b.WriteString(strconv.Itoa(r))
++	}
++	return b.String()
++}
++
++// valid reports whether the end of the match can still be reached from n at
++// pos, which is what keeps n in the GNU C library's sifted states.
++func (m *matcher) valid(n, pos int, regs []int) bool {
++	if m.re.backref {
++		k := m.key(n, pos, regs)
++		if v, ok := m.reachB[k]; ok {
++			return v
++		}
++		end := m.end
++		var seen map[string]bool
++		if m.re.plural {
++			seen = map[string]bool{}
++		}
++		v := m.explore(n, pos, regs, &end, seen, nil)
++		m.reachB[k] = v
++		return v
++	}
++	return pos >= m.start && pos <= m.end && m.sifted[pos-m.start][n]
++}
++
++// sift computes, for each position of the match, the nodes from which the
++// end of the match is reachable.
++func (m *matcher) sift() {
++	nodes := m.re.nodes
++	m.sifted = make([][]bool, m.end-m.start+1)
++	for pos := m.end; pos >= m.start; pos-- {
++		in := make([]bool, len(nodes))
++		if pos == m.end {
++			in[m.re.end] = true
++		}
++		for n := range nodes {
++			nd := &nodes[n]
++			if !isEpsilon(nd.op) && nd.op != opEnd && nd.op != opBackref && pos < m.end &&
++				m.accepts(nd, pos) && m.sifted[pos+1-m.start][nd.next] {
++				in[n] = true
++			}
++		}
++		for changed := true; changed; {
++			changed = false
++			for n := range nodes {
++				nd := &nodes[n]
++				if in[n] || !isEpsilon(nd.op) || nd.op == opAnchor && !m.satisfies(nd.constraint, pos) {
++					continue
++				}
++				for _, d := range nd.edests {
++					if in[d] {
++						in[n], changed = true, true
++						break
++					}
++				}
++			}
++		}
++		m.sifted[pos-m.start] = in
++	}
++}
++
++type failPoint struct {
++	pos, node int
++	regs      []int
++	eps       map[int]bool
++}
++
++// registers walks from start to end the way the GNU C library's set_regs
++// does, so that the sub-expressions come from the same path.
++func (m *matcher) registers(start, end int) []int {
++	m.start, m.end = start, end
++	m.reachB = map[string]bool{}
++	if !m.re.backref {
++		m.sift()
++	}
++	regs := m.initialRegs(start, end)
++	half := len(regs) / 2
++	var stack []failPoint
++	useStack := m.re.backref && m.re.plural
++	eps := map[int]bool{}
++	cur, pos := m.re.init, start
++	skipUpdate := false
++	for {
++		if !skipUpdate {
++			m.updateRegs(regs, cur, pos)
++		}
++		skipUpdate = false
++		if (pos == end && cur == m.re.end) || (useStack && eps[cur]) {
++			open := false
++			for i := 0; useStack && i < half; i += 2 {
++				if regs[i] > -1 && regs[i+1] == -1 {
++					open = true
++					break
++				}
++			}
++			if !open {
++				return regs[:half]
++			}
++			if len(stack) == 0 {
++				return nil
++			}
++			f := stack[len(stack)-1]
++			stack = stack[:len(stack)-1]
++			pos, cur, regs, eps = f.pos, f.node, f.regs, f.eps
++		}
++		next := m.proceed(cur, &pos, regs, eps, &stack, useStack)
++		if next < 0 {
++			if len(stack) == 0 {
++				return nil
++			}
++			f := stack[len(stack)-1]
++			stack = stack[:len(stack)-1]
++			pos, next, regs, eps = f.pos, f.node, f.regs, f.eps
++		}
++		cur = next
++	}
++}
++
++func (m *matcher) proceed(n int, pos *int, regs []int, eps map[int]bool, stack *[]failPoint, useStack bool) int {
++	nd := &m.re.nodes[n]
++	if isEpsilon(nd.op) {
++		eps[n] = true
++		dest := -1
++		for _, cand := range nd.edests {
++			if !m.valid(cand, *pos, regs) {
++				continue
++			}
++			if dest == -1 {
++				dest = cand
++				continue
++			}
++			if eps[dest] {
++				return cand
++			}
++			if useStack {
++				*stack = append(*stack, failPoint{pos: *pos, node: cand, regs: slices.Clone(regs), eps: maps.Clone(eps)})
++			}
++			break
++		}
++		return dest
++	}
++	accepted := 0
++	if nd.op == opBackref {
++		r := 2 * (nd.idx + 1)
++		so, eo := regs[r], regs[r+1]
++		accepted = eo - so
++		if useStack {
++			if so == -1 || eo == -1 {
++				return -1
++			}
++			if accepted > 0 && (*pos+accepted > len(m.in) || m.in[so:eo] != m.in[*pos:*pos+accepted]) {
++				return -1
++			}
++		}
++		if accepted == 0 {
++			eps[n] = true
++			if dest := nd.edests[0]; m.valid(dest, *pos, regs) {
++				return dest
++			}
++		}
++	}
++	if accepted != 0 || m.accepts(nd, *pos) {
++		dest := nd.next
++		if accepted == 0 {
++			*pos++
++		} else {
++			*pos += accepted
++		}
++		if useStack && (*pos > m.end || !m.valid(dest, *pos, regs)) {
++			return -1
++		}
++		clear(eps)
++		return dest
++	}
++	return -1
++}

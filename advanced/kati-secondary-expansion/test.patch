@@ -1,0 +1,969 @@
+diff --git a/secondexp_66cf49/secondexp_66cf49_test.go b/secondexp_66cf49/secondexp_66cf49_test.go
+new file mode 100644
+index 0000000..26d2d8b
+--- /dev/null
++++ b/secondexp_66cf49/secondexp_66cf49_test.go
+@@ -0,0 +1,746 @@
++package secondexp
++
++import (
++	"bytes"
++	"context"
++	"io/ioutil"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++)
++
++type testCase struct {
++	name     string
++	makefile string
++	files    map[string]string
++	goals    []string
++}
++
++var cases = []testCase{
++	{
++		name: "variable_defined_after_rule",
++		makefile: `.SECONDEXPANSION:
++test: prog
++prog: $$(PROG_PARTS)
++	@echo link $@ from $^
++PROG_PARTS := first.part second.part
++first.part second.part:
++	@echo build $@
++`,
++	},
++	{
++		name: "last_assignment_wins",
++		makefile: `.SECONDEXPANSION:
++LIST := early.part
++test: app
++app: $$(LIST)
++	@echo $@ uses $^
++LIST := late.part
++early.part late.part:
++	@echo build $@
++`,
++	},
++	{
++		name: "target_name_selects_variable",
++		makefile: `.SECONDEXPANSION:
++PROGS := alpha beta
++test: $(PROGS)
++$(PROGS): $$($$@_PARTS)
++	@echo $@: $^
++alpha_PARTS := one.part two.part
++beta_PARTS := two.part three.part
++%.part:
++	@echo build $@
++`,
++	},
++	{
++		name: "directory_and_file_of_target",
++		makefile: `.SECONDEXPANSION:
++test: out/a/one.res out/b/two.res
++out/a/one.res out/b/two.res: $$(@D)/dir.stamp src/$$(@F).in
++	@cat $(word 2,$^) > $@
++	@echo $@ from $^
++%/dir.stamp:
++	@mkdir -p $(@D)
++	@touch $@
++`,
++		files: map[string]string{"src/one.res.in": "one\n", "src/two.res.in": "two\n"},
++	},
++	{
++		name: "directory_and_file_forms_of_other_variables",
++		makefile: `.SECONDEXPANSION:
++test: out/app.bin build/sub/x.res
++out/app.bin: src/main.part lib/util.part
++	@mkdir -p $(@D)
++	@echo $^ > $@
++out/app.bin: $$(addsuffix .dep,$$(^F)) $$(<D)/extra.part
++build/%.res: $$(*D)/$$(*F).in
++	@echo $@ from $^
++src/%.part:
++	@echo build $@
++lib/%.part:
++	@echo build $@
++%.dep:
++	@echo dep $@
++`,
++		files: map[string]string{"sub/x.in": ""},
++	},
++	{
++		name: "explicit_rule_keeps_percent",
++		makefile: `.SECONDEXPANSION:
++test: app.res lib.res
++app.res lib.res: $$(patsubst %.res,%.in,$$@)
++	@echo $@ from $^
++`,
++		files: map[string]string{"app.in": "", "lib.in": ""},
++	},
++	{
++		name: "static_pattern_stem_selects_variable",
++		makefile: `.SECONDEXPANSION:
++OBJS := main.obj util.obj
++main_SRCS := main.src common.inc
++util_SRCS := util.src
++test: $(OBJS)
++$(OBJS): %.obj: $$(%_SRCS)
++	@echo $@ [$*] from $^
++`,
++		files: map[string]string{"main.src": "", "common.inc": "", "util.src": ""},
++	},
++	{
++		name: "static_pattern_stem_in_directories",
++		makefile: `.SECONDEXPANSION:
++OBJS := lib/a.obj lib/b.obj
++test: $(OBJS)
++$(OBJS): lib/%.obj: $$(wildcard src/%.in) $$(@D)/dir.stamp
++	@echo $@ [$*] from $^
++lib/dir.stamp:
++	@mkdir -p lib && touch $@
++`,
++		files: map[string]string{"src/a.in": "", "src/b.in": ""},
++	},
++	{
++		name: "substitution_reference_in_static_pattern",
++		makefile: `.SECONDEXPANSION:
++OBJS := a.obj b.obj
++a_SRCS := a.in
++b_SRCS := b.in x.in
++test: $(OBJS)
++$(OBJS): %.obj: $$(%_SRCS:.in=.part) $${%_SRCS:.in=.sig}
++	@echo $@ from $^
++%.part:
++	@echo build $@
++%.sig:
++	@echo sign $@
++`,
++	},
++	{
++		name: "pattern_rule_stem_selects_variable",
++		makefile: `.SECONDEXPANSION:
++test: x.res y.res
++x_SRC := x.in
++y_SRC := y.in extra.in
++%.res: $$(%_SRC)
++	@echo $@ [$*] from $^
++`,
++		files: map[string]string{"x.in": "", "y.in": "", "extra.in": ""},
++	},
++	{
++		name: "pattern_rule_rejected_when_expansion_missing",
++		makefile: `.SECONDEXPANSION:
++test: x.res y.res
++x_SRC := x.in
++y_SRC := missing.in
++%.res: %.default
++	@echo $@ falls back to $^
++%.res: $$(%_SRC)
++	@echo $@ from $^
++`,
++		files: map[string]string{"x.in": "", "y.default": ""},
++	},
++	{
++		name: "pattern_rule_sees_explicit_prerequisites",
++		makefile: `.SECONDEXPANSION:
++test: app.res
++app.res: app.cfg
++%.res: $$(addsuffix .sig,$$^) %.src
++	@echo $@ from $^
++app.cfg app.cfg.sig:
++	@echo make $@
++`,
++		files: map[string]string{"app.src": ""},
++	},
++	{
++		name: "target_specific_variable",
++		makefile: `.SECONDEXPANSION:
++test: app
++app: $$(LIBS)
++	@echo $@ links $^
++app: LIBS := liba.lib libb.lib
++%.lib:
++	@echo archive $@
++`,
++	},
++	{
++		name: "target_specific_append_and_conditional",
++		makefile: `.SECONDEXPANSION:
++LIBS := base.lib
++test: app tool
++app: LIBS += extra.lib
++tool: LIBS ?= never.lib
++app tool: $$(LIBS)
++	@echo $@ links $^
++%.lib:
++	@echo archive $@
++`,
++	},
++	{
++		name: "appended_variable_expands_in_target_scope",
++		makefile: `.SECONDEXPANSION:
++ROOT = global
++DEPS = $(ROOT).part
++test: app top
++app: ROOT = app
++app: DEPS += tail.part
++app: $$(DEPS)
++	@echo $@ from $^
++top: ROOT = top
++top: helper
++	@echo $@ from $^
++helper: DEPS += extra.part
++helper: $$(DEPS)
++	@echo $@ from $^
++%.part:
++	@echo build $@
++`,
++	},
++	{
++		name: "target_append_on_pattern_variable",
++		makefile: `.SECONDEXPANSION:
++DEPS = base.part
++test: x.res y.res
++%.res: DEPS = pat.part
++x.res: DEPS += own.part
++%.res: $$(DEPS)
++	@echo $@ from $^
++base.part pat.part own.part:
++	@echo build $@
++`,
++	},
++	{
++		name: "append_over_simple_variable_expands_when_used",
++		makefile: `.SECONDEXPANSION:
++X := old
++V = before
++test: t u
++t: X += $(V)
++u: X := own
++u: X += $(V)
++V = after
++t u: $$(addsuffix .part,$$(X))
++	@echo $@ from $^
++%.part:
++	@echo build $@
++`,
++	},
++	{
++		name: "conditional_target_variable_over_pattern_variable",
++		makefile: `.SECONDEXPANSION:
++LIBS = global.part
++test: foo.res
++%.res: DEPS = pattern.part
++%.res: LIBS = pattern-lib.part
++foo.res: DEPS ?= target.part
++foo.res: LIBS ?= target-lib.part
++%.res: $$(DEPS) $$(LIBS)
++	@echo $@ from $^
++pattern.part target.part pattern-lib.part target-lib.part global.part:
++	@echo build $@
++`,
++	},
++	{
++		name: "target_conditional_decided_when_read",
++		makefile: `.SECONDEXPANSION:
++test: t u v w
++t: X ?= own.part
++u: X ?= own.part
++u: X += more.part
++X := global.part
++v: X ?= own.part
++w: X ?= own.part
++w: X += more.part
++t u v w: $$(X)
++	@echo $@ from $^
++own.part global.part more.part:
++	@echo build $@
++`,
++	},
++	{
++		name: "append_to_empty_value_has_no_space",
++		makefile: `.SECONDEXPANSION:
++EMPTY =
++DEPS = $(EMPTY)
++test: app
++app: DEPS += tail.part
++app: $$(shell echo "<$$(DEPS)>" > seen.txt) tail.part
++	@echo $@ from $^
++tail.part:
++	@echo build $@
++`,
++	},
++	{
++		name: "inherited_variable_not_used",
++		makefile: `.SECONDEXPANSION:
++LIBS := global.lib
++test: app
++app: LIBS := app.lib
++app: helper
++	@echo $@ needs $^
++helper: $$(LIBS)
++	@echo '$@ needs $^ while its recipe sees $(LIBS)'
++%.lib:
++	@echo archive $@
++`,
++	},
++	{
++		name: "pattern_specific_variable",
++		makefile: `.SECONDEXPANSION:
++test: one.res two.res
++%.res: EXTRA := common.part
++two.res: EXTRA := special.part
++%.res: $$(EXTRA)
++	@echo $@ uses $^
++common.part special.part:
++	@echo build $@
++`,
++	},
++	{
++		name: "static_pattern_specific_variable",
++		makefile: `.SECONDEXPANSION:
++OBJS := a.obj b.obj
++test: $(OBJS)
++%.obj: DEPS = common.part
++b.obj: DEPS = special.part
++$(OBJS): %.obj: $$(DEPS)
++	@echo $@ from $^
++common.part special.part:
++	@echo build $@
++`,
++	},
++	{
++		name: "own_list_not_in_its_expansion",
++		makefile: `.SECONDEXPANSION:
++test: foo
++foo: foo.1 $$(addsuffix .sig,$$^)
++	@echo $@ from [$^]
++foo.1 foo.1.sig:
++	@echo build $@
++`,
++	},
++	{
++		name: "rules_expanded_with_recipe_rule_first",
++		makefile: `.SECONDEXPANSION:
++test: bundle
++bundle: alpha.part $$(addsuffix .sig,$$^)
++bundle: beta.part $$(addsuffix .chk,$$^)
++	@echo $@ from $^
++%.part:
++	@echo build $@
++%.sig:
++	@echo sign $@
++%.chk:
++	@echo check $@
++`,
++	},
++	{
++		name: "all_prerequisites_include_later_rules",
++		makefile: `.SECONDEXPANSION:
++test: pkg
++pkg: $$(addsuffix .sig,$$^)
++pkg: base.part
++	@echo $@ from $^
++pkg: extra.part
++%.part:
++	@echo build $@
++%.sig:
++	@echo sign $@
++`,
++	},
++	{
++		name: "first_prerequisite_from_recipe_rule",
++		makefile: `.SECONDEXPANSION:
++test: bundle
++bundle: alpha.part
++bundle: beta.part
++	@echo $@ from $^ first $<
++bundle: $$<.sig
++%.part:
++	@echo build $@
++%.sig:
++	@echo sign $@
++`,
++	},
++	{
++		name: "automatic_variables_across_rules",
++		makefile: `.SECONDEXPANSION:
++test: foo
++foo:
++	@echo $@: [$^] [$+]
++foo: foo.1 bar.1 $$< $$^ $$+
++foo: foo.2 bar.2 $$< $$^ $$+
++foo: foo.3 bar.3 $$< $$^ $$+
++foo.%:
++	@echo build $@
++bar.%:
++	@echo build $@
++`,
++	},
++	{
++		name: "double_colon_rules_expand_alone",
++		makefile: `.SECONDEXPANSION:
++test: foo
++foo:: a.in
++	@echo first $@
++foo:: $$(warning second $$@) $$(shell echo '<$$^> <$$<> <$$+> <$$|>' > foo.seen) b.in
++	@echo second $@
++foo:: | $$(warning third $$@)
++	@echo third $@
++`,
++		files: map[string]string{"a.in": "", "b.in": ""},
++	},
++	{
++		name: "hash_from_first_expansion_is_kept",
++		makefile: `HASH := \#
++LATE := tail
++.SECONDEXPANSION:
++test: app
++app: $(HASH)literal $$(LATE)
++	@echo '$@ from [$^]'
++`,
++		files: map[string]string{"#literal": "", "tail": ""},
++	},
++	{
++		name: "rules_before_special_target_stay_literal",
++		makefile: `test: early late
++early: cost$$x
++	@echo '$@ from [$^]'
++.SECONDEXPANSION:
++late: cost$$$$x $$(LATE_DEPS)
++	@echo '$@ from [$^]'
++LATE_DEPS := late.part
++late.part:
++	@echo build $@
++`,
++		files: map[string]string{"cost$x": ""},
++	},
++	{
++		name: "included_and_evaluated_rules",
++		makefile: `test: all
++.SECONDEXPANSION:
++include parts.mk
++define GEN_RULE
++$(1): $$$$($(1)_DEPS)
++	@echo $$@ from $$^
++endef
++$(eval $(call GEN_RULE,gen))
++gen_DEPS := g.part
++ALL_DEPS := a.part
++%.part:
++	@echo build $@
++`,
++		files: map[string]string{"parts.mk": "all: $$(ALL_DEPS) gen\n\t@echo $@ from $^\n"},
++	},
++	{
++		name: "order_only_prerequisite_from_expansion",
++		makefile: `.SECONDEXPANSION:
++test: out/x.res
++out/x.res: x.in | $$(@D)/dir.stamp
++	@cp $< $@
++%/dir.stamp:
++	@mkdir -p $(@D) && touch $@
++`,
++		files: map[string]string{"x.in": "x\n"},
++	},
++	{
++		name: "unbuilt_target_expanded_too",
++		makefile: `.SECONDEXPANSION:
++test: app
++	@echo done
++app:
++	@echo app
++unused: $$(error unused target expanded)
++`,
++	},
++	{
++		name: "unbuilt_target_error_at_its_recipe",
++		makefile: `.SECONDEXPANSION:
++test: app
++	@echo done
++unused: $$(error unused target expanded)
++	@echo never
++app:
++	@echo app
++`,
++	},
++	{
++		name: "message_at_recipe_after_semicolon",
++		makefile: `.SECONDEXPANSION:
++test: app
++	@echo done
++app: $$(warning expanding $$@) ; @echo app
++`,
++	},
++	{
++		name: "pattern_rule_message_has_no_location",
++		makefile: `.SECONDEXPANSION:
++test: x.res
++	@echo done
++%.res: $$(warning trying $$@ for $$*) %.in
++	@echo $@ from $^
++`,
++		files: map[string]string{"x.in": ""},
++	},
++	{
++		name: "shell_in_target_without_recipe",
++		makefile: `.SECONDEXPANSION:
++test: app
++	@echo done
++app: other
++app: $$(shell echo "<x>" > seen.txt && echo tail.part)
++tail.part other:
++	@echo build $@
++`,
++	},
++	{
++		name: "order_only_seen_from_other_rules",
++		makefile: `.SECONDEXPANSION:
++test: app
++app: | ord.dir
++app: x.part $$(addsuffix .copy,$$|)
++	@echo $@ from $^
++x.part ord.dir.copy:
++	@echo build $@
++`,
++		files: map[string]string{"ord.dir/keep": ""},
++	},
++	{
++		name: "suffix_rule_prerequisites_expanded_not_used",
++		makefile: `.SECONDEXPANSION:
++test: x.info
++.texi.info: $$(shell touch marker && echo extra.part)
++	@echo $@ from $^
++extra.part:
++	@echo build $@
++`,
++		files: map[string]string{"x.texi": ""},
++	},
++	{
++		name: "missing_expanded_prerequisite",
++		makefile: `.SECONDEXPANSION:
++test: app
++app: $$(APP_LIBS)
++	@echo linking $@
++APP_LIBS := missing.lib
++`,
++	},
++}
++
++type normalization struct {
++	regexp  *regexp.Regexp
++	replace string
++}
++
++var normalizeQuotes = normalization{
++	regexp.MustCompile("([`'\"]|\xe2\x80\x98|\xe2\x80\x99)"), `"`,
++}
++
++var normalizeMake = []normalization{
++	normalizeQuotes,
++	{regexp.MustCompile(`make(?:\[\d+\])?: (Entering|Leaving) directory[^\n]*\n`), ""},
++	{regexp.MustCompile(`make(?:\[\d+\])?: `), ""},
++	{regexp.MustCompile(`\s+Stop\.`), ""},
++	{regexp.MustCompile(`\[\S+:\d+: `), "["},
++}
++
++var normalizeKati = []normalization{
++	normalizeQuotes,
++	{regexp.MustCompile(`\*kati\*[^\n]*`), ""},
++	{regexp.MustCompile(`c?kati: `), ""},
++}
++
++var normalizeNinja = []normalization{
++	{regexp.MustCompile(`NINJACMD: [^\n]*\n`), ""},
++	{regexp.MustCompile(`ninja: no work to do\.\n`), ""},
++	{regexp.MustCompile(`ninja: error: (.*, needed by .*),[^\n]*`), "*** No rule to make target ${1}."},
++	{regexp.MustCompile(`FAILED: [^\n]*\n`), ""},
++	{regexp.MustCompile(`ninja: build stopped: [^\n]*\n`), ""},
++}
++
++func normalize(out []byte, normalizations []normalization) string {
++	for _, n := range normalizations {
++		out = n.regexp.ReplaceAll(out, []byte(n.replace))
++	}
++	return string(out)
++}
++
++type result struct {
++	output string
++	ok     bool
++	files  map[string]string
++}
++
++func setup(t *testing.T, tc testCase) string {
++	dir := t.TempDir()
++	files := map[string]string{"Makefile": tc.makefile}
++	for name, content := range tc.files {
++		files[name] = content
++	}
++	for name, content := range files {
++		path := filepath.Join(dir, name)
++		if err := os.MkdirAll(filepath.Dir(path), 0777); err != nil {
++			t.Fatal(err)
++		}
++		if err := ioutil.WriteFile(path, []byte(content), 0666); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return dir
++}
++
++func outputFiles(t *testing.T, dir string) map[string]string {
++	ret := map[string]string{}
++	ignore := map[string]bool{"Makefile": true, "build.ninja": true, "env.sh": true, "ninja.sh": true}
++	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
++		if err != nil {
++			return err
++		}
++		rel, err := filepath.Rel(dir, path)
++		if err != nil || rel == "." {
++			return err
++		}
++		if !strings.Contains(rel, "/") && (ignore[rel] || strings.HasPrefix(rel, ".") || strings.HasPrefix(rel, "kati")) {
++			if info.IsDir() {
++				return filepath.SkipDir
++			}
++			return nil
++		}
++		if info.IsDir() {
++			return nil
++		}
++		data, err := ioutil.ReadFile(path)
++		if err != nil {
++			return err
++		}
++		ret[rel] = string(data)
++		return nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return ret
++}
++
++func run(dir string, name string, args ...string) ([]byte, bool) {
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, name, args...)
++	cmd.Dir = dir
++	out, err := cmd.CombinedOutput()
++	return out, err == nil
++}
++
++func runMake(t *testing.T, tc testCase, ninja bool) result {
++	dir := setup(t, tc)
++	args := []string{"SHELL=/bin/bash"}
++	if ninja {
++		args = append(args, "-s")
++	}
++	out, ok := run(dir, "make", append(args, tc.goals...)...)
++	return result{normalize(out, normalizeMake), ok, outputFiles(t, dir)}
++}
++
++func runKati(t *testing.T, kati string, tc testCase, ninja bool) result {
++	dir := setup(t, tc)
++	args := []string{"--use_find_emulator", "SHELL=/bin/bash"}
++	if ninja {
++		args = append(args, "--ninja")
++	}
++	out, ok := run(dir, kati, append(args, tc.goals...)...)
++	if ok && ninja {
++		var ninjaOut []byte
++		ninjaOut, ok = run(dir, "./ninja.sh", "-j1", "-v")
++		out = append(out, normalize(ninjaOut, normalizeNinja)...)
++	}
++	return result{normalize(out, normalizeKati), ok, outputFiles(t, dir)}
++}
++
++func describeFiles(files map[string]string) string {
++	var names []string
++	for name := range files {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	var b bytes.Buffer
++	for _, name := range names {
++		b.WriteString(name + " = " + strings.TrimSuffix(files[name], "\n") + "\n")
++	}
++	return b.String()
++}
++
++func TestMain(m *testing.M) {
++	os.Unsetenv("MAKEFLAGS")
++	os.Unsetenv("MAKELEVEL")
++	os.Setenv("NINJA_STATUS", "NINJACMD: ")
++	os.Exit(m.Run())
++}
++
++func TestSecondExpansion(t *testing.T) {
++	out, err := exec.Command("make", "--version").Output()
++	if err != nil || !bytes.HasPrefix(out, []byte("GNU Make 4.2.1\n")) {
++		t.Fatalf("GNU make 4.2.1 is needed as make: %q %v", out, err)
++	}
++	root, err := filepath.Abs("..")
++	if err != nil {
++		t.Fatal(err)
++	}
++	engines := []struct{ name, path string }{
++		{"ckati", filepath.Join(root, "ckati")},
++		{"rkati", filepath.Join(root, "target", "debug", "rkati")},
++	}
++	for _, e := range engines {
++		if _, err := os.Stat(e.path); err != nil {
++			t.Fatalf("%s must be built before testing: %v", e.name, err)
++		}
++	}
++	for _, tc := range cases {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			for _, ninja := range []bool{false, true} {
++				want := runMake(t, tc, ninja)
++				for _, e := range engines {
++					name := e.name
++					if ninja {
++						name += "_ninja"
++					}
++					t.Run(name, func(t *testing.T) {
++						got := runKati(t, e.path, tc, ninja)
++						if got.output != want.output {
++							t.Errorf("output differs from make\nmake:\n%s\n%s:\n%s", want.output, name, got.output)
++						}
++						if got.ok != want.ok {
++							t.Errorf("make succeeded: %v, %s succeeded: %v", want.ok, name, got.ok)
++						}
++						if wantFiles, gotFiles := describeFiles(want.files), describeFiles(got.files); wantFiles != gotFiles {
++							t.Errorf("files differ from make\nmake:\n%s\n%s:\n%s", wantFiles, name, gotFiles)
++						}
++					})
++				}
++			}
++		})
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..da048ce
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,211 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++mode=""
++mode_count=0
++output_path=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      mode="$1"
++      mode_count=$((mode_count + 1))
++      shift
++      ;;
++    --output_path)
++      if [ $# -lt 2 ] || [ -z "$2" ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      output_path="$2"
++      shift 2
++      ;;
++    --output_path=*)
++      output_path="${1#--output_path=}"
++      if [ -z "$output_path" ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$mode_count" -eq 1 ] || usage
++case "$output_path" in
++  ""|/*) ;;
++  *) output_path="$PWD/$output_path" ;;
++esac
++
++cd "$(dirname "$0")" || exit 2
++
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export CARGO_NET_OFFLINE=true
++export RUSTC_BOOTSTRAP=1
++gocache="$(go env GOCACHE 2>/dev/null)"
++if [ -z "$gocache" ] || ! mkdir -p "$gocache" 2>/dev/null || [ ! -w "$gocache" ]; then
++  export GOCACHE="/tmp/kati-gocache-$(id -u)"
++fi
++
++base_commit=55ea1e26f4da6d52a4ddca8f36a130dc26120525
++new_package=./secondexp_66cf49/
++work="$(mktemp -d)"
++trap 'rm -rf "$work"' EXIT
++status=0
++runs=0
++
++note() {
++  runs=$((runs + 1))
++  echo "$runs $1 $2 $3" >>"$work/index"
++  cp "$4" "$work/$runs.log"
++  [ "$3" -ne 0 ] && status=1
++  return 0
++}
++
++build() {
++  rm -rf out ckati find_test ninja_test strutil_test target/debug/rkati
++  local s=0
++  make -j"$(nproc)" ckati "$@" >"$work/build.log" 2>&1 || s=1
++  cargo build --offline >>"$work/build.log" 2>&1 || s=1
++  note build build "$s" "$work/build.log"
++}
++
++run_go() {
++  local name="$1"
++  shift
++  go test -v -count=1 -timeout 30m "$@" >"$work/go.log" 2>&1
++  local s=$?
++  if [ "$name" != TestKati ]; then
++    sed -i -E "s/\bTestKati\b/$name/g" "$work/go.log"
++  fi
++  note go "$name" "$s" "$work/go.log"
++}
++
++if [ "$mode" = base ]; then
++  cases=""
++  if git -c safe.directory='*' cat-file -e "$base_commit^{commit}" 2>/dev/null; then
++    git -c safe.directory='*' checkout -q "$base_commit" -- run_test.go testcase/
++    cases="$(git -c safe.directory='*' ls-tree --name-only "$base_commit" testcase/ | sed 's#^testcase/##')"
++  fi
++  [ -n "$cases" ] || cases="$(ls testcase)"
++  pattern="$(printf '%s\n' "$cases" | grep -E '\.(mk|sh)$' | sed 's/\./\\./g' | paste -sd '|' -)"
++  build ckati_tests
++  run_go TestKati -run "^TestKati\$/^($pattern)\$" .
++  run_go TestKati_ninja -run "^TestKati\$/^($pattern)\$" . --ninja
++  run_go TestKati_rkati -run "^TestKati\$/^($pattern)\$" . --rkati
++  run_go TestKati_rkati_ninja -run "^TestKati\$/^($pattern)\$" . --rkati --ninja
++  for t in find_test ninja_test strutil_test; do
++    s=1
++    if [ -x "./$t" ]; then
++      "./$t" >"$work/unit.log" 2>&1 && s=0
++    else
++      echo "$t was not built" >"$work/unit.log"
++    fi
++    note unit "ckati_$t" "$s" "$work/unit.log"
++  done
++  cargo test --offline -- -Z unstable-options --format json --report-time >"$work/cargo.json" 2>"$work/cargo.err"
++  s=$?
++  cat "$work/cargo.err" >>"$work/cargo.json"
++  note cargo rkati_unit "$s" "$work/cargo.json"
++else
++  build
++  run_go TestSecondExpansion "$new_package"
++fi
++
++while read -r i kind name s; do
++  echo "===== $name (exit $s)"
++  cat "$work/$i.log"
++done <"$work/index"
++
++if [ -n "$output_path" ]; then
++  mkdir -p "$(dirname "$output_path")"
++  while read -r i kind name s; do
++    case "$kind" in
++      go) go-junit-report -in "$work/$i.log" -out "$work/$i.xml" 2>"$work/$i.convert" || status=1 ;;
++      cargo) grep '^{' "$work/$i.log" | cargo2junit >"$work/$i.xml" 2>"$work/$i.convert" || status=1 ;;
++    esac
++  done <"$work/index"
++  if ! python3 - "$work" "$output_path" <<'PY'
++import os
++import sys
++import xml.etree.ElementTree as ET
++
++work, output = sys.argv[1], sys.argv[2]
++root = ET.Element("testsuites")
++
++
++def tail(path, lines=100):
++    try:
++        with open(path, errors="replace") as f:
++            return "".join(f.readlines()[-lines:])
++    except OSError:
++        return ""
++
++
++def failure(suite_name, case_name, message, text):
++    suite = ET.SubElement(root, "testsuite", name=suite_name)
++    case = ET.SubElement(suite, "testcase", classname=suite_name, name=case_name)
++    ET.SubElement(case, "failure", message=message).text = text
++
++
++def load(path):
++    try:
++        top = ET.parse(path).getroot()
++    except (OSError, ET.ParseError):
++        return []
++    return [top] if top.tag == "testsuite" else top.findall("testsuite")
++
++
++with open(os.path.join(work, "index")) as f:
++    runs = [line.split() for line in f if line.strip()]
++for i, kind, name, code in runs:
++    log = os.path.join(work, i + ".log")
++    if kind == "build":
++        if code != "0":
++            failure("kati_build", "build", "ckati or rkati failed to build", tail(log))
++        continue
++    if kind == "unit":
++        suite = ET.SubElement(root, "testsuite", name="ckati_unit")
++        case = ET.SubElement(suite, "testcase", classname="ckati_unit", name=name)
++        if code != "0":
++            ET.SubElement(case, "failure", message="exit status " + code).text = tail(log)
++        continue
++    suites = load(os.path.join(work, i + ".xml"))
++    cases = [c for s in suites for c in s.iter("testcase")]
++    if not cases:
++        failure(name, "results", "no test results could be read",
++                tail(os.path.join(work, i + ".convert")) + tail(log))
++        continue
++    for case in cases:
++        for problem in case.findall("failure") + case.findall("error"):
++            if not (problem.text or "").strip():
++                problem.text = tail(log, 60)
++    if code != "0" and not any(c.find("failure") is not None or c.find("error") is not None for c in cases):
++        failure(name, "exit_status", "the run failed without a failing test", tail(log))
++    root.extend(suites)
++
++if not list(root.iter("testcase")):
++    failure("kati", "collect", "no test results were produced", "")
++for suite in root.findall("testsuite"):
++    cases = suite.findall("testcase")
++    suite.set("tests", str(len(cases)))
++    suite.set("failures", str(sum(c.find("failure") is not None for c in cases)))
++    suite.set("errors", str(sum(c.find("error") is not None for c in cases)))
++ET.ElementTree(root).write(output, encoding="UTF-8", xml_declaration=True)
++PY
++  then
++    echo "could not write $output_path" >&2
++    status=1
++  fi
++fi
++
++exit "$status"

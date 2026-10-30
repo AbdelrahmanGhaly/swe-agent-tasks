@@ -1,0 +1,1422 @@
+diff --git a/cmd/snapshot_diff_changes_980467_test.go b/cmd/snapshot_diff_changes_980467_test.go
+new file mode 100644
+index 00000000..03a4e23f
+--- /dev/null
++++ b/cmd/snapshot_diff_changes_980467_test.go
+@@ -0,0 +1,1214 @@
++package cmd_test
++
++import (
++	"archive/tar"
++	"bytes"
++	"compress/gzip"
++	"context"
++	"encoding/json"
++	"fmt"
++	"net"
++	"net/http"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"slices"
++	"sort"
++	"strconv"
++	"strings"
++	"testing"
++)
++
++var (
++	aptlyBinary     string
++	aptlyEnviron    []string
++	aptlySetupError error
++)
++
++func TestMain(m *testing.M) {
++	dir, err := os.MkdirTemp("", "aptly-diff-changes")
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++	aptlyBinary = filepath.Join(dir, "aptly")
++	if out, err := exec.Command("go", "build", "-o", aptlyBinary, "..").CombinedOutput(); err != nil {
++		aptlySetupError = fmt.Errorf("unable to build aptly: %v\n%s", err, out)
++	} else if aptlyEnviron, err = environWithoutDpkg(filepath.Join(dir, "no-dpkg")); err != nil {
++		aptlySetupError = fmt.Errorf("unable to hide the dpkg tools from aptly: %v", err)
++	}
++	code := m.Run()
++	_ = os.RemoveAll(dir)
++	os.Exit(code)
++}
++
++func environWithoutDpkg(dir string) ([]string, error) {
++	if err := os.MkdirAll(dir, 0755); err != nil {
++		return nil, err
++	}
++	tools := map[string]bool{"dpkg": true, "dpkg-deb": true, "dpkg-parsechangelog": true, "dpkg-source": true}
++	for _, pathDir := range filepath.SplitList(os.Getenv("PATH")) {
++		found, _ := filepath.Glob(filepath.Join(pathDir, "dpkg*"))
++		for _, tool := range found {
++			tools[filepath.Base(tool)] = true
++		}
++	}
++	for tool := range tools {
++		stub := "#!/bin/sh\necho \"" + tool + " is not available to aptly\" >&2\nexit 127\n"
++		if err := os.WriteFile(filepath.Join(dir, tool), []byte(stub), 0755); err != nil {
++			return nil, err
++		}
++	}
++	environ := []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH")}
++	for _, variable := range os.Environ() {
++		if !strings.HasPrefix(variable, "PATH=") {
++			environ = append(environ, variable)
++		}
++	}
++	return environ, nil
++}
++
++type aptlyEnv struct {
++	t      *testing.T
++	dir    string
++	config string
++	builds int
++}
++
++func newAptlyEnv(t *testing.T) *aptlyEnv {
++	t.Helper()
++	if aptlySetupError != nil {
++		t.Fatal(aptlySetupError)
++	}
++	dir := t.TempDir()
++	config := filepath.Join(dir, "aptly.conf")
++	content := fmt.Sprintf("{\"rootDir\": %q, \"architectures\": []}\n", filepath.Join(dir, "root"))
++	if err := os.WriteFile(config, []byte(content), 0644); err != nil {
++		t.Fatal(err)
++	}
++	return &aptlyEnv{t: t, dir: dir, config: config}
++}
++
++func (e *aptlyEnv) exec(args ...string) (string, string, error) {
++	cmd := exec.Command(aptlyBinary, append([]string{"-config=" + e.config}, args...)...)
++	cmd.Env = aptlyEnviron
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout = &stdout
++	cmd.Stderr = &stderr
++	err := cmd.Run()
++	return stdout.String(), stderr.String(), err
++}
++
++func (e *aptlyEnv) run(args ...string) string {
++	e.t.Helper()
++	stdout, stderr, err := e.exec(args...)
++	if err != nil {
++		e.t.Fatalf("aptly %s: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout, stderr)
++	}
++	return stdout
++}
++
++func (e *aptlyEnv) workDir(kind string) string {
++	e.t.Helper()
++	e.builds++
++	dir := filepath.Join(e.dir, kind, strconv.Itoa(e.builds))
++	if err := os.MkdirAll(dir, 0755); err != nil {
++		e.t.Fatal(err)
++	}
++	return dir
++}
++
++func writeFile(t *testing.T, path string, content []byte) {
++	t.Helper()
++	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(path, content, 0644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func gzipped(t *testing.T, content string) []byte {
++	t.Helper()
++	var buf bytes.Buffer
++	gz := gzip.NewWriter(&buf)
++	if _, err := gz.Write([]byte(content)); err != nil {
++		t.Fatal(err)
++	}
++	if err := gz.Close(); err != nil {
++		t.Fatal(err)
++	}
++	return buf.Bytes()
++}
++
++func tarGz(t *testing.T, files map[string]string) []byte {
++	t.Helper()
++	var buf bytes.Buffer
++	gz := gzip.NewWriter(&buf)
++	tw := tar.NewWriter(gz)
++	names := make([]string, 0, len(files))
++	for name := range files {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	for _, name := range names {
++		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(files[name]))}); err != nil {
++			t.Fatal(err)
++		}
++		if _, err := tw.Write([]byte(files[name])); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := tw.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := gz.Close(); err != nil {
++		t.Fatal(err)
++	}
++	return buf.Bytes()
++}
++
++type debFile struct {
++	path, content, link string
++}
++
++func doc(pkg, name, content string) debFile {
++	return debFile{path: "usr/share/doc/" + pkg + "/" + name, content: content}
++}
++
++func symlink(path, target string) debFile {
++	return debFile{path: path, link: target}
++}
++
++type debPackage struct {
++	name, version, arch, compression string
++	files                            []debFile
++}
++
++func (e *aptlyEnv) deb(p debPackage) string {
++	e.t.Helper()
++	dir := e.workDir("debs")
++	root := filepath.Join(dir, "root")
++	control := fmt.Sprintf("Package: %s\nVersion: %s\nArchitecture: %s\nMaintainer: Ann Example <ann@example.org>\nDescription: test package\n",
++		p.name, p.version, p.arch)
++	writeFile(e.t, filepath.Join(root, "DEBIAN", "control"), []byte(control))
++	if err := os.Chmod(filepath.Join(root, "DEBIAN"), 0755); err != nil {
++		e.t.Fatal(err)
++	}
++	for _, f := range p.files {
++		path := filepath.Join(root, f.path)
++		if f.link != "" {
++			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++				e.t.Fatal(err)
++			}
++			if err := os.Symlink(f.link, path); err != nil {
++				e.t.Fatal(err)
++			}
++		} else if strings.HasSuffix(f.path, ".gz") {
++			writeFile(e.t, path, gzipped(e.t, f.content))
++		} else {
++			writeFile(e.t, path, []byte(f.content))
++		}
++	}
++	compression := p.compression
++	if compression == "" {
++		compression = "xz"
++	}
++	out := filepath.Join(dir, strings.ReplaceAll(p.name+"_"+p.version+"_"+p.arch, ":", "%3a")+".deb")
++	if output, err := exec.Command("dpkg-deb", "--root-owner-group", "-Z"+compression, "--build", root, out).CombinedOutput(); err != nil {
++		e.t.Fatalf("dpkg-deb --build %s %s: %v\n%s", p.name, p.version, err, output)
++	}
++	return out
++}
++
++type sourcePackage struct {
++	name, upstream, format, compression string
++	native, gitArchive                  bool
++	changelog, origChangelog            string
++}
++
++func (e *aptlyEnv) gitArchive(prefix string, files map[string]string, out string) {
++	e.t.Helper()
++	repo := e.workDir("git")
++	for name, content := range files {
++		writeFile(e.t, filepath.Join(repo, name), []byte(content))
++	}
++	environ := []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_AUTHOR_DATE=2025-10-20T10:00:00Z", "GIT_COMMITTER_DATE=2025-10-20T10:00:00Z"}
++	for _, variable := range os.Environ() {
++		if !strings.HasPrefix(variable, "GIT_") {
++			environ = append(environ, variable)
++		}
++	}
++	for _, args := range [][]string{{"init", "-q"}, {"add", "."}, {"commit", "-q", "-m", "Release " + prefix}, {"archive", "--format=tar.gz", "--prefix=" + prefix + "/", "-o", out, "HEAD"}} {
++		cmd := exec.Command("git", append([]string{"-c", "user.name=Ann Example", "-c", "user.email=ann@example.org", "-c", "init.defaultBranch=main"}, args...)...)
++		cmd.Dir = repo
++		cmd.Env = environ
++		if output, err := cmd.CombinedOutput(); err != nil {
++			e.t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
++		}
++	}
++}
++
++func (e *aptlyEnv) source(p sourcePackage) string {
++	e.t.Helper()
++	dir := e.workDir("sources")
++	if !p.native {
++		orig := map[string]string{"README": "upstream sources\n"}
++		if p.origChangelog != "" {
++			orig["debian/changelog"] = p.origChangelog
++		}
++		origPath := filepath.Join(dir, p.name+"_"+p.upstream+".orig.tar.gz")
++		if p.gitArchive {
++			e.gitArchive(p.name+"-"+p.upstream, orig, origPath)
++		} else {
++			prefixed := map[string]string{}
++			for name, content := range orig {
++				prefixed[p.name+"-"+p.upstream+".orig/"+name] = content
++			}
++			writeFile(e.t, origPath, tarGz(e.t, prefixed))
++		}
++	}
++	tree := filepath.Join(dir, p.name+"-"+p.upstream)
++	control := fmt.Sprintf("Source: %s\nMaintainer: Ann Example <ann@example.org>\n\nPackage: %s\nArchitecture: any\nDescription: test package\n test package\n",
++		p.name, p.name)
++	writeFile(e.t, filepath.Join(tree, "README"), []byte("upstream sources\n"))
++	writeFile(e.t, filepath.Join(tree, "debian", "changelog"), []byte(p.changelog))
++	writeFile(e.t, filepath.Join(tree, "debian", "control"), []byte(control))
++	writeFile(e.t, filepath.Join(tree, "debian", "source", "format"), []byte(p.format+"\n"))
++	args := []string{"-b"}
++	if p.compression != "" {
++		args = append(args, "-Z"+p.compression)
++	}
++	cmd := exec.Command("dpkg-source", append(args, filepath.Base(tree))...)
++	cmd.Dir = dir
++	if output, err := cmd.CombinedOutput(); err != nil {
++		e.t.Fatalf("dpkg-source -b %s: %v\n%s", p.name, err, output)
++	}
++	dscs, err := filepath.Glob(filepath.Join(dir, "*.dsc"))
++	if err != nil || len(dscs) != 1 {
++		e.t.Fatalf("dpkg-source -b %s built %v (%v)", p.name, dscs, err)
++	}
++	return dscs[0]
++}
++
++func (e *aptlyEnv) snapshot(name string, files ...string) {
++	e.t.Helper()
++	e.run("repo", "create", name)
++	if len(files) > 0 {
++		e.run(append([]string{"repo", "add", name}, files...)...)
++	}
++	e.run("snapshot", "create", name, "from", "repo", name)
++}
++
++func diffKey(line string) string {
++	fields := strings.Split(line, "|")
++	if len(fields) < 2 {
++		return ""
++	}
++	return strings.TrimSpace(fields[1]) + "_" + strings.TrimSpace(strings.TrimPrefix(fields[0], "!"))
++}
++
++func (e *aptlyEnv) assertChanges(a, b string, want map[string]string, flags ...string) {
++	e.t.Helper()
++	plain := e.run(append(append([]string{"snapshot", "diff"}, flags...), a, b)...)
++	listed := map[string]bool{}
++	for _, line := range strings.SplitAfter(plain, "\n") {
++		if !strings.HasPrefix(line, "!") {
++			continue
++		}
++		key := diffKey(line)
++		if _, ok := want[key]; !ok {
++			e.t.Fatalf("aptly snapshot diff %s %s lists %s as changed, the test expects no such package:\n%s", a, b, key, plain)
++		}
++		listed[key] = true
++	}
++	for key := range want {
++		if !listed[key] {
++			e.t.Fatalf("aptly snapshot diff %s %s does not list %s as changed:\n%s", a, b, key, plain)
++		}
++	}
++	args := append(append([]string{"snapshot", "diff", "-changes"}, flags...), a, b)
++	e.assertTextUnderRows(strings.Join(args, " "), plain, e.run(args...), want)
++}
++
++func (e *aptlyEnv) assertTextUnderRows(command, plain, got string, want map[string]string) {
++	e.t.Helper()
++	rows := strings.SplitAfter(plain, "\n")
++	under := map[int]string{}
++	next := 0
++	for _, line := range strings.SplitAfter(got, "\n") {
++		if line != "" && next < len(rows) && line == rows[next] {
++			next++
++		} else {
++			under[next-1] += line
++		}
++	}
++	if strings.Join(rows[next:], "") != "" {
++		e.t.Fatalf("aptly %s does not keep the lines of the plain diff in order:\n%s\nplain diff:\n%s", command, got, plain)
++	}
++	for i := -1; i < next; i++ {
++		row, text := "the start of the output", ""
++		if i >= 0 {
++			row = strings.TrimSpace(rows[i])
++			if strings.HasPrefix(rows[i], "!") {
++				text = want[diffKey(rows[i])]
++			}
++		}
++		if sameChanges(under[i], text) {
++			continue
++		}
++		if text == "" {
++			e.t.Errorf("aptly %s printed under %q:\n%s\nwant nothing there", command, row, under[i])
++		} else {
++			e.t.Errorf("aptly %s printed under %q:\n%s\nwant these lines (blank lines around them, a common indentation and one label line above them are fine):\n%s",
++				command, row, under[i], text)
++		}
++	}
++}
++
++func changesLines(text string) []string {
++	var lines []string
++	for _, line := range strings.Split(text, "\n") {
++		if len(lines) > 0 || strings.TrimSpace(line) != "" {
++			lines = append(lines, line)
++		}
++	}
++	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
++		lines = lines[:len(lines)-1]
++	}
++	indent, first := "", true
++	for _, line := range lines {
++		trimmed := strings.TrimLeft(line, " \t")
++		if trimmed == "" {
++			continue
++		}
++		lead := line[:len(line)-len(trimmed)]
++		if first {
++			indent, first = lead, false
++		}
++		for !strings.HasPrefix(lead, indent) {
++			indent = indent[:len(indent)-1]
++		}
++	}
++	for i, line := range lines {
++		lines[i] = strings.TrimPrefix(line, indent)
++	}
++	return lines
++}
++
++func sameChanges(got, want string) bool {
++	gotLines, wantLines := changesLines(got), changesLines(want)
++	if slices.Equal(gotLines, wantLines) {
++		return true
++	}
++	return len(wantLines) > 0 && len(gotLines) == len(wantLines)+1 &&
++		slices.Equal(changesLines(strings.Join(gotLines[1:], "\n")), wantLines)
++}
++
++func parsedChanges(t *testing.T, changelog, since string) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "changelog")
++	writeFile(t, path, []byte(changelog))
++	out, err := exec.Command("dpkg-parsechangelog", "-l", path, "--since", since, "-S", "Changes").Output()
++	if err != nil {
++		t.Fatalf("dpkg-parsechangelog --since %s: %v", since, err)
++	}
++	return string(out)
++}
++
++const trailer = " -- Ann Example <ann@example.org>  Mon, 20 Oct 2025 10:00:00 +0000"
++
++func entry(source, version string, changes ...string) string {
++	return source + " (" + version + ") unstable; urgency=medium\n\n" + strings.Join(changes, "\n") + "\n\n" + trailer + "\n\n"
++}
++
++func binNMUEntry(source, version, arch string) string {
++	return source + " (" + version + ") unstable; urgency=low, binary-only=yes\n\n" +
++		"  * Binary-only non-maintainer upload for " + arch + "; no source changes.\n" +
++		"  * Rebuild against libssl3t64.\n\n" +
++		" -- " + arch + " Build Daemon <buildd_" + arch + "@buildd.debian.org>  Sat, 18 Oct 2025 12:00:00 +0000\n\n"
++}
++
++func TestSnapshotDiffChangesBinaryPackages(t *testing.T) {
++	e := newAptlyEnv(t)
++	fooBase := entry("foo", "1.0-1", "  * Initial release. (Closes: #1000)") + entry("foo", "0.9-1", "  * Preview upload.")
++	fooNew := entry("foo", "1.2-1", "  * New upstream release.", "    - Drops the legacy API.") +
++		entry("foo", "1.1-1", "  * Fix the build on arm64.") + fooBase
++	upstream := "2025-09-30  Ann Example <ann@example.org>\n\n\t* src/main.c: Rework option parsing.\n"
++	barNew := entry("bar", "2.1", "  * New upstream release.") + entry("bar", "2.0", "  * Initial release.")
++	rebuilt := entry("rebuilt", "1.0-1", "  * Initial release.") + entry("rebuilt", "0.9-1", "  * Preview upload.")
++	e.snapshot("a",
++		e.deb(debPackage{name: "foo", version: "1.0-1", arch: "amd64", files: []debFile{
++			doc("foo", "changelog.Debian.gz", fooBase), doc("foo", "changelog.gz", upstream)}}),
++		e.deb(debPackage{name: "bar", version: "2.0", arch: "amd64", files: []debFile{
++			doc("bar", "changelog.gz", entry("bar", "2.0", "  * Initial release."))}}),
++		e.deb(debPackage{name: "nochangelog", version: "1.0-1", arch: "amd64", files: []debFile{
++			doc("nochangelog", "copyright", "Files: *\n")}}),
++		e.deb(debPackage{name: "gone", version: "1.0-1", arch: "amd64", files: []debFile{
++			doc("gone", "changelog.Debian.gz", entry("gone", "1.0-1", "  * Initial release."))}}),
++		e.deb(debPackage{name: "rebuilt", version: "1.0-1", arch: "amd64", files: []debFile{
++			doc("rebuilt", "changelog.Debian.gz", rebuilt)}}),
++	)
++	e.snapshot("b",
++		e.deb(debPackage{name: "foo", version: "1.2-1", arch: "amd64", files: []debFile{
++			doc("foo", "changelog.Debian.gz", fooNew), doc("foo", "changelog.gz", upstream)}}),
++		e.deb(debPackage{name: "bar", version: "2.1", arch: "amd64", files: []debFile{
++			doc("bar", "changelog.gz", barNew)}}),
++		e.deb(debPackage{name: "nochangelog", version: "1.0-2", arch: "amd64", files: []debFile{
++			doc("nochangelog", "copyright", "Files: *\n")}}),
++		e.deb(debPackage{name: "added", version: "1.0-1", arch: "amd64", files: []debFile{
++			doc("added", "changelog.Debian.gz", entry("added", "1.0-1", "  * Initial release."))}}),
++		e.deb(debPackage{name: "rebuilt", version: "1.0-1", arch: "amd64", files: []debFile{
++			doc("rebuilt", "changelog.Debian.gz", rebuilt), doc("rebuilt", "README.Debian", "Rebuilt against the new toolchain.\n")}}),
++	)
++	e.assertChanges("a", "b", map[string]string{
++		"foo_amd64": "\nfoo (1.2-1) unstable; urgency=medium\n.\n  * New upstream release.\n    - Drops the legacy API.\n" +
++			".\nfoo (1.1-1) unstable; urgency=medium\n.\n  * Fix the build on arm64.\n",
++		"bar_amd64":         "\nbar (2.1) unstable; urgency=medium\n.\n  * New upstream release.\n",
++		"nochangelog_amd64": "",
++		"rebuilt_amd64":     "",
++	})
++}
++
++func TestSnapshotDiffChangesFollowDpkgVersionOrder(t *testing.T) {
++	e := newAptlyEnv(t)
++	downOld := entry("down", "1.5-1", "  * Fix a crash on startup.") + entry("down", "1.0-1", "  * Initial release.")
++	downNew := entry("down", "2.0-1", "  * New upstream release.") + downOld
++	epochOld := entry("epo", "2.3-1", "  * New snapshot.") + entry("epo", "2.2-1", "  * Initial release.")
++	epochNew := entry("epo", "1:0.9-1", "  * Follow the new upstream version scheme, which needs an epoch.") + epochOld
++	preOld := entry("pre", "3.0~rc1-1", "  * Package the first release candidate.") + entry("pre", "2.9-1", "  * Initial release.")
++	preNew := entry("pre", "3.0-1", "  * Package the final release.") + preOld
++	toolA := entry("tool", "4.3.5a-1", "  * Package the 4.3.5a tarball.") + entry("tool", "4.3.4-1", "  * Initial release.")
++	toolB := entry("tool", "4.3.5-rc3-1", "  * Package the 4.3.5-rc3 tarball.") + toolA
++	ciA := entry("ci", "2.1+ci20251020103015000000001-1", "  * Rebuild from CI run 1.") + entry("ci", "2.0-1", "  * Initial release.")
++	ciB := entry("ci", "2.1+ci20251020103015000000002-1", "  * Rebuild from CI run 2.") + ciA
++	e.snapshot("a",
++		e.deb(debPackage{name: "down", version: "2.0-1", arch: "amd64", files: []debFile{doc("down", "changelog.Debian.gz", downNew)}}),
++		e.deb(debPackage{name: "epo", version: "1:0.9-1", arch: "all", files: []debFile{doc("epo", "changelog.Debian.gz", epochNew)}}),
++		e.deb(debPackage{name: "pre", version: "3.0~rc1-1", arch: "amd64", files: []debFile{doc("pre", "changelog.Debian.gz", preOld)}}),
++		e.deb(debPackage{name: "tool", version: "4.3.5a-1", arch: "amd64", files: []debFile{doc("tool", "changelog.Debian.gz", toolA)}}),
++		e.deb(debPackage{name: "ci", version: "2.1+ci20251020103015000000001-1", arch: "amd64", files: []debFile{doc("ci", "changelog.Debian.gz", ciA)}}),
++	)
++	e.snapshot("b",
++		e.deb(debPackage{name: "down", version: "1.5-1", arch: "amd64", files: []debFile{doc("down", "changelog.Debian.gz", downOld)}}),
++		e.deb(debPackage{name: "epo", version: "2.3-1", arch: "all", files: []debFile{doc("epo", "changelog.Debian.gz", epochOld)}}),
++		e.deb(debPackage{name: "pre", version: "3.0-1", arch: "amd64", files: []debFile{doc("pre", "changelog.Debian.gz", preNew)}}),
++		e.deb(debPackage{name: "tool", version: "4.3.5-rc3-1", arch: "amd64", files: []debFile{doc("tool", "changelog.Debian.gz", toolB)}}),
++		e.deb(debPackage{name: "ci", version: "2.1+ci20251020103015000000002-1", arch: "amd64", files: []debFile{doc("ci", "changelog.Debian.gz", ciB)}}),
++	)
++	want := map[string]string{
++		"down_amd64": "\ndown (2.0-1) unstable; urgency=medium\n.\n  * New upstream release.\n",
++		"epo_all":    "\nepo (1:0.9-1) unstable; urgency=medium\n.\n  * Follow the new upstream version scheme, which needs an epoch.\n",
++		"pre_amd64":  "\npre (3.0-1) unstable; urgency=medium\n.\n  * Package the final release.\n",
++		"tool_amd64": "\ntool (4.3.5-rc3-1) unstable; urgency=medium\n.\n  * Package the 4.3.5-rc3 tarball.\n",
++		"ci_amd64":   "\nci (2.1+ci20251020103015000000002-1) unstable; urgency=medium\n.\n  * Rebuild from CI run 2.\n",
++	}
++	e.assertChanges("a", "b", want)
++	e.assertChanges("b", "a", want)
++}
++
++func TestSnapshotDiffChangesPutBinNMUEntriesFirst(t *testing.T) {
++	e := newAptlyEnv(t)
++	binBase := entry("bin", "1.0-1", "  * New upstream release.") + entry("bin", "0.9-1", "  * Initial release.")
++	multiBase := entry("multi", "1.0-1", "  * New upstream release.") + entry("multi", "0.9-1", "  * Initial release.")
++	natBase := entry("nat", "2.0", "  * New upstream release.") + entry("nat", "1.9", "  * Initial release.")
++	e.snapshot("a",
++		e.deb(debPackage{name: "bin", version: "1.0-1", arch: "amd64", files: []debFile{doc("bin", "changelog.Debian.gz", binBase)}}),
++		e.deb(debPackage{name: "bin", version: "1.0-1", arch: "i386", files: []debFile{doc("bin", "changelog.Debian.gz", binBase)}}),
++		e.deb(debPackage{name: "multi", version: "0.9-1", arch: "arm64", files: []debFile{
++			doc("multi", "changelog.Debian.gz", entry("multi", "0.9-1", "  * Initial release."))}}),
++		e.deb(debPackage{name: "nat", version: "1.9", arch: "amd64", files: []debFile{
++			doc("nat", "changelog.gz", entry("nat", "1.9", "  * Initial release."))}}),
++	)
++	e.snapshot("b",
++		e.deb(debPackage{name: "bin", version: "1.0-1+b1", arch: "amd64", files: []debFile{
++			doc("bin", "changelog.Debian.gz", binBase), doc("bin", "changelog.Debian.amd64.gz", binNMUEntry("bin", "1.0-1+b1", "amd64"))}}),
++		e.deb(debPackage{name: "bin", version: "1.0-1+b1", arch: "i386", files: []debFile{
++			doc("bin", "changelog.Debian.gz", binBase), doc("bin", "changelog.Debian.i386.gz", binNMUEntry("bin", "1.0-1+b1", "i386"))}}),
++		e.deb(debPackage{name: "multi", version: "1.0-1+b2", arch: "arm64", files: []debFile{
++			doc("multi", "changelog.Debian.gz", multiBase), doc("multi", "changelog.Debian.arm64.gz", binNMUEntry("multi", "1.0-1+b2", "arm64"))}}),
++		e.deb(debPackage{name: "nat", version: "2.0+b1", arch: "amd64", files: []debFile{
++			doc("nat", "changelog.gz", natBase), doc("nat", "changelog.Debian.amd64.gz", binNMUEntry("nat", "2.0+b1", "amd64"))}}),
++	)
++	e.assertChanges("a", "b", map[string]string{
++		"bin_amd64": "\nbin (1.0-1+b1) unstable; urgency=low, binary-only=yes\n.\n" +
++			"  * Binary-only non-maintainer upload for amd64; no source changes.\n  * Rebuild against libssl3t64.\n",
++		"bin_i386": "\nbin (1.0-1+b1) unstable; urgency=low, binary-only=yes\n.\n" +
++			"  * Binary-only non-maintainer upload for i386; no source changes.\n  * Rebuild against libssl3t64.\n",
++		"multi_arm64": "\nmulti (1.0-1+b2) unstable; urgency=low, binary-only=yes\n.\n" +
++			"  * Binary-only non-maintainer upload for arm64; no source changes.\n  * Rebuild against libssl3t64.\n" +
++			".\nmulti (1.0-1) unstable; urgency=medium\n.\n  * New upstream release.\n",
++		"nat_amd64": "\nnat (2.0+b1) unstable; urgency=low, binary-only=yes\n.\n" +
++			"  * Binary-only non-maintainer upload for amd64; no source changes.\n  * Rebuild against libssl3t64.\n" +
++			".\nnat (2.0) unstable; urgency=medium\n.\n  * New upstream release.\n",
++	})
++}
++
++func TestSnapshotDiffChangesFollowDocSymlinks(t *testing.T) {
++	e := newAptlyEnv(t)
++	libfooOld := entry("libfoo", "1.0-1", "  * Initial release.")
++	libfooNew := entry("libfoo", "1.1-1", "  * New upstream release.", "  * Split the headers into libfoo-dev.") + libfooOld
++	fooOld := entry("foo", "2.0-1", "  * Initial release.")
++	fooNew := entry("foo", "2.1-1", "  * Compress the data files.") + fooOld
++	innerOld := entry("inner", "0.5-1", "  * Initial release.")
++	innerNew := entry("inner", "0.6-1", "  * Move the documentation to /usr/share/inner/doc.") + innerOld
++	dualOld := entry("dual", "3.0-1", "  * Initial release.")
++	dualOwn := entry("dual", "3.1-1", "  * Changelog shipped inside dual.") + dualOld
++	dualCommon := entry("dual", "3.1-1", "  * Changelog shipped in dual-common.") + dualOld
++	libbarOld := entry("libbar", "5.0-1", "  * Initial release.")
++	libbarNew := entry("libbar", "5.0-2", "  * Rebuild with the new toolchain.") + libbarOld
++	sameOld := entry("libsame", "7.0-1", "  * Initial release.")
++	sameNew := entry("libsame", "7.0-2", "  * Ship the tools in libsame-bin.") + sameOld
++	missOld := entry("libmiss", "4.0-1", "  * Initial release.")
++	missCommonNew := entry("libmiss", "4.1-1", "  * Update the shared data only.") + missOld
++	backOld := entry("back", "3.0-1", "  * Initial release.")
++	backNew := entry("back", "3.1-1", "  * Keep the changelog in the history directory.") + backOld
++	packages := func(libfoo, foo, inner, dual, dualChangelog, dualCommonChangelog, libbar, libbarChangelog, miss, missCommon, arch, nodoc, same, sameChangelog, back string) []string {
++		return []string{
++			e.deb(debPackage{name: "libfoo-common", version: libfoo, arch: "all", files: []debFile{
++				doc("libfoo-common", "changelog.Debian.gz", map[string]string{"1.0-1": libfooOld, "1.1-1": libfooNew}[libfoo])}}),
++			e.deb(debPackage{name: "libfoo1", version: libfoo, arch: "amd64", files: []debFile{
++				symlink("usr/share/doc/libfoo1", "libfoo-common")}}),
++			e.deb(debPackage{name: "libfoo-dev", version: libfoo, arch: "amd64", files: []debFile{
++				symlink("usr/share/doc/libfoo-dev", "/usr/share/doc/libfoo-common")}}),
++			e.deb(debPackage{name: "foo-data", version: foo, arch: "amd64", files: []debFile{
++				doc("foo-data", "changelog.Debian.gz", map[string]string{"2.0-1": fooOld, "2.1-1": fooNew}[foo])}}),
++			e.deb(debPackage{name: "foo-bin", version: foo, arch: "amd64", files: []debFile{
++				doc("foo-bin", "copyright", "Files: *\n"),
++				symlink("usr/share/doc/foo-bin/changelog.Debian.gz", "../foo-data/changelog.Debian.gz")}}),
++			e.deb(debPackage{name: "inner", version: inner, arch: "amd64", files: []debFile{
++				symlink("usr/share/doc/inner", "../inner/doc"),
++				{path: "usr/share/inner/doc/changelog.Debian.gz", content: map[string]string{"0.5-1": innerOld, "0.6-1": innerNew}[inner]}}}),
++			e.deb(debPackage{name: "dual", version: dual, arch: "amd64", files: []debFile{
++				symlink("usr/share/doc/dual", "dual-common"),
++				doc("dual-common", "changelog.Debian.gz", dualChangelog)}}),
++			e.deb(debPackage{name: "dual-common", version: dual, arch: "all", files: []debFile{
++				doc("dual-common", "changelog.Debian.gz", dualCommonChangelog)}}),
++			e.deb(debPackage{name: "libbar1", version: libbar, arch: "amd64", files: []debFile{
++				symlink("usr/share/doc/libbar1", "libbar-common")}}),
++			e.deb(debPackage{name: "libbar-common", version: libbar, arch: "all", files: []debFile{
++				symlink("usr/share/doc/libbar-common", "../libbar/doc"),
++				{path: "usr/share/libbar/doc/changelog.Debian.gz", content: libbarChangelog}}}),
++			e.deb(debPackage{name: "libmiss1", version: miss, arch: "amd64", files: []debFile{
++				symlink("usr/share/doc/libmiss1", "libmiss-common")}}),
++			e.deb(debPackage{name: "libmiss-common", version: missCommon, arch: "all", files: []debFile{
++				doc("libmiss-common", "changelog.Debian.gz", map[string]string{"4.0-1": missOld, "4.1-1": missCommonNew}[missCommon])}}),
++			e.deb(debPackage{name: "libarch1", version: arch, arch: "amd64", files: []debFile{
++				symlink("usr/share/doc/libarch1", "libarch-common")}}),
++			e.deb(debPackage{name: "libarch-common", version: arch, arch: "i386", files: []debFile{
++				doc("libarch-common", "changelog.Debian.gz", entry("libarch", arch, "  * Upload "+arch+".")+entry("libarch", "6.0-1", "  * Initial release."))}}),
++			e.deb(debPackage{name: "nodoc", version: nodoc, arch: "amd64", files: []debFile{
++				symlink("usr/share/doc/nodoc", "nodoc-common")}}),
++			e.deb(debPackage{name: "libsame1", version: same, arch: "amd64", files: []debFile{
++				symlink("usr/share/doc/libsame1", "libsame-bin")}}),
++			e.deb(debPackage{name: "libsame-bin", version: same, arch: "amd64", files: []debFile{
++				doc("libsame-bin", "changelog.Debian.gz", sameChangelog)}}),
++			e.deb(debPackage{name: "back", version: back, arch: "amd64", files: []debFile{
++				doc("back", "history/changelog.Debian.gz", map[string]string{"3.0-1": backOld, "3.1-1": backNew}[back]),
++				symlink("usr/share/doc/back/changelog.Debian.gz", "../back-common/changelog.Debian.gz")}}),
++			e.deb(debPackage{name: "back-common", version: back, arch: "amd64", files: []debFile{
++				doc("back-common", "copyright", "Files: *\n"),
++				symlink("usr/share/doc/back-common/changelog.Debian.gz", "../back/history/changelog.Debian.gz")}}),
++		}
++	}
++	e.snapshot("a", packages("1.0-1", "2.0-1", "0.5-1", "3.0-1", dualOld, dualOld, "5.0-1", libbarOld, "4.0-1", "4.0-1", "6.0-1", "1.0-1", "7.0-1", sameOld, "3.0-1")...)
++	e.snapshot("b", packages("1.1-1", "2.1-1", "0.6-1", "3.1-1", dualOwn, dualCommon, "5.0-2", libbarNew, "4.0-2", "4.1-1", "6.0-2", "1.1-1", "7.0-2", sameNew, "3.1-1")...)
++	libfoo := "\nlibfoo (1.1-1) unstable; urgency=medium\n.\n  * New upstream release.\n  * Split the headers into libfoo-dev.\n"
++	foo := "\nfoo (2.1-1) unstable; urgency=medium\n.\n  * Compress the data files.\n"
++	libbar := "\nlibbar (5.0-2) unstable; urgency=medium\n.\n  * Rebuild with the new toolchain.\n"
++	same := "\nlibsame (7.0-2) unstable; urgency=medium\n.\n  * Ship the tools in libsame-bin.\n"
++	back := "\nback (3.1-1) unstable; urgency=medium\n.\n  * Keep the changelog in the history directory.\n"
++	e.assertChanges("a", "b", map[string]string{
++		"libfoo-common_all":   libfoo,
++		"libfoo1_amd64":       libfoo,
++		"libfoo-dev_amd64":    libfoo,
++		"foo-data_amd64":      foo,
++		"foo-bin_amd64":       foo,
++		"inner_amd64":         "\ninner (0.6-1) unstable; urgency=medium\n.\n  * Move the documentation to /usr/share/inner/doc.\n",
++		"dual_amd64":          "\ndual (3.1-1) unstable; urgency=medium\n.\n  * Changelog shipped inside dual.\n",
++		"dual-common_all":     "\ndual (3.1-1) unstable; urgency=medium\n.\n  * Changelog shipped in dual-common.\n",
++		"libbar1_amd64":       libbar,
++		"libbar-common_all":   libbar,
++		"libmiss1_amd64":      "",
++		"libmiss-common_all":  "\nlibmiss (4.1-1) unstable; urgency=medium\n.\n  * Update the shared data only.\n",
++		"libarch1_amd64":      "",
++		"libarch-common_i386": "\nlibarch (6.0-2) unstable; urgency=medium\n.\n  * Upload 6.0-2.\n",
++		"nodoc_amd64":         "",
++		"libsame1_amd64":      same,
++		"libsame-bin_amd64":   same,
++		"back_amd64":          back,
++		"back-common_amd64":   back,
++	})
++}
++
++func TestSnapshotDiffChangesReadLinkedDocsFromTheNewerSnapshot(t *testing.T) {
++	e := newAptlyEnv(t)
++	quxOld := entry("libqux", "1.0-1", "  * Initial release.")
++	quxNew := entry("libqux", "2.0-1", "  * New upstream release.") + quxOld
++	lateOld := entry("liblate", "2.5-1", "  * Update the shared data only.") + entry("liblate", "2.0-1", "  * Initial release.")
++	lateNew := entry("liblate", "3.0-1", "  * New upstream release.") + lateOld
++	e.snapshot("a",
++		e.deb(debPackage{name: "libqux1", version: "2.0-1", arch: "amd64", files: []debFile{symlink("usr/share/doc/libqux1", "libqux-common")}}),
++		e.deb(debPackage{name: "libqux-common", version: "2.0-1", arch: "all", files: []debFile{doc("libqux-common", "changelog.Debian.gz", quxNew)}}),
++		e.deb(debPackage{name: "liblate1", version: "2.0-1", arch: "amd64", files: []debFile{symlink("usr/share/doc/liblate1", "liblate-common")}}),
++		e.deb(debPackage{name: "liblate-common", version: "3.0-1", arch: "all", files: []debFile{doc("liblate-common", "changelog.Debian.gz", lateNew)}}),
++	)
++	e.snapshot("b",
++		e.deb(debPackage{name: "libqux1", version: "1.0-1", arch: "amd64", files: []debFile{symlink("usr/share/doc/libqux1", "libqux-common")}}),
++		e.deb(debPackage{name: "libqux-common", version: "1.0-1", arch: "all", files: []debFile{doc("libqux-common", "changelog.Debian.gz", quxOld)}}),
++		e.deb(debPackage{name: "liblate1", version: "3.0-1", arch: "amd64", files: []debFile{symlink("usr/share/doc/liblate1", "liblate-common")}}),
++		e.deb(debPackage{name: "liblate-common", version: "2.5-1", arch: "all", files: []debFile{doc("liblate-common", "changelog.Debian.gz", lateOld)}}),
++	)
++	qux := "\nlibqux (2.0-1) unstable; urgency=medium\n.\n  * New upstream release.\n"
++	late := "\nliblate (3.0-1) unstable; urgency=medium\n.\n  * New upstream release.\n"
++	want := map[string]string{
++		"libqux1_amd64":      qux,
++		"libqux-common_all":  qux,
++		"liblate1_amd64":     "",
++		"liblate-common_all": late,
++	}
++	e.assertChanges("a", "b", want)
++	e.assertChanges("b", "a", want)
++}
++
++func TestSnapshotDiffChangesReadEveryDataTarCompression(t *testing.T) {
++	e := newAptlyEnv(t)
++	var a, b []string
++	want := map[string]string{}
++	for _, compression := range []string{"gzip", "xz", "zstd", "none"} {
++		name := "z" + compression
++		old := entry(name, "1.0-1", "  * Initial release.")
++		changelog := entry(name, "1.1-1", "  * Build the package with "+compression+" compression.") + old
++		a = append(a, e.deb(debPackage{name: name, version: "1.0-1", arch: "amd64", compression: compression, files: []debFile{doc(name, "changelog.Debian.gz", old)}}))
++		b = append(b, e.deb(debPackage{name: name, version: "1.1-1", arch: "amd64", compression: compression, files: []debFile{doc(name, "changelog.Debian.gz", changelog)}}))
++		want[name+"_amd64"] = "\n" + name + " (1.1-1) unstable; urgency=medium\n.\n  * Build the package with " + compression + " compression.\n"
++	}
++	e.snapshot("a", a...)
++	e.snapshot("b", b...)
++	e.assertChanges("a", "b", want)
++}
++
++func TestSnapshotDiffChangesSourcePackages(t *testing.T) {
++	e := newAptlyEnv(t)
++	quiltyOld := entry("quilty", "1.0-1", "  * Initial release.")
++	quiltyNew := entry("quilty", "1.1-1", "  * New upstream release.") + entry("quilty", "1.0-2", "  * Fix the watch file.") + quiltyOld
++	stale := entry("quilty", "0.1-1", "  * Changelog left in the upstream tarball.")
++	gzOld := entry("quiltgz", "2.0-1", "  * Initial release.")
++	gzNew := entry("quiltgz", "2.0-2", "  * Compress the debian tarball with gzip.") + gzOld
++	bzOld := entry("quiltbz", "2.0-1", "  * Initial release.")
++	bzNew := entry("quiltbz", "2.1-1", "  * Compress the debian tarball with bzip2.") + bzOld
++	lzOld := entry("quiltlz", "2.0-1", "  * Initial release.")
++	lzNew := entry("quiltlz", "2.0-1.1", "  * Compress the debian tarball with lzma.") + lzOld
++	natOld := entry("nat", "5", "  * Initial release.")
++	natNew := entry("nat", "6", "  * Native release 6.") + natOld
++	oldNativeOld := entry("onat", "0.1", "  * Initial release.")
++	oldNativeNew := entry("onat", "0.2", "  * Native 1.0 release.") + oldNativeOld
++	diffOld := entry("odiff", "1.0-1", "  * Initial release.")
++	diffNew := entry("odiff", "1.0-2", "  * Keep the Debian changes in the diff.") + diffOld
++	patchUpstream := entry("opatch", "1.0-1", "  * Debian directory shipped by upstream.")
++	patchNew := entry("opatch", "1.1-1", "  * Update the Debian changelog in the diff.") + patchUpstream
++	keepOld := entry("okeep", "1.0-1", "  * Initial release.")
++	keepNew := entry("okeep", "2.0-1", "  * Changelog kept as upstream ships it.") + keepOld
++	e.snapshot("a",
++		e.source(sourcePackage{name: "quilty", upstream: "1.0", format: "3.0 (quilt)", changelog: quiltyOld, origChangelog: stale}),
++		e.source(sourcePackage{name: "quiltgz", upstream: "2.0", format: "3.0 (quilt)", compression: "gzip", changelog: gzOld}),
++		e.source(sourcePackage{name: "quiltbz", upstream: "2.0", format: "3.0 (quilt)", compression: "bzip2", changelog: bzOld}),
++		e.source(sourcePackage{name: "quiltlz", upstream: "2.0", format: "3.0 (quilt)", compression: "lzma", changelog: lzOld}),
++		e.source(sourcePackage{name: "nat", upstream: "5", format: "3.0 (native)", native: true, changelog: natOld}),
++		e.source(sourcePackage{name: "onat", upstream: "0.1", format: "1.0", native: true, changelog: oldNativeOld}),
++		e.source(sourcePackage{name: "odiff", upstream: "1.0", format: "1.0", changelog: diffOld}),
++		e.source(sourcePackage{name: "opatch", upstream: "1.0", format: "1.0", changelog: patchUpstream, origChangelog: patchUpstream}),
++		e.source(sourcePackage{name: "okeep", upstream: "1.0", format: "1.0", changelog: keepOld}),
++	)
++	e.snapshot("b",
++		e.source(sourcePackage{name: "quilty", upstream: "1.1", format: "3.0 (quilt)", changelog: quiltyNew, origChangelog: stale}),
++		e.source(sourcePackage{name: "quiltgz", upstream: "2.0", format: "3.0 (quilt)", compression: "gzip", changelog: gzNew}),
++		e.source(sourcePackage{name: "quiltbz", upstream: "2.1", format: "3.0 (quilt)", compression: "bzip2", changelog: bzNew}),
++		e.source(sourcePackage{name: "quiltlz", upstream: "2.0", format: "3.0 (quilt)", compression: "lzma", changelog: lzNew}),
++		e.source(sourcePackage{name: "nat", upstream: "6", format: "3.0 (native)", native: true, changelog: natNew}),
++		e.source(sourcePackage{name: "onat", upstream: "0.2", format: "1.0", native: true, changelog: oldNativeNew}),
++		e.source(sourcePackage{name: "odiff", upstream: "1.0", format: "1.0", changelog: diffNew}),
++		e.source(sourcePackage{name: "opatch", upstream: "1.1", format: "1.0", changelog: patchNew, origChangelog: patchUpstream}),
++		e.source(sourcePackage{name: "okeep", upstream: "2.0", format: "1.0", changelog: keepNew, origChangelog: keepNew}),
++	)
++	e.assertChanges("a", "b", map[string]string{
++		"quilty_source": "\nquilty (1.1-1) unstable; urgency=medium\n.\n  * New upstream release.\n" +
++			".\nquilty (1.0-2) unstable; urgency=medium\n.\n  * Fix the watch file.\n",
++		"quiltgz_source": "\nquiltgz (2.0-2) unstable; urgency=medium\n.\n  * Compress the debian tarball with gzip.\n",
++		"quiltbz_source": "\nquiltbz (2.1-1) unstable; urgency=medium\n.\n  * Compress the debian tarball with bzip2.\n",
++		"quiltlz_source": "\nquiltlz (2.0-1.1) unstable; urgency=medium\n.\n  * Compress the debian tarball with lzma.\n",
++		"nat_source":     "\nnat (6) unstable; urgency=medium\n.\n  * Native release 6.\n",
++		"onat_source":    "\nonat (0.2) unstable; urgency=medium\n.\n  * Native 1.0 release.\n",
++		"odiff_source":   "\nodiff (1.0-2) unstable; urgency=medium\n.\n  * Keep the Debian changes in the diff.\n",
++		"opatch_source":  "\nopatch (1.1-1) unstable; urgency=medium\n.\n  * Update the Debian changelog in the diff.\n",
++		"okeep_source":   "\nokeep (2.0-1) unstable; urgency=medium\n.\n  * Changelog kept as upstream ships it.\n",
++	})
++}
++
++func TestSnapshotDiffChangesUnpackGitArchiveOrigTarballs(t *testing.T) {
++	e := newAptlyEnv(t)
++	patchUpstream := entry("gpatch", "1.0-1", "  * Debian directory shipped by upstream.")
++	patchNew := entry("gpatch", "1.1-1", "  * Update the Debian changelog in the diff.") + patchUpstream
++	keepOld := entry("gkeep", "1.0-1", "  * Initial release.")
++	keepNew := entry("gkeep", "2.0-1", "  * Changelog kept as upstream ships it.") + keepOld
++	diffOld := entry("gdiff", "1.0-1", "  * Initial release.")
++	diffNew := entry("gdiff", "1.0-2", "  * Keep the Debian changes in the diff.") + diffOld
++	quiltOld := entry("gquilt", "2.0-1", "  * Initial release.")
++	quiltNew := entry("gquilt", "2.1-1", "  * New upstream release.") + quiltOld
++	stale := entry("gquilt", "0.1-1", "  * Changelog left in the upstream repository.")
++	e.snapshot("a",
++		e.source(sourcePackage{name: "gpatch", upstream: "1.0", format: "1.0", gitArchive: true, changelog: patchUpstream, origChangelog: patchUpstream}),
++		e.source(sourcePackage{name: "gkeep", upstream: "1.0", format: "1.0", gitArchive: true, changelog: keepOld}),
++		e.source(sourcePackage{name: "gdiff", upstream: "1.0", format: "1.0", gitArchive: true, changelog: diffOld}),
++		e.source(sourcePackage{name: "gquilt", upstream: "2.0", format: "3.0 (quilt)", gitArchive: true, changelog: quiltOld, origChangelog: stale}),
++	)
++	e.snapshot("b",
++		e.source(sourcePackage{name: "gpatch", upstream: "1.1", format: "1.0", gitArchive: true, changelog: patchNew, origChangelog: patchUpstream}),
++		e.source(sourcePackage{name: "gkeep", upstream: "2.0", format: "1.0", gitArchive: true, changelog: keepNew, origChangelog: keepNew}),
++		e.source(sourcePackage{name: "gdiff", upstream: "1.0", format: "1.0", gitArchive: true, changelog: diffNew}),
++		e.source(sourcePackage{name: "gquilt", upstream: "2.1", format: "3.0 (quilt)", gitArchive: true, changelog: quiltNew, origChangelog: stale}),
++	)
++	e.assertChanges("a", "b", map[string]string{
++		"gpatch_source": "\ngpatch (1.1-1) unstable; urgency=medium\n.\n  * Update the Debian changelog in the diff.\n",
++		"gkeep_source":  "\ngkeep (2.0-1) unstable; urgency=medium\n.\n  * Changelog kept as upstream ships it.\n",
++		"gdiff_source":  "\ngdiff (1.0-2) unstable; urgency=medium\n.\n  * Keep the Debian changes in the diff.\n",
++		"gquilt_source": "\ngquilt (2.1-1) unstable; urgency=medium\n.\n  * New upstream release.\n",
++	})
++}
++
++const securityMerged = `sec (2.2-1) unstable; urgency=medium
++
++  * New upstream release.
++
++ -- Ann Example <ann@example.org>  Mon, 20 Oct 2025 10:00:00 +0000
++
++sec (2.1-1+deb13u1) trixie-security; urgency=high
++
++  * Fix CVE-2025-1234.
++
++ -- Ann Example <ann@example.org>  Fri, 17 Oct 2025 10:00:00 +0000
++
++sec (2.1-2) unstable; urgency=medium
++
++  * Fix the test suite.
++
++ -- Ann Example <ann@example.org>  Mon, 13 Oct 2025 10:00:00 +0000
++
++sec (2.1-1) unstable; urgency=medium
++
++  * Initial release.
++
++ -- Ann Example <ann@example.org>  Mon, 06 Oct 2025 10:00:00 +0000
++`
++
++const spacedChangelog = "fmt (1.5-1) unstable; urgency=medium \t\n" +
++	"\n" +
++	"   \n" +
++	"  * First change.  \n" +
++	"\n" +
++	"\t\n" +
++	"    - nested detail\t\n" +
++	"  [ Ann Example ]\n" +
++	"  * Second change.\n" +
++	"\n" +
++	"\n" +
++	trailer + "  \n" +
++	"\n" +
++	"fmt (1.4-1) experimental; urgency=low\n" +
++	"  * Directly after the heading.\n" +
++	trailer + "\n" +
++	"fmt (1.3-1) unstable; urgency=low\n" +
++	"\n" +
++	"  * Initial release.\n" +
++	"\n" +
++	trailer + "\n"
++
++func TestSnapshotDiffChangesSelectEntriesLikeDpkgParsechangelog(t *testing.T) {
++	e := newAptlyEnv(t)
++	hello := entry("hello", "2.4-1", "  * New upstream release.") + entry("hello", "2.3-2", "  * Fix the manual page.") +
++		entry("hello", "2.3-1", "  * New upstream release.") + entry("hello", "2.2-1", "  * Initial release.")
++	olden := entry("olden", "1.3-1", "  * New upstream release.") + entry("olden", "1.2-1", "  * Initial release.")
++	sec2 := entry("sectwo", "3.1-1", "  * New upstream release.") + entry("sectwo", "3.0-1+deb13u2", "  * Fix CVE-2025-2222.") +
++		entry("sectwo", "3.0-2", "  * Fix the build.") + entry("sectwo", "3.0-1+deb13u1", "  * Fix CVE-2025-1111.") +
++		entry("sectwo", "3.0-1", "  * Initial release.")
++	cases := []struct{ name, older, newer, changelog, want string }{
++		{"hello", "2.3-2~bpo12+1", "2.4-1", hello,
++			"\nhello (2.4-1) unstable; urgency=medium\n.\n  * New upstream release.\n.\nhello (2.3-2) unstable; urgency=medium\n.\n  * Fix the manual page.\n"},
++		{"olden", "0.8-3", "1.3-1", olden,
++			"\nolden (1.3-1) unstable; urgency=medium\n.\n  * New upstream release.\n.\nolden (1.2-1) unstable; urgency=medium\n.\n  * Initial release.\n"},
++		{"sec", "2.1-2", "2.2-1", securityMerged,
++			"\nsec (2.2-1) unstable; urgency=medium\n.\n  * New upstream release.\n.\nsec (2.1-1+deb13u1) trixie-security; urgency=high\n.\n  * Fix CVE-2025-1234.\n"},
++		{"sectwo", "3.0-1+deb13u2", "3.1-1", sec2,
++			"\nsectwo (3.1-1) unstable; urgency=medium\n.\n  * New upstream release.\n"},
++		{"fmt", "1.3-1", "1.5-1", spacedChangelog,
++			"\nfmt (1.5-1) unstable; urgency=medium\n.\n  * First change.\n.\n.\n    - nested detail\n  [ Ann Example ]\n  * Second change.\n" +
++				".\nfmt (1.4-1) experimental; urgency=low\n.\n  * Directly after the heading.\n"},
++	}
++	var a, b []string
++	want := map[string]string{}
++	for _, c := range cases {
++		a = append(a, e.deb(debPackage{name: c.name, version: c.older, arch: "amd64", files: []debFile{
++			doc(c.name, "changelog.Debian.gz", entry(c.name, c.older, "  * Older upload."))}}))
++		b = append(b, e.deb(debPackage{name: c.name, version: c.newer, arch: "amd64", files: []debFile{
++			doc(c.name, "changelog.Debian.gz", c.changelog)}}))
++		want[c.name+"_amd64"] = c.want
++	}
++	e.snapshot("a", a...)
++	e.snapshot("b", b...)
++	e.assertChanges("a", "b", want)
++	e.assertChanges("a", "b", want, "-only-matching")
++}
++
++type changelogRand struct{ state uint64 }
++
++func (r *changelogRand) next() uint64 {
++	r.state += 0x9E3779B97F4A7C15
++	z := r.state
++	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
++	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
++	return z ^ (z >> 31)
++}
++
++func (r *changelogRand) intn(n int) int { return int(r.next() % uint64(n)) }
++
++func (r *changelogRand) chance(percent int) bool { return r.intn(100) < percent }
++
++func (r *changelogRand) pick(choices ...string) string { return choices[r.intn(len(choices))] }
++
++func randomHistory(r *changelogRand) []string {
++	epoch, major, minor, pre, rev, nmu := "", r.intn(3), 1+r.intn(5), 0, 1, false
++	format := func() string {
++		version := epoch + strconv.Itoa(major) + "." + strconv.Itoa(minor)
++		if pre > 0 {
++			version += "~rc" + strconv.Itoa(pre)
++		}
++		version += "-" + strconv.Itoa(rev)
++		if nmu {
++			version += ".1"
++		}
++		return version
++	}
++	history := []string{format()}
++	for n := 3 + r.intn(5); len(history) < n; {
++		switch {
++		case pre > 0 && r.chance(40):
++			pre++
++		case pre > 0:
++			pre = 0
++		case !nmu && r.chance(15):
++			nmu = true
++		case epoch == "" && r.chance(5):
++			epoch, major, minor, rev, nmu = "1:", 0, 1+r.intn(3), 1, false
++		case r.chance(35):
++			rev, nmu = rev+1, false
++		case r.chance(20):
++			major, minor, rev, nmu = major+1, 0, 1, false
++		default:
++			minor, rev, nmu = minor+1, 1, false
++			if r.chance(30) {
++				pre = 1
++			}
++		}
++		history = append(history, format())
++	}
++	return history
++}
++
++var changePhrases = []string{
++	"New upstream release.",
++	"Fix a crash when the configuration file is empty. (Closes: #1065432)",
++	"Update the Brazilian Portuguese debconf translation, thanks to José Silva.",
++	"Bump Standards-Version to 4.7.0, no changes needed.",
++	"Build-Depend on libssl-dev instead of libssl1.1-dev.",
++	"Drop patches applied upstream:",
++	"fix-spelling.patch",
++	"Install the systemd unit into /usr/lib/systemd/system.",
++	"Team upload.",
++	"Non-maintainer upload.",
++	"Refresh patches; one now needs a 3-line offset.",
++	"Mark libfoo-dev Multi-Arch: same.",
++}
++
++func randomBlankLines(r *changelogRand, b *strings.Builder) {
++	count := 1
++	if r.chance(15) {
++		count = 0
++	} else if r.chance(15) {
++		count = 2
++	}
++	for i := 0; i < count; i++ {
++		if r.chance(20) {
++			b.WriteString(r.pick(" ", "\t", "   "))
++		}
++		b.WriteString("\n")
++	}
++}
++
++func randomTrailingSpace(r *changelogRand) string {
++	return r.pick("", "", "", "", " ", "  ", "\t", " \t")
++}
++
++func randomChangelog(r *changelogRand, source string, versions []string) string {
++	var b strings.Builder
++	for i, version := range versions {
++		distribution := r.pick("unstable", "unstable", "experimental", "trixie unstable")
++		if strings.Contains(version, "+deb") {
++			distribution = "trixie-security"
++		}
++		b.WriteString(source + " (" + version + ") " + distribution + "; urgency=" +
++			r.pick("low", "medium", "high", "critical") + randomTrailingSpace(r) + "\n")
++		randomBlankLines(r, &b)
++		items := 1 + r.intn(4)
++		for k := 0; k < items; k++ {
++			if r.chance(10) {
++				b.WriteString("  [ " + r.pick("Ann Example", "Bob Builder", "Zoë Tester") + " ]\n")
++			}
++			b.WriteString(r.pick("  * ", "  * ", "  * ", "    - ", "    + ") + changePhrases[r.intn(len(changePhrases))] + randomTrailingSpace(r) + "\n")
++			if k+1 < items && r.chance(20) {
++				randomBlankLines(r, &b)
++			}
++		}
++		randomBlankLines(r, &b)
++		b.WriteString(" -- " + r.pick("Ann Example <ann@example.org>", "Bob Builder <bob@example.net>") +
++			"  " + r.pick("Mon, 20 Oct 2025 10:00:00 +0000", "Tue, 02 Sep 2025 23:15:42 +0200", "Sun, 05 Jan 2025 08:01:09 -0500") +
++			randomTrailingSpace(r) + "\n")
++		if i+1 < len(versions) {
++			randomBlankLines(r, &b)
++		}
++	}
++	return b.String()
++}
++
++func checkRandomChangelogs(t *testing.T, seed uint64) {
++	e := newAptlyEnv(t)
++	r := &changelogRand{state: seed}
++	var a, b []string
++	want := map[string]string{}
++	for i := 0; i < 10; i++ {
++		name := fmt.Sprintf("rand%d-%d", seed, i)
++		arch := r.pick("amd64", "amd64", "i386", "arm64", "all")
++		history := randomHistory(r)
++		versions := make([]string, 0, len(history)+1)
++		for j := len(history) - 1; j >= 0; j-- {
++			versions = append(versions, history[j])
++		}
++		if len(versions) >= 3 && r.chance(35) {
++			at := 1 + r.intn(len(versions)-2)
++			security := versions[at+1] + "+deb13u1"
++			versions = append(versions[:at], append([]string{security}, versions[at:]...)...)
++		}
++		var older string
++		switch k := r.intn(10); {
++		case k < 5:
++			older = versions[1+r.intn(len(versions)-1)]
++		case k < 8:
++			older = versions[1+r.intn(len(versions)-1)] + "+x1"
++		default:
++			older = "0.0.1-1"
++		}
++		changelog := randomChangelog(r, name, versions)
++		compression := r.pick("gzip", "xz", "zstd", "none")
++		newerDeb := e.deb(debPackage{name: name, version: versions[0], arch: arch, compression: compression, files: []debFile{
++			doc(name, "changelog.Debian.gz", changelog)}})
++		olderDeb := e.deb(debPackage{name: name, version: older, arch: arch, compression: compression, files: []debFile{
++			doc(name, "changelog.Debian.gz", entry(name, older, "  * Older upload."))}})
++		if r.chance(30) {
++			a, b = append(a, newerDeb), append(b, olderDeb)
++		} else {
++			a, b = append(a, olderDeb), append(b, newerDeb)
++		}
++		want[name+"_"+arch] = parsedChanges(t, changelog, older)
++	}
++	e.snapshot("a", a...)
++	e.snapshot("b", b...)
++	e.assertChanges("a", "b", want)
++}
++
++func TestSnapshotDiffChangesRandomChangelogs1(t *testing.T) { checkRandomChangelogs(t, 1) }
++
++func TestSnapshotDiffChangesRandomChangelogs2(t *testing.T) { checkRandomChangelogs(t, 2) }
++
++func TestSnapshotDiffChangesRandomChangelogs3(t *testing.T) { checkRandomChangelogs(t, 3) }
++
++func TestSnapshotDiffChangesRandomChangelogs4(t *testing.T) { checkRandomChangelogs(t, 4) }
++
++func (e *aptlyEnv) serveAPI() *http.Client {
++	e.t.Helper()
++	socket := filepath.Join(e.dir, "api.sock")
++	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	listener.SetUnlinkOnClose(false)
++	file, err := listener.File()
++	_ = listener.Close()
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	log, err := os.Create(filepath.Join(e.dir, "api.log"))
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	cmd := exec.Command("sh", "-c", `LISTEN_PID=$$ LISTEN_FDS=1 exec "$0" "$@"`, aptlyBinary, "-config="+e.config, "api", "serve")
++	cmd.ExtraFiles = []*os.File{file}
++	cmd.Env = aptlyEnviron
++	cmd.Stdout, cmd.Stderr = log, log
++	err = cmd.Start()
++	_ = file.Close()
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	e.t.Cleanup(func() {
++		_ = cmd.Process.Kill()
++		_ = cmd.Wait()
++		_ = log.Close()
++	})
++	return &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
++		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
++	}}}
++}
++
++func (e *aptlyEnv) apiDiff(client *http.Client, path string) []map[string]*string {
++	e.t.Helper()
++	resp, err := client.Get("http://aptly" + path)
++	if err != nil {
++		output, _ := os.ReadFile(filepath.Join(e.dir, "api.log"))
++		e.t.Fatalf("GET %s: %v\n%s", path, err, output)
++	}
++	defer func() { _ = resp.Body.Close() }()
++	if resp.StatusCode != http.StatusOK {
++		e.t.Fatalf("GET %s: status %d", path, resp.StatusCode)
++	}
++	var entries []map[string]*string
++	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
++		e.t.Fatal(err)
++	}
++	return entries
++}
++
++func apiEntryName(entry map[string]*string) string {
++	key := entry["Left"]
++	if key == nil {
++		key = entry["Right"]
++	}
++	fields := strings.Fields(*key)
++	return fields[1] + "_" + strings.TrimPrefix(fields[0], "P")
++}
++
++func TestSnapshotDiffChangesHTTPAPI(t *testing.T) {
++	e := newAptlyEnv(t)
++	fooOld := entry("foo", "1.0-1", "  * Initial release.")
++	fooNew := entry("foo", "1.1-1", "  * New upstream release.") + fooOld
++	srcOld := entry("srcpkg", "0.1-1", "  * Initial release.")
++	srcNew := entry("srcpkg", "0.2-1", "  * New upstream release.") + srcOld
++	e.snapshot("a",
++		e.deb(debPackage{name: "foo", version: "1.0-1", arch: "amd64", files: []debFile{doc("foo", "changelog.Debian.gz", fooOld)}}),
++		e.deb(debPackage{name: "bare", version: "1.0-1", arch: "all"}),
++		e.deb(debPackage{name: "gone", version: "1.0-1", arch: "amd64", files: []debFile{doc("gone", "changelog.Debian.gz", entry("gone", "1.0-1", "  * Initial release."))}}),
++		e.source(sourcePackage{name: "srcpkg", upstream: "0.1", format: "3.0 (quilt)", changelog: srcOld}),
++	)
++	e.snapshot("b",
++		e.deb(debPackage{name: "foo", version: "1.1-1", arch: "amd64", files: []debFile{doc("foo", "changelog.Debian.gz", fooNew)}}),
++		e.deb(debPackage{name: "bare", version: "1.1-1", arch: "all"}),
++		e.deb(debPackage{name: "added", version: "1.0-1", arch: "amd64", files: []debFile{doc("added", "changelog.Debian.gz", entry("added", "1.0-1", "  * Initial release."))}}),
++		e.source(sourcePackage{name: "srcpkg", upstream: "0.2", format: "3.0 (quilt)", changelog: srcNew}),
++	)
++	want := map[string]string{
++		"foo_amd64":     "\nfoo (1.1-1) unstable; urgency=medium\n.\n  * New upstream release.\n",
++		"bare_all":      "",
++		"srcpkg_source": "\nsrcpkg (0.2-1) unstable; urgency=medium\n.\n  * New upstream release.\n",
++	}
++	client := e.serveAPI()
++	for _, path := range []string{"/api/snapshots/a/diff/b?changes=1", "/api/snapshots/a/diff/b?onlyMatching=1&changes=1", "/api/snapshots/b/diff/a?changes=1"} {
++		onlyMatching := strings.Contains(path, "onlyMatching=1")
++		entries := e.apiDiff(client, path)
++		count := 0
++		for _, entry := range entries {
++			name := apiEntryName(entry)
++			if entry["Left"] == nil || entry["Right"] == nil {
++				if onlyMatching {
++					t.Errorf("GET %s returned %s, which is missing from one of the snapshots", path, name)
++				}
++				continue
++			}
++			count++
++			changes := entry["Changes"]
++			if changes == nil {
++				t.Errorf("GET %s: %s has no Changes", path, name)
++			} else if *changes != want[name] {
++				t.Errorf("GET %s: Changes of %s = %q, want %q", path, name, *changes, want[name])
++			}
++		}
++		if count != len(want) {
++			t.Errorf("GET %s returned %d packages present in both snapshots, want %d", path, count, len(want))
++		}
++		if !onlyMatching && len(entries) != len(want)+2 {
++			t.Errorf("GET %s returned %d entries, want %d", path, len(entries), len(want)+2)
++		}
++	}
++	plain := e.apiDiff(client, "/api/snapshots/a/diff/b")
++	if len(plain) != len(want)+2 {
++		t.Errorf("GET without changes returned %d entries, want %d", len(plain), len(want)+2)
++	}
++	for _, entry := range plain {
++		if changes := entry["Changes"]; changes != nil {
++			t.Errorf("GET without changes=1 gives %s Changes %q", apiEntryName(entry), *changes)
++		}
++	}
++}
++
++func TestSnapshotDiffChangesKeepThePlainDiff(t *testing.T) {
++	e := newAptlyEnv(t)
++	fooOld := entry("foo", "1.0-1", "  * Initial release.")
++	fooNew := entry("foo", "1.1-1", "  * New upstream release.") + fooOld
++	same := e.deb(debPackage{name: "same", version: "1.0-1", arch: "all", files: []debFile{doc("same", "changelog.Debian.gz", entry("same", "1.0-1", "  * Initial release."))}})
++	e.snapshot("a",
++		e.deb(debPackage{name: "foo", version: "1.0-1", arch: "amd64", files: []debFile{doc("foo", "changelog.Debian.gz", fooOld)}}),
++		e.deb(debPackage{name: "gone", version: "1.0-1", arch: "amd64", files: []debFile{doc("gone", "changelog.Debian.gz", entry("gone", "1.0-1", "  * Initial release."))}}),
++		same,
++	)
++	e.snapshot("b",
++		e.deb(debPackage{name: "foo", version: "1.1-1", arch: "amd64", files: []debFile{doc("foo", "changelog.Debian.gz", fooNew)}}),
++		e.deb(debPackage{name: "added", version: "1.0-1", arch: "amd64", files: []debFile{doc("added", "changelog.Debian.gz", entry("added", "1.0-1", "  * Initial release."))}}),
++		same,
++	)
++	header := "  Arch   | Package                                  | Version in A                             | Version in B\n"
++	line := func(code, arch, name, a, b string) string {
++		return fmt.Sprintf("%s %-6s | %-40s | %-40s | %-40s\n", code, arch, name, a, b)
++	}
++	foo := line("!", "amd64", "foo", "1.0-1", "1.1-1")
++	added, gone := line("+", "amd64", "added", "-", "1.0-1"), line("-", "amd64", "gone", "1.0-1", "-")
++	changes := map[string]string{"foo_amd64": "\nfoo (1.1-1) unstable; urgency=medium\n.\n  * New upstream release.\n"}
++	for _, c := range []struct {
++		args []string
++		want string
++	}{
++		{[]string{"a", "b"}, header + added + foo + gone},
++		{[]string{"-only-matching", "a", "b"}, header + foo},
++		{[]string{"a", "a"}, "Snapshots are identical.\n"},
++	} {
++		args := append([]string{"snapshot", "diff"}, c.args...)
++		if got := e.run(args...); got != c.want {
++			t.Errorf("aptly %s printed:\n%s\nwant:\n%s", strings.Join(args, " "), got, c.want)
++		}
++	}
++	for _, c := range []struct {
++		args  []string
++		plain string
++	}{
++		{[]string{"-changes", "a", "b"}, header + added + foo + gone},
++		{[]string{"-changes", "-only-matching", "a", "b"}, header + foo},
++	} {
++		args := append([]string{"snapshot", "diff"}, c.args...)
++		e.assertTextUnderRows(strings.Join(args, " "), c.plain, e.run(args...), changes)
++	}
++}
++
++func TestSnapshotDiffChangesOnIdenticalSnapshots(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("a", e.deb(debPackage{name: "foo", version: "1.0-1", arch: "amd64", files: []debFile{
++		doc("foo", "changelog.Debian.gz", entry("foo", "1.0-1", "  * Initial release."))}}))
++	if got := e.run("snapshot", "diff", "-changes", "a", "a"); got != "Snapshots are identical.\n" {
++		t.Errorf("aptly snapshot diff -changes a a printed %q", got)
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..1785ceed
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,196 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || { echo "missing value for --output_path" >&2; usage; }
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 2
++# main.go embeds VERSION, which the image writes and git ignores
++[ -f VERSION ] || printf '%s' 1.6.2 >VERSION
++
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++export GOPROXY=off
++for dir in /usr/local/go/bin /opt/go/bin /usr/local/bin; do
++  case ":$PATH:" in
++    *":$dir:"*) ;;
++    *) [ -d "$dir" ] && PATH="$dir:$PATH" ;;
++  esac
++done
++export PATH
++if ! go list -m all >/dev/null 2>&1 && [ -d /opt/go/pkg/mod ]; then
++  export GOPATH=/opt/go
++  export GOMODCACHE=/opt/go/pkg/mod
++fi
++GO_BUILD_CACHE="$(go env GOCACHE 2>/dev/null)"
++if [ -z "$GO_BUILD_CACHE" ] || ! mkdir -p "$GO_BUILD_CACHE" 2>/dev/null || [ ! -w "$GO_BUILD_CACHE" ]; then
++  GO_BUILD_CACHE="/tmp/go-build-$(id -u)"
++fi
++export GOCACHE="$GO_BUILD_CACHE"
++GOPATH="$(go env GOPATH)"
++GOMODCACHE="$(go env GOMODCACHE)"
++export GOPATH GOMODCACHE
++# the api and context suites keep their default aptly root (~/.aptly) under HOME, so every run gets a fresh one
++export HOME="$(mktemp -d)"
++
++NEW_PKG="github.com/aptly-dev/aptly/cmd"
++NEW_FILE="cmd/snapshot_diff_changes_980467_test.go"
++NEW_RUN='^TestSnapshotDiffChanges'
++LOG="$(mktemp)"
++LIST_ERR="$(mktemp)"
++trap 'rm -f "$LOG" "$LIST_ERR"' EXIT
++LIST_STATUS=0
++
++if [ "$MODE" = "base" ]; then
++  # the regression suites run from the test files the repository ships, whatever the change did to them
++  if git -c safe.directory='*' rev-parse --verify -q HEAD >/dev/null 2>&1; then
++    git -c safe.directory='*' ls-tree -r -z --name-only HEAD | grep -z '_test\.go$' |
++      xargs -0 -r git -c safe.directory='*' checkout -q HEAD -- >>"$LOG" 2>&1
++  fi
++  PKGS="$(go list ./... 2>"$LIST_ERR")"
++  LIST_STATUS=$?
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    PKGS="$(go list -e ./... 2>/dev/null)"
++  fi
++  cat "$LIST_ERR" >>"$LOG"
++  # database/etcddb: every test connects to an etcd server on 127.0.0.1:2379, which the image does not run
++  # files: DiskFullSuite needs a tiny filesystem, either loop-mounted (root with mount privileges) or already mounted at /smallfs
++  # http: the *ConnectError tests expect a DNS "no such host" error, while the offline sandbox reports "network is unreachable"
++  # pgp: Gnupg2VerifierSuite.TestVerifyClearsigned expects three good signing keys, the gpgv in the image reports two
++  # swift: each test binds its fake Swift server to a random port in 20000-29999 with no retry (swift/public_test.go:28), so a port already taken on the host fails it
++  PKGS="$(printf '%s\n' "$PKGS" | grep -v -e '^$' -e "^$NEW_PKG\$" \
++    -e '/database/etcddb$' -e '/files$' -e '/http$' -e '/pgp$' -e '/swift$' -e '/api$')"
++  if [ -n "$PKGS" ]; then
++    go test -v -count=1 -timeout 20m $PKGS >>"$LOG" 2>&1
++    STATUS=$?
++  else
++    STATUS=1
++  fi
++  # api: FilesUploadDiskFullSuite provokes permission errors, which never happen when the tests run as root
++  go test -v -count=1 -timeout 20m ./api/ \
++    -check.f '^(APISuite|GPGSuite|MiddlewareSuite|MirrorSuite|PackagesSuite|PublishedFileMissingSuite|ReposSuite|SnapshotsSuite)\.' >>"$LOG" 2>&1
++  API_STATUS=$?
++  [ "$API_STATUS" -ne 0 ] && STATUS="$API_STATUS"
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    echo "[setup failed] go list ./... exited with status $LIST_STATUS" >>"$LOG"
++    [ "$STATUS" -eq 0 ] && STATUS="$LIST_STATUS"
++  fi
++else
++  go test -v -count=1 -timeout 20m -run "$NEW_RUN" ./cmd/ >>"$LOG" 2>&1
++  STATUS=$?
++fi
++
++if ! grep -qE '^ *--- (PASS|FAIL|SKIP):' "$LOG"; then
++  echo "no tests were collected in mode $MODE" >>"$LOG"
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++cat "$LOG"
++
++expected_tests() {
++  grep -ho '^func TestSnapshotDiffChanges[A-Za-z0-9_]*' "$NEW_FILE" 2>/dev/null | sed 's/^func //'
++}
++
++xml_escape() {
++  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' | tr -d '\000-\010\013\014\016-\037'
++}
++
++add_failures() {
++  suite="$1"
++  message="$2"
++  detail="$3"
++  shift 3
++  grep -q '</testsuites>' "$OUTPUT_PATH" 2>/dev/null || printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++  EXTRA="$(mktemp)"
++  MERGED="$(mktemp)"
++  {
++    echo "<testsuite name=\"$suite\" tests=\"$#\" failures=\"$#\" errors=\"0\">"
++    for name in "$@"; do
++      echo "<testcase name=\"$name\" classname=\"$suite\"><failure message=\"$message\">$detail</failure></testcase>"
++    done
++    echo '</testsuite>'
++  } >"$EXTRA"
++  awk -v extra="$EXTRA" '/<\/testsuites>/ { while ((getline line < extra) > 0) print line } { print }' "$OUTPUT_PATH" >"$MERGED"
++  TESTS="$(grep -c '<testcase ' "$MERGED")"
++  FAILURES="$(grep -c '<failure' "$MERGED")"
++  ERRORS="$(grep -c '<error' "$MERGED")"
++  sed -E "1,/<testsuites/ s#<testsuites[^>]*>#<testsuites tests=\"$TESTS\" failures=\"$FAILURES\" errors=\"$ERRORS\">#" "$MERGED" >"$OUTPUT_PATH"
++  rm -f "$EXTRA" "$MERGED"
++}
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOG" | tr -d '\000-\010\013\014\016-\037' | go-junit-report >"$OUTPUT_PATH" 2>/dev/null || true
++  PANICKED="$(awk '/^--- FAIL: /{name=$3} /^panic: /{print name; exit}' "$LOG")"
++  RAN=0
++  NAMES=""
++  if [ "$MODE" = "new" ]; then
++    SUITE="$NEW_PKG"
++    for name in $(expected_tests); do
++      if grep -q "<testcase name=\"$name\"" "$OUTPUT_PATH" 2>/dev/null; then
++        RAN=1
++      else
++        NAMES="$NAMES $name"
++      fi
++    done
++  else
++    SUITE="github.com/aptly-dev/aptly"
++    if grep -q '<testcase ' "$OUTPUT_PATH" 2>/dev/null; then
++      RAN=1
++    else
++      NAMES="build"
++    fi
++  fi
++  if [ -n "$NAMES" ]; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    DETAIL="$(grep -E '^# |\.go:[0-9]+:[0-9]+: |\[(build|setup) failed\]|^panic|timed out' "$LOG" | head -n 40)"
++    [ -n "$DETAIL" ] || DETAIL="$(tail -n 40 "$LOG")"
++    DETAIL="$(printf '%s\n' "$DETAIL" | xml_escape)"
++    if [ "$RAN" -eq 1 ] && [ -n "$PANICKED" ]; then
++      MESSAGE="not run: the test binary exited after $PANICKED panicked"
++    elif [ "$RAN" -eq 1 ]; then
++      MESSAGE="not run: the test binary exited before reaching this test"
++    else
++      MESSAGE="the test package failed to build or run"
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++    fi
++    add_failures "$SUITE" "$MESSAGE" "$DETAIL" $NAMES
++  fi
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    DETAIL="$(head -n 40 "$LIST_ERR" | xml_escape)"
++    add_failures "$SUITE" "package discovery failed: go list ./... exited with status $LIST_STATUS" "$DETAIL" package_discovery
++  fi
++fi
++
++exit "$STATUS"

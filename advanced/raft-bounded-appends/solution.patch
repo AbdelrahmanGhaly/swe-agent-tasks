@@ -1,0 +1,524 @@
+diff --git a/log.go b/log.go
+index 02e2bb7..8a07de3 100644
+--- a/log.go
++++ b/log.go
+@@ -268,10 +268,49 @@ func (l *raftLog) maxAppliableIndex(allowUnstable bool) uint64 {
+ 	hi := l.committed
+ 	if !allowUnstable {
+ 		hi = min(hi, l.unstable.offset-1)
++	} else {
++		hi = min(hi, l.lastAppendingIndex())
+ 	}
+ 	return hi
+ }
+ 
++// replaced returns true if the log no longer holds the given entry. Compacted
++// entries are not considered replaced, since their terms are no longer known:
++// the messages naming an entry that a snapshot supersedes are dropped when the
++// snapshot is restored, see supersededBySnapshot.
++func (l *raftLog) replaced(id entryID) bool {
++	t, err := l.term(id.index)
++	if err == ErrCompacted {
++		return false
++	}
++	return err != nil || t != id.term
++}
++
++// supersededBySnapshot returns true if restoring a snapshot at the given index
++// compacts the given entry while it is replaced, or while it is neither handed
++// out for appending to storage nor committed. Committed entries are part of
++// the snapshot. The restore loses the terms of the compacted entries, so this
++// has to be checked before it.
++func (l *raftLog) supersededBySnapshot(id entryID, index uint64) bool {
++	if id.index >= index {
++		return false
++	}
++	return l.replaced(id) || (id.index >= l.unstable.offsetInProgress && id.index > l.committed)
++}
++
++// limitsAppends returns true if MaxAppendSizePerReady limits the entries handed
++// out for appending to storage.
++func (l *raftLog) limitsAppends() bool { return l.unstable.maxNextEntsSize != 0 }
++
++// lastAppendingIndex returns the index of the last log entry that is in stable
++// storage, is being written to it, or is returned by nextUnstableEnts.
++func (l *raftLog) lastAppendingIndex() uint64 {
++	if ents := l.nextUnstableEnts(); len(ents) > 0 {
++		return ents[len(ents)-1].GetIndex()
++	}
++	return l.unstable.offsetInProgress - 1
++}
++
+ // nextUnstableSnapshot returns the snapshot, if present, that is available to
+ // be applied to the local storage and is not already in-progress.
+ func (l *raftLog) nextUnstableSnapshot() *pb.Snapshot {
+diff --git a/log_unstable.go b/log_unstable.go
+index a0cbb59..30141e3 100644
+--- a/log_unstable.go
++++ b/log_unstable.go
+@@ -49,6 +49,9 @@ type unstable struct {
+ 	// contains the index following the largest in-progress entry.
+ 	// Invariant: offset <= offsetInProgress
+ 	offsetInProgress uint64
++	// maxNextEntsSize limits the byte size of the entries returned by
++	// nextEntries. Zero means no limit.
++	maxNextEntsSize entryEncodingSize
+ 
+ 	logger Logger
+ }
+@@ -96,13 +99,17 @@ func (u *unstable) maybeTerm(i uint64) (uint64, bool) {
+ }
+ 
+ // nextEntries returns the unstable entries that are not already in the process
+-// of being written to storage.
++// of being written to storage, up to maxNextEntsSize bytes.
+ func (u *unstable) nextEntries() []*pb.Entry {
+ 	inProgress := int(u.offsetInProgress - u.offset)
+ 	if len(u.entries) == inProgress {
+ 		return nil
+ 	}
+-	return u.entries[inProgress:]
++	ents := u.entries[inProgress:]
++	if u.maxNextEntsSize != 0 {
++		ents = limitSize(ents, u.maxNextEntsSize)
++	}
++	return ents
+ }
+ 
+ // nextSnapshot returns the unstable snapshot, if one exists that is not already
+@@ -114,15 +121,20 @@ func (u *unstable) nextSnapshot() *pb.Snapshot {
+ 	return proto.Clone(u.snapshot).(*pb.Snapshot)
+ }
+ 
+-// acceptInProgress marks all entries and the snapshot, if any, in the unstable
+-// as having begun the process of being written to storage. The entries/snapshot
+-// will no longer be returned from nextEntries/nextSnapshot. However, new
+-// entries/snapshots added after a call to acceptInProgress will be returned
+-// from those methods, until the next call to acceptInProgress.
++// acceptInProgress marks the entries returned by nextEntries and the snapshot,
++// if any, in the unstable as having begun the process of being written to
++// storage. The entries/snapshot will no longer be returned from
++// nextEntries/nextSnapshot. However, new entries/snapshots added after a call
++// to acceptInProgress, and entries left out by maxNextEntsSize, will be
++// returned from those methods, until the next call to acceptInProgress.
+ func (u *unstable) acceptInProgress() {
+-	if len(u.entries) > 0 {
++	ents := u.entries
++	if u.maxNextEntsSize != 0 {
++		ents = u.nextEntries()
++	}
++	if len(ents) > 0 {
+ 		// NOTE: +1 because offsetInProgress is exclusive, like offset.
+-		u.offsetInProgress = u.entries[len(u.entries)-1].GetIndex() + 1
++		u.offsetInProgress = ents[len(ents)-1].GetIndex() + 1
+ 	}
+ 	if u.snapshot != nil {
+ 		u.snapshotInProgress = true
+diff --git a/node.go b/node.go
+index b65bf7a..3967682 100644
+--- a/node.go
++++ b/node.go
+@@ -351,17 +351,23 @@ func (n *node) run() {
+ 	lead := None
+ 
+ 	for {
+-		if advancec == nil && n.rn.HasReady() {
+-			// Populate a Ready. Note that this Ready is not guaranteed to
+-			// actually be handled. We will arm readyc, but there's no guarantee
+-			// that we will actually send on it. It's possible that we will
+-			// service another channel instead, loop around, and then populate
+-			// the Ready again. We could instead force the previous Ready to be
+-			// handled first, but it's generally good to emit larger Readys plus
+-			// it simplifies testing (by emitting less frequently and more
+-			// predictably).
+-			rd = n.rn.readyWithoutAccept()
+-			readyc = n.readyc
++		if advancec == nil {
++			if n.rn.HasReady() {
++				// Populate a Ready. Note that this Ready is not guaranteed to
++				// actually be handled. We will arm readyc, but there's no
++				// guarantee that we will actually send on it. It's possible that
++				// we will service another channel instead, loop around, and then
++				// populate the Ready again. We could instead force the previous
++				// Ready to be handled first, but it's generally good to emit
++				// larger Readys plus it simplifies testing (by emitting less
++				// frequently and more predictably).
++				rd = n.rn.readyWithoutAccept()
++				readyc = n.readyc
++			} else {
++				// A Ready populated before the last state change may no longer
++				// match the RawNode, so it must not be handed out.
++				readyc = nil
++			}
+ 		}
+ 
+ 		if lead != r.lead {
+diff --git a/raft.go b/raft.go
+index 5d92f7b..ee489e2 100644
+--- a/raft.go
++++ b/raft.go
+@@ -199,6 +199,12 @@ type Config struct {
+ 	// Ready structs to encompass all outstanding entries in unacknowledged
+ 	// MsgStorageApply messages when AsyncStorageWrites is enabled.
+ 	MaxCommittedSizePerReady uint64
++	// MaxAppendSizePerReady limits the byte size of the log entries handed to
++	// the application for appending to storage in one Ready (or one
++	// MsgStorageAppend when AsyncStorageWrites is enabled), counted like
++	// MaxSizePerMsg. An entry larger than the limit is handed out alone, and
++	// the remaining entries wait for later Ready structs. Note: 0 for no limit.
++	MaxAppendSizePerReady uint64
+ 	// MaxUncommittedEntriesSize limits the aggregate byte size of the
+ 	// uncommitted entries that may be appended to a leader's log. Once this
+ 	// limit is exceeded, proposals will begin to return ErrProposalDropped
+@@ -366,6 +372,10 @@ type raft struct {
+ 	//
+ 	// Messages in this list must target other nodes.
+ 	msgs []*pb.Message
++	// msgsAwaitingEntries contains messages from msgs that refer to log
++	// entries which MaxAppendSizePerReady has not handed out for appending to
++	// storage yet.
++	msgsAwaitingEntries []*pb.Message
+ 	// msgsAfterAppend contains the list of messages that should be sent after
+ 	// the accumulated unstable state (e.g. term, vote, []entry, and snapshot)
+ 	// has been persisted to durable storage. This includes waiting for any
+@@ -377,6 +387,10 @@ type raft struct {
+ 	// Messages in this list have the type MsgAppResp, MsgVoteResp, or
+ 	// MsgPreVoteResp. See the comment in raft.send for details.
+ 	msgsAfterAppend []*pb.Message
++	// msgsAwaitingAppend contains append acknowledgements from msgsAfterAppend
++	// that cover log entries which MaxAppendSizePerReady has not handed out for
++	// appending to storage yet.
++	msgsAwaitingAppend []*pb.Message
+ 
+ 	// the leader id
+ 	lead uint64
+@@ -441,6 +455,7 @@ func newRaft(c *Config) *raft {
+ 		panic(err.Error())
+ 	}
+ 	raftlog := newLogWithSize(c.Storage, c.Logger, entryEncodingSize(c.MaxCommittedSizePerReady))
++	raftlog.unstable.maxNextEntsSize = entryEncodingSize(c.MaxAppendSizePerReady)
+ 	hs, cs, err := c.Storage.InitialState()
+ 	if err != nil {
+ 		panic(err) // TODO(bdarnell)
+@@ -509,6 +524,109 @@ func (r *raft) hardState() *pb.HardState {
+ 	}
+ }
+ 
++// readyHardState returns the HardState to hand out with the next Ready. Its
++// commit index does not exceed the log entries handed out for appending to
++// storage, so that the node can restart from what the application persisted.
++func (r *raft) readyHardState() *pb.HardState {
++	hs := r.hardState()
++	hs.Commit = new(min(r.raftLog.committed, r.raftLog.lastAppendingIndex()))
++	return hs
++}
++
++// afterAppendMsgs splits the messages waiting for the unstable state to be
++// persisted into those that can be released once the log entries up to index
++// are persisted, and the append acknowledgements that cover later entries and
++// have to keep waiting. An acknowledgement is dropped once the term has moved
++// on, since a newer leader may have replaced the entries it acknowledges. Vote
++// responses and append rejections are released right away.
++func (r *raft) afterAppendMsgs(index uint64) (release, wait []*pb.Message) {
++	for _, msgs := range [][]*pb.Message{r.msgsAwaitingAppend, r.msgsAfterAppend} {
++		for _, m := range msgs {
++			if m.GetType() == pb.MsgAppResp && !m.GetReject() {
++				if m.GetTerm() < r.Term {
++					continue
++				}
++				if m.GetIndex() > index {
++					wait = append(wait, m)
++					continue
++				}
++			}
++			release = append(release, m)
++		}
++	}
++	return release, wait
++}
++
++// readyMsgs splits the messages to be sent into those that only refer to log
++// entries up to index, and those that refer to later entries and have to wait.
++// A message naming an entry that has since been replaced is dropped, since the
++// entry it depends on will never be handed out.
++func (r *raft) readyMsgs(index uint64) (release, wait []*pb.Message) {
++	for _, msgs := range [][]*pb.Message{r.msgsAwaitingEntries, r.msgs} {
++		for _, m := range msgs {
++			last, id := msgLogDependency(m)
++			if id.index != 0 && r.raftLog.replaced(id) {
++				continue
++			}
++			if last > index {
++				wait = append(wait, m)
++				continue
++			}
++			release = append(release, m)
++		}
++	}
++	return release, wait
++}
++
++// msgsNotSupersededBy returns the given messages without those naming a log
++// entry that restoring a snapshot at the given index supersedes. Such a message
++// can never be sent, and the restore loses the term readyMsgs would need to
++// tell.
++func (r *raft) msgsNotSupersededBy(msgs []*pb.Message, index uint64) []*pb.Message {
++	var kept []*pb.Message
++	for _, m := range msgs {
++		if _, id := msgLogDependency(m); id.index == 0 || !r.raftLog.supersededBySnapshot(id, index) {
++			kept = append(kept, m)
++		}
++	}
++	return kept
++}
++
++// msgLogDependency returns the highest log index a message refers to, and the
++// last entry it carries or names, if any.
++func msgLogDependency(m *pb.Message) (uint64, entryID) {
++	switch m.GetType() {
++	case pb.MsgApp:
++		id := entryID{term: m.GetLogTerm(), index: m.GetIndex()}
++		if ents := m.GetEntries(); len(ents) > 0 {
++			id = entryID{term: ents[len(ents)-1].GetTerm(), index: ents[len(ents)-1].GetIndex()}
++		}
++		return max(id.index, m.GetCommit()), id
++	case pb.MsgVote, pb.MsgPreVote:
++		return m.GetIndex(), entryID{term: m.GetLogTerm(), index: m.GetIndex()}
++	case pb.MsgHeartbeat:
++		return m.GetCommit(), entryID{}
++	case pb.MsgReadIndexResp:
++		return m.GetIndex(), entryID{}
++	}
++	return 0, entryID{}
++}
++
++// readyReadStates splits the read states into those that only refer to log
++// entries up to index, and those that refer to later entries and have to wait
++// for them to be handed out. Without MaxAppendSizePerReady, read states are
++// returned as soon as they are known, as before.
++func (r *raft) readyReadStates(index uint64) (release, wait []ReadState) {
++	for _, rs := range r.readStates {
++		if r.raftLog.limitsAppends() && rs.Index > index {
++			wait = append(wait, rs)
++			continue
++		}
++		release = append(release, rs)
++	}
++	return release, wait
++}
++
+ // send schedules persisting state to a stable storage and AFTER that
+ // sending the message (as part of next Ready message processing).
+ func (r *raft) send(m *pb.Message) {
+@@ -1918,6 +2036,8 @@ func (r *raft) restore(s *pb.Snapshot) bool {
+ 		return false
+ 	}
+ 
++	r.msgs = r.msgsNotSupersededBy(r.msgs, id.index)
++	r.msgsAwaitingEntries = r.msgsNotSupersededBy(r.msgsAwaitingEntries, id.index)
+ 	r.raftLog.restore(s)
+ 
+ 	// Reset the configuration and add the (potentially updated) peers in anew.
+diff --git a/rawnode.go b/rawnode.go
+index dddb798..49cf161 100644
+--- a/rawnode.go
++++ b/rawnode.go
+@@ -139,32 +139,35 @@ func (rn *RawNode) Ready() Ready {
+ func (rn *RawNode) readyWithoutAccept() Ready {
+ 	r := rn.raft
+ 
++	index := r.raftLog.lastAppendingIndex()
++	msgs, _ := r.readyMsgs(index)
+ 	rd := Ready{
+ 		Entries:          r.raftLog.nextUnstableEnts(),
+ 		CommittedEntries: r.raftLog.nextCommittedEnts(rn.applyUnstableEntries()),
+-		Messages:         r.msgs,
++		Messages:         msgs,
+ 	}
+ 	if softSt := r.softState(); !softSt.equal(rn.prevSoftSt) {
+ 		// Allocate only when SoftState changes.
+ 		escapingSoftSt := softSt
+ 		rd.SoftState = &escapingSoftSt
+ 	}
+-	if hardSt := r.hardState(); !isHardStateEqual(hardSt, rn.prevHardSt) {
++	if hardSt := r.readyHardState(); !isHardStateEqual(hardSt, rn.prevHardSt) {
+ 		rd.HardState = hardSt
+ 	}
+ 	if r.raftLog.hasNextUnstableSnapshot() {
+ 		rd.Snapshot = r.raftLog.nextUnstableSnapshot()
+ 	}
+-	if len(r.readStates) != 0 {
+-		rd.ReadStates = r.readStates
++	if readStates, _ := r.readyReadStates(index); len(readStates) != 0 {
++		rd.ReadStates = readStates
+ 	}
+ 	rd.MustSync = MustSync(r.hardState(), rn.prevHardSt, len(rd.Entries))
+ 
++	afterAppend, _ := r.afterAppendMsgs(index)
+ 	if rn.asyncStorageWrites {
+ 		// If async storage writes are enabled, enqueue messages to
+ 		// local storage threads, where applicable.
+-		if needStorageAppendMsg(r, rd) {
+-			m := newStorageAppendMsg(r, rd)
++		if needStorageAppendMsg(rd, afterAppend) {
++			m := newStorageAppendMsg(r, rd, afterAppend)
+ 			rd.Messages = append(rd.Messages, m)
+ 		}
+ 		if needStorageApplyMsg(rd) {
+@@ -176,7 +179,7 @@ func (rn *RawNode) readyWithoutAccept() Ready {
+ 		// msgsAfterAppend to be sent out. The Ready struct contract
+ 		// mandates that Messages cannot be sent until after Entries
+ 		// are written to stable storage.
+-		for _, m := range r.msgsAfterAppend {
++		for _, m := range afterAppend {
+ 			if m.GetTo() != r.id {
+ 				rd.Messages = append(rd.Messages, m)
+ 			}
+@@ -197,14 +200,14 @@ func MustSync(st, prevst *pb.HardState, entsnum int) bool {
+ 	return entsnum != 0 || st.GetVote() != prevst.GetVote() || st.GetTerm() != prevst.GetTerm()
+ }
+ 
+-func needStorageAppendMsg(r *raft, rd Ready) bool {
++func needStorageAppendMsg(rd Ready, afterAppend []*pb.Message) bool {
+ 	// Return true if log entries, hard state, or a snapshot need to be written
+ 	// to stable storage. Also return true if any messages are contingent on all
+ 	// prior MsgStorageAppend being processed.
+ 	return len(rd.Entries) > 0 ||
+ 		!IsEmptyHardState(rd.HardState) ||
+ 		!IsEmptySnap(rd.Snapshot) ||
+-		len(r.msgsAfterAppend) > 0
++		len(afterAppend) > 0
+ }
+ 
+ func needStorageAppendRespMsg(r *raft, rd Ready) bool {
+@@ -220,7 +223,7 @@ func needStorageAppendRespMsg(r *raft, rd Ready) bool {
+ // state, and apply a snapshot. The message also carries a set of responses
+ // that should be delivered after the rest of the message is processed. Used
+ // with AsyncStorageWrites.
+-func newStorageAppendMsg(r *raft, rd Ready) *pb.Message {
++func newStorageAppendMsg(r *raft, rd Ready, afterAppend []*pb.Message) *pb.Message {
+ 	m := &pb.Message{
+ 		Type:    pb.MsgStorageAppend.Enum(),
+ 		To:      new(LocalAppendThread),
+@@ -242,16 +245,16 @@ func newStorageAppendMsg(r *raft, rd Ready) *pb.Message {
+ 	if !IsEmptySnap(rd.Snapshot) {
+ 		m.Snapshot = rd.Snapshot
+ 	}
+-	// Attach all messages in msgsAfterAppend as responses to be delivered after
+-	// the message is processed, along with a self-directed MsgStorageAppendResp
+-	// to acknowledge the entry stability.
++	// Attach the messages from msgsAfterAppend that can be released as
++	// responses to be delivered after the message is processed, along with a
++	// self-directed MsgStorageAppendResp to acknowledge the entry stability.
+ 	//
+ 	// NB: it is important for performance that MsgStorageAppendResp message be
+ 	// handled after self-directed MsgAppResp messages on the leader (which will
+ 	// be contained in msgsAfterAppend). This ordering allows the MsgAppResp
+ 	// handling to use a fast-path in r.raftLog.term() before the newly appended
+ 	// entries are removed from the unstable log.
+-	m.Responses = r.msgsAfterAppend
++	m.Responses = afterAppend
+ 	if needStorageAppendRespMsg(r, rd) {
+ 		resp := newStorageAppendRespMsg(r, rd)
+ 		m.Responses = append(m.GetResponses(), resp)
+@@ -336,12 +339,13 @@ func newStorageAppendRespMsg(r *raft, rd Ready) *pb.Message {
+ 		//
+ 		//  if len(rd.Entries) > 0 { ... }
+ 		//
+-		// To do so, we attach r.raftLog.lastIndex() and r.raftLog.lastTerm(), not the
+-		// (index, term) of the last entry in rd.Entries. If rd.Entries is not empty,
+-		// these will be the same. However, if rd.Entries is empty, we still want to
+-		// attest that this (index, term) is correct at the current term, in case the
+-		// MsgStorageAppend that contained the last entry in the unstable slice carried
+-		// an earlier term and was dropped.
++		// To do so, we attach the (index, term) of the last entry handed out for
++		// appending, not the (index, term) of the last entry in rd.Entries. If
++		// rd.Entries is not empty, these will be the same. However, if rd.Entries is
++		// empty, we still want to attest that this (index, term) is correct at the
++		// current term, in case the MsgStorageAppend that contained the last entry
++		// handed out carried an earlier term and was dropped. Entries that
++		// MaxAppendSizePerReady holds back for later Ready structs are not covered.
+ 		//
+ 		// A MsgStorageAppend with a new term is emitted on each term change. This is
+ 		// the same condition that causes MsgStorageAppendResp messages with earlier
+@@ -352,9 +356,13 @@ func newStorageAppendRespMsg(r *raft, rd Ready) *pb.Message {
+ 		// dropped from memory.
+ 		//
+ 		// [^1]: https://en.wikipedia.org/wiki/ABA_problem
+-		last := r.raftLog.lastEntryID()
+-		m.Index = new(last.index)
+-		m.LogTerm = new(last.term)
++		index := r.raftLog.lastAppendingIndex()
++		term, err := r.raftLog.term(index)
++		if err != nil {
++			r.logger.Panicf("unexpected error when getting the term at %d: %v", index, err)
++		}
++		m.Index = new(index)
++		m.LogTerm = new(term)
+ 	}
+ 	if !IsEmptySnap(rd.Snapshot) {
+ 		m.Snapshot = rd.Snapshot
+@@ -398,20 +406,22 @@ func newStorageApplyRespMsg(r *raft, ents []*pb.Entry) *pb.Message {
+ // ahead and handle a Ready. Nothing must alter the state of the RawNode between
+ // this call and the prior call to Ready().
+ func (rn *RawNode) acceptReady(rd Ready) {
++	index := rn.raft.raftLog.lastAppendingIndex()
++	_, awaitingEntries := rn.raft.readyMsgs(index)
++	_, readStates := rn.raft.readyReadStates(index)
++	afterAppend, awaitingAppend := rn.raft.afterAppendMsgs(index)
+ 	if rd.SoftState != nil {
+ 		rn.prevSoftSt = rd.SoftState
+ 	}
+ 	if !IsEmptyHardState(rd.HardState) {
+ 		rn.prevHardSt = rd.HardState
+ 	}
+-	if len(rd.ReadStates) != 0 {
+-		rn.raft.readStates = nil
+-	}
++	rn.raft.readStates = readStates
+ 	if !rn.asyncStorageWrites {
+ 		if len(rn.stepsOnAdvance) != 0 {
+ 			rn.raft.logger.Panicf("two accepted Ready structs without call to Advance")
+ 		}
+-		for _, m := range rn.raft.msgsAfterAppend {
++		for _, m := range afterAppend {
+ 			if m.GetTo() == rn.raft.id {
+ 				rn.stepsOnAdvance = append(rn.stepsOnAdvance, m)
+ 			}
+@@ -426,7 +436,9 @@ func (rn *RawNode) acceptReady(rd Ready) {
+ 		}
+ 	}
+ 	rn.raft.msgs = nil
++	rn.raft.msgsAwaitingEntries = awaitingEntries
+ 	rn.raft.msgsAfterAppend = nil
++	rn.raft.msgsAwaitingAppend = awaitingAppend
+ 	rn.raft.raftLog.acceptUnstable()
+ 	if len(rd.CommittedEntries) > 0 {
+ 		ents := rd.CommittedEntries
+@@ -451,19 +463,23 @@ func (rn *RawNode) HasReady() bool {
+ 	if softSt := r.softState(); !softSt.equal(rn.prevSoftSt) {
+ 		return true
+ 	}
+-	if hardSt := r.hardState(); !IsEmptyHardState(hardSt) && !isHardStateEqual(hardSt, rn.prevHardSt) {
++	if hardSt := r.readyHardState(); !IsEmptyHardState(hardSt) && !isHardStateEqual(hardSt, rn.prevHardSt) {
+ 		return true
+ 	}
+ 	if r.raftLog.hasNextUnstableSnapshot() {
+ 		return true
+ 	}
+-	if len(r.msgs) > 0 || len(r.msgsAfterAppend) > 0 {
++	index := r.raftLog.lastAppendingIndex()
++	if msgs, _ := r.readyMsgs(index); len(msgs) > 0 {
++		return true
++	}
++	if afterAppend, _ := r.afterAppendMsgs(index); len(afterAppend) > 0 {
+ 		return true
+ 	}
+ 	if r.raftLog.hasNextUnstableEnts() || r.raftLog.hasNextCommittedEnts(rn.applyUnstableEntries()) {
+ 		return true
+ 	}
+-	if len(r.readStates) != 0 {
++	if readStates, _ := r.readyReadStates(index); len(readStates) != 0 {
+ 		return true
+ 	}
+ 	return false

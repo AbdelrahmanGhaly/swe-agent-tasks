@@ -1,0 +1,839 @@
+diff --git a/docs/source/db.md b/docs/source/db.md
+index 92cdf6e..29b7046 100644
+--- a/docs/source/db.md
++++ b/docs/source/db.md
+@@ -414,6 +414,20 @@ git push origin main
+ redun push prod
+ ```
+ 
++## Pruning executions
++
++A repository keeps every execution it has ever recorded. `RedunBackendDb.prune()` removes executions that are no longer needed, along with the records that only they used:
++
++```py
++from redun import Scheduler
++
++scheduler = Scheduler()
++scheduler.load()
++scheduler.backend.prune(["6ae55d13-...", "c0e7cb04-..."])
++```
++
++Records are shared between executions, so a CallNode, Value or Tag is only removed once no remaining execution refers to it. The cached results of the removed task calls are dropped as well, so a call that no remaining execution made runs again the next time it is evaluated. With a [value store](#optional-value-store), the stored data of every removed value is deleted from it too.
++
+ ## Database migration
+ 
+ The redun CLI will automatically initialize and upgrade the redun database in most cases, so users will oftentimes not need to manage database versioning themselves. However, there are certain situations where users may want or need to manage database upgrades explicitly, such as upgrading a central shared PostgreSQL database. Here, we review common commands for inspecting and managing database version upgrades.
+diff --git a/redun/backends/db/__init__.py b/redun/backends/db/__init__.py
+index dac4cb4..5aa7709 100644
+--- a/redun/backends/db/__init__.py
++++ b/redun/backends/db/__init__.py
+@@ -61,7 +61,7 @@ from sqlalchemy.sql.expression import cast as sa_cast
+ from sqlalchemy.types import TypeDecorator
+ 
+ from redun.backends.base import KeyValue, RedunBackend, TagEntity, TagMap
+-from redun.backends.db import serializers
++from redun.backends.db import pruning, serializers
+ from redun.backends.value_store import ValueStore
+ from redun.config import Section, create_config_section
+ from redun.db_utils import filter_in, get_or_create, query_filter_in
+@@ -2469,6 +2469,13 @@ class RedunBackendDb(RedunBackend):
+             for call_node in call_nodes
+             if call_node2task_hashes[call_node.call_hash] <= scheduler_task_hashes
+         ]
++        if current_call_nodes:
++            cacheable = pruning.find_cacheable_call_nodes(
++                self.session, [call_node.call_hash for call_node in current_call_nodes]
++            )
++            current_call_nodes = [
++                call_node for call_node in current_call_nodes if call_node.call_hash in cacheable
++            ]
+ 
+         if current_call_nodes:
+             # Use the newest CallNode.
+@@ -3211,6 +3218,36 @@ class RedunBackendDb(RedunBackend):
+             # Propose next edges to search.
+             child_edges = self.get_child_record_ids(new_model_ids)
+ 
++    @db_retry
++    @use_acquire
++    def prune(self, execution_ids: Iterable[str]) -> None:
++        """
++        Removes Executions along with the records that only they use.
++
++        Parameters
++        ----------
++        execution_ids : Iterable[str]
++            Ids of Executions to remove.
++        """
++        assert self.session
++
++        selected = pruning.select_executions(self.session, execution_ids)
++        prune_set = pruning.find_prune_set(
++            self.session, selected, lambda value_hash: self.get_value(value_hash)[0]
++        )
++        try:
++            pruning.delete_prune_set(self.session, prune_set)
++            self.session.commit()
++        except Exception:
++            self.session.rollback()
++            raise
++        self.session.expire_all()
++
++        # Value data is only removed once the database no longer refers to it.
++        if self.value_store:
++            for value_hash in sorted(prune_set.value_hashes):
++                self.value_store.delete(value_hash)
++
+     @staticmethod
+     def _get_uri(db_uri: str | None, conf: Section) -> str:
+         db_aws_secret_name = conf.get("db_aws_secret_name", "")
+diff --git a/redun/backends/db/pruning.py b/redun/backends/db/pruning.py
+new file mode 100644
+index 0000000..ef596df
+--- /dev/null
++++ b/redun/backends/db/pruning.py
+@@ -0,0 +1,694 @@
++from collections import defaultdict
++from collections.abc import Callable, Iterable, Iterator
++from typing import Any, NamedTuple
++
++from sqlalchemy.orm import Session
++
++from redun.backends import db
++from redun.db_utils import filter_in, query_filter_in
++from redun.handle import Handle, get_call_state_hash
++from redun.utils import iter_nested_value
++
++EvalKey = tuple[str, str]
++ValueLoader = Callable[[str], Any]
++
++
++class PruneSet(NamedTuple):
++    """
++    The rows a prune removes, grouped by the id they are deleted by.
++    """
++
++    execution_ids: set[str]
++    job_ids: set[str]
++    call_hashes: set[str]
++    eval_hashes: set[str]
++    value_hashes: set[str]
++    tag_hashes: set[str]
++
++
++def select_executions(session: Session, execution_ids: Iterable[str]) -> set[str]:
++    """
++    Returns the ids of the Executions that exist among the given ids.
++    """
++    return {
++        execution_id
++        for (execution_id,) in filter_in(
++            session.query(db.Execution.id), db.Execution.id, set(execution_ids)
++        )
++    }
++
++
++def _close(roots: Iterable[str], edges: dict[str, set[str]]) -> set[str]:
++    """
++    Returns all nodes reachable from `roots` by following `edges`.
++    """
++    seen: set[str] = set()
++    stack = list(roots)
++    while stack:
++        node = stack.pop()
++        if node in seen:
++            continue
++        seen.add(node)
++        stack.extend(edges.get(node, ()))
++    return seen
++
++
++def _expand(
++    session: Session,
++    roots: Iterable[str],
++    get_children: Callable[[Session, Iterable[str]], Iterable[str]],
++) -> set[str]:
++    """
++    Returns `roots` and their descendants, fetching children a layer at a time.
++    """
++    seen: set[str] = set()
++    layer = set(roots)
++    while layer:
++        seen |= layer
++        layer = set(get_children(session, layer)) - seen
++    return seen
++
++
++def _get_call_node_children(session: Session, call_hashes: Iterable[str]) -> Iterator[str]:
++    """
++    Iterates the child and upstream CallNodes of the given CallNodes.
++    """
++    call_hashes = list(call_hashes)
++    for (child_id,) in filter_in(
++        session.query(db.CallEdge.child_id), db.CallEdge.parent_id, call_hashes
++    ):
++        yield child_id
++
++    upstreams = session.query(db.ArgumentResult.result_call_hash).join(
++        db.Argument, db.Argument.arg_hash == db.ArgumentResult.arg_hash
++    )
++    for (upstream_id,) in filter_in(upstreams, db.Argument.call_hash, call_hashes):
++        yield upstream_id
++
++
++def _iter_handle_links(
++    session: Session, handle_hashes: Iterable[str]
++) -> Iterator[tuple[str, str]]:
++    """
++    Iterates the (parent, child) hashes of the lineage links that touch the given Handle states.
++
++    Most links are HandleEdges. A state that was forked outside of a Task has none, but its
++    hash is derived from the hash of the state it was forked from, which is how that link is
++    recognized.
++    """
++    handle_hashes = set(handle_hashes)
++    for column in (db.HandleEdge.parent_id, db.HandleEdge.child_id):
++        for parent_hash, child_hash in filter_in(
++            session.query(db.HandleEdge.parent_id, db.HandleEdge.child_id), column, handle_hashes
++        ):
++            yield parent_hash, child_hash
++
++    fullnames = {
++        fullname
++        for (fullname,) in filter_in(
++            session.query(db.Handle.fullname), db.Handle.hash, handle_hashes
++        )
++    }
++    for fullname in fullnames:
++        states = (
++            session.query(db.Handle.hash, db.Handle.key)
++            .filter(db.Handle.fullname == fullname)
++            .all()
++        )
++        forks = {handle_hash: key or "" for handle_hash, key in states}
++        keys = set(forks.values())
++        for parent_hash, _ in states:
++            for key in keys:
++                child_hash = get_call_state_hash(fullname, key, parent_hash)
++                if forks.get(child_hash) == key and handle_hashes & {parent_hash, child_hash}:
++                    yield parent_hash, child_hash
++
++
++def _get_handle_values(session: Session, handle_hashes: Iterable[str]) -> dict[str, str]:
++    """
++    Returns the Value of each of the given Handle states.
++    """
++    return {
++        handle_hash: value_hash
++        for handle_hash, value_hash in filter_in(
++            session.query(db.Handle.hash, db.Handle.value_hash), db.Handle.hash, handle_hashes
++        )
++    }
++
++
++def _get_value_children(session: Session, value_hashes: Iterable[str]) -> Iterator[str]:
++    """
++    Iterates the Values that hang off the given Values.
++
++    These are their subvalues and, for Handles, the neighboring states of their lineage.
++    """
++    value_hashes = list(value_hashes)
++    for (value_hash,) in filter_in(
++        session.query(db.Subvalue.value_hash), db.Subvalue.parent_value_hash, value_hashes
++    ):
++        yield value_hash
++
++    handle_hashes = [
++        handle_hash
++        for (handle_hash,) in filter_in(
++            session.query(db.Handle.hash), db.Handle.value_hash, value_hashes
++        )
++    ]
++    neighbors = {
++        handle_hash for link in _iter_handle_links(session, handle_hashes) for handle_hash in link
++    }
++    yield from _get_handle_values(session, neighbors).values()
++
++
++def _get_call_node_parents(
++    session: Session, call_hashes: set[str]
++) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
++    """
++    Returns the CallNodes that refer to each of the given CallNodes.
++
++    The first mapping gives the callers of a CallNode. The second one gives the CallNodes that
++    received its result as an argument.
++    """
++    callers: dict[str, set[str]] = defaultdict(set)
++    for parent_id, child_id in filter_in(
++        session.query(db.CallEdge.parent_id, db.CallEdge.child_id),
++        db.CallEdge.child_id,
++        call_hashes,
++    ):
++        callers[child_id].add(parent_id)
++
++    downstreams: dict[str, set[str]] = defaultdict(set)
++    query = session.query(db.Argument.call_hash, db.ArgumentResult.result_call_hash).join(
++        db.ArgumentResult, db.Argument.arg_hash == db.ArgumentResult.arg_hash
++    )
++    for call_hash, upstream_id in filter_in(
++        query, db.ArgumentResult.result_call_hash, call_hashes
++    ):
++        downstreams[upstream_id].add(call_hash)
++    return callers, downstreams
++
++
++def _invert(edges: dict[str, set[str]]) -> dict[str, set[str]]:
++    """
++    Returns the reverse of a mapping of edges.
++    """
++    inverse: dict[str, set[str]] = defaultdict(set)
++    for target, sources in edges.items():
++        for source in sources:
++            inverse[source].add(target)
++    return inverse
++
++
++def _find_call_nodes(session: Session, job_ids: set[str]) -> tuple[set[str], set[str]]:
++    """
++    Determines what happens to the CallNodes that the given Jobs hold on to.
++
++    Returns the CallNodes to remove and the CallNodes that stay as records only. The latter
++    are the source of an argument of a remaining CallNode, but no remaining Execution made
++    those calls, so they stay without their cached result.
++    """
++    roots = {
++        call_hash
++        for (call_hash,) in filter_in(session.query(db.Job.call_hash), db.Job.id, job_ids)
++        if call_hash
++    }
++    candidates = _expand(session, roots, _get_call_node_children)
++    callers, downstreams = _get_call_node_parents(session, candidates)
++
++    # A remaining Job, or a caller outside of the candidates, still makes the call.
++    called_roots = {
++        call_hash
++        for call_hash, job_id in filter_in(
++            session.query(db.Job.call_hash, db.Job.id), db.Job.call_hash, candidates
++        )
++        if job_id not in job_ids
++    }
++    called_roots.update(
++        call_hash for call_hash, parent_ids in callers.items() if parent_ids - candidates
++    )
++    called = _close(called_roots, _invert(callers))
++
++    # A called CallNode, or a CallNode outside of the candidates, keeps the source of its
++    # arguments as well.
++    kept_roots = called | {
++        call_hash for call_hash, child_ids in downstreams.items() if child_ids - candidates
++    }
++    edges = _invert(callers)
++    for call_hash, upstream_ids in _invert(downstreams).items():
++        edges[call_hash] |= upstream_ids
++    kept = _close(kept_roots, edges)
++    return candidates - kept, kept - called
++
++
++def _get_eval_keys(session: Session, call_hashes: Iterable[str]) -> set[EvalKey]:
++    """
++    Returns the task and arguments hashes of the given CallNodes.
++    """
++    return {
++        (task_hash, args_hash)
++        for task_hash, args_hash in filter_in(
++            session.query(db.CallNode.task_hash, db.CallNode.args_hash),
++            db.CallNode.call_hash,
++            call_hashes,
++        )
++    }
++
++
++def _find_evaluations(session: Session, call_hashes: set[str], uncalled: set[str]) -> set[str]:
++    """
++    Returns the cached Evaluations that no remaining call accounts for.
++
++    An Evaluation belongs to the CallNodes that share its task and arguments. It is removed
++    once every one of them is either removed (`call_hashes`) or only kept as a record
++    (`uncalled`, or a record an earlier prune kept). Evaluations that never had a CallNode
++    cannot be traced to an Execution and are left alone.
++    """
++    released = call_hashes | uncalled
++    released_keys = _get_eval_keys(session, released)
++    task_hashes = {task_hash for task_hash, _ in released_keys}
++
++    others = {
++        call_hash: (task_hash, args_hash)
++        for task_hash, args_hash, call_hash in filter_in(
++            session.query(db.CallNode.task_hash, db.CallNode.args_hash, db.CallNode.call_hash),
++            db.CallNode.task_hash,
++            task_hashes,
++        )
++        if call_hash not in released
++    }
++    kept_keys = {others[call_hash] for call_hash in find_cacheable_call_nodes(session, others)}
++    return {
++        eval_hash
++        for eval_hash, task_hash, args_hash in filter_in(
++            session.query(
++                db.Evaluation.eval_hash, db.Evaluation.task_hash, db.Evaluation.args_hash
++            ),
++            db.Evaluation.task_hash,
++            task_hashes,
++        )
++        if (task_hash, args_hash) in released_keys and (task_hash, args_hash) not in kept_keys
++    }
++
++
++def _iter_value_refs(
++    session: Session, value_hashes: Iterable[str], load_value: ValueLoader | None = None
++) -> Iterator[tuple[str, Any]]:
++    """
++    Iterates (value_hash, owner) for every row that refers to one of the given Values.
++
++    The owner is a (model, id) pair naming the row holding the reference.
++    """
++    value_hashes = list(value_hashes)
++
++    for value_hash, call_hash in filter_in(
++        session.query(db.CallNode.value_hash, db.CallNode.call_hash),
++        db.CallNode.value_hash,
++        value_hashes,
++    ):
++        yield value_hash, (db.CallNode, call_hash)
++    for task_hash, call_hash in filter_in(
++        session.query(db.CallNode.task_hash, db.CallNode.call_hash),
++        db.CallNode.task_hash,
++        value_hashes,
++    ):
++        yield task_hash, (db.CallNode, call_hash)
++    for value_hash, call_hash in filter_in(
++        session.query(db.Argument.value_hash, db.Argument.call_hash),
++        db.Argument.value_hash,
++        value_hashes,
++    ):
++        yield value_hash, (db.CallNode, call_hash)
++    for task_hash, call_hash in filter_in(
++        session.query(db.CallSubtreeTask.task_hash, db.CallSubtreeTask.call_hash),
++        db.CallSubtreeTask.task_hash,
++        value_hashes,
++    ):
++        yield task_hash, (db.CallNode, call_hash)
++
++    for value_hash, eval_hash in filter_in(
++        session.query(db.Evaluation.value_hash, db.Evaluation.eval_hash),
++        db.Evaluation.value_hash,
++        value_hashes,
++    ):
++        yield value_hash, (db.Evaluation, eval_hash)
++    for task_hash, eval_hash in filter_in(
++        session.query(db.Evaluation.task_hash, db.Evaluation.eval_hash),
++        db.Evaluation.task_hash,
++        value_hashes,
++    ):
++        yield task_hash, (db.Evaluation, eval_hash)
++
++    for task_hash, job_id in filter_in(
++        session.query(db.Job.task_hash, db.Job.id), db.Job.task_hash, value_hashes
++    ):
++        yield task_hash, (db.Job, job_id)
++
++    for value_hash, parent_hash in filter_in(
++        session.query(db.Subvalue.value_hash, db.Subvalue.parent_value_hash),
++        db.Subvalue.value_hash,
++        value_hashes,
++    ):
++        yield value_hash, (db.Value, parent_hash)
++
++    # A Handle state has to outlive the states derived from it, so that rolling it back
++    # still reaches them.
++    parents = {
++        handle_hash: value_hash
++        for handle_hash, value_hash in filter_in(
++            session.query(db.Handle.hash, db.Handle.value_hash),
++            db.Handle.value_hash,
++            value_hashes,
++        )
++    }
++    links = [link for link in _iter_handle_links(session, parents) if link[0] in parents]
++    children = _get_handle_values(session, {child_hash for _, child_hash in links})
++    for parent_hash, child_hash in links:
++        yield parents[parent_hash], (db.Value, children[child_hash])
++
++    yield from _iter_argument_fork_refs(session, parents, load_value)
++
++
++def _iter_argument_fork_refs(
++    session: Session, handle_values: dict[str, str], load_value: ValueLoader | None = None
++) -> Iterator[tuple[str, Any]]:
++    """
++    Iterates (value_hash, owner) for the given Handle states that were forked from a Handle
++    argument as it passed into a Task.
++
++    A Handle with a key is forked with that key, so the fork belongs to every call taking the
++    Handle. A Handle without one is forked with the number of times the calling Task has passed
++    it so far, or with 0 for the first call of a workflow, so the fork belongs to every caller that
++    passed the Handle that many times, or to the Job of that first call.
++    """
++    links = [
++        link for link in _iter_handle_links(session, handle_values) if link[1] in handle_values
++    ]
++    if not links:
++        return
++    states = {
++        handle_hash: (key or "", value_hash)
++        for handle_hash, key, value_hash in filter_in(
++            session.query(db.Handle.hash, db.Handle.key, db.Handle.value_hash),
++            db.Handle.hash,
++            {handle_hash for link in links for handle_hash in link},
++        )
++    }
++    parent_values = {states[parent_hash][1] for parent_hash, _ in links if parent_hash in states}
++
++    # Count how often each call takes each of the parent states as an argument.
++    uses: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
++    for value_hash, call_hash in filter_in(
++        session.query(db.Argument.value_hash, db.Argument.call_hash),
++        db.Argument.value_hash,
++        parent_values,
++    ):
++        uses[value_hash][call_hash] += 1
++
++    # Handles nested in an argument are forked one by one, and a container records each
++    # distinct Handle only once as a Subvalue, so count them in the argument itself.
++    containers: set[str] = set()
++    layer = set(parent_values)
++    while layer:
++        layer = {
++            parent_hash
++            for (parent_hash,) in filter_in(
++                session.query(db.Subvalue.parent_value_hash), db.Subvalue.value_hash, layer
++            )
++        } - containers
++        containers |= layer
++    if containers and load_value:
++        handle_value = {
++            parent_hash: states[parent_hash][1]
++            for parent_hash, _ in links
++            if parent_hash in states
++        }
++        for value_hash, call_hash in filter_in(
++            session.query(db.Argument.value_hash, db.Argument.call_hash),
++            db.Argument.value_hash,
++            containers,
++        ):
++            try:
++                leaves = list(iter_nested_value(load_value(value_hash)))
++            except Exception:
++                continue
++            for leaf in leaves:
++                if isinstance(leaf, Handle) and leaf.get_hash() in handle_value:
++                    uses[handle_value[leaf.get_hash()]][call_hash] += 1
++    call_hashes = {call_hash for calls in uses.values() for call_hash in calls}
++
++    callers: dict[str, set[str]] = defaultdict(set)
++    for parent_id, child_id in filter_in(
++        session.query(db.CallEdge.parent_id, db.CallEdge.child_id),
++        db.CallEdge.child_id,
++        call_hashes,
++    ):
++        callers[child_id].add(parent_id)
++    root_jobs: dict[str, set[str]] = defaultdict(set)
++    for job_id, call_hash in filter_in(
++        session.query(db.Job.id, db.Job.call_hash).filter(db.Job.parent_id.is_(None)),
++        db.Job.call_hash,
++        call_hashes,
++    ):
++        root_jobs[call_hash].add(job_id)
++
++    for parent_hash, child_hash in links:
++        if parent_hash not in states or child_hash not in states:
++            continue
++        parent_key, parent_value = states[parent_hash]
++        key, child_value = states[child_hash]
++        calls = uses.get(parent_value, {})
++        if parent_key:
++            if key == parent_key:
++                for call_hash in calls:
++                    yield child_value, (db.CallNode, call_hash)
++        elif key == "0":
++            for call_hash in calls:
++                for job_id in root_jobs.get(call_hash, ()):
++                    yield child_value, (db.Job, job_id)
++        elif key.isdigit():
++            passes: dict[str, int] = defaultdict(int)
++            for call_hash, count in calls.items():
++                for caller in callers.get(call_hash, ()):
++                    passes[caller] += count
++            for caller, count in passes.items():
++                if count >= int(key):
++                    yield child_value, (db.CallNode, caller)
++
++
++def _find_values(
++    session: Session,
++    job_ids: set[str],
++    call_hashes: set[str],
++    eval_hashes: set[str],
++    load_value: ValueLoader | None = None,
++) -> set[str]:
++    """
++    Returns the Values that are only referred to by the given Jobs, CallNodes and Evaluations.
++    """
++    removed = {db.Job: job_ids, db.CallNode: call_hashes, db.Evaluation: eval_hashes}
++
++    # Gather Values referred to by the removed rows.
++    roots: set[str] = set()
++    for value_hash, task_hash in filter_in(
++        session.query(db.CallNode.value_hash, db.CallNode.task_hash),
++        db.CallNode.call_hash,
++        call_hashes,
++    ):
++        roots.update([value_hash, task_hash])
++    for (value_hash,) in filter_in(
++        session.query(db.Argument.value_hash), db.Argument.call_hash, call_hashes
++    ):
++        roots.add(value_hash)
++    for (task_hash,) in filter_in(
++        session.query(db.CallSubtreeTask.task_hash), db.CallSubtreeTask.call_hash, call_hashes
++    ):
++        roots.add(task_hash)
++    for value_hash, task_hash in filter_in(
++        session.query(db.Evaluation.value_hash, db.Evaluation.task_hash),
++        db.Evaluation.eval_hash,
++        eval_hashes,
++    ):
++        roots.update([value_hash, task_hash])
++    for (task_hash,) in filter_in(session.query(db.Job.task_hash), db.Job.id, job_ids):
++        roots.add(task_hash)
++
++    existing = {
++        value_hash
++        for (value_hash,) in filter_in(
++            session.query(db.Value.value_hash), db.Value.value_hash, roots
++        )
++    }
++    candidates = _expand(session, existing, _get_value_children)
++
++    # A candidate stays when a row that is not being removed refers to it.
++    kept_roots: set[str] = set()
++    children: dict[str, set[str]] = defaultdict(set)
++    for value_hash, (model, owner_id) in _iter_value_refs(session, candidates, load_value):
++        if model is db.Value:
++            if owner_id in candidates:
++                children[owner_id].add(value_hash)
++            else:
++                kept_roots.add(value_hash)
++        elif owner_id not in removed[model]:
++            kept_roots.add(value_hash)
++    return candidates - _close(kept_roots, children)
++
++
++def _find_tags(session: Session, entity_ids: Iterable[str]) -> set[str]:
++    """
++    Returns the Tags of the given entities along with their edit history.
++    """
++    tag_hashes = {
++        tag_hash
++        for (tag_hash,) in filter_in(session.query(db.Tag.tag_hash), db.Tag.entity_id, entity_ids)
++    }
++
++    # Tags marking a deletion have no entity of their own, so follow the edits to find them.
++    layer = set(tag_hashes)
++    while layer:
++        children = {
++            child_id
++            for (child_id,) in filter_in(
++                session.query(db.TagEdit.child_id), db.TagEdit.parent_id, layer
++            )
++        }
++        layer = {
++            tag_hash
++            for (tag_hash,) in filter_in(
++                session.query(db.Tag.tag_hash).filter(db.Tag.entity_id == ""),
++                db.Tag.tag_hash,
++                children - tag_hashes,
++            )
++        }
++        tag_hashes |= layer
++    return tag_hashes
++
++
++def find_cacheable_call_nodes(session: Session, call_hashes: Iterable[str]) -> set[str]:
++    """
++    Returns the CallNodes, among the given ones, whose results may still be reused.
++
++    A prune can keep a CallNode only because a remaining call received its result as an
++    argument. No Job reaches such a CallNode through its callers anymore, so it is kept as a
++    record of where that argument came from and must not answer for the call it records.
++    """
++    call_hashes = set(call_hashes)
++    with_jobs = {
++        call_hash
++        for (call_hash,) in filter_in(
++            session.query(db.Job.call_hash), db.Job.call_hash, call_hashes
++        )
++    }
++    rest = call_hashes - with_jobs
++    if not rest:
++        return call_hashes
++
++    callers: dict[str, set[str]] = defaultdict(set)
++    seen = set(rest)
++    layer = set(rest)
++    while layer:
++        parents = set()
++        for parent_id, child_id in filter_in(
++            session.query(db.CallEdge.parent_id, db.CallEdge.child_id),
++            db.CallEdge.child_id,
++            layer,
++        ):
++            callers[child_id].add(parent_id)
++            parents.add(parent_id)
++        layer = parents - seen
++        seen |= layer
++
++    called = {
++        call_hash
++        for (call_hash,) in filter_in(session.query(db.Job.call_hash), db.Job.call_hash, seen)
++    }
++    sources = {
++        call_hash
++        for (call_hash,) in filter_in(
++            session.query(db.ArgumentResult.result_call_hash),
++            db.ArgumentResult.result_call_hash,
++            seen,
++        )
++    }
++    cacheable = set(with_jobs)
++    for call_hash in rest:
++        lineage = _close({call_hash}, callers)
++        if lineage & called or not lineage & sources:
++            cacheable.add(call_hash)
++    return cacheable
++
++
++def find_prune_set(
++    session: Session, execution_ids: set[str], load_value: ValueLoader | None = None
++) -> PruneSet:
++    """
++    Determines every row that removing the given Executions takes with it.
++
++    Rows are shared between Executions by content address, so a row is only removed when
++    nothing that remains still refers to it.
++    """
++    job_ids = {
++        job_id
++        for (job_id,) in filter_in(session.query(db.Job.id), db.Job.execution_id, execution_ids)
++    }
++
++    call_hashes, uncalled = _find_call_nodes(session, job_ids)
++    eval_hashes = _find_evaluations(session, call_hashes, uncalled)
++    value_hashes = _find_values(session, job_ids, call_hashes, eval_hashes, load_value)
++    tag_hashes = _find_tags(session, execution_ids | job_ids | call_hashes | value_hashes)
++
++    return PruneSet(execution_ids, job_ids, call_hashes, eval_hashes, value_hashes, tag_hashes)
++
++
++def _delete(session: Session, model: Any, column: Any, ids: Iterable[str]) -> None:
++    """
++    Deletes the rows of `model` whose `column` is one of `ids`.
++    """
++    for query in query_filter_in(session.query(model), column, ids):
++        query.delete(synchronize_session=False)
++
++
++def delete_prune_set(session: Session, prune_set: PruneSet) -> None:
++    """
++    Deletes the rows of a PruneSet, dependents first.
++    """
++    execution_ids, job_ids, call_hashes, eval_hashes, value_hashes, tag_hashes = prune_set
++
++    _delete(session, db.TagEdit, db.TagEdit.parent_id, tag_hashes)
++    _delete(session, db.TagEdit, db.TagEdit.child_id, tag_hashes)
++    _delete(session, db.Tag, db.Tag.tag_hash, tag_hashes)
++
++    # Executions and Jobs refer to each other, so their constraints are checked at commit.
++    # Jobs also refer to their parent Job, so detach them before deleting in chunks.
++    with db.with_defer_constraints(session):
++        for query in query_filter_in(session.query(db.Job), db.Job.id, job_ids):
++            query.update({db.Job.parent_id: None}, synchronize_session=False)
++        _delete(session, db.Job, db.Job.id, job_ids)
++        _delete(session, db.Execution, db.Execution.id, execution_ids)
++
++    arg_hashes = [
++        arg_hash
++        for (arg_hash,) in filter_in(
++            session.query(db.Argument.arg_hash), db.Argument.call_hash, call_hashes
++        )
++    ]
++    _delete(session, db.ArgumentResult, db.ArgumentResult.arg_hash, arg_hashes)
++    _delete(session, db.Argument, db.Argument.arg_hash, arg_hashes)
++    _delete(session, db.CallEdge, db.CallEdge.parent_id, call_hashes)
++    _delete(session, db.CallSubtreeTask, db.CallSubtreeTask.call_hash, call_hashes)
++    _delete(session, db.Evaluation, db.Evaluation.eval_hash, eval_hashes)
++    _delete(session, db.CallNode, db.CallNode.call_hash, call_hashes)
++
++    handle_hashes = [
++        handle_hash
++        for (handle_hash,) in filter_in(
++            session.query(db.Handle.hash), db.Handle.value_hash, value_hashes
++        )
++    ]
++    _delete(session, db.HandleEdge, db.HandleEdge.parent_id, handle_hashes)
++    _delete(session, db.HandleEdge, db.HandleEdge.child_id, handle_hashes)
++    _delete(session, db.Handle, db.Handle.hash, handle_hashes)
++    _delete(session, db.File, db.File.value_hash, value_hashes)
++    _delete(session, db.Subvalue, db.Subvalue.parent_value_hash, value_hashes)
++    _delete(session, db.Task, db.Task.hash, value_hashes)
++    _delete(session, db.Value, db.Value.value_hash, value_hashes)
+diff --git a/redun/backends/value_store.py b/redun/backends/value_store.py
+index b900ae7..f54be56 100644
+--- a/redun/backends/value_store.py
++++ b/redun/backends/value_store.py
+@@ -47,6 +47,14 @@ class ValueStore:
+         with File(self.get_value_path(value_hash)).open("wb") as out:
+             out.write(data)
+ 
++    def delete(self, value_hash: str) -> None:
++        """
++        Remove Value data, if it is in the store.
++        """
++        file = File(self.get_value_path(value_hash))
++        if file.exists():
++            file.remove()
++
+     def get(self, value_hash: str) -> tuple[bytes, bool]:
+         """
+         Retrieve Value data.
+diff --git a/redun/handle.py b/redun/handle.py
+index c7d3485..6b8cb97 100644
+--- a/redun/handle.py
++++ b/redun/handle.py
+@@ -27,6 +27,15 @@ def get_fullname(namespace: Optional[str], name: str) -> str:
+ H = TypeVar("H", bound="Handle")
+ 
+ 
++def get_call_state_hash(fullname: str, key: str, call_hash: str) -> str:
++    """
++    Returns the hash of a Handle state that a call or a fork derives from another state.
++
++    For a fork, `call_hash` is the hash of the state that was forked.
++    """
++    return hash_struct(["Handle", fullname, "call_hash", key, call_hash])
++
++
+ class Handle(Value):
+     """
+     A `Value` that opaquely accumulates state as it passes through `Task`s. This subclass of
+@@ -118,9 +127,7 @@ class Handle(Value):
+             if self.call_hash:
+                 # For a Handle that is the output of a Task, switch to using information about the
+                 # Task invocation.
+-                return hash_struct(
+-                    ["Handle", self.fullname, "call_hash", self.key, self.call_hash]
+-                )
++                return get_call_state_hash(self.fullname, self.key, self.call_hash)
+             else:
+                 # The initial state is defined by constructor data only.
+                 args_hash = hash_positional_args(get_type_registry(), self.args)

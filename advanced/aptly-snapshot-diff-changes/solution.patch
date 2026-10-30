@@ -1,0 +1,1499 @@
+diff --git a/api/snapshot.go b/api/snapshot.go
+index 7b6422f0..77a56dca 100644
+--- a/api/snapshot.go
++++ b/api/snapshot.go
+@@ -512,17 +512,20 @@ func apiSnapshotsDrop(c *gin.Context) {
+ // @Description **Return the diff between two snapshots (name & withSnapshot)**
+ // @Description Provide `onlyMatching=1` to return only packages present in both snapshots.
+ // @Description Otherwise, returns a `left` and `right` result providing packages only in the first and second snapshots
++// @Description Provide `changes=1` to add `Changes` with changelog entries of the newer version since the older one to packages present in both snapshots
+ // @Tags Snapshots
+ // @Produce json
+ // @Param name path string true "Snapshot name"
+ // @Param withSnapshot path string true "Snapshot name to diff against"
+ // @Param onlyMatching query string false "Only return packages present in both snapshots"
++// @Param changes query string false "Return changelog entries of packages present in both snapshots"
+ // @Success 200 {array} deb.PackageDiff "Package Diff"
+ // @Failure 404 {object} Error "Snapshot Not Found"
+ // @Failure 500 {object} Error "Internal Server Error"
+ // @Router /api/snapshots/{name}/diff/{withSnapshot} [get]
+ func apiSnapshotsDiff(c *gin.Context) {
+ 	onlyMatching := c.Request.URL.Query().Get("onlyMatching") == "1"
++	withChanges := c.Request.URL.Query().Get("changes") == "1"
+ 
+ 	collectionFactory := context.NewCollectionFactory()
+ 	collection := collectionFactory.SnapshotCollection()
+@@ -558,6 +561,14 @@ func apiSnapshotsDiff(c *gin.Context) {
+ 		return
+ 	}
+ 
++	if withChanges {
++		err = diff.LoadChanges(snapshotA.RefList(), snapshotB.RefList(), collectionFactory.PackageCollection(), context.PackagePool())
++		if err != nil {
++			AbortWithJSONError(c, 500, err)
++			return
++		}
++	}
++
+ 	result := []deb.PackageDiff{}
+ 
+ 	for _, pdiff := range diff {
+diff --git a/cmd/snapshot_diff.go b/cmd/snapshot_diff.go
+index ccbea32e..c6849bd9 100644
+--- a/cmd/snapshot_diff.go
++++ b/cmd/snapshot_diff.go
+@@ -15,6 +15,7 @@ func aptlySnapshotDiff(cmd *commander.Command, args []string) error {
+ 	}
+ 
+ 	onlyMatching := context.Flags().Lookup("only-matching").Value.Get().(bool)
++	withChanges := context.Flags().Lookup("changes").Value.Get().(bool)
+ 	collectionFactory := context.NewCollectionFactory()
+ 
+ 	// Load <name-a> snapshot
+@@ -45,6 +46,13 @@ func aptlySnapshotDiff(cmd *commander.Command, args []string) error {
+ 		return fmt.Errorf("unable to calculate diff: %s", err)
+ 	}
+ 
++	if withChanges {
++		err = diff.LoadChanges(snapshotA.RefList(), snapshotB.RefList(), collectionFactory.PackageCollection(), context.PackagePool())
++		if err != nil {
++			return fmt.Errorf("unable to load changes: %s", err)
++		}
++	}
++
+ 	if len(diff) == 0 {
+ 		context.Progress().Printf("Snapshots are identical.\n")
+ 	} else {
+@@ -83,6 +91,9 @@ func aptlySnapshotDiff(cmd *commander.Command, args []string) error {
+ 			}
+ 
+ 			context.Progress().ColoredPrintf(code+" %-6s | %-40s | %-40s | %-40s", arch, pkg, verA, verB)
++			if pdiff.Changes != nil {
++				context.Progress().Printf("%s", *pdiff.Changes)
++			}
+ 		}
+ 	}
+ 
+@@ -98,7 +109,8 @@ func makeCmdSnapshotDiff() *commander.Command {
+ Displays difference in packages between two snapshots. Snapshot is a list
+ of packages, so difference between snapshots is a difference between package
+ lists. Package could be either completely missing in one snapshot, or package
+-is present in both snapshots with different versions.
++is present in both snapshots with different versions. With -changes, such
++packages are followed by changelog entries of the newer version since the older one.
+ 
+ Example:
+ 
+@@ -108,6 +120,7 @@ Example:
+ 	}
+ 
+ 	cmd.Flag.Bool("only-matching", false, "display diff only for matching packages (don't display missing packages)")
++	cmd.Flag.Bool("changes", false, "display changelog entries of newer package versions since older ones")
+ 
+ 	return cmd
+ }
+diff --git a/completion.d/_aptly b/completion.d/_aptly
+index 6a70dfe3..7ae150bb 100644
+--- a/completion.d/_aptly
++++ b/completion.d/_aptly
+@@ -390,6 +390,7 @@ local keyring="*-keyring=[gpg keyring to use when verifying Release file (could
+                         ;;
+                     diff)
+                         _arguments \
++                            "-changes=[display changelog entries of newer package versions since older ones]:$bool" \
+                             "-only-matching=[display diff only for matching packages (don’t display missing packages)]:$bool" \
+                             "(-)2:snapshot name a:$snapshots" "3:snapshot name b:$snapshots"
+                         ;;
+diff --git a/completion.d/aptly b/completion.d/aptly
+index bdfbe722..d1233d99 100644
+--- a/completion.d/aptly
++++ b/completion.d/aptly
+@@ -455,7 +455,7 @@ _aptly()
+           ;;
+           "diff")
+             if [[ $numargs -eq 0 ]] && [[ "$cur" == -* ]]; then
+-              COMPREPLY=($(compgen -W "-only-matching" -- ${cur}))
++              COMPREPLY=($(compgen -W "-changes -only-matching" -- ${cur}))
+               return 0
+             fi
+ 
+diff --git a/deb/changelog.go b/deb/changelog.go
+new file mode 100644
+index 00000000..2c4deb52
+--- /dev/null
++++ b/deb/changelog.go
+@@ -0,0 +1,421 @@
++package deb
++
++import (
++	"archive/tar"
++	"bytes"
++	"compress/gzip"
++	"fmt"
++	"io"
++	"path"
++	"sort"
++	"strings"
++
++	"github.com/aptly-dev/aptly/aptly"
++	"github.com/pkg/errors"
++)
++
++// packageTree lists members of data.tar of a .deb package
++type packageTree struct {
++	members  map[string]*tar.Header
++	dirs     map[string]bool
++	contents map[string][]byte
++}
++
++// treePath is a path in the tree of a package
++type treePath struct {
++	pkg  *Package
++	tree *packageTree
++	path string
++}
++
++// linkKey identifies a symlink by its tree and its path there
++type linkKey struct {
++	tree *packageTree
++	path string
++}
++
++// pathWalker follows paths through package trees the way the installed system resolves them: each symlink
++// is resolved once per walk, and one reached again while its own target is being resolved is a loop;
++// enter, when set, names the tree a path continues in once it leaves the current one
++type pathWalker struct {
++	enter func(at treePath, missing string) (*treePath, error)
++	links map[linkKey]*treePath
++}
++
++// changelogFinder looks up changelogs of packages from one package list; it keeps the trees of the packages
++// other packages take doc files from, as many packages usually share them, and the tree of the package
++// being looked up only for that lookup
++type changelogFinder struct {
++	refs        *PackageRefList
++	collection  *PackageCollection
++	packagePool aptly.PackagePool
++	shared      map[string]*packageTree
++	ownKey      string
++	own         *packageTree
++}
++
++// LoadChanges sets Changes of every entry with both packages to what
++// dpkg-parsechangelog -l <changelog> --since <older version> -S Changes prints for the changelog of
++// the newer package in dpkg's version order; left and right are the lists the packages come from
++func (diffs PackageDiffs) LoadChanges(left, right *PackageRefList, collection *PackageCollection, packagePool aptly.PackagePool) error {
++	leftFinder := newChangelogFinder(left, collection, packagePool)
++	rightFinder := newChangelogFinder(right, collection, packagePool)
++
++	for i := range diffs {
++		diff := &diffs[i]
++		if diff.Left == nil || diff.Right == nil {
++			continue
++		}
++
++		var (
++			changes string
++			err     error
++		)
++
++		r := compareDpkgVersions(diff.Left.Version, diff.Right.Version)
++		if r < 0 {
++			changes, err = rightFinder.changesSince(diff.Right, diff.Left.Version)
++		} else if r > 0 {
++			changes, err = leftFinder.changesSince(diff.Left, diff.Right.Version)
++		}
++		if err != nil {
++			return err
++		}
++
++		diff.Changes = &changes
++	}
++
++	return nil
++}
++
++// newChangelogFinder creates changelogFinder for packages from refs
++func newChangelogFinder(refs *PackageRefList, collection *PackageCollection, packagePool aptly.PackagePool) *changelogFinder {
++	return &changelogFinder{
++		refs:        refs,
++		collection:  collection,
++		packagePool: packagePool,
++		shared:      make(map[string]*packageTree),
++	}
++}
++
++// changesSince returns entries of the changelog of p which come after version
++func (f *changelogFinder) changesSince(p *Package, version string) (string, error) {
++	f.ownKey, f.own = string(p.Key("")), nil
++	changelog, err := f.changelog(p)
++	f.own = nil
++	if err != nil {
++		return "", err
++	}
++
++	return ChangesSince(changelog, version), nil
++}
++
++// changelog returns debian/changelog of a source package, or changelog.Debian.gz (changelog.gz
++// if there is none) of a binary package preceded by its binNMU changelog for the package architecture
++func (f *changelogFinder) changelog(p *Package) ([]byte, error) {
++	if p.IsSource {
++		return sourceChangelog(p, f.packagePool)
++	}
++
++	changelog, err := f.docFile(p, "changelog.Debian.gz")
++	if err == nil && changelog == nil {
++		changelog, err = f.docFile(p, "changelog.gz")
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	binNMU, err := f.docFile(p, "changelog.Debian."+p.Architecture+".gz")
++	if err != nil || binNMU == nil {
++		return changelog, err
++	}
++
++	if len(binNMU) > 0 && binNMU[len(binNMU)-1] != '\n' {
++		binNMU = append(binNMU, '\n')
++	}
++
++	return append(binNMU, changelog...), nil
++}
++
++// docFile returns uncompressed usr/share/doc/<package>/<name> of binary package p or nil if it is missing
++//
++// Symlinks are followed, and a doc directory the package does not contain is looked up in the package
++// with that name, the same version and the same architecture (or all).
++func (f *changelogFinder) docFile(p *Package, name string) ([]byte, error) {
++	tree, err := f.tree(p)
++	if err != nil {
++		return nil, err
++	}
++
++	walker := &pathWalker{links: make(map[linkKey]*treePath)}
++	walker.enter = func(at treePath, missing string) (*treePath, error) {
++		parts := strings.SplitN(missing, "/", 5)
++		if len(parts) < 4 || parts[0] != "usr" || parts[1] != "share" || parts[2] != "doc" ||
++			at.tree.has("usr/share/doc/"+parts[3]) {
++			return nil, nil
++		}
++
++		sibling, err := f.sibling(parts[3], p.Version, p.Architecture)
++		if err != nil || sibling == nil || bytes.Equal(sibling.Key(""), at.pkg.Key("")) {
++			return nil, err
++		}
++
++		siblingTree, err := f.tree(sibling)
++		if err != nil {
++			return nil, err
++		}
++
++		return &treePath{pkg: sibling, tree: siblingTree}, nil
++	}
++
++	found, err := walker.walk(treePath{pkg: p, tree: tree}, "usr/share/doc/"+p.Name+"/"+name)
++	if err != nil || found == nil {
++		return nil, err
++	}
++
++	content, err := f.read(found.pkg, found.tree, found.path)
++	if err != nil || content == nil {
++		return nil, err
++	}
++
++	return gunzipChangelog(content, found.pkg)
++}
++
++// sibling finds package with name, version and either architecture or all in the list
++func (f *changelogFinder) sibling(name, version, architecture string) (*Package, error) {
++	for _, arch := range []string{architecture, ArchitectureAll} {
++		key := []byte("P" + arch + " " + name + " " + version)
++		refs := f.refs.Refs
++		i := sort.Search(len(refs), func(j int) bool { return bytes.Compare(refs[j], key) >= 0 })
++		for ; i < len(refs) && bytes.HasPrefix(refs[i], key); i++ {
++			if len(refs[i]) == len(key) || refs[i][len(key)] == ' ' {
++				return f.collection.ByKey(refs[i])
++			}
++		}
++	}
++
++	return nil, nil
++}
++
++// tree reads members of data.tar of binary package p, keeping contents of changelog files
++func (f *changelogFinder) tree(p *Package) (*packageTree, error) {
++	key := string(p.Key(""))
++	if key == f.ownKey && f.own != nil {
++		return f.own, nil
++	}
++	if tree, ok := f.shared[key]; ok {
++		return tree, nil
++	}
++
++	tree := &packageTree{
++		members:  make(map[string]*tar.Header),
++		dirs:     map[string]bool{"": true},
++		contents: make(map[string][]byte),
++	}
++
++	err := walkPackageData(p, f.packagePool, func(header *tar.Header, reader io.Reader) error {
++		name := cleanMemberName(header.Name)
++		if name == "" {
++			return nil
++		}
++
++		tree.members[name] = header
++		for dir := path.Dir(name); dir != "."; dir = path.Dir(dir) {
++			tree.dirs[dir] = true
++		}
++
++		switch header.Typeflag {
++		case tar.TypeDir:
++			tree.dirs[name] = true
++		case tar.TypeReg:
++			if strings.HasPrefix(path.Base(name), "changelog") {
++				content, err := io.ReadAll(reader)
++				if err != nil {
++					return err
++				}
++				tree.contents[name] = content
++			}
++		}
++
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	if key == f.ownKey {
++		f.own = tree
++	} else {
++		f.shared[key] = tree
++	}
++	return tree, nil
++}
++
++// read returns content of regular file name (or of the file it is a hard link to) from binary package p
++func (f *changelogFinder) read(p *Package, tree *packageTree, name string) ([]byte, error) {
++	member := tree.members[name]
++	if member != nil && member.Typeflag == tar.TypeLink {
++		name = cleanMemberName(member.Linkname)
++		member = tree.members[name]
++	}
++
++	if member == nil || member.Typeflag != tar.TypeReg {
++		return nil, nil
++	}
++
++	if content, ok := tree.contents[name]; ok {
++		return content, nil
++	}
++
++	var content []byte
++	err := walkPackageData(p, f.packagePool, func(header *tar.Header, reader io.Reader) error {
++		if header.Typeflag != tar.TypeReg || cleanMemberName(header.Name) != name {
++			return nil
++		}
++
++		var err error
++		content, err = io.ReadAll(reader)
++		return err
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	tree.contents[name] = content
++	return content, nil
++}
++
++// has checks whether the package contains name
++func (tree *packageTree) has(name string) bool {
++	return tree.members[name] != nil || tree.dirs[name]
++}
++
++// walk follows name from directory at and returns the path it leads to, or nil when it does not exist
++func (w *pathWalker) walk(at treePath, name string) (*treePath, error) {
++	parts := strings.Split(name, "/")
++
++	for i, part := range parts {
++		switch part {
++		case "", ".":
++			continue
++		case "..":
++			if at.path = path.Dir(at.path); at.path == "." {
++				at.path = ""
++			}
++			continue
++		}
++
++		next := path.Join(at.path, part)
++		member := at.tree.members[next]
++
++		if member != nil && member.Typeflag == tar.TypeSymlink {
++			target, err := w.link(treePath{pkg: at.pkg, tree: at.tree, path: next}, member.Linkname)
++			if err != nil || target == nil {
++				return nil, err
++			}
++
++			at = *target
++			continue
++		}
++
++		if member == nil && !at.tree.dirs[next] {
++			if w.enter == nil {
++				return nil, nil
++			}
++
++			missing := path.Join(append([]string{next}, parts[i+1:]...)...)
++			other, err := w.enter(at, missing)
++			if err != nil || other == nil {
++				return nil, err
++			}
++
++			return w.walk(*other, missing)
++		}
++
++		at.path = next
++	}
++
++	return &at, nil
++}
++
++// link returns the path symlink at points to, or nil when it points nowhere or back to itself
++func (w *pathWalker) link(at treePath, target string) (*treePath, error) {
++	key := linkKey{tree: at.tree, path: at.path}
++	if resolved, ok := w.links[key]; ok {
++		return resolved, nil
++	}
++	w.links[key] = nil
++
++	from := at
++	if from.path = path.Dir(at.path); from.path == "." || strings.HasPrefix(target, "/") {
++		from.path = ""
++	}
++
++	resolved, err := w.walk(from, target)
++	if err != nil {
++		return nil, err
++	}
++
++	w.links[key] = resolved
++	return resolved, nil
++}
++
++// walkPackageData calls handler for every member of data.tar in the .deb file of binary package p
++func walkPackageData(p *Package, packagePool aptly.PackagePool, handler func(*tar.Header, io.Reader) error) error {
++	files := p.Files()
++	if len(files) == 0 {
++		return fmt.Errorf("package %s has no files", p)
++	}
++
++	poolPath, err := files[0].GetPoolPath(packagePool)
++	if err != nil {
++		return err
++	}
++
++	reader, err := packagePool.Open(poolPath)
++	if err != nil {
++		return err
++	}
++	defer func() { _ = reader.Close() }()
++
++	untar, closeTar, err := openDataTar(reader, files[0].Filename)
++	if err != nil {
++		return err
++	}
++	defer closeTar()
++
++	for {
++		header, err := untar.Next()
++		if err == io.EOF {
++			return nil
++		}
++		if err != nil {
++			return errors.Wrapf(err, "unable to read .tar archive from %s", files[0].Filename)
++		}
++
++		if err = handler(header, untar); err != nil {
++			return err
++		}
++	}
++}
++
++// cleanMemberName turns tar member name like ./usr/share/doc/ into usr/share/doc
++func cleanMemberName(name string) string {
++	return strings.TrimPrefix(path.Clean("/"+name), "/")
++}
++
++// gunzipChangelog uncompresses changelog file of package p
++func gunzipChangelog(content []byte, p *Package) ([]byte, error) {
++	reader, err := gzip.NewReader(bytes.NewReader(content))
++	if err != nil {
++		return nil, errors.Wrapf(err, "unable to ungzip changelog of %s", p)
++	}
++	defer func() { _ = reader.Close() }()
++
++	changelog, err := io.ReadAll(reader)
++	if err != nil {
++		return nil, errors.Wrapf(err, "unable to ungzip changelog of %s", p)
++	}
++
++	return changelog, nil
++}
+diff --git a/deb/changelog_parse.go b/deb/changelog_parse.go
+new file mode 100644
+index 00000000..4b914c73
+--- /dev/null
++++ b/deb/changelog_parse.go
+@@ -0,0 +1,364 @@
++package deb
++
++import (
++	"regexp"
++	"strconv"
++	"strings"
++)
++
++// changelogEntry is one entry of a Debian changelog: its heading line, the version from the heading
++// (empty when it is not a valid version) and the change lines with the blank lines between them
++type changelogEntry struct {
++	header  string
++	version string
++	changes []string
++}
++
++// states of the changelog parser, as in dpkg's Dpkg::Changelog::Debian
++const (
++	expectFirstHeading = iota
++	expectStartChanges
++	expectChangesOrTrailer
++	expectNextOrEOF
++)
++
++// changelogSpace is what Perl's \s matches in dpkg's changelog parser
++const changelogSpace = "\t\n\v\f\r "
++
++var (
++	changelogHeaderRegexp  = regexp.MustCompile(`^\w[-+0-9A-Za-z.]* \(([^() \t]+)\)(?:[\t\n\v\f\r ]+[-+0-9A-Za-z.]+)+;`)
++	changelogTrailerRegexp = regexp.MustCompile(`^ -- .* <.*>  ?(?:\w+,[\t\n\v\f\r ]*)?\d{1,2}[\t\n\v\f\r ]+\w+[\t\n\v\f\r ]+\d{4}[\t\n\v\f\r ]+\d{1,2}:\d\d:\d\d[\t\n\v\f\r ]+[-+]\d{4}[\t\n\v\f\r ]*$`)
++	changelogChangeRegexp  = regexp.MustCompile(`^[\t\n\v\f\r ]{2,}[^\t\n\v\f\r ]`)
++	changelogEndRegexp     = regexp.MustCompile(`(?i)^(?:(?:;;[\t\n\v\f\r ]*)?local variables:|vim:)`)
++	changelogSkipRegexp    = regexp.MustCompile(`^(?:\$\w+:.*\$|# |/\*.*\*/)`)
++	changelogAncientRegexp = regexp.MustCompile(`(?i)^(?:` +
++		`\w+\s+\w+\s+\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}\s+[\w\s]*\d{4}\s+.*\s+[<(].*[)>]` +
++		`|\w+\s+\w+\s+\d{1,2},?\s*\d{4}\s+.*\s+[<(].*[)>]` +
++		`|\w[-+0-9a-z.]* \([^() \t]+\);?` +
++		`|[\w.+-]+[- ]\S+ Debian \S+` +
++		`|Changes from version .* to .*:` +
++		`|Changes for [\w.+-]+-[\w.+-]+:?\s*$` +
++		`|Old Changelog:\s*$` +
++		`|(?:\d+:)?\w[\w.+~-]*:?\s*$` +
++		`)`)
++)
++
++// isChangelogBlank checks whether line has no other characters than whitespace
++func isChangelogBlank(line string) bool {
++	return strings.Trim(line, changelogSpace) == ""
++}
++
++// parseChangelog splits changelog into entries the way dpkg-parsechangelog does; with a non-empty since
++// it stops reading after the first entry with that version, as dpkg does when --since is given
++func parseChangelog(changelog []byte, since string) []changelogEntry {
++	var (
++		entries    []changelogEntry
++		entry      changelogEntry
++		filled     bool
++		blankLines []string
++		unknown    = 1
++		expect     = expectFirstHeading
++	)
++
++	lines := strings.Split(string(changelog), "\n")
++	if lines[len(lines)-1] == "" {
++		lines = lines[:len(lines)-1]
++	}
++
++	flush := func() {
++		entries = append(entries, entry)
++		entry = changelogEntry{}
++		filled = false
++	}
++
++	addChanges := func(line string) {
++		entry.changes = append(entry.changes, blankLines...)
++		entry.changes = append(entry.changes, line)
++		blankLines = nil
++		filled = true
++		expect = expectChangesOrTrailer
++	}
++
++lines:
++	for _, line := range lines {
++		if match := changelogHeaderRegexp.FindStringSubmatch(line); match != nil {
++			if filled {
++				flush()
++				if since != "" {
++					for _, e := range entries {
++						if sameDpkgVersion(e.version, since) {
++							break lines
++						}
++					}
++				}
++			}
++			entry.header = line
++			if dpkgVersionValid(match[1]) {
++				entry.version = match[1]
++			}
++			filled = true
++			blankLines = nil
++			expect = expectStartChanges
++			continue
++		}
++
++		switch {
++		case changelogEndRegexp.MatchString(line):
++			break lines
++		case changelogSkipRegexp.MatchString(line):
++		case changelogAncientRegexp.MatchString(line):
++			break lines
++		case line != "" && !strings.ContainsRune(changelogSpace, rune(line[0])):
++		case changelogTrailerRegexp.MatchString(line):
++			blankLines = nil
++			filled = true
++			expect = expectNextOrEOF
++		case strings.HasPrefix(line, " --"):
++		case changelogChangeRegexp.MatchString(line):
++			if expect == expectNextOrEOF && filled {
++				flush()
++				entry.header = "unknown (unknown" + strconv.Itoa(unknown) + ") unknown; urgency=unknown"
++				unknown++
++			}
++			addChanges(line)
++		case isChangelogBlank(line):
++			if expect != expectStartChanges && expect != expectNextOrEOF {
++				blankLines = append(blankLines, line)
++			}
++		default:
++			if expect != expectStartChanges && expect != expectChangesOrTrailer {
++				addChanges(line)
++			}
++		}
++	}
++
++	if filled {
++		flush()
++	}
++
++	return entries
++}
++
++// selectChangelogRange picks the entries dpkg-parsechangelog --since <since> prints: the ones before the
++// first entry with that version in dpkg's order (so 1.0 and 1.0-0 are the same), or, when no entry has it,
++// before the first entry older than it, so none when even the newest entry is older
++func selectChangelogRange(entries []changelogEntry, since string) ([]changelogEntry, bool) {
++	for i, entry := range entries {
++		if sameDpkgVersion(entry.version, since) {
++			return entries[:i], true
++		}
++	}
++
++	last := -1
++	for i, entry := range entries {
++		if entry.version != "" {
++			last = i
++		}
++	}
++	if last == -1 {
++		return entries, true
++	}
++
++	if !dpkgVersionValid(since) {
++		return nil, false
++	}
++
++	for i, entry := range entries {
++		if entry.version != "" && compareDpkgVersions(entry.version, since) < 0 {
++			return entries[:i], true
++		}
++	}
++
++	for i, entry := range entries {
++		if sameDpkgVersion(entry.version, entries[last].version) {
++			return entries[:i+1], true
++		}
++	}
++
++	return entries, true
++}
++
++// formatChanges renders entries like dpkg-parsechangelog -S Changes prints them
++func formatChanges(entries []changelogEntry) string {
++	var field strings.Builder
++	for i, entry := range entries {
++		if i > 0 {
++			field.WriteString("\n")
++		}
++		field.WriteString("\n" + strings.TrimRight(entry.header, changelogSpace) + "\n\n" + strings.Join(entry.changes, "\n"))
++	}
++
++	lines := strings.Split(field.String(), "\n")
++	for len(lines) > 0 && lines[len(lines)-1] == "" {
++		lines = lines[:len(lines)-1]
++	}
++	if len(lines) == 0 {
++		return "\n"
++	}
++
++	var result strings.Builder
++	result.WriteString(lines[0] + "\n")
++	for _, line := range lines[1:] {
++		line = strings.TrimRight(line, changelogSpace)
++		if strings.Trim(line, ".") == "" {
++			result.WriteString(".")
++		}
++		result.WriteString(line + "\n")
++	}
++
++	return result.String()
++}
++
++// ChangesSince returns what dpkg-parsechangelog -l <changelog> --since <since> -S Changes prints
++func ChangesSince(changelog []byte, since string) string {
++	entries, ok := selectChangelogRange(parseChangelog(changelog, since), since)
++	if !ok || len(entries) == 0 {
++		return ""
++	}
++
++	return formatChanges(entries)
++}
++
++// dpkgVersionValid checks version the way dpkg's Dpkg::Version does
++func dpkgVersionValid(version string) bool {
++	if version == "" {
++		return false
++	}
++
++	epoch, rest := "0", version
++	if i := strings.Index(version, ":"); i != -1 && i+1 < len(version) {
++		epoch, rest = version[:i], version[i+1:]
++	}
++
++	upstream, revision := rest, "0"
++	if i := strings.LastIndex(rest, "-"); i != -1 {
++		upstream, revision = rest[:i], rest[i+1:]
++	}
++
++	if epoch == "" || upstream == "" || revision == "" || upstream[0] < '0' || upstream[0] > '9' {
++		return false
++	}
++
++	for _, c := range epoch {
++		if c < '0' || c > '9' {
++			return false
++		}
++	}
++
++	for _, c := range version {
++		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || strings.ContainsRune("-+:.~", c)) {
++			return false
++		}
++	}
++
++	return true
++}
++
++// parseDpkgVersion breaks down version like dpkg does: unlike parseVersion, the Debian revision is
++// everything after the last hyphen
++func parseDpkgVersion(version string) (epoch, upstream, debian string) {
++	epoch, debian = "0", "0"
++	if i := strings.Index(version, ":"); i != -1 && i+1 < len(version) {
++		epoch, version = version[:i], version[i+1:]
++	}
++
++	if i := strings.LastIndex(version, "-"); i != -1 {
++		debian, version = version[i+1:], version[:i]
++	}
++
++	upstream = version
++	return
++}
++
++// sameDpkgVersion checks whether entryVersion (empty for an invalid one) equals version in dpkg's order
++func sameDpkgVersion(entryVersion, version string) bool {
++	return entryVersion != "" && compareDpkgVersions(entryVersion, version) == 0
++}
++
++// compareDpkgVersions compares two package versions in dpkg's order
++func compareDpkgVersions(ver1, ver2 string) int {
++	e1, u1, d1 := parseDpkgVersion(ver1)
++	e2, u2, d2 := parseDpkgVersion(ver2)
++
++	if r := compareDpkgVersionPart(e1, e2); r != 0 {
++		return r
++	}
++
++	if r := compareDpkgVersionPart(u1, u2); r != 0 {
++		return r
++	}
++
++	return compareDpkgVersionPart(d1, d2)
++}
++
++// compareDpkgVersionPart compares parts of versions like dpkg's verrevcmp(), so digit runs of any length
++// compare by their value
++func compareDpkgVersionPart(part1, part2 string) int {
++	for part1 != "" || part2 != "" {
++		for (part1 != "" && !isDigit(part1[0])) || (part2 != "" && !isDigit(part2[0])) {
++			if r := dpkgCharOrder(part1) - dpkgCharOrder(part2); r != 0 {
++				return signum(r)
++			}
++			part1, part2 = part1[1:], part2[1:]
++		}
++
++		part1, part2 = strings.TrimLeft(part1, "0"), strings.TrimLeft(part2, "0")
++		digits1, digits2 := leadingDigits(part1), leadingDigits(part2)
++		if len(digits1) != len(digits2) {
++			return signum(len(digits1) - len(digits2))
++		}
++		if r := strings.Compare(digits1, digits2); r != 0 {
++			return r
++		}
++
++		part1, part2 = part1[len(digits1):], part2[len(digits2):]
++	}
++
++	return 0
++}
++
++// dpkgCharOrder is the weight dpkg gives the first character of s: tilde sorts first, then the end of
++// the string, then letters and then everything else
++func dpkgCharOrder(s string) int {
++	if s == "" {
++		return 0
++	}
++
++	switch c := s[0]; {
++	case c == '~':
++		return -1
++	case isDigit(c):
++		return 0
++	case c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z':
++		return int(c)
++	default:
++		return int(c) + 256
++	}
++}
++
++// leadingDigits returns the digits s starts with
++func leadingDigits(s string) string {
++	i := 0
++	for i < len(s) && isDigit(s[i]) {
++		i++
++	}
++
++	return s[:i]
++}
++
++// isDigit checks whether c is an ASCII digit
++func isDigit(c byte) bool {
++	return c >= '0' && c <= '9'
++}
++
++// signum returns -1, 0 or 1 by the sign of x
++func signum(x int) int {
++	switch {
++	case x < 0:
++		return -1
++	case x > 0:
++		return 1
++	}
++
++	return 0
++}
+diff --git a/deb/changelog_source.go b/deb/changelog_source.go
+new file mode 100644
+index 00000000..c54597d8
+--- /dev/null
++++ b/deb/changelog_source.go
+@@ -0,0 +1,406 @@
++package deb
++
++import (
++	"archive/tar"
++	"compress/bzip2"
++	"compress/gzip"
++	"fmt"
++	"io"
++	"path"
++	"regexp"
++	"slices"
++	"strconv"
++	"strings"
++
++	"github.com/aptly-dev/aptly/aptly"
++	"github.com/kjk/lzma"
++	"github.com/klauspost/compress/zstd"
++	"github.com/pkg/errors"
++	xz "github.com/smira/go-xz"
++)
++
++// sourceTarExtensions lists compressions of 3.0 source tarballs
++var sourceTarExtensions = []string{"gz", "bz2", "lzma", "xz", "zst"}
++
++var diffHunkRegexp = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@(?: .*)?$`)
++
++// sourceChangelog returns debian/changelog of source package p as dpkg-source -x unpacks it (formats
++// 1.0, 3.0 (quilt) and 3.0 (native)), or nil if there is none
++func sourceChangelog(p *Package, packagePool aptly.PackagePool) ([]byte, error) {
++	version := p.Version
++	if i := strings.Index(version, ":"); i != -1 && i+1 < len(version) {
++		version = version[i+1:]
++	}
++	upstream := version
++	if i := strings.LastIndex(version, "-"); i != -1 {
++		upstream = version[:i]
++	}
++	basename, basenameRev := p.Name+"_"+upstream, p.Name+"_"+version
++
++	files := make(map[string]PackageFile)
++	for _, file := range p.Files() {
++		files[file.Filename] = file
++	}
++
++	switch strings.TrimSpace(p.Extra()["Format"]) {
++	case "3.0 (quilt)":
++		for _, ext := range sourceTarExtensions {
++			if file, ok := files[basenameRev+".debian.tar."+ext]; ok {
++				return sourceTarballMember(file, packagePool, "debian/changelog", true)
++			}
++		}
++	case "3.0 (native)":
++		for _, ext := range sourceTarExtensions {
++			if file, ok := files[basenameRev+".tar."+ext]; ok {
++				return sourceTarballMember(file, packagePool, "debian/changelog", false)
++			}
++		}
++	case "", "1.0":
++		tarball, ok := files[basename+".orig.tar.gz"]
++		if !ok {
++			tarball, ok = files[basenameRev+".tar.gz"]
++		}
++		if !ok {
++			return nil, nil
++		}
++
++		changelog, err := sourceTarballMember(tarball, packagePool, "debian/changelog", false)
++		if err != nil {
++			return nil, err
++		}
++
++		diffFile, ok := files[basenameRev+".diff.gz"]
++		if !ok {
++			return changelog, nil
++		}
++
++		diff, err := readGzippedPoolFile(diffFile, packagePool)
++		if err != nil {
++			return nil, err
++		}
++
++		return patchSourceFile(diff, "debian/changelog", changelog), nil
++	}
++
++	return nil, nil
++}
++
++// sourceTarballMember returns content of name in source tarball file as dpkg-source extracts it:
++// unless inPlace, paths are relative to the only directory of the tarball if it has a single entry,
++// and symlinks inside the tarball are followed
++func sourceTarballMember(file PackageFile, packagePool aptly.PackagePool, name string, inPlace bool) ([]byte, error) {
++	members := make(map[string]*tar.Header)
++	contents := make(map[string][]byte)
++	tops := make(map[string]bool)
++
++	err := walkSourceTarball(file, packagePool, func(header *tar.Header, reader io.Reader) error {
++		memberName := cleanMemberName(header.Name)
++		if memberName == "" || header.Typeflag == tar.TypeXGlobalHeader {
++			return nil
++		}
++
++		members[memberName] = header
++		tops[strings.SplitN(memberName, "/", 2)[0]] = true
++
++		if header.Typeflag == tar.TypeReg && path.Base(memberName) == path.Base(name) {
++			content, err := io.ReadAll(reader)
++			if err != nil {
++				return err
++			}
++			contents[memberName] = content
++		}
++
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	if !inPlace && len(tops) == 1 {
++		for top := range tops {
++			if member := members[top]; member == nil || member.Typeflag == tar.TypeDir {
++				name = top + "/" + name
++			}
++		}
++	}
++
++	tree := &packageTree{members: members, dirs: map[string]bool{"": true}}
++	for memberName, member := range members {
++		for dir := path.Dir(memberName); dir != "."; dir = path.Dir(dir) {
++			tree.dirs[dir] = true
++		}
++		if member.Typeflag == tar.TypeDir {
++			tree.dirs[memberName] = true
++		}
++	}
++
++	walker := &pathWalker{links: make(map[linkKey]*treePath)}
++	found, err := walker.walk(treePath{tree: tree}, name)
++	if err != nil || found == nil {
++		return nil, err
++	}
++
++	name = found.path
++	member := members[name]
++	if member != nil && member.Typeflag == tar.TypeLink {
++		name = cleanMemberName(member.Linkname)
++		member = members[name]
++	}
++
++	if member == nil || member.Typeflag != tar.TypeReg {
++		return nil, nil
++	}
++
++	if content, ok := contents[name]; ok {
++		return content, nil
++	}
++
++	var content []byte
++	err = walkSourceTarball(file, packagePool, func(header *tar.Header, reader io.Reader) error {
++		if header.Typeflag != tar.TypeReg || cleanMemberName(header.Name) != name {
++			return nil
++		}
++
++		var err error
++		content, err = io.ReadAll(reader)
++		return err
++	})
++
++	return content, err
++}
++
++// walkSourceTarball calls handler for every member of source tarball file
++func walkSourceTarball(file PackageFile, packagePool aptly.PackagePool, handler func(*tar.Header, io.Reader) error) error {
++	reader, err := openPoolFile(file, packagePool)
++	if err != nil {
++		return err
++	}
++	defer func() { _ = reader.Close() }()
++
++	var (
++		tarInput  io.Reader
++		closeTar  = func() {}
++		extension = path.Ext(file.Filename)
++	)
++
++	switch extension {
++	case ".gz":
++		ungzip, err := gzip.NewReader(reader)
++		if err != nil {
++			return errors.Wrapf(err, "unable to ungzip %s", file.Filename)
++		}
++		closeTar = func() { _ = ungzip.Close() }
++		tarInput = ungzip
++	case ".bz2":
++		tarInput = bzip2.NewReader(reader)
++	case ".xz":
++		unxz, err := xz.NewReader(reader)
++		if err != nil {
++			return errors.Wrapf(err, "unable to unxz %s", file.Filename)
++		}
++		closeTar = func() { _ = unxz.Close() }
++		tarInput = unxz
++	case ".lzma":
++		unlzma := lzma.NewReader(reader)
++		closeTar = func() { _ = unlzma.Close() }
++		tarInput = unlzma
++	case ".zst":
++		unzstd, err := zstd.NewReader(reader)
++		if err != nil {
++			return errors.Wrapf(err, "unable to unzstd %s", file.Filename)
++		}
++		closeTar = unzstd.Close
++		tarInput = unzstd
++	default:
++		return fmt.Errorf("unsupported tar compression in %s", file.Filename)
++	}
++	defer closeTar()
++
++	untar := tar.NewReader(tarInput)
++	for {
++		header, err := untar.Next()
++		if err == io.EOF {
++			return nil
++		}
++		if err != nil {
++			return errors.Wrapf(err, "unable to read .tar archive from %s", file.Filename)
++		}
++
++		if err = handler(header, untar); err != nil {
++			return err
++		}
++	}
++}
++
++// readGzippedPoolFile returns uncompressed content of gzipped file from the pool
++func readGzippedPoolFile(file PackageFile, packagePool aptly.PackagePool) ([]byte, error) {
++	reader, err := openPoolFile(file, packagePool)
++	if err != nil {
++		return nil, err
++	}
++	defer func() { _ = reader.Close() }()
++
++	ungzip, err := gzip.NewReader(reader)
++	if err != nil {
++		return nil, errors.Wrapf(err, "unable to ungzip %s", file.Filename)
++	}
++	defer func() { _ = ungzip.Close() }()
++
++	content, err := io.ReadAll(ungzip)
++	if err != nil {
++		return nil, errors.Wrapf(err, "unable to ungzip %s", file.Filename)
++	}
++
++	return content, nil
++}
++
++// openPoolFile opens package file stored in the pool
++func openPoolFile(file PackageFile, packagePool aptly.PackagePool) (aptly.ReadSeekerCloser, error) {
++	poolPath, err := file.GetPoolPath(packagePool)
++	if err != nil {
++		return nil, err
++	}
++
++	return packagePool.Open(poolPath)
++}
++
++// patchSourceFile applies the hunks of unified diff (like a 1.0 source package .diff.gz) for file name to
++// original, nil when the file does not exist yet; it returns nil if the file ends up missing or a hunk
++// does not apply
++func patchSourceFile(diff []byte, name string, original []byte) []byte {
++	var lines []string
++	if original != nil {
++		lines = strings.Split(strings.TrimSuffix(string(original), "\n"), "\n")
++	}
++	exists := original != nil
++
++	diffLines := strings.Split(string(diff), "\n")
++	for i := 0; i+1 < len(diffLines); i++ {
++		if !strings.HasPrefix(diffLines[i], "--- ") || !strings.HasPrefix(diffLines[i+1], "+++ ") {
++			continue
++		}
++
++		oldName, newName := diffFileName(diffLines[i]), diffFileName(diffLines[i+1])
++		patched := newName
++		if patched == "" {
++			patched = oldName
++		}
++		target := patched == name
++		removed := strings.HasPrefix(strings.TrimLeft(diffLines[i+1][4:], changelogSpace), "/dev/null")
++		i += 2
++
++		delta := 0
++		for i < len(diffLines) {
++			if strings.HasPrefix(diffLines[i], "\\ ") {
++				i++
++				continue
++			}
++
++			match := diffHunkRegexp.FindStringSubmatch(diffLines[i])
++			if match == nil {
++				break
++			}
++			i++
++
++			oldStart, _ := strconv.Atoi(match[1])
++			oldCount, newCount := 1, 1
++			if match[2] != "" {
++				oldCount, _ = strconv.Atoi(match[2])
++			}
++			if match[3] != "" {
++				newCount, _ = strconv.Atoi(match[3])
++			}
++
++			position := oldStart
++			if oldCount > 0 {
++				position--
++			}
++
++			var oldLines, newLines []string
++			for (oldCount > 0 || newCount > 0) && i < len(diffLines) {
++				line := diffLines[i]
++				i++
++
++				switch {
++				case strings.HasPrefix(line, "\\ "):
++				case line == "" || line[0] == ' ':
++					text := strings.TrimPrefix(line, " ")
++					oldLines = append(oldLines, text)
++					newLines = append(newLines, text)
++					oldCount--
++					newCount--
++				case line[0] == '-':
++					oldLines = append(oldLines, line[1:])
++					oldCount--
++				case line[0] == '+':
++					newLines = append(newLines, line[1:])
++					newCount--
++				default:
++					return nil
++				}
++			}
++
++			if !target {
++				continue
++			}
++
++			var ok bool
++			if lines, delta, ok = applyHunk(lines, oldLines, newLines, position, delta); !ok {
++				return nil
++			}
++			exists = true
++		}
++		i--
++
++		if target && removed {
++			exists, lines = false, nil
++		}
++	}
++
++	if !exists {
++		return nil
++	}
++
++	return []byte(strings.Join(lines, "\n") + "\n")
++}
++
++// diffFileName returns file name from ---/+++ line of a diff without its first directory, like patch -p1
++// does, or an empty string for /dev/null
++func diffFileName(line string) string {
++	name := strings.TrimLeft(line[4:], changelogSpace)
++	if i := strings.IndexByte(name, '\t'); i != -1 {
++		name = name[:i]
++	} else if i := strings.IndexAny(name, changelogSpace); i != -1 {
++		name = name[:i]
++	}
++
++	i := strings.IndexByte(name, '/')
++	if name == "/dev/null" || i == -1 {
++		return ""
++	}
++
++	return path.Clean(strings.TrimLeft(name[i:], "/"))
++}
++
++// applyHunk replaces oldLines with newLines at position (shifted by delta), looking around it when the
++// lines moved like patch does; it returns the new delta for the following hunks
++func applyHunk(lines, oldLines, newLines []string, position, delta int) ([]string, int, bool) {
++	expected := position + delta
++
++	for distance := 0; distance <= len(lines); distance++ {
++		for _, at := range []int{expected - distance, expected + distance} {
++			if at < 0 || at+len(oldLines) > len(lines) || !slices.Equal(lines[at:at+len(oldLines)], oldLines) {
++				continue
++			}
++
++			result := make([]string, 0, len(lines)-len(oldLines)+len(newLines))
++			result = append(result, lines[:at]...)
++			result = append(result, newLines...)
++			result = append(result, lines[at+len(oldLines):]...)
++
++			return result, at - position + len(newLines) - len(oldLines), true
++		}
++	}
++
++	return nil, 0, false
++}
+diff --git a/deb/deb.go b/deb/deb.go
+index 56469b0d..8e1a9d6d 100644
+--- a/deb/deb.go
++++ b/deb/deb.go
+@@ -149,14 +149,42 @@ func GetControlFileFromDsc(dscFile string, verifier pgp.Verifier) (Stanza, error
+ 
+ // GetContentsFromDeb returns list of files installed by .deb package
+ func GetContentsFromDeb(file io.Reader, packageFile string) ([]string, error) {
++	untar, closeTar, err := openDataTar(file, packageFile)
++	if err != nil {
++		return nil, err
++	}
++	defer closeTar()
++
++	var results []string
++	for {
++		tarHeader, err := untar.Next()
++		if err == io.EOF {
++			return results, nil
++		}
++		if err != nil {
++			return nil, errors.Wrapf(err, "unable to read .tar archive from %s", packageFile)
++		}
++
++		if tarHeader.Typeflag == tar.TypeDir {
++			continue
++		}
++
++		tarHeader.Name = strings.TrimPrefix(tarHeader.Name[2:], "./")
++		results = append(results, tarHeader.Name)
++	}
++}
++
++// openDataTar finds data.tar.* part of .deb package and returns tar reader for it,
++// closeTar releases decompressor
++func openDataTar(file io.Reader, packageFile string) (untar *tar.Reader, closeTar func(), err error) {
+ 	library := ar.NewReader(file)
+ 	for {
+ 		header, err := library.Next()
+ 		if err == io.EOF {
+-			return nil, fmt.Errorf("unable to find data.tar.* part in %s", packageFile)
++			return nil, nil, fmt.Errorf("unable to find data.tar.* part in %s", packageFile)
+ 		}
+ 		if err != nil {
+-			return nil, errors.Wrapf(err, "unable to read .deb archive from %s", packageFile)
++			return nil, nil, errors.Wrapf(err, "unable to read .deb archive from %s", packageFile)
+ 		}
+ 
+ 		if strings.HasPrefix(header.Name, "data.tar") {
+@@ -169,6 +197,7 @@ func GetContentsFromDeb(file io.Reader, packageFile string) ([]string, error) {
+ 			}
+ 
+ 			var tarInput io.Reader
++			closeTar = func() {}
+ 
+ 			switch header.Name {
+ 			case "data.tar":
+@@ -179,9 +208,9 @@ func GetContentsFromDeb(file io.Reader, packageFile string) ([]string, error) {
+ 				} else {
+ 					ungzip, err := gzip.NewReader(bufReader)
+ 					if err != nil {
+-						return nil, errors.Wrapf(err, "unable to ungzip data.tar.gz from %s", packageFile)
++						return nil, nil, errors.Wrapf(err, "unable to ungzip data.tar.gz from %s", packageFile)
+ 					}
+-					defer func() { _ = ungzip.Close() }()
++					closeTar = func() { _ = ungzip.Close() }
+ 					tarInput = ungzip
+ 				}
+ 			case "data.tar.bz2":
+@@ -189,43 +218,26 @@ func GetContentsFromDeb(file io.Reader, packageFile string) ([]string, error) {
+ 			case "data.tar.xz":
+ 				unxz, err := xz.NewReader(bufReader)
+ 				if err != nil {
+-					return nil, errors.Wrapf(err, "unable to unxz data.tar.xz from %s", packageFile)
++					return nil, nil, errors.Wrapf(err, "unable to unxz data.tar.xz from %s", packageFile)
+ 				}
+-				defer func() { _ = unxz.Close() }()
++				closeTar = func() { _ = unxz.Close() }
+ 				tarInput = unxz
+ 			case "data.tar.lzma":
+ 				unlzma := lzma.NewReader(bufReader)
+-				defer func() { _ = unlzma.Close() }()
++				closeTar = func() { _ = unlzma.Close() }
+ 				tarInput = unlzma
+ 			case "data.tar.zst":
+ 				unzstd, err := zstd.NewReader(bufReader)
+ 				if err != nil {
+-					return nil, errors.Wrapf(err, "unable to unzstd %s from %s", header.Name, packageFile)
++					return nil, nil, errors.Wrapf(err, "unable to unzstd %s from %s", header.Name, packageFile)
+ 				}
+-				defer unzstd.Close()
++				closeTar = unzstd.Close
+ 				tarInput = unzstd
+ 			default:
+-				return nil, fmt.Errorf("unsupported tar compression in %s: %s", packageFile, header.Name)
++				return nil, nil, fmt.Errorf("unsupported tar compression in %s: %s", packageFile, header.Name)
+ 			}
+ 
+-			untar := tar.NewReader(tarInput)
+-			var results []string
+-			for {
+-				tarHeader, err := untar.Next()
+-				if err == io.EOF {
+-					return results, nil
+-				}
+-				if err != nil {
+-					return nil, errors.Wrapf(err, "unable to read .tar archive from %s", packageFile)
+-				}
+-
+-				if tarHeader.Typeflag == tar.TypeDir {
+-					continue
+-				}
+-
+-				tarHeader.Name = strings.TrimPrefix(tarHeader.Name[2:], "./")
+-				results = append(results, tarHeader.Name)
+-			}
++			return tar.NewReader(tarInput), closeTar, nil
+ 		}
+ 	}
+ }
+diff --git a/deb/reflist.go b/deb/reflist.go
+index 0a5c1831..db2b614f 100644
+--- a/deb/reflist.go
++++ b/deb/reflist.go
+@@ -158,8 +158,10 @@ func (l *PackageRefList) Subtract(r *PackageRefList) *PackageRefList {
+ // If left & right are present, difference is in package version
+ // If left is nil, package is present only in right
+ // If right is nil, package is present only in left
++// Changes is filled by PackageDiffs.LoadChanges when left & right are present
+ type PackageDiff struct {
+ 	Left, Right *Package
++	Changes     *string
+ }
+ 
+ // Check interface
+@@ -171,7 +173,10 @@ var (
+ func (d PackageDiff) MarshalJSON() ([]byte, error) {
+ 	serialized := struct {
+ 		Left, Right *string
+-	}{}
++		Changes     *string `json:",omitempty"`
++	}{
++		Changes: d.Changes,
++	}
+ 
+ 	if d.Left != nil {
+ 		serialized.Left = pointer.ToString(string(d.Left.Key("")))
+diff --git a/man/aptly.1 b/man/aptly.1
+index 67351d7a..e5fe28f0 100644
+--- a/man/aptly.1
++++ b/man/aptly.1
+@@ -1379,7 +1379,7 @@ don\(cqt remove other package versions when pulling package
+ \fBaptly\fR \fBsnapshot\fR \fBdiff\fR \fIname\-a\fR \fIname\-b\fR
+ .
+ .P
+-Displays difference in packages between two snapshots\. Snapshot is a list of packages, so difference between snapshots is a difference between package lists\. Package could be either completely missing in one snapshot, or package is present in both snapshots with different versions\.
++Displays difference in packages between two snapshots\. Snapshot is a list of packages, so difference between snapshots is a difference between package lists\. Package could be either completely missing in one snapshot, or package is present in both snapshots with different versions\. With \-changes, such packages are followed by changelog entries of the newer version since the older one\.
+ .
+ .P
+ Example:
+@@ -1398,6 +1398,10 @@ $ aptly snapshot diff \-only\-matching wheezy\-main wheezy\-backports
+ Options:
+ .
+ .TP
++\-\fBchanges\fR
++display changelog entries of newer package versions since older ones
++.
++.TP
+ \-\fBonly\-matching\fR
+ display diff only for matching packages (don\(cqt display missing packages)
+ .

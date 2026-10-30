@@ -1,0 +1,1126 @@
+diff --git a/include/linuxdeploy/core/appdir.h b/include/linuxdeploy/core/appdir.h
+index 82580ff..2d98e62 100644
+--- a/include/linuxdeploy/core/appdir.h
++++ b/include/linuxdeploy/core/appdir.h
+@@ -114,6 +114,10 @@ namespace linuxdeploy {
+ 
+                     // disable deployment of copyright files for this instance
+                     void setDisableCopyrightFilesDeployment(bool disable);
++
++                    // save the debug information of the files that are stripped in a tree at the given path, which
++                    // mirrors the AppDir; an empty path disables it
++                    void setDebugSymbolsDirectory(const std::filesystem::path& path);
+             };
+         }
+     }
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 0632c70..ad87b35 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -36,7 +36,7 @@ execute_process(
+ 
+ add_subdirectory(copyright)
+ 
+-add_library(linuxdeploy_core STATIC elf_file.cpp appdir.cpp ${HEADERS} appdir_root_setup.cpp)
++add_library(linuxdeploy_core STATIC elf_file.cpp appdir.cpp ${HEADERS} appdir_root_setup.cpp debug_symbols.cpp)
+ target_link_libraries(linuxdeploy_core PUBLIC
+     linuxdeploy_plugin linuxdeploy_log linuxdeploy_util linuxdeploy_desktopfile_static
+     CImg ${CMAKE_THREAD_LIBS_INIT}
+diff --git a/src/core/appdir.cpp b/src/core/appdir.cpp
+index 8f31102..3a9cce3 100644
+--- a/src/core/appdir.cpp
++++ b/src/core/appdir.cpp
+@@ -21,6 +21,7 @@
+ // auto-generated headers
+ #include "excludelist.h"
+ #include "appdir_root_setup.h"
++#include "debug_symbols.h"
+ 
+ using namespace linuxdeploy::core;
+ using namespace linuxdeploy::desktopfile;
+@@ -106,6 +107,12 @@ namespace linuxdeploy {
+                     std::set<fs::path> stripOperations;
+                     std::map<fs::path, std::string> setElfRPathOperations;
+ 
++                    // the originals of the files in stripOperations: the files they were copied from, or the files themselves
++                    std::map<fs::path, fs::path> stripOperationSources;
++
++                    // keeps the debug information of the files that are stripped, if set
++                    std::shared_ptr<debug_symbols::DebugSymbolsTree> debugSymbolsTree;
++
+                     // stores all files that have been visited by the deploy functions, e.g., when they're blacklisted,
+                     // have been added to the deferred operations already, etc.
+                     // lookups in a single container are a lot faster than having to look up in several ones, therefore
+@@ -234,9 +241,17 @@ namespace linuxdeploy {
+                         bool success = true;
+ 
+                         const auto copyOperations = copyOperationsStorage.getOperations();
+-                        std::for_each(copyOperations.begin(), copyOperations.end(), [&success](const CopyOperation& operation) {
++                        std::for_each(copyOperations.begin(), copyOperations.end(), [this, &success](const CopyOperation& operation) {
++                            // a file that is already at the destination is kept, and is then its own original
++                            const auto kept = fs::exists(operation.toPath);
++
+                             if (!copyFile(operation.fromPath, operation.toPath, operation.addedPermissions)) {
+                                 success = false;
++                            } else {
++                                const auto source = stripOperationSources.find(operation.toPath);
++
++                                if (source != stripOperationSources.end())
++                                    source->second = kept ? operation.toPath : operation.fromPath;
+                             }
+                         });
+                         copyOperationsStorage.clear();
+@@ -247,6 +262,7 @@ namespace linuxdeploy {
+                         if (getenv("NO_STRIP") != nullptr) {
+                             ldLog() << LD_WARNING << "$NO_STRIP environment variable detected, not stripping binaries" << std::endl;
+                             stripOperations.clear();
++                            stripOperationSources.clear();
+                         } else {
+                             const auto stripPath = getStripPath();
+ 
+@@ -256,6 +272,10 @@ namespace linuxdeploy {
+                                 if (util::stringStartsWith(elf_file::ElfFile(filePath).getRPath(), "$")) {
+                                     ldLog() << LD_WARNING << "Not calling strip on binary" << filePath << LD_NO_SPACE
+                                             << ": rpath starts with $" << std::endl;
++                                } else if (!saveDebugInformation(filePath)) {
++                                    ldLog() << LD_ERROR << "Not calling strip on binary" << filePath << LD_NO_SPACE
++                                            << ": could not save its debug information" << std::endl;
++                                    success = false;
+                                 } else {
+                                     ldLog() << "Calling strip on library" << filePath << std::endl;
+ 
+@@ -272,8 +292,17 @@ namespace linuxdeploy {
+                                         ldLog() << LD_ERROR << "Strip call failed:" << err << std::endl;
+                                         success = false;
+                                     }
++
++                                    if (debugSymbolsTree != nullptr) {
++                                        // a file strip could not process keeps its own debug information
++                                        if (result.exit_code() != 0)
++                                            debugSymbolsTree->discardDebugInformation(filePath);
++                                        else if (!debugSymbolsTree->linkDebugInformation(filePath))
++                                            success = false;
++                                    }
+                                 }
+ 
++                                stripOperationSources.erase(filePath);
+                                 stripOperations.erase(stripOperations.begin());
+                             }
+                         }
+@@ -376,6 +405,17 @@ namespace linuxdeploy {
+                         return true;
+                     }
+ 
++                    // the debug information has to be saved before strip removes it
++                    bool saveDebugInformation(const fs::path& filePath) const {
++                        if (debugSymbolsTree == nullptr)
++                            return true;
++
++                        const auto source = stripOperationSources.find(filePath);
++                        const auto sourcePath = source != stripOperationSources.end() ? source->second : filePath;
++
++                        return debugSymbolsTree->saveDebugInformation(filePath, sourcePath);
++                    }
++
+                     static std::string getStripPath() {
+                         // by default, try to use a strip next to the linuxdeploy binary
+                         // if that isn't available, fall back to searching for strip in the PATH
+@@ -464,6 +504,7 @@ namespace linuxdeploy {
+                         }
+ 
+                         stripOperations.insert(actualDestination);
++                        stripOperationSources[actualDestination] = path;
+ 
+                         if (!deployDependencies)
+                             return true;
+@@ -506,6 +547,7 @@ namespace linuxdeploy {
+ 
+                         setElfRPathOperations[destinationPath / path.filename()] = rpath;
+                         stripOperations.insert(destinationPath / path.filename());
++                        stripOperationSources[destinationPath / path.filename()] = path;
+ 
+                         if (!deployElfDependencies(path))
+                             return false;
+@@ -975,6 +1017,15 @@ namespace linuxdeploy {
+             void AppDir::setDisableCopyrightFilesDeployment(bool disable) {
+                 d->disableCopyrightFilesDeployment = disable;
+             }
++
++            void AppDir::setDebugSymbolsDirectory(const std::filesystem::path& path) {
++                if (path.empty()) {
++                    d->debugSymbolsTree = nullptr;
++                    return;
++                }
++
++                d->debugSymbolsTree = std::make_shared<debug_symbols::DebugSymbolsTree>(d->appDirPath, path);
++            }
+         }
+     }
+ }
+diff --git a/src/core/debug_symbols.cpp b/src/core/debug_symbols.cpp
+new file mode 100644
+index 0000000..492bd8a
+--- /dev/null
++++ b/src/core/debug_symbols.cpp
+@@ -0,0 +1,871 @@
++// system headers
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <elf.h>
++#include <fstream>
++#include <iomanip>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <vector>
++
++// local headers
++#include "linuxdeploy/log/log.h"
++#include "linuxdeploy/subprocess/subprocess.h"
++#include "linuxdeploy/util/util.h"
++#include "debug_symbols.h"
++
++using namespace linuxdeploy::log;
++
++namespace fs = std::filesystem;
++
++namespace linuxdeploy {
++    namespace core {
++        namespace debug_symbols {
++            namespace {
++                // what GDB looks at in an ELF file when it decides where the debug information comes from
++                struct DebugInfo {
++                    bool hasDwarf = false;
++                    bool hasSymbolTable = false;
++                    std::string buildId;
++
++                    bool hasDebugLink = false;
++                    std::string debugLinkName;
++                    uint32_t debugLinkCrc = 0;
++
++                    bool hasAltLink = false;
++                    std::string altLinkName;
++                    std::string altLinkBuildId;
++                };
++
++                std::string readBytes(std::ifstream& ifs, uint64_t offset, uint64_t size) {
++                    ifs.clear();
++                    ifs.seekg(0, std::ios::end);
++                    const auto fileSize = static_cast<uint64_t>(ifs.tellg());
++
++                    // offsets and sizes come from the file, so they must not reach past its end
++                    if (offset > fileSize || size > fileSize - offset)
++                        return {};
++
++                    std::string data(size, '\0');
++
++                    ifs.seekg(static_cast<std::streamoff>(offset));
++
++                    if (!ifs.read(&data[0], static_cast<std::streamsize>(size)))
++                        return {};
++
++                    return data;
++                }
++
++                std::string findBuildIdNote(const std::string& notes, uint64_t alignment) {
++                    if (alignment < 4)
++                        alignment = 4;
++
++                    auto align = [alignment](uint64_t value) {
++                        return (value + alignment - 1) / alignment * alignment;
++                    };
++
++                    uint64_t offset = 0;
++
++                    while (offset + sizeof(Elf64_Nhdr) <= notes.size()) {
++                        Elf64_Nhdr header{};
++                        std::memcpy(&header, notes.data() + offset, sizeof(header));
++
++                        const auto nameOffset = offset + sizeof(header);
++                        const auto descOffset = nameOffset + align(header.n_namesz);
++
++                        if (descOffset + header.n_descsz > notes.size())
++                            break;
++
++                        if (header.n_type == NT_GNU_BUILD_ID && header.n_namesz == 4 &&
++                            notes.compare(nameOffset, 4, std::string("GNU\0", 4)) == 0) {
++                            return notes.substr(descOffset, header.n_descsz);
++                        }
++
++                        offset = descOffset + align(header.n_descsz);
++                    }
++
++                    return {};
++                }
++
++                template<typename Ehdr_T, typename Shdr_T, typename Phdr_T>
++                bool readElfFile(std::ifstream& ifs, DebugInfo& info) {
++                    const auto header = readBytes(ifs, 0, sizeof(Ehdr_T));
++
++                    if (header.size() != sizeof(Ehdr_T))
++                        return false;
++
++                    Ehdr_T ehdr{};
++                    std::memcpy(&ehdr, header.data(), sizeof(ehdr));
++
++                    std::vector<Shdr_T> sections;
++
++                    if (ehdr.e_shoff != 0 && ehdr.e_shentsize == sizeof(Shdr_T)) {
++                        const auto table = readBytes(ifs, ehdr.e_shoff, uint64_t(ehdr.e_shnum) * sizeof(Shdr_T));
++
++                        sections.resize(table.size() / sizeof(Shdr_T));
++                        if (!table.empty())
++                            std::memcpy(sections.data(), table.data(), sections.size() * sizeof(Shdr_T));
++                    }
++
++                    std::string names;
++                    if (ehdr.e_shstrndx != SHN_UNDEF && ehdr.e_shstrndx < sections.size())
++                        names = readBytes(ifs, sections[ehdr.e_shstrndx].sh_offset, sections[ehdr.e_shstrndx].sh_size);
++
++                    for (const auto& section : sections) {
++                        const std::string name = section.sh_name < names.size() ? names.c_str() + section.sh_name : "";
++                        const bool hasContents = section.sh_type != SHT_NOBITS && section.sh_size > 0;
++
++                        if (!hasContents)
++                            continue;
++
++                        if (name == ".debug_info" || name == ".zdebug_info") {
++                            info.hasDwarf = true;
++                        } else if (section.sh_type == SHT_SYMTAB) {
++                            // the first entry of every symbol table is the null symbol
++                            info.hasSymbolTable = info.hasSymbolTable || section.sh_size > section.sh_entsize;
++                        } else if (section.sh_type == SHT_NOTE) {
++                            if (info.buildId.empty())
++                                info.buildId = findBuildIdNote(readBytes(ifs, section.sh_offset, section.sh_size), section.sh_addralign);
++                        } else if (name == ".gnu_debuglink") {
++                            const auto data = readBytes(ifs, section.sh_offset, section.sh_size);
++                            const auto nameLength = data.find('\0');
++
++                            // the CRC follows the name, aligned to four bytes
++                            const auto crcOffset = (nameLength + 4) / 4 * 4;
++
++                            if (nameLength != std::string::npos && crcOffset + 4 <= data.size()) {
++                                info.hasDebugLink = true;
++                                info.debugLinkName = data.substr(0, nameLength);
++                                std::memcpy(&info.debugLinkCrc, data.data() + crcOffset, 4);
++                            }
++                        } else if (name == ".gnu_debugaltlink") {
++                            const auto data = readBytes(ifs, section.sh_offset, section.sh_size);
++                            const auto nameLength = data.find('\0');
++
++                            if (nameLength != std::string::npos) {
++                                info.hasAltLink = true;
++                                info.altLinkName = data.substr(0, nameLength);
++                                info.altLinkBuildId = data.substr(nameLength + 1);
++                            }
++                        }
++                    }
++
++                    // files without section headers still carry the build ID in a PT_NOTE segment
++                    if (info.buildId.empty() && ehdr.e_phoff != 0 && ehdr.e_phentsize == sizeof(Phdr_T)) {
++                        const auto table = readBytes(ifs, ehdr.e_phoff, uint64_t(ehdr.e_phnum) * sizeof(Phdr_T));
++
++                        for (size_t i = 0; i + sizeof(Phdr_T) <= table.size() && info.buildId.empty(); i += sizeof(Phdr_T)) {
++                            Phdr_T phdr{};
++                            std::memcpy(&phdr, table.data() + i, sizeof(phdr));
++
++                            if (phdr.p_type == PT_NOTE && phdr.p_filesz > 0)
++                                info.buildId = findBuildIdNote(readBytes(ifs, phdr.p_offset, phdr.p_filesz), phdr.p_align);
++                        }
++                    }
++
++                    return true;
++                }
++
++                std::optional<DebugInfo> readDebugInfo(const fs::path& path) {
++                    std::ifstream ifs(path, std::ios::binary);
++
++                    if (!ifs)
++                        return std::nullopt;
++
++                    const auto ident = readBytes(ifs, 0, EI_NIDENT);
++
++                    if (ident.size() != EI_NIDENT || ident.compare(0, SELFMAG, ELFMAG) != 0)
++                        return std::nullopt;
++
++                    // like the rest of linuxdeploy, only files in the native byte order are supported
++                    const uint16_t probe = 1;
++                    const auto nativeData = *reinterpret_cast<const uint8_t*>(&probe) == 1 ? ELFDATA2LSB : ELFDATA2MSB;
++
++                    if (ident[EI_DATA] != nativeData)
++                        return std::nullopt;
++
++                    DebugInfo info;
++                    bool parsed = false;
++
++                    switch (ident[EI_CLASS]) {
++                        case ELFCLASS32:
++                            parsed = readElfFile<Elf32_Ehdr, Elf32_Shdr, Elf32_Phdr>(ifs, info);
++                            break;
++                        case ELFCLASS64:
++                            parsed = readElfFile<Elf64_Ehdr, Elf64_Shdr, Elf64_Phdr>(ifs, info);
++                            break;
++                    }
++
++                    if (!parsed)
++                        return std::nullopt;
++
++                    return info;
++                }
++
++                // the CRC GNU tools store in .gnu_debuglink sections
++                uint32_t calculateCrc32(const fs::path& path) {
++                    static const auto table = []() {
++                        std::array<uint32_t, 256> values{};
++
++                        for (uint32_t i = 0; i < values.size(); ++i) {
++                            auto value = i;
++
++                            for (int bit = 0; bit < 8; ++bit)
++                                value = (value & 1) ? 0xedb88320u ^ (value >> 1) : value >> 1;
++
++                            values[i] = value;
++                        }
++
++                        return values;
++                    }();
++
++                    std::ifstream ifs(path, std::ios::binary);
++                    std::vector<char> buffer(1 << 16);
++
++                    uint32_t crc = 0xffffffffu;
++
++                    while (ifs) {
++                        ifs.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
++
++                        for (std::streamsize i = 0; i < ifs.gcount(); ++i)
++                            crc = table[(crc ^ static_cast<uint8_t>(buffer[i])) & 0xffu] ^ (crc >> 8);
++                    }
++
++                    return crc ^ 0xffffffffu;
++                }
++
++                // the build ID given to a file linked without one, computed like ld --build-id=sha1 but over the saved
++                // debug file, so that it stays the same when the same file is deployed again
++                std::string calculateSha1(const fs::path& path) {
++                    std::array<uint32_t, 5> state{0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u, 0xc3d2e1f0u};
++                    std::array<uint8_t, 64> block{};
++                    size_t used = 0;
++                    uint64_t length = 0;
++
++                    auto rotate = [](uint32_t value, int bits) {
++                        return (value << bits) | (value >> (32 - bits));
++                    };
++
++                    auto processBlock = [&state, &block, &rotate]() {
++                        std::array<uint32_t, 80> words{};
++
++                        for (size_t i = 0; i < 16; ++i) {
++                            words[i] = uint32_t(block[i * 4]) << 24 | uint32_t(block[i * 4 + 1]) << 16 |
++                                       uint32_t(block[i * 4 + 2]) << 8 | uint32_t(block[i * 4 + 3]);
++                        }
++
++                        for (size_t i = 16; i < words.size(); ++i)
++                            words[i] = rotate(words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16], 1);
++
++                        auto a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
++
++                        for (size_t i = 0; i < words.size(); ++i) {
++                            uint32_t f, k;
++
++                            if (i < 20) {
++                                f = (b & c) | (~b & d);
++                                k = 0x5a827999u;
++                            } else if (i < 40) {
++                                f = b ^ c ^ d;
++                                k = 0x6ed9eba1u;
++                            } else if (i < 60) {
++                                f = (b & c) | (b & d) | (c & d);
++                                k = 0x8f1bbcdcu;
++                            } else {
++                                f = b ^ c ^ d;
++                                k = 0xca62c1d6u;
++                            }
++
++                            const auto next = rotate(a, 5) + f + e + k + words[i];
++                            e = d;
++                            d = c;
++                            c = rotate(b, 30);
++                            b = a;
++                            a = next;
++                        }
++
++                        state[0] += a;
++                        state[1] += b;
++                        state[2] += c;
++                        state[3] += d;
++                        state[4] += e;
++                    };
++
++                    auto feed = [&block, &used, &processBlock](const uint8_t* bytes, size_t count) {
++                        for (size_t i = 0; i < count; ++i) {
++                            block[used++] = bytes[i];
++
++                            if (used == block.size()) {
++                                processBlock();
++                                used = 0;
++                            }
++                        }
++                    };
++
++                    std::ifstream ifs(path, std::ios::binary);
++                    std::vector<char> buffer(1 << 16);
++
++                    while (ifs) {
++                        ifs.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
++                        const auto count = static_cast<size_t>(ifs.gcount());
++                        length += count;
++                        feed(reinterpret_cast<const uint8_t*>(buffer.data()), count);
++                    }
++
++                    const uint8_t terminator = 0x80;
++                    const uint8_t zero = 0;
++                    feed(&terminator, 1);
++
++                    while (used != 56)
++                        feed(&zero, 1);
++
++                    std::array<uint8_t, 8> bitLength{};
++                    for (size_t i = 0; i < bitLength.size(); ++i)
++                        bitLength[i] = static_cast<uint8_t>((length * 8) >> ((7 - i) * 8));
++                    feed(bitLength.data(), bitLength.size());
++
++                    std::string digest;
++                    for (const auto value : state) {
++                        for (int shift = 24; shift >= 0; shift -= 8)
++                            digest.push_back(static_cast<char>((value >> shift) & 0xffu));
++                    }
++
++                    return digest;
++                }
++
++                std::string buildIdNote(const std::string& buildId) {
++                    const uint32_t header[] = {4, static_cast<uint32_t>(buildId.size()), NT_GNU_BUILD_ID};
++
++                    std::string note(reinterpret_cast<const char*>(header), sizeof(header));
++                    note.append("GNU\0", 4);
++                    note.append(buildId);
++                    note.resize((note.size() + 3) / 4 * 4, '\0');
++
++                    return note;
++                }
++
++                std::string toHex(const std::string& bytes) {
++                    std::ostringstream oss;
++
++                    for (const auto byte : bytes)
++                        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned int>(static_cast<uint8_t>(byte));
++
++                    return oss.str();
++                }
++
++                // <dir>/.build-id/ab/cdef....debug, the place GDB looks at first
++                fs::path buildIdPath(const fs::path& directory, const std::string& buildId) {
++                    const auto hex = toHex(buildId);
++                    return directory / ".build-id" / hex.substr(0, 2) / (hex.substr(2) + ".debug");
++                }
++
++                bool hasBuildId(const fs::path& path, const std::string& buildId) {
++                    if (!fs::is_regular_file(path))
++                        return false;
++
++                    const auto info = readDebugInfo(path);
++                    return info.has_value() && info->buildId == buildId;
++                }
++
++                // "dir", "dir/" and "dir/." name the same directory
++                fs::path normalizedDirectory(const fs::path& path) {
++                    auto result = fs::absolute(path).lexically_normal().string();
++
++                    while (result.size() > 1 && result.back() == '/')
++                        result.pop_back();
++
++                    return result;
++                }
++
++                fs::path realPath(const fs::path& path) {
++                    std::error_code ec;
++                    auto result = fs::canonical(path, ec);
++
++                    if (ec)
++                        return fs::absolute(path).lexically_normal();
++
++                    return result;
++                }
++
++                std::string getObjcopyPath() {
++                    // like strip, prefer an objcopy next to the linuxdeploy binary over the one in the $PATH
++                    const auto localObjcopyPath = fs::path(util::getOwnExecutablePath()).parent_path() / "objcopy";
++
++                    if (fs::exists(localObjcopyPath))
++                        return localObjcopyPath.string();
++
++                    return "objcopy";
++                }
++
++                // rename does not work across file systems, the staging directory may be on another one
++                void moveFile(const fs::path& from, const fs::path& to) {
++                    std::error_code ec;
++                    fs::rename(from, to, ec);
++
++                    if (ec) {
++                        fs::copy_file(from, to, fs::copy_options::overwrite_existing);
++                        fs::remove(from);
++                    }
++                }
++
++                // creates a directory with its missing parents, and records the ones it creates
++                void createDirectories(const fs::path& directory, std::vector<fs::path>& createdPaths) {
++                    std::vector<fs::path> missing;
++
++                    for (auto path = directory; path != path.parent_path() && !fs::exists(path); path = path.parent_path())
++                        missing.push_back(path);
++
++                    createdPaths.insert(createdPaths.end(), missing.rbegin(), missing.rend());
++                    fs::create_directories(directory);
++                }
++
++                bool runObjcopy(const std::vector<std::string>& arguments) {
++                    std::vector<std::string> args{getObjcopyPath()};
++                    args.insert(args.end(), arguments.begin(), arguments.end());
++
++                    auto env = subprocess::get_environment();
++                    env["LC_ALL"] = "C";
++
++                    const auto result = subprocess::subprocess(args, env).run();
++
++                    if (result.exit_code() != 0) {
++                        ldLog() << LD_ERROR << "objcopy call failed:" << result.stderr_string() << std::endl;
++                        return false;
++                    }
++
++                    return true;
++                }
++            }
++
++            class DebugSymbolsTree::Private {
++            public:
++                // what was saved to the tree for a file before it was stripped
++                struct SavedDebugInformation {
++                    fs::path targetPath;
++                    std::string addedBuildId;
++
++                    // the tree entries this save added, directories included, removed again when strip does not process
++                    // the file
++                    std::vector<fs::path> createdPaths;
++
++                    // the files and symbolic links this save replaced, with the file kept in the staging directory or the
++                    // link's target, put back when strip does not process the file
++                    std::vector<std::pair<fs::path, fs::path>> replacedFiles;
++                    std::vector<std::pair<fs::path, fs::path>> replacedLinks;
++                };
++
++                fs::path appDirPath;
++                fs::path treePath;
++                std::vector<fs::path> globalDebugDirectories;
++
++                fs::path stagingDirectory;
++                size_t stagedFiles = 0;
++
++                // the save of the file that is being stripped; files are taken one at a time, so taking a save back never
++                // removes what another save relies on, like a dwz file both refer to or a build ID link
++                std::optional<std::pair<fs::path, SavedDebugInformation>> pending;
++
++            public:
++                Private(const fs::path& appDirPath, const fs::path& treePath)
++                    : appDirPath(normalizedDirectory(appDirPath)), treePath(normalizedDirectory(treePath)) {
++                    const auto* const directories = getenv("LINUXDEPLOY_DEBUG_FILE_DIRECTORY");
++
++                    if (directories == nullptr) {
++                        globalDebugDirectories.emplace_back("/usr/lib/debug");
++                        return;
++                    }
++
++                    for (const auto& directory : util::split(directories, ':')) {
++                        if (!directory.empty())
++                            globalDebugDirectories.emplace_back(directory);
++                    }
++                }
++
++                ~Private() {
++                    if (!stagingDirectory.empty()) {
++                        std::error_code ec;
++                        fs::remove_all(stagingDirectory, ec);
++                    }
++                }
++
++                fs::path newStagingPath() {
++                    if (stagingDirectory.empty()) {
++                        auto pattern = (fs::temp_directory_path() / "linuxdeploy-debug-symbols-XXXXXX").string();
++
++                        if (mkdtemp(&pattern[0]) == nullptr) {
++                            ldLog() << LD_ERROR << "Failed to create a staging directory for debug information:" << strerror(errno) << std::endl;
++                            return {};
++                        }
++
++                        stagingDirectory = pattern;
++                    }
++
++                    return stagingDirectory / (std::to_string(stagedFiles++) + ".debug");
++                }
++
++                // the separate debug file GDB loads for a file without DWARF: build ID first, then the debug link next
++                // to the file, in its .debug directory and under the global directories
++                fs::path findSeparateDebugFile(const fs::path& filePath, const DebugInfo& info) const {
++                    if (!info.buildId.empty()) {
++                        for (const auto& directory : globalDebugDirectories) {
++                            const auto candidate = buildIdPath(directory, info.buildId);
++
++                            if (!fs::exists(candidate))
++                                continue;
++
++                            const auto resolved = realPath(candidate);
++
++                            if (!hasBuildId(resolved, info.buildId))
++                                continue;
++
++                            // GDB does not take the file itself, and moves on to the debug link
++                            if (resolved == filePath)
++                                break;
++
++                            return resolved;
++                        }
++                    }
++
++                    if (!info.hasDebugLink)
++                        return {};
++
++                    const auto directory = filePath.parent_path();
++
++                    std::vector<fs::path> candidates{
++                        directory / info.debugLinkName,
++                        directory / ".debug" / info.debugLinkName,
++                    };
++
++                    for (const auto& globalDirectory : globalDebugDirectories)
++                        candidates.emplace_back(globalDirectory / directory.relative_path() / info.debugLinkName);
++
++                    for (const auto& candidate : candidates) {
++                        std::error_code ec;
++
++                        if (candidate == filePath || !fs::is_regular_file(candidate) || fs::equivalent(candidate, filePath, ec))
++                            continue;
++
++                        if (calculateCrc32(candidate) == info.debugLinkCrc)
++                            return realPath(candidate);
++
++                        ldLog() << LD_DEBUG << "CRC of" << candidate << "does not match debug link of" << filePath << std::endl;
++                    }
++
++                    return {};
++                }
++
++                // the dwz file GDB loads for a .gnu_debugaltlink: the path it records (relative to the file it was read
++                // from), then its build ID under the global directories
++                fs::path findSupplementaryFile(const fs::path& referencingFilePath, const DebugInfo& info) const {
++                    auto candidate = fs::path(info.altLinkName);
++
++                    if (candidate.is_relative())
++                        candidate = referencingFilePath.parent_path() / candidate;
++
++                    if (hasBuildId(candidate, info.altLinkBuildId))
++                        return realPath(candidate);
++
++                    for (const auto& directory : globalDebugDirectories) {
++                        const auto buildIdCandidate = buildIdPath(directory, info.altLinkBuildId);
++
++                        if (fs::exists(buildIdCandidate) && hasBuildId(realPath(buildIdCandidate), info.altLinkBuildId))
++                            return realPath(buildIdCandidate);
++                    }
++
++                    return {};
++                }
++
++                bool addBuildIdNote(const fs::path& filePath, const std::string& buildId) {
++                    const auto notePath = newStagingPath();
++
++                    if (notePath.empty())
++                        return false;
++
++                    {
++                        std::ofstream ofs(notePath, std::ios::binary | std::ios::trunc);
++                        ofs << buildIdNote(buildId);
++
++                        if (!ofs) {
++                            ldLog() << LD_ERROR << "Failed to write" << notePath << std::endl;
++                            return false;
++                        }
++                    }
++
++                    const auto success = runObjcopy({"--remove-section=.note.gnu.build-id", "--add-section", ".note.gnu.build-id=" + notePath.string(),
++                                                     "--set-section-flags", ".note.gnu.build-id=contents,readonly", filePath.string()});
++
++                    std::error_code ec;
++                    fs::remove(notePath, ec);
++
++                    return success;
++                }
++
++                // moves a file or symbolic link out of the way of a save, so that it can be put back when strip does not
++                // process the file; a path nothing is at yet is recorded as created
++                bool setAside(const fs::path& path, SavedDebugInformation& entry) {
++                    const auto status = fs::symlink_status(path);
++
++                    if (fs::is_symlink(status)) {
++                        entry.replacedLinks.emplace_back(path, fs::read_symlink(path));
++                        fs::remove(path);
++                    } else if (fs::is_regular_file(status)) {
++                        const auto keptPath = newStagingPath();
++
++                        if (keptPath.empty())
++                            return false;
++
++                        moveFile(path, keptPath);
++                        entry.replacedFiles.emplace_back(path, keptPath);
++                    } else if (!fs::exists(status)) {
++                        entry.createdPaths.push_back(path);
++                    }
++
++                    return true;
++                }
++
++                // copy the dwz file into <tree>/.dwz once, and refer to it from the debug file by a name relative to the
++                // directory the debug file is saved in
++                bool saveSupplementaryFile(const fs::path& debugFilePath, const fs::path& savedDirectory, const fs::path& originPath,
++                                           const DebugInfo& info, SavedDebugInformation& entry) {
++                    const auto supplementaryFilePath = findSupplementaryFile(originPath, info);
++
++                    if (supplementaryFilePath.empty()) {
++                        ldLog() << LD_WARNING << "Could not find dwz file" << info.altLinkName << "referenced by" << originPath << std::endl;
++                        return true;
++                    }
++
++                    const auto savedPath = treePath / ".dwz" / (toHex(info.altLinkBuildId) + ".debug");
++
++                    try {
++                        createDirectories(savedPath.parent_path(), entry.createdPaths);
++
++                        if (!hasBuildId(savedPath, info.altLinkBuildId)) {
++                            ldLog() << "Saving dwz file" << supplementaryFilePath << "to" << savedPath << std::endl;
++
++                            if (!setAside(savedPath, entry))
++                                return false;
++
++                            fs::copy_file(supplementaryFilePath, savedPath, fs::copy_options::overwrite_existing);
++                        }
++                    } catch (const fs::filesystem_error& e) {
++                        ldLog() << LD_ERROR << "Failed to save dwz file" << supplementaryFilePath << LD_NO_SPACE << ":" << e.what() << std::endl;
++                        return false;
++                    }
++
++                    const auto reference = savedPath.lexically_relative(savedDirectory);
++
++                    const auto sectionPath = debugFilePath.string() + ".gnu_debugaltlink";
++                    {
++                        std::ofstream ofs(sectionPath, std::ios::binary | std::ios::trunc);
++                        ofs << reference.string() << '\0' << info.altLinkBuildId;
++
++                        if (!ofs) {
++                            ldLog() << LD_ERROR << "Failed to write" << sectionPath << std::endl;
++                            return false;
++                        }
++                    }
++
++                    const auto success = runObjcopy({"--update-section", ".gnu_debugaltlink=" + sectionPath, debugFilePath.string()});
++
++                    std::error_code ec;
++                    fs::remove(sectionPath, ec);
++
++                    return success;
++                }
++
++                // the debug file, the dwz file it refers to and the build ID link, all written before the file is stripped
++                bool saveDebugFile(const fs::path& deployedPath, const fs::path& originPath, bool extract, SavedDebugInformation& entry) {
++                    const auto& targetPath = entry.targetPath;
++
++                    try {
++                        createDirectories(targetPath.parent_path(), entry.createdPaths);
++                    } catch (const fs::filesystem_error& e) {
++                        ldLog() << LD_ERROR << "Failed to create directory" << targetPath.parent_path() << LD_NO_SPACE << ":" << e.what() << std::endl;
++                        return false;
++                    }
++
++                    const auto stagedPath = newStagingPath();
++
++                    if (stagedPath.empty())
++                        return false;
++
++                    ldLog() << "Saving debug information for" << deployedPath << "from" << originPath << "to" << targetPath << std::endl;
++
++                    if (extract) {
++                        if (!runObjcopy({"--only-keep-debug", originPath.string(), stagedPath.string()}))
++                            return false;
++                    } else {
++                        try {
++                            fs::copy_file(originPath, stagedPath, fs::copy_options::overwrite_existing);
++                        } catch (const fs::filesystem_error& e) {
++                            ldLog() << LD_ERROR << "Failed to copy debug information from" << originPath << LD_NO_SPACE << ":" << e.what() << std::endl;
++                            return false;
++                        }
++                    }
++
++                    const auto stagedInfo = readDebugInfo(stagedPath);
++
++                    if (stagedInfo.has_value() && stagedInfo->hasAltLink &&
++                        !saveSupplementaryFile(stagedPath, targetPath.parent_path(), originPath, *stagedInfo, entry))
++                        return false;
++
++                    // GDB finds a debug file through debug-file-directory by build ID only, and takes it only if it has that
++                    // build ID: the debug file gets the stripped file's build ID, and a file linked without one gets a new one
++                    const auto deployedInfo = readDebugInfo(deployedPath);
++                    const auto debugFileBuildId = stagedInfo.has_value() ? stagedInfo->buildId : std::string();
++                    auto buildId = deployedInfo.has_value() ? deployedInfo->buildId : std::string();
++
++                    if (deployedInfo.has_value() && buildId.empty()) {
++                        buildId = !debugFileBuildId.empty() ? debugFileBuildId : calculateSha1(stagedPath);
++                        entry.addedBuildId = buildId;
++                    }
++
++                    if (!buildId.empty() && debugFileBuildId != buildId && !addBuildIdNote(stagedPath, buildId))
++                        return false;
++
++                    try {
++                        if (!setAside(targetPath, entry))
++                            return false;
++
++                        moveFile(stagedPath, targetPath);
++                    } catch (const fs::filesystem_error& e) {
++                        ldLog() << LD_ERROR << "Failed to save debug information to" << targetPath << LD_NO_SPACE << ":" << e.what() << std::endl;
++                        return false;
++                    }
++
++                    if (buildId.empty())
++                        return true;
++
++                    const auto linkPath = buildIdPath(treePath, buildId);
++
++                    try {
++                        createDirectories(linkPath.parent_path(), entry.createdPaths);
++
++                        if (!setAside(linkPath, entry))
++                            return false;
++
++                        fs::create_symlink(targetPath.lexically_relative(linkPath.parent_path()), linkPath);
++                    } catch (const fs::filesystem_error& e) {
++                        ldLog() << LD_ERROR << "Failed to create build ID link" << linkPath << LD_NO_SPACE << ":" << e.what() << std::endl;
++                        return false;
++                    }
++
++                    return true;
++                }
++
++                // takes the tree back to what it was before a save: removes what the save added, then puts back what it
++                // replaced
++                void undoSave(const SavedDebugInformation& entry) const {
++                    std::error_code ec;
++
++                    for (auto path = entry.createdPaths.rbegin(); path != entry.createdPaths.rend(); ++path)
++                        fs::remove(*path, ec);
++
++                    for (const auto& replaced : entry.replacedFiles) {
++                        try {
++                            fs::remove(replaced.first);
++                            moveFile(replaced.second, replaced.first);
++                        } catch (const fs::filesystem_error& e) {
++                            ldLog() << LD_WARNING << "Failed to restore" << replaced.first << LD_NO_SPACE << ":" << e.what() << std::endl;
++                        }
++                    }
++
++                    for (const auto& replaced : entry.replacedLinks) {
++                        fs::remove(replaced.first, ec);
++                        fs::create_symlink(replaced.second, replaced.first, ec);
++
++                        if (ec)
++                            ldLog() << LD_WARNING << "Failed to restore" << replaced.first << LD_NO_SPACE << ":" << ec.message() << std::endl;
++                    }
++                }
++            };
++
++            DebugSymbolsTree::DebugSymbolsTree(const fs::path& appDirPath, const fs::path& treePath) {
++                d = std::make_shared<Private>(appDirPath, treePath);
++            }
++
++            bool DebugSymbolsTree::saveDebugInformation(const fs::path& deployedPath, const fs::path& sourcePath) const {
++                if (d->pending.has_value()) {
++                    ldLog() << LD_ERROR << "Debug information of" << d->pending->first << "is neither linked nor discarded,"
++                            << "not saving the debug information of" << deployedPath << std::endl;
++                    return false;
++                }
++
++                const auto realSourcePath = realPath(sourcePath);
++                const auto sourceInfo = readDebugInfo(realSourcePath);
++
++                if (!sourceInfo.has_value()) {
++                    ldLog() << LD_WARNING << "Could not read" << realSourcePath << LD_NO_SPACE << ", not saving debug information" << std::endl;
++                    return true;
++                }
++
++                fs::path originPath = realSourcePath;
++                bool extract = true;
++
++                if (!sourceInfo->hasDwarf) {
++                    const auto separateDebugFilePath = d->findSeparateDebugFile(realSourcePath, *sourceInfo);
++
++                    if (!separateDebugFilePath.empty()) {
++                        originPath = separateDebugFilePath;
++                        extract = false;
++                    } else if (!sourceInfo->hasSymbolTable) {
++                        ldLog() << LD_DEBUG << "No debug information found for" << sourcePath << std::endl;
++                        return true;
++                    }
++                }
++
++                const auto deployedDirectory = fs::absolute(deployedPath).lexically_normal().parent_path();
++                const auto relativeDirectory = deployedDirectory.lexically_relative(d->appDirPath);
++
++                if (relativeDirectory.empty() || *relativeDirectory.begin() == "..") {
++                    ldLog() << LD_WARNING << deployedPath << "is not inside the AppDir, not saving debug information" << std::endl;
++                    return true;
++                }
++
++                Private::SavedDebugInformation entry;
++                entry.targetPath = (d->treePath / relativeDirectory / ".debug" / (deployedPath.filename().string() + ".debug")).lexically_normal();
++
++                if (!d->saveDebugFile(deployedPath, originPath, extract, entry)) {
++                    d->undoSave(entry);
++                    return false;
++                }
++
++                d->pending.emplace(deployedPath, entry);
++                return true;
++            }
++
++            bool DebugSymbolsTree::linkDebugInformation(const fs::path& deployedPath) const {
++                if (!d->pending.has_value() || d->pending->first != deployedPath)
++                    return true;
++
++                const auto saved = d->pending->second;
++                d->pending.reset();
++
++                // the file is stripped, so what its save replaced is not put back anymore
++                for (const auto& replaced : saved.replacedFiles) {
++                    std::error_code ec;
++                    fs::remove(replaced.second, ec);
++                }
++
++                // objcopy keeps an existing link when asked to add another one, so the old one has to go first
++                if (!runObjcopy({"--remove-section=.gnu_debuglink", "--add-gnu-debuglink=" + saved.targetPath.string(), deployedPath.string()}))
++                    return false;
++
++                return saved.addedBuildId.empty() || d->addBuildIdNote(deployedPath, saved.addedBuildId);
++            }
++
++            void DebugSymbolsTree::discardDebugInformation(const fs::path& deployedPath) const {
++                if (!d->pending.has_value() || d->pending->first != deployedPath)
++                    return;
++
++                d->undoSave(d->pending->second);
++                d->pending.reset();
++            }
++        }
++    }
++}
+diff --git a/src/core/debug_symbols.h b/src/core/debug_symbols.h
+new file mode 100644
+index 0000000..1a1ceaf
+--- /dev/null
++++ b/src/core/debug_symbols.h
+@@ -0,0 +1,60 @@
++#pragma once
++
++// system headers
++#include <filesystem>
++#include <memory>
++#include <vector>
++
++namespace linuxdeploy {
++    namespace core {
++        namespace debug_symbols {
++            /**
++             * Keeps the debug information of the ELF files linuxdeploy strips in a separate tree that mirrors the
++             * AppDir. GDB finds it when the tree is unpacked over the AppDir (debug links) or when its
++             * debug-file-directory points to the tree (build IDs).
++             *
++             * Files are taken one at a time: a file's save is linked or discarded before the next file is saved, so
++             * that discarding a save never removes what another one relies on, like a dwz file both refer to.
++             */
++            class DebugSymbolsTree {
++            private:
++                // PImpl
++                class Private;
++                std::shared_ptr<Private> d;
++
++            public:
++                DebugSymbolsTree(const std::filesystem::path& appDirPath, const std::filesystem::path& treePath);
++
++                /**
++                 * Save the debug information of a file that is about to be stripped to the tree, together with the dwz
++                 * file it refers to and its build ID link. It is read from the original, or from the separate debug file
++                 * GDB would load for the original. The debug file carries the build ID of the file, and a file linked
++                 * without one gets one, so that GDB finds it through debug-file-directory too.
++                 *
++                 * @param deployedPath file in the AppDir
++                 * @param sourcePath original: the file it was copied from, or the file itself when linuxdeploy kept it
++                 * @return false if the debug information could not be saved, or if another file's save is neither linked
++                 * nor discarded yet; the file must not be stripped then
++                 */
++                bool saveDebugInformation(const std::filesystem::path& deployedPath, const std::filesystem::path& sourcePath) const;
++
++                /**
++                 * Point the debug link of a stripped file to its saved debug information, and give the file the build
++                 * ID its debug file got.
++                 *
++                 * @param deployedPath stripped file in the AppDir
++                 * @return false on errors
++                 */
++                bool linkDebugInformation(const std::filesystem::path& deployedPath) const;
++
++                /**
++                 * Take back what was saved to the tree for a file strip did not process, so that the tree is as it was
++                 * before the save.
++                 *
++                 * @param deployedPath file in the AppDir
++                 */
++                void discardDebugInformation(const std::filesystem::path& deployedPath) const;
++            };
++        }
++    }
++}
+diff --git a/src/main.cpp b/src/main.cpp
+index bb99ee2..b0ffaab 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -45,6 +45,8 @@ int main(int argc, char** argv) {
+ 
+     args::ValueFlag<std::string> customAppRunPath(parser, "AppRun path", "Path to custom AppRun script (linuxdeploy will not create a symlink but copy this file instead)", {"custom-apprun"});
+ 
++    args::ValueFlag<std::string> debugSymbolsDirPath(parser, "directory", "Save the debug information of the ELF files linuxdeploy strips to this directory, in a tree that mirrors the AppDir", {"debug-symbols-dir"});
++
+     args::Flag listPlugins(parser, "", "Search for plugins, print them to stdout and exit", {"list-plugins"});
+     args::ValueFlagList<std::string> inputPlugins(parser, "name", "Input plugins to run (check whether they are available with --list-plugins)", {'p', "plugin"});
+     args::ValueFlagList<std::string> outputPlugins(parser, "name", "Output plugins to run (check whether they are available with --list-plugins)", {'o', "output"});
+@@ -111,6 +113,10 @@ int main(int argc, char** argv) {
+     appdir::AppDir appDir(appDirPath.Get());
+     appDir.setExcludeLibraryPatterns(excludeLibraryPatterns.Get());
+ 
++    if (debugSymbolsDirPath) {
++        appDir.setDebugSymbolsDirectory(debugSymbolsDirPath.Get());
++    }
++
+     // allow disabling copyright files deployment via environment variable
+     if (getenv("DISABLE_COPYRIGHT_FILES_DEPLOYMENT") != nullptr) {
+         ldLog() << std::endl << LD_WARNING << "Copyright files deployment disabled" << std::endl;

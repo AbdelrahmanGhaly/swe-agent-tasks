@@ -1,0 +1,1724 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 000000000..de262afac
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,91 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() { echo "usage: $0 [--output_path <path>] base|new" >&2; exit 2; }
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new) MODE="$1"; MODE_COUNT=$((MODE_COUNT + 1)); shift ;;
++    --output_path) shift; [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }; OUTPUT_PATH="$1"; shift ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    *) echo "unknown argument: $1" >&2; usage ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")"
++OUTPUT_PATH="${OUTPUT_PATH:-$PWD/junit-$MODE.xml}"
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++WORK="$(mktemp -d)"
++trap 'rm -rf "$WORK"' EXIT
++
++NEW_TESTS=unittests/fortranmodulescan_4e9b1d_tests.py
++STATUS=0
++
++run_pytest() {
++  python -m pytest -p no:cacheprovider -o addopts= -q "$@" --junitxml="$WORK/unit.xml" 2>&1 | tee "$WORK/unit.log"
++}
++
++if [ "$MODE" = base ]; then
++  # The Fortran project tests and the Fortran unit tests cover the module
++  # scanning code. run_project_tests.py deletes files under test cases/ when
++  # it starts, so it runs on a copy of the tree.
++  mkdir "$WORK/tree"
++  tar --exclude=./.git -cf - . | tar -xf - -C "$WORK/tree"
++  PROJECTS=0
++  (cd "$WORK/tree" && python run_project_tests.py --only fortran --use-tmpdir) > "$WORK/projects.log" 2>&1 || PROJECTS=1
++  tail -n 25 "$WORK/projects.log"
++  if [ -f "$WORK/tree/meson-test-run.xml" ]; then
++    mv "$WORK/tree/meson-test-run.xml" "$WORK/projects.xml"
++  fi
++  UNIT=0
++  run_pytest unittests/allplatformstests.py -k fortran || UNIT=1
++  PHASES=("projects=$PROJECTS" "unit=$UNIT")
++else
++  UNIT=0
++  run_pytest "$NEW_TESTS" || UNIT=1
++  PHASES=("unit=$UNIT")
++fi
++
++for phase in "${PHASES[@]}"; do
++  [ "${phase#*=}" = 0 ] || STATUS=1
++done
++
++python - "$OUTPUT_PATH" "$WORK" "${PHASES[@]}" <<'EOF' || STATUS=1
++import os
++import sys
++import xml.etree.ElementTree as ET
++
++out, work = sys.argv[1], sys.argv[2]
++root = ET.Element('testsuites')
++synthesized = False
++for arg in sys.argv[3:]:
++    phase, status = arg.split('=')
++    try:
++        tree = ET.parse(os.path.join(work, phase + '.xml')).getroot()
++        suites = [tree] if tree.tag == 'testsuite' else tree.findall('testsuite')
++    except (OSError, ET.ParseError):
++        suites = []
++    root.extend(suites)
++    cases = [c for s in suites for c in s.iter('testcase')]
++    failing = [c for c in cases if c.find('failure') is not None or c.find('error') is not None]
++    if cases and (status == '0' or failing):
++        continue
++    synthesized = True
++    try:
++        with open(os.path.join(work, phase + '.log'), encoding='utf-8', errors='replace') as f:
++            log = f.read()[-4000:]
++    except OSError:
++        log = ''
++    suite = ET.SubElement(root, 'testsuite', name=f'test.sh {phase}', tests='1', failures='1')
++    case = ET.SubElement(suite, 'testcase', name=phase, classname='test.sh')
++    failure = ET.SubElement(case, 'failure', message=f'{phase} tests exited with status {status} without a failing test result')
++    failure.text = log
++ET.ElementTree(root).write(out, encoding='utf-8', xml_declaration=True)
++sys.exit(1 if synthesized else 0)
++EOF
++
++exit "$STATUS"
+diff --git a/unittests/fortranmodulescan_4e9b1d_tests.py b/unittests/fortranmodulescan_4e9b1d_tests.py
+new file mode 100644
+index 000000000..616ccbe58
+--- /dev/null
++++ b/unittests/fortranmodulescan_4e9b1d_tests.py
+@@ -0,0 +1,1621 @@
++import json
++import os
++import random
++import re
++import shlex
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).resolve().parent.parent
++MESON = [sys.executable, str(ROOT / 'meson.py')]
++
++NO_PROGRAMS = '''import sys
++
++LAUNCHERS = {'system', 'popen', 'execl', 'execle', 'execlp', 'execv', 'execve', 'execvp', 'execvpe',
++             'fexecve', 'posix_spawn', 'posix_spawnp', 'fork', 'vfork'}
++
++
++def refuse(event, args):
++    programs = {'subprocess.Popen', 'os.system', 'os.exec', 'os.posix_spawn', 'os.spawn', 'os.startfile',
++                '_winapi.CreateProcess'}
++    launcher = event in {'ctypes.dlsym', 'ctypes.dlsym/handle'} and args[1] in LAUNCHERS
++    if (event in programs or launcher) and '--internal' in sys.argv:
++        raise RuntimeError(f'the scan ran a program: {event} {args!r}')
++
++
++sys.addaudithook(refuse)
++'''
++
++
++def lib(name, sources, args=(), incdirs=(), link=()):
++    return {'name': name, 'sources': list(sources), 'args': list(args),
++            'incdirs': list(incdirs), 'link': list(link)}
++
++
++def meson_build(case):
++    out = ["project('scan', 'fortran')"]
++    if case.get('project_args'):
++        out.append(f"add_project_arguments({case['project_args']!r}, language: 'fortran')")
++    headers = []
++    if case.get('build_time_headers'):
++        out.append("fs = import('fs')")
++        for i, (name, template) in enumerate(sorted(case['build_time_headers'].items())):
++            out.append(f"header{i} = fs.copyfile({template!r}, {name!r})")
++            headers.append(f'header{i}')
++    for t in case['targets']:
++        kwargs = [f"fortran_args: {t['args']!r}"]
++        if t['incdirs']:
++            kwargs.append(f"include_directories: include_directories({', '.join(map(repr, t['incdirs']))})")
++        if t['link']:
++            kwargs.append(f"link_with: [{', '.join('t_' + n for n in t['link'])}]")
++        sources = f"{t['sources']!r} + [{', '.join(headers)}]" if headers else repr(t['sources'])
++        out.append(f"t_{t['name']} = static_library({t['name']!r}, {sources}, {', '.join(kwargs)})")
++    return '\n'.join(out) + '\n'
++
++
++def split_unescaped(text, sep):
++    i = 0
++    while i < len(text):
++        if text[i] == '$':
++            i += 2
++            continue
++        if text[i] == sep:
++            return text[:i], text[i + 1:]
++        i += 1
++    return text, ''
++
++
++def ninja_paths(text):
++    paths, cur, i = [], '', 0
++    while i < len(text):
++        c = text[i]
++        if c == '$' and i + 1 < len(text):
++            cur += text[i + 1]
++            i += 2
++            continue
++        if c == ' ':
++            if cur:
++                paths.append(cur)
++            cur = ''
++        else:
++            cur += c
++        i += 1
++    if cur:
++        paths.append(cur)
++    return paths
++
++
++def dyndep_files(build):
++    objects = {}
++    current = None
++    for line in (build / 'build.ninja').read_text().splitlines():
++        if line.startswith('build '):
++            outs, rest = split_unescaped(line[6:], ':')
++            rule = rest.split()[0] if rest.split() else ''
++            current = ninja_paths(outs)[0] if rule.startswith('fortran_COMPILER') else None
++        elif current and line.startswith(' dyndep = '):
++            objects[current] = line.split('=', 1)[1].strip()
++    return objects
++
++
++def read_dyndeps(build, objects):
++    entries = {}
++    for dd in sorted(set(objects.values())):
++        for line in (build / dd).read_text().splitlines():
++            if not line.startswith('build '):
++                continue
++            outs, rest = split_unescaped(line[6:], ':')
++            outs = ninja_paths(outs)
++            ins = ninja_paths(rest)
++            assert ins[:1] == ['dyndep'], line
++            entries[outs[0]] = (set(p for p in outs[1:] if p != '|'), set(p for p in ins[1:] if p != '|'))
++    return entries
++
++
++def setup_project(tmp_path, case):
++    src = tmp_path / 'src'
++    for name, text in case['files'].items():
++        path = src / name
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(text)
++    (src / 'meson.build').write_text(meson_build(case))
++    build = tmp_path / 'build'
++    r = subprocess.run(MESON + ['setup', '--backend=ninja', str(build), str(src)],
++                       capture_output=True, text=True)
++    assert r.returncode == 0, r.stdout + r.stderr
++    if case.get('private_files'):
++        compdb = json.loads((build / 'compile_commands.json').read_text())
++        outputs = {os.path.normpath(build / e['file']): e['output'] for e in compdb}
++        for t in case['targets']:
++            private = build / os.path.dirname(outputs[os.path.normpath(src / t['sources'][0])])
++            for name, text in case['private_files'].get(t['name'], {}).items():
++                (private / name).write_text(text)
++    objects = dyndep_files(build)
++    run_scan(tmp_path, build, objects)
++    return src, build, objects
++
++
++def run_scan(tmp_path, build, objects):
++    guard = tmp_path / 'guard'
++    guard.mkdir(exist_ok=True)
++    (guard / 'sitecustomize.py').write_text(NO_PROGRAMS)
++    env = dict(os.environ)
++    env['PYTHONPATH'] = os.pathsep.join(filter(None, [str(guard), env.get('PYTHONPATH')]))
++    r = subprocess.run(['ninja', '-C', str(build)] + sorted(set(objects.values())),
++                       capture_output=True, text=True, env=env)
++    assert r.returncode == 0, r.stdout + r.stderr
++
++
++def module_dir(argv):
++    for i, a in enumerate(argv):
++        if a == '-J':
++            return argv[i + 1]
++        if a.startswith('-J'):
++            return a[2:]
++    raise AssertionError(argv)
++
++
++def search_dirs(argv):
++    dirs = [module_dir(argv)]
++    for i, a in enumerate(argv):
++        if a == '-I':
++            dirs.append(argv[i + 1])
++        elif a.startswith('-I'):
++            dirs.append(a[2:])
++    return dirs
++
++
++def compile_once(argv, build, scratch):
++    shutil.rmtree(scratch, ignore_errors=True)
++    scratch.mkdir()
++    argv = list(argv)
++    jdir = module_dir(argv)
++    argv = [('-J' + str(scratch)) if a == '-J' + jdir else a for a in argv]
++    argv[argv.index('-o') + 1] = str(scratch / 'probe.o')
++    return subprocess.run(argv, cwd=build, capture_output=True, text=True)
++
++
++def gfortran_truth(src, build, case, tmp_path):
++    compdb = json.loads((build / 'compile_commands.json').read_text())
++    by_source = {os.path.normpath(build / e['file']): e for e in compdb}
++    scratch = tmp_path / 'scratch'
++    pending = [(t['name'], s) for t in case['targets'] for s in t['sources']]
++    info = {}
++    while pending:
++        failures = {}
++        remaining = len(pending)
++        for target, s in list(pending):
++            entry = by_source[os.path.normpath(src / s)]
++            argv = shlex.split(entry['command'])
++            jdir = module_dir(argv)
++            mdir = build / jdir
++            mdir.mkdir(parents=True, exist_ok=True)
++            before = set(os.listdir(mdir))
++            r = subprocess.run(argv, cwd=build, capture_output=True, text=True)
++            new = set(os.listdir(mdir)) - before
++            if r.returncode != 0:
++                for f in new:
++                    (mdir / f).unlink()
++                failures[s] = r.stderr
++                continue
++            pending.remove((target, s))
++            info[s] = {'target': target, 'object': entry['output'], 'dir': jdir, 'argv': argv,
++                       'writes': {f for f in new if f.endswith(('.mod', '.smod'))}}
++        assert len(pending) < remaining, \
++            'invalid case, gfortran fails on ' + ', '.join(failures) + ':\n' + '\n'.join(failures.values())
++    for s, i in info.items():
++        reads = set()
++        for d in dict.fromkeys(os.path.normpath(d) for d in search_dirs(i['argv'])):
++            full = build / d
++            if not full.is_dir():
++                continue
++            for f in sorted(os.listdir(full)):
++                if not f.endswith(('.mod', '.smod')) or (d == os.path.normpath(i['dir']) and f in i['writes']):
++                    continue
++                kept = (full / f).read_bytes()
++                (full / f).write_bytes(b'not a module file\n')
++                try:
++                    probe = compile_once(i['argv'], build, scratch)
++                finally:
++                    (full / f).write_bytes(kept)
++                if probe.returncode != 0 and f in probe.stderr:
++                    reads.add((d, f))
++        i['reads'] = reads
++    provider = {}
++    for s, i in info.items():
++        for f in i['writes']:
++            provider[(os.path.normpath(i['dir']), f)] = s
++    expected = {}
++    for s, i in info.items():
++        ins = set()
++        for d, f in i['reads']:
++            p = provider.get((d, f))
++            if p is None or p == s:
++                continue
++            if info[p]['target'] == i['target']:
++                ins.add(f"{info[p]['dir']}/{f}")
++            else:
++                ins.add(info[p]['object'])
++        expected[i['object']] = ({f"{i['dir']}/{f}" for f in i['writes']}, ins)
++    return expected
++
++
++def check(tmp_path, case):
++    src, build, objects = setup_project(tmp_path, case)
++    compare(tmp_path, case, src, build, objects)
++
++
++def compare(tmp_path, case, src, build, objects):
++    got = read_dyndeps(build, objects)
++    if case.get('build_time_headers'):
++        r = subprocess.run(['ninja', '-C', str(build)] + sorted(case['build_time_headers']),
++                           capture_output=True, text=True)
++        assert r.returncode == 0, r.stdout + r.stderr
++    expected = gfortran_truth(src, build, case, tmp_path)
++    assert set(got) == set(expected), sorted(set(got) ^ set(expected))
++    separate = set(case.get('separate', ()))
++    either_way = {f for outs, _ in expected.values() for f in outs
++                  if f.endswith('.smod') and '@' not in os.path.basename(f)
++                  and os.path.basename(f)[:-len('.smod')] not in separate}
++    listed = {o: got.get(o, (set(), set())) for o in expected}
++    assert {o: (outs - either_way, ins - either_way) for o, (outs, ins) in listed.items()} == \
++        {o: (outs - either_way, ins - either_way) for o, (outs, ins) in expected.items()}
++    assert {o: (outs - expected[o][0], ins - expected[o][1]) for o, (outs, ins) in listed.items()} == \
++        {o: (set(), set()) for o in expected}
++
++
++FREE_SUFFIXES = ['f90', 'F90', 'f95', 'F95', 'f03', 'F08']
++FIXED_SUFFIXES = ['f', 'F', 'for', 'FOR', 'ftn', 'fpp']
++STARTS = 'hjqxyz'
++LETTERS = 'abcdefghijklmnopqrstuvwxyz'
++TRICKY = ['module fake', 'use nothere', '; module y', 'a ! b', 'x & y', "it''s", 'end module', 'include']
++
++
++class Tok:
++    def __init__(self, kind, text):
++        self.kind = kind
++        self.text = text
++
++
++def kw(t):
++    return Tok('kw', t)
++
++
++def nm(t):
++    return Tok('name', t)
++
++
++def op(t):
++    return Tok('op', t)
++
++
++def macro(t):
++    return Tok('macro', t)
++
++
++def lit(t):
++    return Tok('str', t)
++
++
++def lname(t):
++    return Tok('lname', t)
++
++
++class Source:
++    def __init__(self, path, free, preprocessed, target):
++        self.path = path
++        self.free = free
++        self.pp = preprocessed
++        self.target = target
++        self.items = []
++        self.defines = {}
++
++
++class Gen:
++    def __init__(self, seed):
++        self.rng = random.Random(seed)
++        self.seed = seed
++        self.used = set()
++        self.files = {}
++        self.targets = []
++        self.project_args = []
++        self.modules = []
++        self.counter = 0
++
++    def name(self, prefix=''):
++        while True:
++            n = prefix + self.rng.choice(STARTS) + ''.join(
++                self.rng.choice(LETTERS + '0123456789') for _ in range(self.rng.randint(2, 6)))
++            if n not in self.used:
++                self.used.add(n)
++                return n
++
++    def macro_name(self):
++        while True:
++            n = 'ZM_' + ''.join(self.rng.choice('ABCDEFGHJKQXYZ') for _ in range(4))
++            if n.lower() not in self.used:
++                self.used.add(n.lower())
++                return n
++
++    def env_for(self, target, source):
++        env = {}
++        for args in (self.project_args, target['args']):
++            for a in args:
++                if a.startswith('-D'):
++                    k, _, v = a[2:].partition('=')
++                    env[k] = v if '=' in a else '1'
++        env.update(source.defines)
++        return env
++
++    def build(self):
++        rng = self.rng
++        if rng.random() < 0.4:
++            m = self.macro_name()
++            self.project_args += [f'-D{m}=7']
++            self.proj_macro = m
++        else:
++            self.proj_macro = None
++        ntargets = rng.randint(1, 3)
++        for ti in range(ntargets):
++            target = {'name': f't{ti}', 'sources': [], 'args': [], 'incdirs': [], 'frozen': False,
++                      'link': [f't{ti - 1}'] if ti and rng.random() < 0.85 else []}
++            if rng.random() < 0.5:
++                target['incdirs'].append(f'inc{ti}')
++                self.files[f'inc{ti}/README'] = 'include files\n'
++            if rng.random() < 0.5:
++                m = self.macro_name()
++                target['args'].append(f'-D{m}')
++            self.targets.append(target)
++            for si in range(rng.randint(1, 3)):
++                self.make_source(target, ti, si)
++        return {'files': self.files, 'project_args': self.project_args,
++                'targets': [{'name': t['name'], 'sources': t['sources'], 'args': t['args'],
++                             'incdirs': t['incdirs'], 'link': t['link']} for t in self.targets],
++                'separate': sorted(m['name'] for m in self.modules if m['smod'])}
++
++    def visible_modules(self, ti, source):
++        linked = set()
++        stack = [ti]
++        while stack:
++            t = stack.pop()
++            for l in self.targets[t]['link']:
++                j = int(l[1:])
++                if j not in linked:
++                    linked.add(j)
++                    stack.append(j)
++        return [m for m in self.modules
++                if m['target'] == ti or m['target'] in linked]
++
++    def make_source(self, target, ti, si):
++        rng = self.rng
++        free = rng.random() < 0.55
++        suffix = rng.choice(FREE_SUFFIXES if free else FIXED_SUFFIXES)
++        sub = rng.choice(['', '', f'dir{ti}{si}/'])
++        path = f'{sub}s{ti}{si}.{suffix}'
++        pp = suffix != suffix.lower() or suffix == 'fpp'
++        src = Source(path, free, pp, target)
++        target['sources'].append(path)
++        self.current = src
++        has_program = False
++        for _ in range(rng.randint(1, 3)):
++            kind = rng.choices(['module', 'submodule', 'program', 'subroutine'], [6, 2, 1, 1])[0]
++            if kind == 'submodule' and not self.smod_parents(ti):
++                kind = 'module'
++            if kind == 'program':
++                if has_program:
++                    kind = 'subroutine'
++                has_program = True
++            getattr(self, 'unit_' + kind)(src, ti)
++        self.render_source(src)
++
++    def smod_parents(self, ti):
++        return [m for m in self.visible_modules(ti, None) if m['smod']]
++
++    def spell(self, src, name, allow_macro=True):
++        rng = self.rng
++        if src.pp and allow_macro and rng.random() < 0.3:
++            m = self.macro_name()
++            r = rng.random()
++            if r < 0.25 and not src.target['frozen']:
++                src.target['args'].append(f'-D{m}={name}')
++            elif r < 0.4:
++                inner = self.macro_name()
++                src.items.append(('define', inner, name))
++                src.items.append(('define', m, inner))
++                src.defines[inner] = name
++            elif r < 0.6:
++                header = self.header(src, [('define', m, name)])
++                src.items.append(('hinclude', header))
++            else:
++                src.items.append(('define', m, name))
++            src.defines[m] = name
++            return macro(m)
++        return nm(name)
++
++    def header(self, src, items):
++        rng = self.rng
++        self.counter += 1
++        hname = f'zh{self.seed}_{self.counter}.h'
++        srcdir = src.path.rpartition('/')[0]
++        incdir = src.target['incdirs'][0] if src.target['incdirs'] else None
++        text = '\n'.join(f'#define {i[1]} {i[2]}' for i in items) + '\n'
++        if incdir and rng.random() < 0.5:
++            if rng.random() < 0.5:
++                self.counter += 1
++                inner = f'zh{self.seed}_{self.counter}.h'
++                self.files[f'{incdir}/{inner}'] = text
++                text = f'#include "{inner}"\n'
++            self.files[f'{incdir}/{hname}'] = text
++        else:
++            self.files[(srcdir + '/' if srcdir else '') + hname] = text
++            if incdir and rng.random() < 0.6:
++                self.files[f'{incdir}/{hname}'] = '#define ZQ_DECOY 1\n'
++        return hname
++
++    def uses(self, src, ti, exclude=(), module_scope=False):
++        rng = self.rng
++        vis = [m for m in self.visible_modules(ti, src) if m['name'] not in exclude
++               and not (module_scope and m['smod'])]
++        stmts = []
++        for m in rng.sample(vis, min(len(vis), rng.randint(0, 3))):
++            form = rng.randint(0, 4)
++            name = lname(m['name']) if m.get('literal') else self.spell(src, m['name'])
++            if form == 0:
++                stmts.append([kw('use'), name])
++            elif form == 1:
++                stmts.append([kw('use'), op('::'), name])
++            elif form == 2:
++                stmts.append([kw('use'), op(','), kw('non_intrinsic'), op('::'), name])
++            elif form == 3:
++                stmts.append([kw('use'), name, op(','), kw('only'), op(':')])
++            else:
++                stmts.append([kw('use'), op(','), kw('non_intrinsic'), op('::'), name, op(','), kw('only'), op(':')])
++        if rng.random() < 0.3:
++            stmts.append([kw('use'), op(','), kw('intrinsic'), op('::'), nm('iso_c_binding')])
++        if rng.random() < 0.2:
++            stmts.append([kw('use'), nm('iso_fortran_env')])
++        return stmts
++
++    def noise_decls(self):
++        rng = self.rng
++        out = []
++        if rng.random() < 0.5:
++            out.append([kw('integer'), op('::'), nm(self.name()), op('='), Tok('num', str(rng.randint(0, 9)))])
++        if rng.random() < 0.5:
++            text = rng.choice(TRICKY)
++            literal = "'" + text + "'" if rng.random() < 0.6 else '"' + text.replace("''", "'") + '"'
++            out.append([kw('character'), op('('), kw('len'), op('='), op('*'), op(')'), op(','),
++                        kw('parameter'), op('::'), nm(self.name()), op('='), lit(literal)])
++        return out
++
++    def dead(self, src, ti):
++        rng = self.rng
++        out = []
++        if rng.random() < 0.6:
++            n = self.name('d')
++            out.append([kw('module'), nm(n)])
++            out.append([kw('end'), kw('module'), nm(n)])
++        vis = self.visible_modules(ti, src)
++        if vis and rng.random() < 0.6:
++            out.append([kw('use'), lname(rng.choice(vis)['name'])])
++        return out
++
++    def guard(self, src, body, ti):
++        rng = self.rng
++        if not src.pp or rng.random() < 0.55:
++            return body
++        env = self.env_for(src.target, src)
++        options = []
++        options.append(('if 1', True))
++        options.append(('if 0', False))
++        for k in env:
++            if k.startswith('ZM_'):
++                options.append((f'ifdef {k}', True))
++                options.append((f'ifndef {k}', False))
++                options.append((f'if defined({k}) || 0', True))
++        if self.proj_macro and self.proj_macro in env:
++            options.append((f'if {self.proj_macro} * 2 - 1 > 12', True))
++            options.append((f'if ({self.proj_macro} % 3) == 2 && defined({self.proj_macro})', False))
++        cond, live = rng.choice(options)
++        dead = self.dead(src, ti)
++        out = [('pp', cond)]
++        if rng.random() < 0.5:
++            out += (body if live else dead)
++            out.append(('pp', 'else'))
++            out += (dead if live else body)
++        else:
++            if live:
++                out += body
++            else:
++                out += dead
++                out.append(('pp', 'elif 1'))
++                out += body
++        out.append(('pp', 'endif'))
++        return out
++
++    def module_new(self, src, ti, smod):
++        rng = self.rng
++        if rng.random() < 0.15 and not src.target['frozen']:
++            m = self.macro_name()
++            if src.pp:
++                src.items.append(('define', m, self.name()))
++                n = m.lower()
++            else:
++                src.target['args'].append(f'-D{m}={self.name()}')
++                n = m.lower()
++            self.used.add(n)
++            self.modules.append({'name': n, 'target': ti, 'smod': smod, 'subs': [], 'literal': m})
++            return n
++        n = self.name()
++        self.modules.append({'name': n, 'target': ti, 'smod': smod, 'subs': []})
++        return n
++
++    def unit_module(self, src, ti):
++        rng = self.rng
++        smod = rng.random() < 0.45
++        n = self.module_new(src, ti, smod)
++        body = []
++        body.append([kw('module'), lname(n) if self.modules[-1].get('literal') else self.spell(src, n)])
++        body += self.uses(src, ti, exclude={n}, module_scope=True)
++        body.append([kw('implicit'), kw('none')])
++        body += self.noise_decls()
++        if smod:
++            body.append([kw('interface')])
++            for _ in range(rng.randint(1, 2)):
++                p = self.name()
++                form = rng.randint(0, 6)
++                if form == 0:
++                    body.append([kw('module'), kw('subroutine'), nm(p), op('('), op(')')])
++                    body.append([kw('end'), kw('subroutine')])
++                elif form == 1:
++                    body.append([kw('pure'), kw('module'), kw('function'), nm(p), op('('), nm('x'), op(')'),
++                                 kw('result'), op('('), nm('r'), op(')')])
++                    body.append([kw('integer'), op(','), kw('intent'), op('('), kw('in'), op(')'), op('::'), nm('x')])
++                    body.append([kw('integer'), op('::'), nm('r')])
++                    body.append([kw('end'), kw('function')])
++                elif form == 2:
++                    body.append([kw('integer'), kw('module'), kw('function'), nm(p), op('('), op(')')])
++                    body.append([kw('end'), kw('function'), nm(p)])
++                elif form == 3:
++                    body.append([kw('module'), kw('recursive'), kw('subroutine'), nm(p), op('('), nm('a'), op(')')])
++                    body.append([kw('real'), op(','), kw('intent'), op('('), kw('inout'), op(')'), op('::'), nm('a')])
++                    body.append([kw('end'), kw('subroutine'), nm(p)])
++                elif form == 4:
++                    body.append([kw('module'), kw('elemental'), kw('integer'), kw('function'), nm(p), op('('), nm('i'), op(')')])
++                    body.append([kw('integer'), op(','), kw('intent'), op('('), kw('in'), op(')'), op('::'), nm('i')])
++                    body.append([kw('end'), kw('function')])
++                elif form == 5:
++                    body.append([kw('impure'), kw('module'), kw('subroutine'), nm(p)])
++                    body.append([kw('end'), kw('subroutine'), nm(p)])
++                else:
++                    body.append([kw('logical'), kw('module'), kw('function'), nm(p), op('('), op(')')])
++                    body.append([kw('end'), kw('function')])
++            body.append([kw('end'), kw('interface')])
++        procs = []
++        if rng.random() < 0.5:
++            g, p = self.name(), self.name()
++            body.append([kw('interface'), nm(g)])
++            if rng.random() < 0.5:
++                body.append([kw('module'), kw('procedure'), nm(p)])
++            else:
++                body.append([kw('module'), kw('procedure'), op('::'), nm(p)])
++            body.append([kw('end'), kw('interface'), nm(g)])
++            procs.append(p)
++        if procs or rng.random() < 0.4:
++            body.append([kw('contains')])
++            for p in procs or [self.name()]:
++                body.append([kw('subroutine'), nm(p), op('('), op(')')])
++                body += self.uses(src, ti, exclude={n})
++                if rng.random() < 0.5:
++                    body.append([kw('block')])
++                    body += self.uses(src, ti, exclude={n})
++                    body.append([kw('end'), kw('block')])
++                body.append([kw('end'), kw('subroutine'), nm(p)])
++        name_tok = lname(n) if self.modules[-1].get('literal') else nm(n)
++        body.append([kw('end'), kw('module'), name_tok] if rng.random() < 0.7 else [kw('end'), kw('module')])
++        src.items += self.guard(src, body, ti)
++
++    def unit_submodule(self, src, ti):
++        rng = self.rng
++        parent = rng.choice(self.smod_parents(ti))
++        n = self.name()
++        head = [kw('submodule'), op('('), lname(parent['name']) if parent.get('literal') else self.spell(src, parent['name'])]
++        visible = {m['target'] for m in self.visible_modules(ti, src)} | {ti}
++        subs = [n2 for n2, t2 in parent['subs'] if t2 in visible]
++        if subs and rng.random() < 0.5:
++            head += [op(':'), nm(rng.choice(subs))]
++        head += [op(')'), nm(n)]
++        body = [head]
++        body += self.uses(src, ti, exclude={parent['name']})
++        body.append([kw('end'), kw('submodule'), nm(n)] if rng.random() < 0.6 else [kw('end'), kw('submodule')])
++        parent['subs'].append((n, ti))
++        src.items += self.guard(src, body, ti)
++
++    def unit_program(self, src, ti):
++        n = self.name()
++        body = [[kw('program'), nm(n)]]
++        body += self.uses(src, ti)
++        body.append([kw('implicit'), kw('none')])
++        body.append([kw('print'), op('*'), op(','), lit("'" + self.rng.choice(TRICKY) + "'")])
++        body.append([kw('end'), kw('program'), nm(n)] if self.rng.random() < 0.7 else [kw('end')])
++        src.items += self.guard(src, body, ti)
++
++    def unit_subroutine(self, src, ti):
++        n = self.name()
++        body = [[kw('subroutine'), nm(n), op('('), op(')')]]
++        body += self.uses(src, ti)
++        body.append([kw('end'), kw('subroutine'), nm(n)] if self.rng.random() < 0.7 else [kw('end')])
++        src.items += self.guard(src, body, ti)
++
++    def case(self, text):
++        r = self.rng.random()
++        if r < 0.4:
++            return text.lower()
++        if r < 0.7:
++            return text.upper()
++        return ''.join(c.upper() if self.rng.random() < 0.5 else c.lower() for c in text)
++
++    def statement_text(self, toks, fixed, pp):
++        rng = self.rng
++        out = ''
++        prev = None
++        for t in toks:
++            if t.kind in {'kw', 'name', 'lname'}:
++                piece = self.case(t.text) if t.kind != 'lname' else t.text.lower()
++                if fixed and rng.random() < 0.08 and len(piece) > 2:
++                    k = rng.randint(1, len(piece) - 1)
++                    piece = piece[:k] + ' ' + piece[k:]
++            else:
++                piece = t.text
++            word = t.kind in {'kw', 'name', 'lname', 'macro', 'num'}
++            if prev is None:
++                sep = ''
++            elif word and prev in {'kw', 'name', 'lname', 'macro', 'num'}:
++                if fixed and t.kind != 'macro' and prev != 'macro' and rng.random() < 0.3:
++                    sep = ''
++                else:
++                    sep = ' ' * rng.randint(1, 2)
++            else:
++                sep = ' ' * rng.randint(0, 1)
++            if t.kind == 'macro' or prev == 'macro':
++                sep = sep or ' '
++            out += sep + piece
++            prev = t.kind
++        return out
++
++    def comment(self):
++        return self.rng.choice(['module zzfake', 'use zzfake', "don't", 'x & y', '"', 'module', 'ends in &'])
++
++    def render_free(self, stmts):
++        rng = self.rng
++        lines = []
++        i = 0
++        while i < len(stmts):
++            item = stmts[i]
++            if item[0] == 'pp':
++                lines.append('#' + ' ' * rng.randint(0, 2) + item[1])
++                i += 1
++                continue
++            if item[0] == 'define':
++                lines.append(f'#define {item[1]} {item[2]}')
++                i += 1
++                continue
++            if item[0] == 'hinclude':
++                lines.append(f'#include "{item[1]}"')
++                i += 1
++                continue
++            if item[0] == 'include':
++                q = rng.choice(["'", '"'])
++                lines.append(' ' * rng.randint(0, 2) + self.case('include') + ' ' * rng.randint(0, 2) + q + item[1] + q
++                             + (rng.choice(['', '  ! ' + self.comment()])))
++                i += 1
++                continue
++            if item[0] == 'raw':
++                lines.append(item[1])
++                i += 1
++                continue
++            text = self.statement_text(item, False, False)
++            if (i + 1 < len(stmts) and isinstance(stmts[i + 1], list) and rng.random() < 0.15
++                    and item[0].text in {'module', 'use', 'implicit'} and stmts[i + 1][0].text in {'use', 'implicit', 'end'}):
++                text += ' ' * rng.randint(0, 1) + ';' + ' ' * rng.randint(0, 2) + self.statement_text(stmts[i + 1], False, False)
++                i += 1
++            if rng.random() < 0.1 and item[0].text in {'module', 'use', 'end'}:
++                self.counter += 1
++                text = str(self.counter) + ' ' + text
++            indent = ' ' * rng.randint(0, 4)
++            spans = [(m.start(), m.end()) for m in re.finditer(r'ZM_[A-Z]+', text)]
++            candidates = [q for q in range(1, len(text)) if not any(a < q < b for a, b in spans)]
++            if len(text) > 4 and candidates and rng.random() < 0.35:
++                p = rng.choice(candidates)
++                before, after = text[:p], text[p:]
++                in_str = before.count("'") % 2 == 1 or before.count('"') % 2 == 1
++                at_blank = before[-1:] == ' ' or after[:1] == ' '
++                lead = in_str or not at_blank or rng.random() < 0.5
++                first = indent + before + '&' + ('' if in_str else rng.choice(['', '  ! ' + self.comment()]))
++                lines.append(first)
++                if not in_str:
++                    for _ in range(rng.randint(0, 2)):
++                        lines.append(rng.choice(['', '   ! ' + self.comment()]))
++                lines.append(' ' * rng.randint(0, 6) + ('&' if lead else '') + (after if lead else after.lstrip() or after))
++            else:
++                lines.append(indent + text + rng.choice(['', '', '  ! ' + self.comment()]))
++            if rng.random() < 0.1:
++                lines.append(rng.choice(['', '! ' + self.comment(), '!$ use zzsentinel']))
++            i += 1
++        return lines
++
++    def render_fixed(self, stmts, pp):
++        rng = self.rng
++        lines = []
++        joined = set()
++        for item in stmts:
++            if id(item) in joined:
++                continue
++            if item[0] == 'pp':
++                lines.append('#' + ' ' * rng.randint(0, 2) + item[1])
++                continue
++            if item[0] == 'define':
++                lines.append(f'#define {item[1]} {item[2]}')
++                continue
++            if item[0] == 'hinclude':
++                lines.append(f'#include "{item[1]}"')
++                continue
++            if item[0] == 'include':
++                kwtext = self.case('include')
++                if rng.random() < 0.3:
++                    kwtext = ' '.join(kwtext)
++                q = rng.choice(["'", '"'])
++                lines.append('      ' + kwtext + ' ' + q + item[1] + q)
++                continue
++            if item[0] == 'raw':
++                lines.append(item[1])
++                continue
++            text = self.statement_text(item, True, pp)
++            nxt = stmts[stmts.index(item) + 1] if stmts.index(item) + 1 < len(stmts) else None
++            if (isinstance(nxt, list) and item[0].text in {'module', 'use'} and nxt[0].text in {'use', 'implicit'}
++                    and rng.random() < 0.12 and len(text) < 40):
++                joined.add(id(nxt))
++                text += ';' + ' ' * rng.randint(0, 1) + self.statement_text(nxt, True, pp)
++            text_all = text
++            chunks = []
++            while text:
++                room = 66
++                if len(text) > room or (len(text) > 6 and rng.random() < 0.25):
++                    p = rng.randint(1, min(room, len(text) - 1))
++                    if any(t.kind == 'macro' for t in item):
++                        p = min(room, len(text))
++                        if p < len(text):
++                            while p > 1 and (text[p - 1].isalnum() or text[p - 1] == '_'):
++                                p -= 1
++                    chunks.append(text[:p])
++                    text = text[p:]
++                else:
++                    chunks.append(text)
++                    text = ''
++            for k, chunk in enumerate(chunks):
++                tab = rng.random() < 0.2
++                if k == 0:
++                    if tab:
++                        line = '\t' + chunk
++                    else:
++                        label = ''
++                        if rng.random() < 0.08 and item[0].text in {'module', 'use'}:
++                            self.counter += 1
++                            label = str(self.counter % 99999 + 1)
++                        line = label.rjust(5) + ' ' + chunk
++                else:
++                    if tab:
++                        line = '\t' + rng.choice('123456789') + chunk
++                    else:
++                        line = '     ' + rng.choice('&123456789+$!a') + chunk
++                    if rng.random() < 0.3:
++                        lines.append(rng.choice(['C ' + self.comment(), 'c', '* ' + self.comment(), '', '  ! ' + self.comment()]))
++                width = len(line.expandtabs(8)) if not tab else 6 + len(chunk) + (1 if k else 0)
++                has_macro = pp and 'ZM_' in text_all
++                quoted = "'" in chunk or '"' in chunk
++                if '\t' not in line and len(line) < 72 and rng.random() < 0.15 and not quoted and not has_macro:
++                    line = line.ljust(72) + rng.choice(['IGNORED', '; MODULE ZJUNK', ' USE ZJUNK2', '&&&'])
++                elif rng.random() < 0.15 and not quoted and width < 60:
++                    line += '  ! ' + self.comment()
++                lines.append(line)
++            if rng.random() < 0.1:
++                lines.append(rng.choice(['C ' + self.comment(), '*', '', '!$ use zzsentinel']))
++        return lines
++
++    def render_source(self, src):
++        rng = self.rng
++        items = src.items
++        if rng.random() < 0.35 and len(items) > 2:
++            start = rng.randint(0, len(items) - 2)
++            end = rng.randint(start + 1, min(len(items), start + 6))
++            chunk = items[start:end]
++            if all(isinstance(x, list) and all(t.kind != 'macro' for t in x) for x in chunk):
++                self.counter += 1
++                name = f'zi{self.seed}_{self.counter}.inc'
++                incdir = src.target['incdirs'][0] if src.target['incdirs'] else None
++                srcdir = src.path.rpartition('/')[0]
++                if incdir and rng.random() < 0.5:
++                    self.add_include_file(f'{incdir}/{name}', chunk, src)
++                else:
++                    self.add_include_file((srcdir + '/' if srcdir else '') + name, chunk, src)
++                    if incdir and rng.random() < 0.6:
++                        fake = self.name('d')
++                        decoy = [[kw('module'), nm(fake)], [kw('end'), kw('module')]]
++                        self.add_include_file(f'{incdir}/{name}', decoy, src)
++                items = items[:start] + [('include', name)] + items[end:]
++        lines = self.render_free(items) if src.free else self.render_fixed(items, src.pp)
++        if not src.pp and rng.random() < 0.3:
++            lines = ['#if 0', '#define ZZ_NOTHING 1'] + lines + ['#endif']
++        self.files[src.path] = '\n'.join(lines) + '\n'
++
++    def add_include_file(self, rel, chunk, src):
++        lines = self.render_free(chunk) if src.free else self.render_fixed(chunk, False)
++        if self.rng.random() < 0.3:
++            lines = ['#if 0'] + lines + ['#endif']
++        self.files[rel] = '\n'.join(lines) + '\n'
++
++
++def generate(seed):
++    return Gen(seed).build()
++
++
++def mod(name):
++    return f'module {name}\nend module\n'
++
++
++SEEDS = list(range(78))
++
++
++def one(files, args=(), incdirs=(), project_args=(), separate=()):
++    names = [n for n in files if os.path.splitext(n)[1][1:].lower() in
++             {'f90', 'f95', 'f03', 'f08', 'f', 'for', 'ftn', 'fpp'}]
++    return {'files': files, 'project_args': list(project_args),
++            'targets': [lib('one', names, args, incdirs)], 'separate': list(separate)}
++
++
++UNSIGNED_CONDITIONS = [
++    '-1 < 1U', '1U - 2 > 0', '-1 / 2U == 9223372036854775807',
++    '-7 % 2U == 1', '(0U - 1) >> 63 == 1', '-1 >> 63 == -1', '(1 ? -1 : 0U) > 0', '-(1U) > 0',
++    '9223372036854775807 + 1 < 0', '1 << 63 < 0', '1U << 63 > 0', '1 << 64 == 0', '1ull == 1L',
++    'defined(ZQ_NONE) < 1U', '-1 < (ZQ_NONE + 1U)', '-1 < 1u == 0',
++]
++
++KEYWORD_NAMES = '''
++abstract access acquired_lock action advance all allocatable allocate assign assignment associate
++asynchronous backspace bind blank block blockdata call case change character class close codimension
++common complex concurrent contains contiguous continue critical cycle data deallocate decimal
++default deferred delim dimension direct do double doublecomplex doubleprecision elemental else
++elseif elsewhere encoding end endassociate endblock endblockdata endcritical enddo endenum endfile
++endforall endfunction endif endinterface endmodule endprocedure endprogram endselect endsubmodule
++endsubroutine endteam endtype endwhere entry enum enumerator eor equivalence err errmsg error
++errorstop event exist exit extends external fail file final flush fmt forall form format formatted
++function generic go goto id if image images implicit import impure in include inout inquire integer
++intent interface intrinsic iolength iomsg iostat is kind len local local_init lock logical memory
++module mold name named namelist new_index newunit nextrec nml non_intrinsic non_overridable
++non_recursive none nopass nullify number only open opened operator optional out pad parameter pass
++pause pending pointer pos position post precision print private procedure program protected public
++pure quiet rank read readwrite real rec recl recursive result return rewind round save select
++selectcase selectrank selecttype sequence sequential shared sign size source stat status stop stream
++submodule subroutine sync syncall syncimages syncmemory target team team_number then to type
++unformatted unit unlock until_count use value volatile wait where while write
++'''.split()
++
++SUFFIXES = ['f90', 'F90', 'f95', 'F95', 'f03', 'F03', 'f08', 'F08', 'f', 'F', 'for', 'FOR', 'ftn', 'FTN', 'fpp', 'FPP']
++
++
++def every_suffix():
++    files = {}
++    used = []
++    for i, suffix in enumerate(SUFFIXES):
++        tag = f'zq_s{i}'
++        free = suffix.lower() in {'f90', 'f95', 'f03', 'f08'}
++        preprocessed = suffix != suffix.lower() or suffix == 'fpp'
++        lead = '' if free else '      '
++        for d in ('a', 'b'):
++            files[f'inc_{d}/{tag}.inc'] = f'{lead}module {tag}_include_{d}\n{lead}end module\n'
++        text = f"{lead}include '{tag}.inc'\n"
++        used.append(f'{tag}_include_a')
++        if preprocessed:
++            for d in ('a', 'b'):
++                files[f'inc_{d}/{tag}.h'] = f'#define ZQ_HNAME {tag}_header_{d}\n'
++            text = (f'#include "{tag}.h"\n' + text
++                    + f'#if ZQ_ORDER == 2\n{lead}module {tag}_target\n{lead}end module\n'
++                    + f'#else\n{lead}module {tag}_project\n{lead}end module\n#endif\n'
++                    + f'{lead}module ZQ_HNAME\n{lead}end module\n')
++            used += [f'{tag}_target', f'{tag}_header_a']
++        files[f'{tag}.{suffix}'] = text
++    files['user.f90'] = 'program p\n' + ''.join(f' use {u}\n' for u in used) + 'end program\n'
++    return one(files, args=['-DZQ_ORDER=2'], incdirs=['inc_a', 'inc_b'], project_args=['-DZQ_ORDER=1'])
++
++
++SHARED_USER = 'module zq_user\ncontains\n subroutine s()\n  use zq_shared\n  print *, v\n end subroutine\nend module\n'
++
++
++def shared_module(value, other):
++    return f'module zq_shared\n integer :: v = {value}\nend module\nmodule {other}\nend module\n'
++
++
++def competing_providers(order):
++    return {
++        'files': {'z.f90': shared_module(1, 'zq_from_z'), 'a.f90': shared_module(2, 'zq_from_a'), 'user.f90': SHARED_USER},
++        'targets': [lib('z', ['z.f90']), lib('a', ['a.f90']), lib('user', ['user.f90'], link=order)],
++    }
++
++
++SMOD_BASE = 'module base\n interface\n  module subroutine run()\n  end subroutine\n end interface\nend module\n'
++
++CASES = {
++    'two_modules_in_one_file': one({
++        'a.f90': 'module first\nend module first\nmodule second\nend module second\n',
++        'b.f90': 'module user\n use first\n use second\nend module\n'}),
++    'modules_separated_by_semicolons': one({
++        'a.f90': 'module m1; end module m1; module m2\nend module m2\n',
++        'b.f90': 'module uses_m2\n use m2\nend module\n'}),
++    'separate_module_procedures_and_submodules': one({
++        'a.f90': SMOD_BASE,
++        'b.f90': 'submodule (base) impl\ncontains\n module procedure run\n end procedure\nend submodule\n',
++        'c.f90': 'submodule (base:impl) deeper\nend submodule\n'}, separate=['base']),
++    'smod_written_because_of_a_use_is_not_of_interest': one({
++        'a.f90': SMOD_BASE,
++        'b.f90': 'module uses_base\n use base\nend module\n',
++        'c.f90': 'program p\n use uses_base\nend program\n'}, separate=['base']),
++    'fixed_form_names_starting_with_keywords': one({
++        'a.f': ('      MODULE KEPT\n      END MODULE\n      MODULE FUNCTIONALITY\n      END MODULE\n'
++                '      MODULE REALM\n      END MODULE\n      MODULE TYPESET\n      END MODULE\n'),
++        'b.f': ('      PROGRAM P\n      USE FUNCTIONALITY\n      USE REALM\n      USE TYPESET\n'
++                '      USE KEPT\n      END\n')}),
++    'modules_named_like_keywords': one({
++        'a.f90': ''.join(f'module {w}\nend module {w}\n' for w in KEYWORD_NAMES),
++        'b.f90': 'program p\n' + ''.join(f' use {w}\n' for w in KEYWORD_NAMES) + 'end program\n'}),
++    'fixed_form_modules_named_like_keywords': one({
++        'a.f': ''.join(f'      MODULE {n.upper()}\n      END MODULE\n' for w in KEYWORD_NAMES for n in (w, w + 'x')),
++        'b.f': ('      PROGRAM P\n' + ''.join(f'      USE {n.upper()}\n' for w in KEYWORD_NAMES for n in (w, w + 'x'))
++                + '      END\n')}),
++    'keyword_named_submodules': one({
++        'a.f90': SMOD_BASE.replace('base', 'zq_kbase'),
++        'b.f90': 'submodule (zq_kbase) procedure\nend submodule procedure\n',
++        'c.f90': 'submodule (zq_kbase:procedure) end\nend submodule end\n',
++        'd.f90': 'submodule (zq_kbase:end) contains\nend submodule\n',
++        'e.f': '      SUBMODULE (ZQ_KBASE) FUNCTIONALITY\n      END SUBMODULE\n',
++        'f.f': '      SUBMODULE (ZQ_KBASE:FUNCTIONALITY) THENCE\n      END\n'}, separate=['zq_kbase']),
++    'keyword_names_in_use_forms': one({
++        'a.f90': ''.join(f'module {w}\n integer :: x_{w} = 1\nend module\n' for w in ['then', 'while', 'only', 'end', 'use']),
++        'b.f90': ('module zq_users\n use, non_intrinsic :: then\n use :: while, only: x_while\n'
++                  ' use only, renamed => x_only\n use end\n use use\nend module\n'),
++        'c.f': ('      MODULE THENCE\n      INTEGER :: Y = 1\n      END MODULE\n      MODULE ZQUSERS\n'
++                '      USE, NON_INTRINSIC :: THENCE\n      USE :: WHILE, ONLY: X_WHILE\n      END MODULE\n')}),
++    'keyword_statements_inside_program_units_in_fixed_form': one({
++        'a.f': ('      MODULE GENA\n      INTERFACE GEN\n      MODULE PROCEDURES\n      END INTERFACE\n'
++                '      INTERFACE\n      MODULE SUBROUTINE SEPX()\n      END SUBROUTINE\n'
++                '      MODULE REAL FUNCTION SEPF(X)\n      REAL X\n      END FUNCTION\n      END INTERFACE\n'
++                '      CONTAINS\n      SUBROUTINE S()\n      END SUBROUTINE\n      END MODULE\n'
++                '      MODULE PROCEDURESB\n      END MODULE\n'),
++        'b.f': ('      SUBMODULE (GENA) GENIMPL\n      CONTAINS\n      MODULE PROCEDURE SEPX\n      END PROCEDURE\n'
++                '      MODULE PROCEDURE SEPF\n      SEPF = X\n      END PROCEDURE\n      END SUBMODULE\n'
++                '      MODULE FUNCTIONALITY\n      END MODULE\n'),
++        'c.f': ('      PROGRAM P\n      USE GENA\n      USE PROCEDURESB\n      USE FUNCTIONALITY\n'
++                '      INTERFACE GG\n      MODULE PROCEDURES\n      END INTERFACE\n      END\n')}, separate=['gena']),
++    'names_starting_with_interface_before_a_module': one({
++        'a.f90': ('module hq_one\ncontains\n subroutine hq_s()\n  integer, pointer :: interface_p\n'
++                  '  integer, target :: hq_t\n  interface_p => hq_t\n end subroutine\nend module\n'
++                  'module hq_two\nend module\n'),
++        'c.f90': ('module hq_three\ncontains\n subroutine hq_u()\n  interface_blk: block\n'
++                  '  end block interface_blk\n end subroutine\nend module\nmodule hq_four\nend module\n'),
++        'd.f': ('      MODULE HQFIVE\n      CONTAINS\n      SUBROUTINE HQV()\n'
++                '      INTEGER, POINTER :: INTERFACEP\n      INTEGER, TARGET :: HQW\n'
++                '      INTERFACEP => HQW\n      END SUBROUTINE\n      END MODULE\n'
++                '      MODULE HQSIX\n      END MODULE\n'),
++        'b.f90': 'program p\n use hq_two\n use hq_four\n use hqsix\nend program\n'}),
++    'smod_for_a_use_with_same_target_and_linked_consumers': {
++        'files': {
++            'a.f90': SMOD_BASE,
++            'b.f90': 'module uses_base\n use base\nend module\n',
++            'c.f90': 'program same_target\n use uses_base\nend program\n',
++            'd.f90': 'module linked_user\n use uses_base\nend module\n',
++            'e.f90': 'program farther\n use uses_base\n use linked_user\nend program\n',
++        },
++        'targets': [lib('first', ['a.f90', 'b.f90', 'c.f90']), lib('second', ['d.f90'], link=['first']),
++                    lib('third', ['e.f90'], link=['second'])],
++        'separate': ['base'],
++    },
++    'unsigned_and_wrapping_arithmetic_in_conditions': one({
++        'a.F90': ''.join(f'#if {e}\nmodule cond_{i}_true\nend module\n#else\nmodule cond_{i}_false\nend module\n#endif\n'
++                         for i, e in enumerate(UNSIGNED_CONDITIONS))}),
++    'binary_constants_in_conditions': one({
++        'a.F90': ''.join(f'#if {e}\nmodule more_{i}_true\nend module\n#else\nmodule more_{i}_false\nend module\n#endif\n'
++                         for i, e in enumerate(['0b101 == 5', '0B11u == 3']))}),
++    'modules_used_by_their_own_source': one({
++        'a.f90': 'module own\nend module\nprogram p\n use own\nend program\n',
++        'b.f90': (SMOD_BASE.replace('base', 'own_base')
++                  + 'submodule (own_base) own_impl\nend submodule\nsubmodule (own_base:own_impl) own_deeper\nend submodule\n'),
++        'c.f90': 'program q\n use own_base\nend program\n'}, separate=['own_base']),
++    'generic_module_procedure_writes_no_smod': one({
++        'a.f90': ('module gen\n interface g\n  module procedure s\n end interface\ncontains\n subroutine s()\n end subroutine\nend module\n'
++                  'module gen_two\n interface gg\n  module procedure :: t\n end interface\ncontains\n subroutine t()\n end subroutine\nend module\n'),
++        'b.f90': 'module usegen\n use gen\n use gen_two\nend module\n'}),
++    'continued_names_and_comments': one({
++        'a.f90': 'mod&\n  &ule spl&\n  ! a comment line\n\n  &it\nend module\n',
++        'b.f90': 'program p\n use sp&\n     &lit ! split\nend program\n'}),
++    'strings_comments_and_sentinels': one({
++        'a.f90': ("module real_one\n character(*), parameter :: s = 'module fake ! use decoy'\n"
++                  ' character(*), parameter :: d = "it\'s; module y & z"\nend module\n'
++                  'module real_two ! not continued &\nend module real_two\n'),
++        'b.f90': ("program p\n use real_one\n!$ use decoy\n use real&\n&_two\n print *, 'abc&\n  &; use decoy'\nend program\n"),
++        'c.f90': 'module decoy\nend module\n'}),
++    'fixed_form_layout': one({
++        'a.f': ('      MODULE FXONE\n      END MODULE\n'
++                'C     MODULE COMMENTED\n*     MODULE STARRED\n'
++                '      M O D U L E   F X T W O\n      ENDMODULE\n'
++                '      MODULE\n     &  FXTHREE\n      END MODULE\n'
++                '      MODULE FXFOUR\n     !CONT\n      END MODULE\n'
++                '      MODULE FXFIVE' + ' ' * 56 + 'IGNORED\n      END MODULE\n'),
++        'b.f': '      PROGRAM P\n      USEFXONE\n      U S E FXFOURCONT\n      USE FXFIVE\n      END\n'}),
++    'fixed_form_tabs_and_continuation_digits': one({
++        'a.f': '\tMODULE TABBED\n\tEND MODULE\n      MODULE DIG\n     1ITS\n      END MODULE\n',
++        'b.f': '\tPROGRAM P\n\tUSE TAB\n\t1BED\n\tUSE DIGITS\n\tEND\n'}),
++    'tab_format_lines_with_comments_in_the_first_columns': one({
++        'a.f': '\tMODULE ZQTA\n\tEND!c\n\tMODULE ZQTB\n\tEND MODULE\n',
++        'b.fpp': '\tMODULE ZQTC\n\tEND!c\n\tMODULE ZQTD\n\tEND MODULE\n',
++        'c.f90': 'program p\n use zqta\n use zqtb\n use zqtc\n use zqtd\nend program\n'}),
++    'form_feeds_and_tabs_as_blanks_in_free_form': one({
++        'a.f90': ('\fmodule zq_fa\nend\fmodule\nmodule\fzq_fb\nend module;\fmodule zq_fc\nend module\n\f\n'
++                  'module\tzq_fd\ncontains\n subroutine s()\n end\fsubroutine\nend module\n'),
++        'b.f90': 'module zq_fe\n interface\n  module\fsubroutine r()\n  end subroutine\n end interface\nend module\n',
++        'c.f90': 'submodule\f(zq_fe)\fzq_ff\nend submodule\n',
++        'd.f90': 'module &\n\f&zq_fg\nend module\nmodule &\f\n\f\n zq_fh\nend module\n',
++        'e.f90': ('program p\n\fuse zq_fa\n use\fzq_fb\n use,\fnon_intrinsic\f::\fzq_fc\n\tuse\tzq_fd\n'
++                  ' use zq_fg\n use zq_fh\nend program\n')}, separate=['zq_fe']),
++    'form_feeds_in_fixed_form': one({
++        'a.f': ('\f\n      MODULE ZQ_FI\n      END MODULE\n      \fMODULE ZQ_FJ\n      END MODULE\n'
++                '      MOD\fULE ZQ_FK\n      END MODULE\n      MODULE\n\f\n     \fZQ_FL\n      END MODULE\n'),
++        'b.f': '      PROGRAM P\n      USE\fZQ_FI\n      USE ZQ_FJ\n      USE ZQ_FK\n      USE ZQ_FL\n      END\n'}),
++    'form_feeds_in_preprocessed_sources': one({
++        'a.F90': '#define ZQ_FMNAME\fzq_fm\n#if\f1\n\fmodule ZQ_FMNAME\nend module\n#endif\n',
++        'b.F': '\f\n#define ZQ_FNNAME zq_fn\n      MODULE ZQ_FNNAME\n      END MODULE\n',
++        'c.f90': 'program p\n use zq_fm\n use zq_fn\nend program\n'}),
++    'carriage_returns_before_line_ends': one({
++        'a.f90': 'module zq_ca\r\nend module\r\n',
++        'b.f': '      MODULE\r\n     &ZQ_CB\r\n      END MODULE\r\n',
++        'c.F90': '#include "zq_cc.h"\r\nmodule ZQ_CCNAME\r\nend module\r\n',
++        'zq_cc.h': '#define ZQ_CCNAME zq_cc\r\n',
++        'd.f90': "program p\r\n use &\r\n zq_ca\r\n use zq_cb\r\ninclude 'zq_cd.inc'\r\nend program\r\n",
++        'zq_cd.inc': ' use zq_cc\r\n'}),
++    'fixed_form_units_closed_by_a_bare_end': one({
++        'a.f': ('      SUBROUTINE ZQS(N)\n      INTEGER N\n      END\n      PROGRAM ZQP\n      CALL INNER()\n'
++                '      CONTAINS\n      SUBROUTINE INNER()\n      END\n      END\n      MODULE ZQA\n      CONTAINS\n'
++                '      SUBROUTINE S()\n      END\n      END\n      MODULE PROCEDURES\n      END MODULE\n'
++                '      MODULE FUNCTIONS\n      END\n'),
++        'b.f90': 'program p\n use zqa\n use procedures\n use functions\nend program\n'}),
++    'modules_after_every_kind_of_program_unit': one({
++        'a.f90': ('program zq_main\nend program zq_main\nsubroutine zq_sub()\nend subroutine zq_sub\n'
++                  'integer function zq_fun()\n zq_fun = 1\nend function zq_fun\n'
++                  'block data zq_init\n common /zq_c/ i\n data i /1/\nend block data zq_init\n'
++                  'module zq_after_units\nend module zq_after_units\nmodule zq_last_in_file\nend module\n'),
++        'b.f': ('      SUBROUTINE ZQSUB2()\n      END SUBROUTINE\n'
++                '      REAL FUNCTION ZQFUN2(X)\n      REAL X\n      ZQFUN2 = X\n      END FUNCTION\n'
++                '      BLOCK DATA ZQINIT2\n      COMMON /ZQD/ J\n      DATA J /2/\n      END BLOCK DATA\n'
++                '      MODULE ZQAFTERUNITS\n      END MODULE\n      MODULE ZQLASTINFILE\n      END MODULE\n'),
++        'c.f90': ('module zq_user\n use zq_after_units\n use zq_last_in_file\n use zqafterunits\n'
++                  ' use zqlastinfile\nend module\n')}),
++    'typed_separate_procedures_in_fixed_form': one({
++        'a.f': ('      MODULE ZQT\n      INTERFACE\n      MODULE INTEGER FUNCTION FI(X)\n      INTEGER X\n'
++                '      END FUNCTION\n      MODULE CHARACTER*8 FUNCTION FC(X)\n      INTEGER X\n      END FUNCTION\n'
++                '      MODULE PURE ELEMENTAL REAL FUNCTION FE(X)\n      REAL, INTENT(IN) :: X\n      END FUNCTION\n'
++                '      MODULE RECURSIVE SUBROUTINE SR\n      END SUBROUTINE\n      END INTERFACE\n      END MODULE\n'
++                '      MODULE INTEGERS\n      END MODULE\n      MODULE PURELY\n      END MODULE\n'),
++        'b.f90': 'program p\n use zqt\n use integers\n use purely\nend program\n'}, separate=['zqt']),
++    'generic_interfaces_closed_with_their_generic_spec': one({
++        'a.f90': ('module zq_ops\n type :: zq_t\n  integer :: n\n end type\n interface operator(.zq.)\n  module procedure zq_combine\n'
++                  ' end interface operator(.zq.)\n interface assignment(=)\n  module procedure zq_assign\n end interface assignment(=)\n'
++                  'contains\n function zq_combine(a, b)\n  type(zq_t), intent(in) :: a, b\n  type(zq_t) :: zq_combine\n'
++                  '  zq_combine%n = a%n + b%n\n end\n subroutine zq_assign(a, i)\n  type(zq_t), intent(out) :: a\n'
++                  '  integer, intent(in) :: i\n  a%n = i\n end\nend\nmodule zq_after_ops\nend module\n'),
++        'b.f': ('      MODULE ZQOPS2\n      TYPE ZQT2\n      INTEGER N\n      END TYPE\n      INTERFACE OPERATOR(.ZQTWO.)\n'
++                '      MODULE PROCEDURE ZQC2\n      END INTERFACE OPERATOR(.ZQTWO.)\n      CONTAINS\n      FUNCTION ZQC2(A, B)\n'
++                '      TYPE(ZQT2), INTENT(IN) :: A, B\n      TYPE(ZQT2) :: ZQC2\n      ZQC2%N = A%N + B%N\n      END\n      END\n'
++                '      MODULE ZQAFTEROPS2\n      END MODULE\n'),
++        'c.f90': 'program p\n use zq_ops\n use zq_after_ops\n use zqops2\n use zqafterops2\nend program\n'}),
++    'select_type_guards_in_procedures': one({
++        'a.f90': ('module zq_sel\n type :: zq_base_t\n end type\ncontains\n subroutine zq_show(x)\n  class(*), intent(in) :: x\n'
++                  '  select type (x)\n  type is (integer)\n   print *, x\n  class is (zq_base_t)\n   print *, 1\n'
++                  '  class default\n   print *, 2\n  end select\n end\nend\nmodule zq_after_sel\nend module\n'),
++        'b.f90': 'program p\n use zq_sel\n use zq_after_sel\nend program\n'}),
++    'kind_lengths_before_a_semicolon': one({
++        'a.f90': 'module zq_star\n integer*4 h; end module\nmodule zq_after_star\nend module\n',
++        'b.f': '      MODULE ZQSTAR2\n      REAL*8 H; END MODULE\n      MODULE ZQAFTERSTAR2\n      END MODULE\n',
++        'c.f90': 'program p\n use zq_star\n use zq_after_star\n use zqstar2\n use zqafterstar2\nend program\n'}),
++    'declarations_named_like_procedure_statements': one({
++        'a.f90': ('module zq_decl\n integer functionality\n logical subroutinecalled\n integer subroutines\n logical functional\n'
++                  'end\nmodule zq_after_decl\nend module\n'),
++        'b.f': ('      MODULE ZQDECL2\n      INTEGER SUBROUTINES\n      LOGICAL FUNCTIONAL\n      END\n'
++                '      MODULE ZQAFTERDECL2\n      END MODULE\n'),
++        'c.f90': 'program p\n use zq_decl\n use zq_after_decl\n use zqdecl2\n use zqafterdecl2\nend program\n'}),
++    'arrays_named_like_construct_keywords': one({
++        'a.f90': ('module zq_k1\ncontains\n subroutine s()\n'
++                  '  integer :: selectcase(2), selecttype(2), associate(2), block(2), critical(2), forall(2), where(2), do(2), if(2)\n'
++                  '  selectcase(1) = 2\n  selecttype(1) = 2\n  associate(1) = 2\n  block(1) = 2\n  critical(1) = 2\n'
++                  '  forall(1) = 2\n  where(1) = 2\n  do(1) = 2\n  if(1) = 2\n end subroutine\nend module\nmodule zq_k2\nend module\n'),
++        'b.f': ('      MODULE ZQK5\n      CONTAINS\n      SUBROUTINE S()\n      INTEGER SELECTCASE(2), ASSOCIATE(2), BLOCK(2), CRITICAL(2)\n'
++                '      SELECTCASE(1) = 2\n      ASSOCIATE(1) = 2\n      BLOCK(1) = 2\n      CRITICAL(1) = 2\n      END SUBROUTINE\n'
++                '      END MODULE\n      MODULE ZQK6\n      END MODULE\n'),
++        'c.f90': 'program p\n use zq_k1\n use zq_k2\n use zqk5\n use zqk6\nend program\n'}),
++    'arrays_whose_names_start_with_block_keywords': one({
++        'a.f90': ('module zq_p1\ncontains\n subroutine s()\n'
++                  '  integer :: types(2), interfaces(2), modules(2), ends(2), blocks(2), programs(2), uses(2)\n'
++                  '  types(1) = abs(2)\n  interfaces(1) = abs(2)\n  modules(1) = abs(2)\n  ends(1) = abs(2)\n'
++                  '  blocks(1) = abs(2)\n  programs(1) = abs(2)\n  uses(1) = abs(2)\n'
++                  ' end subroutine\nend module\nmodule zq_p2\nend module\n'),
++        'b.f': ('      MODULE ZQP3\n      CONTAINS\n      SUBROUTINE S()\n      INTEGER TYPES(2), INTERFACES(2), MODULES(2)\n'
++                '      TYPES(1) = ABS(2)\n      INTERFACES(1) = ABS(2)\n      MODULES(1) = ABS(2)\n      END SUBROUTINE\n'
++                '      END MODULE\n      MODULE ZQP4\n      END MODULE\n'),
++        'c.f90': 'program p\n use zq_p1\n use zq_p2\n use zqp3\n use zqp4\nend program\n'}),
++    'fixed_form_include_lines_before_column_7': one({
++        'a.f': "INCLUDE 'zq_col1.inc'\n  INCLUDE 'zq_col3.inc'\n",
++        'zq_col1.inc': '      MODULE ZQ_INC_COL1\n      END MODULE\n',
++        'zq_col3.inc': '      MODULE ZQ_INC_COL3\n      END MODULE\n',
++        'c.F': "    INCLUDE 'zq_col5.inc'\n",
++        'zq_col5.inc': '      MODULE ZQ_INC_COL5\n      END MODULE\n',
++        'b.f90': 'program p\n use zq_inc_col1\n use zq_inc_col3\n use zq_inc_col5\nend program\n'}),
++    'comment_lines_between_fixed_form_continuation_lines': one({
++        'a.f': ('      MODULE ZQCA\nC     a comment line\n     &B\n      END MODULE\n'
++                '      MODULE ZQCC\n\n     &D\n      END MODULE\n'
++                '      MODULE ZQCE\n      ! a comment line\n     &F\n      END MODULE\n'
++                '      MODULE ZQCG\n   ! another one\n     &H\n      END MODULE\n'),
++        'b.f90': 'program p\n use zqcab\n use zqccd\n use zqcef\n use zqcgh\nend program\n'}),
++    'fixed_form_comment_lines_and_labels': one({
++        'a.f': ('c     module notone\n*     module nottwo\n!     module notthree\n  !   module notfour\n'
++                '      MODULE ZEROLINE\n     0END MODULE\n  100 MODULE LABELLED\n      END MODULE\n'),
++        'b.f': '      PROGRAM P\n      USE ZEROLINE\n      USE LABELLED\n      END\n'}),
++    'fixed_name_cut_at_column_72': one({
++        'a.f': '      MODULE ' + 'A' * 59 + 'BBB\n      END MODULE\n      MODULE OTHER\n      END MODULE\n',
++        'b.f': '      PROGRAM P\n      USE ' + 'A' * 59 + '\n      END\n'}),
++    'macro_expansion_cut_at_column_72': one({
++        'a.F': '#define LONGNAME ' + 'abcdefghij' * 6 + '\n      MODULE LONGNAME\n      END MODULE\n      MODULE SHORT\n      END MODULE\n',
++        'b.f90': 'program p\n use ' + 'abcdefghij' * 5 + 'abcdefghi\nend program\n'}),
++    'run_together_macro_is_not_expanded': one({
++        'a.F': '#define ZM_A expanded_a\n      MODULEZM_A\n      END MODULE\n      MODULE ZM_A\n      END MODULE\n',
++        'b.f90': 'program p\n use zm_a\n use expanded_a\nend program\n'}),
++    'defines_do_not_reach_sources_gfortran_does_not_preprocess': {
++        'files': {
++            'a.f90': '#ifdef GONE\nmodule kept_one\nend module\n#endif\nmodule ZQ_NAME\nend module\n',
++            'd.f90': 'program p\n use kept_one\n use zq_name\nend program\n',
++        },
++        'targets': [lib('first', ['a.f90'], ['-DZQ_NAME=renamed', '-DGONE']),
++                    lib('third', ['d.f90'], link=['first'])],
++    },
++    'hash_lines_in_fortran_include_files': one({
++        'a.F90': "#define ZM_Q should_not_apply\ninclude 'plain.inc'\nmodule after_include\nend module\n",
++        'plain.inc': '#if 0\nmodule inside_include\nend module\n#endif\nmodule ZM_Q\nend module\n',
++        'b.f90': 'program p\n use inside_include\n use zm_q\n use after_include\nend program\n',
++        'c.F': "      INCLUDE 'fixed.inc'\n",
++        'fixed.inc': '      MODULE FIXED_INC\n#ifdef ZZ_NEVER\n      END MODULE\n#endif\n'}),
++    'include_search_order': {
++        'files': {
++            'sub/a.f90': "include 'dup.inc'\ninclude 'outer.inc'\ninclude 'ord.inc'\n",
++            'sub/dup.inc': 'module dup_from_srcdir\nend module\n',
++            'sub/inner.inc': 'module inner_from_srcdir\nend module\n',
++            'inc/dup.inc': 'module dup_from_inc\nend module\n',
++            'inc/outer.inc': "include 'inner.inc'\n",
++            'inc/inner.inc': 'module inner_from_inc\nend module\n',
++            'inc/ord.inc': 'module ord_first\nend module\n',
++            'inc2/ord.inc': 'module ord_second\nend module\n',
++            'b.f90': 'program p\n use dup_from_srcdir\n use inner_from_srcdir\n use ord_first\nend program\n',
++        },
++        'targets': [lib('one', ['sub/a.f90', 'b.f90'], incdirs=['inc', 'inc2'])],
++    },
++    'header_search_order': {
++        'files': {
++            'sub/a.F90': ('#include "h.h"\n#include <angle.h>\n#include <outer.h>\n'
++                          'module NAME_Q\nend module\nmodule NAME_A\nend module\nmodule NAME_I\nend module\n'),
++            'sub/h.h': '#define NAME_Q quote_from_srcdir\n',
++            'inc/h.h': '#define NAME_Q quote_from_inc\n',
++            'sub/angle.h': '#define NAME_A angle_from_srcdir\n',
++            'inc/angle.h': '#define NAME_A angle_from_inc\n',
++            'inc/outer.h': '#include "inner.h"\n',
++            'inc/inner.h': '#define NAME_I inner_from_inc\n',
++            'sub/inner.h': '#define NAME_I inner_from_srcdir\n',
++            'b.f90': 'program p\n use quote_from_srcdir\n use angle_from_inc\n use inner_from_inc\nend program\n',
++        },
++        'targets': [lib('one', ['sub/a.F90', 'b.f90'], incdirs=['inc'])],
++    },
++    'conditions_elif_chains_and_nesting': one({
++        'a.F90': ('#if 0\n#  if 1\nmodule dead_nested\nend module\n#  else\nmodule dead_nested_else\nend module\n#  endif\n'
++                  '#elif defined(ZQ_TWO) && ZQ_TWO > 1\nmodule second_branch\nend module\n'
++                  '#else\nmodule else_branch\nend module\n#endif\n'
++                  '#ifndef ZQ_MISSING\n#  ifdef ZQ_TWO\nmodule nested_live\nend module\n#  elif 1\n'
++                  'module nested_dead\nend module\n#  endif\n#endif\n'),
++        'b.f90': 'program p\n use second_branch\n use nested_live\nend program\n'}, args=['-DZQ_TWO=2']),
++    'condition_expressions': one({
++        'a.F90': ('#if (A << 2) == 8 && B % 3 == 1\nmodule shift_mod\nend module\n#endif\n'
++                  '#if 010 == 8 && 0x10 == 16\nmodule octal_hex\nend module\n#endif\n'
++                  '#if defined C ? !defined(D) : 0\nmodule ternary\nend module\n#endif\n'
++                  '#if -A + 3 == 1 && ~0 == -1\nmodule unary_ops\nend module\n#endif\n'
++                  '#if B / 2 == 3 && (B > 5 || A < 0)\nmodule division\nend module\n#endif\n'
++                  '#if UNDEFINED_NAME == 0\nmodule undefined_is_zero\nend module\n#endif\n'
++                  '#if C == 1\nmodule bare_define_is_one\nend module\n#endif\n'
++                  '#if A == 2 || B == 0 && A == 0\nmodule or_binds_looser\nend module\n#endif\n'
++                  '#if -B / 2 == -3 && -B % 2 == -1\nmodule truncating_division\nend module\n#endif\n'
++                  '#if defined D ? 0 : 1\nmodule ternary_false\nend module\n#endif\n'
++                  '#if A > B\nmodule never_written\nend module\n#endif\n'),
++        'b.f90': 'program p\n use shift_mod\n use undefined_is_zero\nend program\n'}, args=['-DA=2', '-DB=7', '-DC']),
++    'undefined_and_chained_macros': one({
++        'a.F90': ('#define ZQ_A ZQ_B\n#define ZQ_B chained_name\nmodule ZQ_A\nend module\n'
++                  '#undef ZQ_B\nmodule ZQ_A\nend module\n#define ZQ_C late\n#undef ZQ_C\nmodule ZQ_C\nend module\n'),
++        'b.f90': 'program p\n use chained_name\n use zq_b\n use zq_c\nend program\n'}),
++    'project_arguments_come_before_target_arguments': one({
++        'a.F90': ('#if ZQ_P == 2\nmodule p_from_target\nend module\n#else\nmodule p_from_project\nend module\n#endif\n'
++                  '#if ZQ_R == 5\nmodule r_is_five\nend module\n#endif\n'),
++        'b.f90': 'program p\n use p_from_target\n use r_is_five\nend program\n'},
++        args=['-DZQ_P=2', '-DZQ_R=5'], project_args=['-DZQ_P=1', '-DZQ_R']),
++    'backslash_continued_directives': one({
++        'a.F90': ('#if defined(ZQ_X) && \\\n    ZQ_X == 3\nmodule continued_condition\nend module\n#endif\n'
++                  '#define ZQ_N \\\nspliced_name\nmodule ZQ_N\nend module\n'),
++        'b.f90': 'program p\n use continued_condition\n use spliced_name\nend program\n'}, args=['-DZQ_X=3']),
++    'labels_in_free_form': one({
++        'a.f90': '100 module labelled\nend module\n 200 module second_label ; end module second_label\n',
++        'b.f90': 'program p\n use labelled\n use second_label\nend program\n'}),
++    'use_forms_and_scopes': one({
++        'a.f90': ''.join(f'module u{i}\n integer :: some{i} = {i}\nend module\n' for i in range(1, 7)),
++        'b.f90': ('module consumer\n use :: u1\n use, non_intrinsic :: u2, only:\n use u3, renamed => some3\n'
++                  ' use, intrinsic :: iso_c_binding\n use iso_fortran_env\n interface\n  subroutine z(x)\n   use u4\n'
++                  '   integer :: x\n  end subroutine\n end interface\ncontains\n subroutine inner()\n  use u5\n'
++                  '  block\n   use u6\n  end block\n end subroutine\nend module\n')}),
++    'submodules_across_targets': {
++        'files': {
++            'base.f90': SMOD_BASE.replace('run()', 'run()\n  end subroutine\n  module subroutine walk()'),
++            's1.f90': 'submodule (base) s1\nend submodule\n',
++            's2.f90': 'submodule (base:s1) s2\nend submodule\n',
++        },
++        'targets': [lib('first', ['base.f90']), lib('second', ['s1.f90'], link=['first']),
++                    lib('third', ['s2.f90'], link=['second'])],
++        'separate': ['base'],
++    },
++    'include_files_in_linked_private_directories': {
++        'files': {
++            'a.f90': 'module from_private_dir\nend module\n',
++            'c.f90': 'module from_include_dir\nend module\n',
++            'inc/picked.inc': 'use from_include_dir\n',
++            'b.f90': "program p\n include 'picked.inc'\nend program\n",
++        },
++        'private_files': {'first': {'picked.inc': 'use from_private_dir\n'}},
++        'targets': [lib('first', ['a.f90', 'c.f90']), lib('second', ['b.f90'], incdirs=['inc'], link=['first'])],
++    },
++    'header_written_during_the_build': {
++        'files': {
++            'a.f90': 'module generated_choice\nend module\n',
++            'b.F90': '#include "gen.h"\nprogram p\n use ZQ_GEN\nend program\n',
++            'gen.h.in': '#define ZQ_GEN generated_choice\n',
++        },
++        'build_time_headers': {'gen.h': 'gen.h.in'},
++        'targets': [lib('one', ['a.f90', 'b.F90'])],
++    },
++    'linked_providers_of_one_module_follow_the_link_order': competing_providers(['z', 'a']),
++    'linked_providers_of_one_module_in_the_other_link_order': competing_providers(['a', 'z']),
++    'linked_provider_comes_before_one_of_the_same_target': {
++        'files': {'z.f90': shared_module(1, 'zq_from_z'), 'own.f90': shared_module(2, 'zq_from_own'),
++                  'user.f90': SHARED_USER},
++        'targets': [lib('z', ['z.f90']), lib('user', ['own.f90', 'user.f90'], link=['z'])],
++    },
++    'nearer_linked_provider_comes_before_a_transitive_one': {
++        'files': {'low.f90': shared_module(1, 'zq_from_low'), 'mid.f90': shared_module(2, 'zq_from_mid'),
++                  'user.f90': SHARED_USER},
++        'targets': [lib('low', ['low.f90']), lib('mid', ['mid.f90'], link=['low']),
++                    lib('user', ['user.f90'], link=['mid'])],
++    },
++    'linked_providers_of_one_parent_submodule_file': {
++        'files': {'z.f90': SMOD_BASE.replace('base', 'zq_base'), 'a.f90': SMOD_BASE.replace('base', 'zq_base'),
++                  'impl.f90': 'submodule (zq_base) zq_impl\ncontains\n module procedure run\n end procedure\nend submodule\n'},
++        'targets': [lib('z', ['z.f90']), lib('a', ['a.f90']), lib('user', ['impl.f90'], link=['z', 'a'])],
++        'separate': ['zq_base'],
++    },
++    'transitive_link_closure': {
++        'files': {
++            'a.f90': 'module deep\nend module\n',
++            'b.f90': 'module mid\n use deep\nend module\n',
++            'c.f90': 'program p\n use de&\n&ep\nend program\n',
++        },
++        'targets': [lib('first', ['a.f90']), lib('second', ['b.f90'], link=['first']),
++                    lib('third', ['c.f90'], link=['second'])],
++    },
++    'sources_listed_out_of_order': {
++        'files': {
++            'a.f90': 'module bottom\nend module\nmodule bottom_two\nend module\n',
++            'b.f90': 'module middle\n use bottom\nend module\n',
++            'c.f90': 'module top\n use middle\n use bottom_two\nend module\n',
++        },
++        'targets': [lib('one', ['c.f90', 'b.f90', 'a.f90'])],
++    },
++    'preprocessing_by_suffix': one({
++        f'{stem}.{suffix}': (('#if 1\n' + mod(f'{stem}_pp') + '#else\n' + mod(f'{stem}_raw') + '#endif\n')
++                             if free else
++                             ('#if 1\n      MODULE ' + stem.upper() + '_PP\n      END MODULE\n#else\n'
++                              '      MODULE ' + stem.upper() + '_RAW\n      END MODULE\n#endif\n'))
++        for stem, suffix, free in [('sa', 'F95', True), ('sb', 'F03', True), ('sc', 'F08', True), ('sd', 'FOR', False),
++                                   ('se', 'FTN', False), ('sf', 'fpp', False), ('sg', 'f95', True), ('sh', 'ftn', False),
++                                   ('si', 'for', False)]}),
++    'every_suffix_with_both_includes_and_ordered_arguments': every_suffix(),
++    'separate_define_and_include_arguments': one({
++        'a.F90': '#include "sep.h"\nmodule ZQ_SEP\nend module\nmodule ZQ_H\nend module\n',
++        'incs/sep.h': '#define ZQ_H from_sep_header\n',
++        'b.f90': 'program p\n use sep_name\n use from_sep_header\nend program\n'},
++        args=['-D', 'ZQ_SEP=sep_name', '-I../src/incs']),
++    'defines_meson_passes_itself': {
++        'files': {
++            'a.F90': ('#ifdef _FILE_OFFSET_BITS\nmodule large_files\nend module\n#endif\n'
++                      '#if _FILE_OFFSET_BITS == 64\nmodule sixty_four_bit_offsets\nend module\n#endif\n'),
++        },
++        'targets': [lib('first', ['a.F90'])],
++    },
++    'c_comments_in_preprocessed_sources': one({
++        'a.F90': ('module /* annotation */ commented_name\nend module\n'
++                  'module /* spans\n two lines */ spanned_name\nend module\n'
++                  '! see /* here\nmodule swallowed_by_a_comment\nend module\n! */\n'
++                  "! don't /* here\nmodule kept_after_an_apostrophe\nend module\n! */\n"
++                  "module kept_after_a_string\n character(*), parameter :: s = '/* text */'\nend module\n"
++                  '#define ZQ_CNAME named_by_macro /* trailing */\nmodule ZQ_CNAME\nend module\n'
++                  'modu/**/le pasted_name\nend module\n'),
++        'b.F': ('      MODULE /* fixed */ FIXED_COMMENTED\n      END MODULE\n'
++                '      MODULE /* ' + 'x' * 60 + ' */ SHIFTED_IN\n      END MODULE\n'),
++        'c.f90': ('program p\n use commented_name\n use spanned_name\n use kept_after_an_apostrophe\n'
++                  ' use named_by_macro\n use pasted_name\n use fixed_commented\n use shifted_in\nend program\n')}),
++    'fixed_form_with_preprocessing_includes_and_ordered_arguments': {
++        'files': {
++            'a.F': ('#if ZQ_ON\n      MODULE ZQ_GONE\n      END MODULE\n#else\n'
++                    '      MODULE ZQ_MOD\n     &_TAIL\n      END MODULE\n#endif\n'
++                    "      INCLUDE 'picked.inc'\n"),
++            'first_inc/picked.inc': '      MODULE FROM_FIRST_INC\n      END MODULE\n',
++            'second_inc/picked.inc': '      MODULE FROM_SECOND_INC\n      END MODULE\n',
++            'b.f90': 'program p\n use chosen_name_tail\nend program\n',
++        },
++        'project_args': ['-DZQ_MOD=proj_name', '-DZQ_ON=1'],
++        'targets': [lib('one', ['a.F', 'b.f90'], ['-DZQ_ON=0', '-DZQ_MOD=chosen_name', '-I../src/second_inc'],
++                        ['first_inc'])],
++    },
++    'free_form_with_preprocessing_includes_and_ordered_arguments': {
++        'files': {
++            'a.F90': ('#include "pick.h"\n'
++                      'module ZQ_HNAME&\n  &_part\nend module\n'
++                      'module fixed_name\nend module\n'
++                      '#if ZQ_DROPPED\nmodule dropped_by_the_target\nend module\n#endif\n'
++                      '#if defined(ZQ_TWICE) && ZQ_LEVEL > 1\n'
++                      "include 'deep.inc'\n#endif\n"),
++            'h1/pick.h': '#include "pick_inner.h"\n',
++            'h2/pick.h': '#include "pick_inner.h"\n',
++            'h1/pick_inner.h': '#define ZQ_HNAME from_h_one\n',
++            'h2/pick_inner.h': '#define ZQ_HNAME from_h_two\n',
++            'h1/deep.inc': 'module deep_from_h_one\nend module\n',
++            'h2/deep.inc': 'module deep_from_h_two\nend module\n',
++            'b.F90': 'program p\n use fixed_name\nend program\n',
++        },
++        'project_args': ['-DZQ_LEVEL=1', '-DZQ_TWICE', '-DZQ_DROPPED=1'],
++        'targets': [lib('one', ['a.F90', 'b.F90'], ['-DZQ_LEVEL=2', '-DZQ_DROPPED=0', '-I../src/h2'], ['h1'])],
++    },
++    'both_forms_with_nested_includes_headers_ordered_arguments_and_users': {
++        'files': {
++            'low.F90': '#if ZQ_SEL == 1\nmodule zq_low_one\nend module\n#else\nmodule zq_low_two\nend module\n#endif\n',
++            'top/a.F': ('#include "pick.h"\n'
++                        '#if ZQ_SEL == 2\n      MODULE ZQ_FIX\n     &_TARGET\n#else\n      MODULE ZQ_FIX_PROJECT\n#endif\n'
++                        '      USE ZQ_LOW_ONE\n      END MODULE\n'
++                        '      MODULE ZQ_HNAME\n      END MODULE\n'
++                        "      INCLUDE 'fixed_outer.inc'\n"),
++            'top/b.F90': ('#include "pick.h"\n'
++                          '#if ZQ_SEL == 2\nmodule zq_free_target\n#else\nmodule zq_free_project\n#endif\n'
++                          "include 'free_outer.inc'\n"
++                          ' use ZQ_HNAME\n use zq_fix_target\nend module\n'),
++            'h1/pick.h': '#include "pick_inner.h"\n',
++            'h2/pick.h': '#include "pick_inner.h"\n',
++            'h1/pick_inner.h': '#define ZQ_HNAME zq_from_h_one\n',
++            'h2/pick_inner.h': '#define ZQ_HNAME zq_from_h_two\n',
++            'h2/fixed_outer.inc': "      INCLUDE 'fixed_inner.inc'\n",
++            'top/fixed_inner.inc': '      MODULE ZQ_FIXED_INNER_TOP\n      END MODULE\n',
++            'h1/fixed_inner.inc': '      MODULE ZQ_FIXED_INNER_H1\n      END MODULE\n',
++            'h1/free_outer.inc': "include 'free_inner.inc'\n",
++            'top/free_inner.inc': ' use zq_fixed_inner_top\n',
++            'h2/free_inner.inc': ' use zq_low_one\n',
++        },
++        'project_args': ['-DZQ_SEL=1'],
++        'targets': [lib('low', ['low.F90']),
++                    lib('top', ['top/a.F', 'top/b.F90'], ['-DZQ_SEL=2', '-I../src/h2'], ['h1'], link=['low'])],
++    },
++    'headers_with_pragma_once_are_read_once': one({
++        'a.F90': ('#define ZQ_WANT 0\n#include "once.h"\n#include "again.h"\n#undef ZQ_WANT\n#define ZQ_WANT 1\n'
++                  '#include "once.h"\n#include "again.h"\nmodule zq_after_headers\nend module\nmodule zq_last\nend module\n'),
++        'once.h': '#pragma once\n#if ZQ_WANT\nmodule zq_once\nend module\n#endif\n',
++        'again.h': '#if ZQ_WANT\nmodule zq_again\nend module\n#endif\n',
++        'b.f90': 'program p\n use zq_again\n use zq_after_headers\nend program\n'}),
++    'include_next_continues_the_header_search': one({
++        'a.F90': '#include "h.h"\nmodule ZQ_NEXT\nend module\n#include <g.h>\nmodule ZQ_NEXT2\nend module\n',
++        'inc1/h.h': '#include_next "h.h"\n',
++        'inc2/h.h': '#define ZQ_NEXT zq_from_next\n',
++        'inc1/g.h': '#define ZQ_NEXT2 zq_from_first\n#undef ZQ_NEXT2\n#include_next <g.h>\n',
++        'inc2/g.h': '#define ZQ_NEXT2 zq_from_second\n',
++        'b.f90': 'program p\n use zq_from_next\n use zq_from_second\nend program\n'}, incdirs=['inc1', 'inc2']),
++    'macro_named_headers': one({
++        'a.F90': '#define ZQ_QUOTED "decl.h"\n#include ZQ_QUOTED\n#define ZQ_ANGLED <angled.h>\n#include ZQ_ANGLED\n',
++        'decl.h': 'module from_quoted_macro\nend module\n',
++        'inc/angled.h': 'module from_angled_macro\nend module\n',
++        'b.f90': 'program p\n use from_quoted_macro\n use from_angled_macro\nend program\n'}, incdirs=['inc']),
++    'macro_names_are_case_sensitive': one({
++        'a.F90': '#define ZQ_K expanded_k\nmodule ZQ_K\nend module\nmodule zq_k\nend module\n',
++        'b.f90': 'program p\n use expanded_k\n use zq_k\nend program\n'}),
++    'macro_bodies_with_semicolons': one({
++        'a.F90': '#define PAIR module pa1; end module pa1\nPAIR\nmodule pa2\nend module\n',
++        'b.f90': 'program p\n use pa1\n use pa2\nend program\n'}),
++    'submodules_named_like_intrinsic_modules': one({
++        'a.f90': SMOD_BASE.replace('base', 'zq_ibase') + 'module zq_after_ibase\nend module\n',
++        'b.f90': 'submodule (zq_ibase) iso_c_binding\nend submodule\n',
++        'c.f90': 'submodule (zq_ibase:iso_c_binding) zq_deeper\nend submodule\n',
++        'd.f': '      SUBMODULE (ZQ_IBASE) IEEE_ARITHMETIC\n      END SUBMODULE\n',
++        'e.f': '      SUBMODULE (ZQ_IBASE:IEEE_ARITHMETIC) ZQDEEPER2\n      END SUBMODULE\n',
++        'f.f90': 'program p\n use zq_after_ibase\nend program\n'}, separate=['zq_ibase']),
++    'cross_target_modules': {
++        'files': {
++            'lib.f90': 'module provider\n interface\n  module subroutine go()\n  end subroutine\n end interface\nend module\n',
++            'impl.f90': 'submodule (provider) worker\ncontains\n module procedure go\n end procedure\nend submodule\n',
++            'app.f90': 'program app\n use provider\nend program\n',
++        },
++        'targets': [lib('first', ['lib.f90']), lib('second', ['impl.f90'], link=['first']),
++                    lib('third', ['app.f90'], link=['second'])],
++        'separate': ['provider'],
++    },
++}
++
++
++@pytest.mark.parametrize('name', sorted(CASES))
++def test_case_matches_gfortran(tmp_path, name):
++    check(tmp_path, CASES[name])
++
++
++@pytest.mark.parametrize('seed', SEEDS)
++def test_generated_project_matches_gfortran(tmp_path, seed):
++    check(tmp_path, generate(seed))
++
++
++INCLUDE_EDITS = {
++    'fortran_include': ("program p\n include 'deps.inc'\nend program\n", 'b.f90', 'deps.inc',
++                        'use first\n', 'use second\n', {}),
++    'preprocessor_header': ('#include "deps.h"\nprogram p\n use ZQ_DEP\nend program\n', 'b.F90', 'deps.h',
++                            '#define ZQ_DEP first\n', '#define ZQ_DEP second\n', {}),
++    'nested_fortran_include': ("program p\n include 'outer.inc'\nend program\n", 'b.f90', 'deps.inc',
++                               'use first\n', 'use second\n', {'outer.inc': "include 'deps.inc'\n"}),
++    'nested_preprocessor_header': ('#include "outer.h"\nprogram p\n use ZQ_DEP\nend program\n', 'b.F90', 'deps.h',
++                                   '#define ZQ_DEP first\n', '#define ZQ_DEP second\n',
++                                   {'outer.h': '#include "deps.h"\n'}),
++    'fortran_include_declaring_a_module': ("include 'mods.inc'\n", 'b.f90', 'mods.inc',
++                                           'module zq_extra_old\nend module\n', 'module zq_extra_new\nend module\n', {}),
++    'preprocessor_header_naming_a_module': ('#include "mods.h"\nmodule ZQ_EXTRA\nend module\n', 'b.F90', 'mods.h',
++                                            '#define ZQ_EXTRA zq_extra_old\n', '#define ZQ_EXTRA zq_extra_new\n', {}),
++}
++
++
++def clear_outputs(build):
++    for f in build.rglob('*'):
++        if f.suffix in {'.mod', '.smod', '.o'}:
++            f.unlink()
++
++
++def build_with_ninja(build, targets=()):
++    r = subprocess.run(['ninja', '-C', str(build), *targets], capture_output=True, text=True)
++    assert r.returncode == 0, r.stdout + r.stderr
++
++
++@pytest.mark.parametrize('name', sorted(INCLUDE_EDITS))
++def test_dyndep_and_object_follow_an_included_file_that_changes(tmp_path, name):
++    consumer, consumer_name, included, before, after, others = INCLUDE_EDITS[name]
++    case = one({'a.f90': mod('first'), 'c.f90': mod('second'), consumer_name: consumer, included: before, **others})
++    src, build, objects = setup_project(tmp_path, case)
++    compare(tmp_path, case, src, build, objects)
++    target = next(o for o in objects if os.path.basename(o).startswith(consumer_name))
++    clear_outputs(build)
++    build_with_ninja(build, sorted(o for o in objects if o != target))
++    build_with_ninja(build)
++    built = (build / target).stat().st_mtime_ns
++    path = src / included
++    path.write_text(after)
++    later = path.stat().st_mtime + 10
++    os.utime(path, (later, later))
++    run_scan(tmp_path, build, objects)
++    build_with_ninja(build)
++    assert (build / target).stat().st_mtime_ns != built
++    clear_outputs(build)
++    build_with_ninja(build, [target])
++    clear_outputs(build)
++    compare(tmp_path, case, src, build, objects)
++
++
++SHARED_INCLUDE_EDITS = {
++    'fortran_include': ({'b.f90': "program p\n include 'deps.inc'\nend program\n",
++                         'd.f90': "module zq_user\ncontains\n subroutine s()\n  include 'deps.inc'\n end subroutine\nend module\n"},
++                        'deps.inc', 'use first\n', 'use second\n', {}),
++    'preprocessor_header': ({'b.F90': '#include "deps.h"\nprogram p\n use ZQ_DEP\nend program\n',
++                             'd.F90': '#include "deps.h"\nmodule zq_user\n use ZQ_DEP\nend module\n'},
++                            'deps.h', '#define ZQ_DEP first\n', '#define ZQ_DEP second\n', {}),
++    'nested_fortran_include': ({'b.f90': "program p\n include 'outer.inc'\nend program\n",
++                                'd.f90': "module zq_user\ncontains\n subroutine s()\n  include 'deps.inc'\n end subroutine\nend module\n"},
++                               'deps.inc', 'use first\n', 'use second\n', {'outer.inc': "include 'deps.inc'\n"}),
++}
++
++
++@pytest.mark.parametrize('name', sorted(SHARED_INCLUDE_EDITS))
++def test_every_object_whose_source_includes_a_changed_file_is_rebuilt(tmp_path, name):
++    consumers, included, before, after, others = SHARED_INCLUDE_EDITS[name]
++    case = one({'a.f90': mod('first'), 'c.f90': mod('second'), **consumers, included: before, **others})
++    src, build, objects = setup_project(tmp_path, case)
++    compare(tmp_path, case, src, build, objects)
++    targets = [next(o for o in objects if os.path.basename(o).startswith(c)) for c in sorted(consumers)]
++    clear_outputs(build)
++    build_with_ninja(build, sorted(o for o in objects if o not in targets))
++    build_with_ninja(build)
++    built = {t: (build / t).stat().st_mtime_ns for t in targets}
++    path = src / included
++    path.write_text(after)
++    later = path.stat().st_mtime + 10
++    os.utime(path, (later, later))
++    run_scan(tmp_path, build, objects)
++    build_with_ninja(build)
++    assert [t for t in targets if (build / t).stat().st_mtime_ns == built[t]] == []
++    clear_outputs(build)
++    compare(tmp_path, case, src, build, objects)
++
++
++CONTENT_EDITS = {
++    'fortran_include': ({'b.f90': "module zq_user\n include 'deps.inc'\nend module\n"}, 'deps.inc',
++                        'integer :: zq_value = 1\n', 'integer :: zq_value = 2\n', {}),
++    'preprocessor_header': ({'b.F90': '#include "deps.h"\nmodule zq_user\n integer :: zq_value = ZQ_VALUE\nend module\n'},
++                            'deps.h', '#define ZQ_VALUE 1\n', '#define ZQ_VALUE 2\n', {}),
++    'nested_shared_include': ({'b.f90': "module zq_user\n include 'outer.inc'\nend module\n",
++                               'd.f90': "module zq_user2\n include 'deps.inc'\nend module\n"},
++                              'deps.inc', 'integer :: zq_value = 1\n', 'integer :: zq_value = 2\n',
++                              {'outer.inc': "include 'deps.inc'\n"}),
++}
++
++
++@pytest.mark.parametrize('name', sorted(CONTENT_EDITS))
++def test_objects_are_rebuilt_when_an_include_changes_but_not_its_modules(tmp_path, name):
++    consumers, included, before, after, others = CONTENT_EDITS[name]
++    case = one({'a.f90': mod('first'), **consumers, included: before, **others})
++    src, build, objects = setup_project(tmp_path, case)
++    compare(tmp_path, case, src, build, objects)
++    targets = [next(o for o in objects if os.path.basename(o).startswith(c)) for c in sorted(consumers)]
++    clear_outputs(build)
++    build_with_ninja(build, sorted(o for o in objects if o not in targets))
++    build_with_ninja(build)
++    built = {t: (build / t).stat().st_mtime_ns for t in targets}
++    path = src / included
++    path.write_text(after)
++    later = path.stat().st_mtime + 10
++    os.utime(path, (later, later))
++    run_scan(tmp_path, build, objects)
++    build_with_ninja(build)
++    assert [t for t in targets if (build / t).stat().st_mtime_ns == built[t]] == []
++    clear_outputs(build)
++    compare(tmp_path, case, src, build, objects)
++
++
++USE_SMOD_PARENTS = {
++    'same_target': {
++        'files': {'a.f90': SMOD_BASE, 'b.f90': 'module zq_parent\n use base\nend module\nmodule zq_after_parent\nend module\n',
++                  'c.f90': 'submodule (zq_parent) zq_child\nend submodule\n'},
++        'targets': [lib('one', ['a.f90', 'b.f90', 'c.f90'])],
++        'separate': ['base'],
++    },
++    'linked': {
++        'files': {'a.f90': SMOD_BASE, 'b.f90': 'module zq_parent\n use base\nend module\nmodule zq_after_parent\nend module\n',
++                  'c.f90': 'submodule (zq_parent) zq_child\nend submodule\n'},
++        'targets': [lib('first', ['a.f90', 'b.f90']), lib('second', ['c.f90'], link=['first'])],
++        'separate': ['base'],
++    },
++}
++
++
++@pytest.mark.parametrize('name', sorted(USE_SMOD_PARENTS))
++def test_submodule_builds_after_a_module_whose_smod_comes_from_a_use(tmp_path, name):
++    case = USE_SMOD_PARENTS[name]
++    src, build, objects = setup_project(tmp_path, case)
++    compare(tmp_path, case, src, build, objects)
++    clear_outputs(build)
++    build_with_ninja(build, [next(o for o in objects if os.path.basename(o).startswith('c.f90'))])

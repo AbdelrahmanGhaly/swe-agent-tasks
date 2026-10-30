@@ -1,0 +1,1671 @@
+diff --git a/cmd/apt_pattern_queries_39db46_test.go b/cmd/apt_pattern_queries_39db46_test.go
+new file mode 100644
+index 00000000..4fe9e681
+--- /dev/null
++++ b/cmd/apt_pattern_queries_39db46_test.go
+@@ -0,0 +1,1468 @@
++package cmd_test
++
++import (
++	"archive/tar"
++	"bytes"
++	"compress/gzip"
++	"context"
++	"crypto/md5"
++	"crypto/sha1"
++	"crypto/sha256"
++	"encoding/json"
++	"fmt"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"regexp"
++	"sort"
++	"strings"
++	"testing"
++)
++
++var (
++	aptlyBinary     string
++	aptlyBuildError error
++)
++
++func TestMain(m *testing.M) {
++	dir, err := os.MkdirTemp("", "aptly-pattern-queries")
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++	aptlyBinary = filepath.Join(dir, "aptly")
++	if out, err := exec.Command("go", "build", "-o", aptlyBinary, "..").CombinedOutput(); err != nil {
++		aptlyBuildError = fmt.Errorf("%v\n%s", err, out)
++	}
++	code := m.Run()
++	_ = os.RemoveAll(dir)
++	os.Exit(code)
++}
++
++type aptlyEnv struct {
++	t      *testing.T
++	dir    string
++	config string
++}
++
++func newAptlyEnv(t *testing.T) *aptlyEnv {
++	t.Helper()
++	if aptlyBuildError != nil {
++		t.Fatalf("unable to build aptly: %s", aptlyBuildError)
++	}
++	dir := t.TempDir()
++	config := filepath.Join(dir, "aptly.conf")
++	content := fmt.Sprintf("{\"rootDir\": %q, \"architectures\": []}\n", filepath.Join(dir, "root"))
++	if err := os.WriteFile(config, []byte(content), 0644); err != nil {
++		t.Fatal(err)
++	}
++	return &aptlyEnv{t: t, dir: dir, config: config}
++}
++
++func (e *aptlyEnv) exec(args ...string) (string, string, error) {
++	cmd := exec.Command(aptlyBinary, append([]string{"-config=" + e.config}, args...)...)
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout = &stdout
++	cmd.Stderr = &stderr
++	err := cmd.Run()
++	return stdout.String(), stderr.String(), err
++}
++
++func (e *aptlyEnv) run(args ...string) string {
++	e.t.Helper()
++	stdout, stderr, err := e.exec(args...)
++	if err != nil {
++		e.t.Fatalf("aptly %s: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout, stderr)
++	}
++	return stdout
++}
++
++func splitStanzas(text string) []string {
++	var stanzas []string
++	for _, block := range strings.Split(strings.TrimSpace(text), "\n\n") {
++		if block = strings.TrimSpace(block); block != "" {
++			stanzas = append(stanzas, block+"\n")
++		}
++	}
++	return stanzas
++}
++
++func stanzaField(stanza, field string) string {
++	for _, line := range strings.Split(stanza, "\n") {
++		if strings.HasPrefix(line, field+": ") {
++			return strings.TrimPrefix(line, field+": ")
++		}
++	}
++	return ""
++}
++
++func tarGz(t *testing.T, files map[string]string) []byte {
++	t.Helper()
++	var buf bytes.Buffer
++	gz := gzip.NewWriter(&buf)
++	tw := tar.NewWriter(gz)
++	names := make([]string, 0, len(files))
++	for name := range files {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	for _, name := range names {
++		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(files[name]))}); err != nil {
++			t.Fatal(err)
++		}
++		if _, err := tw.Write([]byte(files[name])); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := tw.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := gz.Close(); err != nil {
++		t.Fatal(err)
++	}
++	return buf.Bytes()
++}
++
++func writeDeb(t *testing.T, path, control string) {
++	t.Helper()
++	var buf bytes.Buffer
++	buf.WriteString("!<arch>\n")
++	members := []struct {
++		name    string
++		content []byte
++	}{
++		{"debian-binary", []byte("2.0\n")},
++		{"control.tar.gz", tarGz(t, map[string]string{"./control": control})},
++		{"data.tar.gz", tarGz(t, nil)},
++	}
++	for _, member := range members {
++		fmt.Fprintf(&buf, "%-16s%-12d%-6d%-6d%-8s%-10d`\n", member.name, 0, 0, 0, "100644", len(member.content))
++		buf.Write(member.content)
++		if len(member.content)%2 == 1 {
++			buf.WriteByte('\n')
++		}
++	}
++	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func writeDsc(t *testing.T, dir, name, version string) {
++	t.Helper()
++	tarball := name + "_" + version + ".tar.gz"
++	content := tarGz(t, map[string]string{name + "/README": "source\n"})
++	if err := os.WriteFile(filepath.Join(dir, tarball), content, 0644); err != nil {
++		t.Fatal(err)
++	}
++	dsc := fmt.Sprintf("Format: 3.0 (native)\nSource: %s\nBinary: %s\nArchitecture: any\nVersion: %s\n"+
++		"Maintainer: Test <test@example.com>\nChecksums-Sha256:\n %x %d %s\nFiles:\n %x %d %s\n",
++		name, name, version, sha256.Sum256(content), len(content), tarball, md5.Sum(content), len(content), tarball)
++	if err := os.WriteFile(filepath.Join(dir, name+"_"+version+".dsc"), []byte(dsc), 0644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func (e *aptlyEnv) packages(name, stanzas string, sources ...string) string {
++	e.t.Helper()
++	dir := filepath.Join(e.dir, "packages-"+name)
++	if err := os.MkdirAll(dir, 0755); err != nil {
++		e.t.Fatal(err)
++	}
++	for _, stanza := range splitStanzas(stanzas) {
++		if stanzaField(stanza, "Maintainer") == "" {
++			stanza += "Maintainer: Test <test@example.com>\n"
++		}
++		if stanzaField(stanza, "Description") == "" {
++			stanza += "Description: test package\n"
++		}
++		file := fmt.Sprintf("%s_%s_%s.deb", stanzaField(stanza, "Package"), strings.ReplaceAll(stanzaField(stanza, "Version"), ":", "%3a"), stanzaField(stanza, "Architecture"))
++		writeDeb(e.t, filepath.Join(dir, file), stanza)
++	}
++	for _, source := range sources {
++		parts := strings.SplitN(source, "_", 2)
++		writeDsc(e.t, dir, parts[0], parts[1])
++	}
++	return dir
++}
++
++func (e *aptlyEnv) repo(name, stanzas string, sources ...string) {
++	e.t.Helper()
++	e.run("repo", "create", name)
++	e.run("repo", "add", name, e.packages(name, stanzas, sources...))
++}
++
++func (e *aptlyEnv) snapshot(name, stanzas string, sources ...string) {
++	e.t.Helper()
++	e.repo(name, stanzas, sources...)
++	e.run("snapshot", "create", name, "from", "repo", name)
++}
++
++var packageKeyLine = regexp.MustCompile(`^[a-z0-9][a-z0-9+.:-]*_[^_\s]+_[a-z0-9-]+$`)
++
++func packageKeys(output string) []string {
++	keys := []string{}
++	for _, line := range strings.Split(output, "\n") {
++		if line = strings.TrimSpace(line); packageKeyLine.MatchString(line) {
++			keys = append(keys, line)
++		}
++	}
++	sort.Strings(keys)
++	return keys
++}
++
++func (e *aptlyEnv) search(args ...string) []string {
++	e.t.Helper()
++	stdout, stderr, err := e.exec(args...)
++	if err != nil {
++		if strings.Contains(stderr, "no results") {
++			return []string{}
++		}
++		e.t.Fatalf("aptly %s: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout, stderr)
++	}
++	return packageKeys(stdout)
++}
++
++func assertKeys(t *testing.T, what string, got []string, want ...string) {
++	t.Helper()
++	sorted := append([]string{}, want...)
++	sort.Strings(sorted)
++	if len(sorted) == 0 {
++		sorted = []string{}
++	}
++	if !reflect.DeepEqual(got, sorted) {
++		t.Errorf("%s:\n got %q\nwant %q", what, got, sorted)
++	}
++}
++
++func (e *aptlyEnv) assertFails(args ...string) {
++	e.t.Helper()
++	stdout, stderr, err := e.exec(args...)
++	if err == nil {
++		e.t.Errorf("aptly %s succeeded, expected an error\nstdout:\n%s", strings.Join(args, " "), stdout)
++		return
++	}
++	if !strings.Contains(stderr, "ERROR") {
++		e.t.Errorf("aptly %s: expected an error message\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), stdout, stderr)
++	}
++}
++
++type patternCase struct {
++	pattern string
++	want    []string
++}
++
++type patternSuite struct {
++	packages string
++	sources  []string
++	cases    []patternCase
++}
++
++func (s patternSuite) check(t *testing.T) {
++	t.Helper()
++	e := newAptlyEnv(t)
++	e.repo("main", s.packages, s.sources...)
++	for _, c := range s.cases {
++		assertKeys(t, "repo search "+c.pattern, e.search("repo", "search", "main", c.pattern), c.want...)
++	}
++}
++
++var plainQuerySuite = patternSuite{
++	packages: `
++Package: libfoo
++Version: 1.0
++Architecture: amd64
++Section: libs
++
++Package: libfoo-dev
++Version: 1.0
++Architecture: amd64
++Section: libdevel
++Depends: libfoo (= 1.0)
++
++Package: foo-tools
++Version: 1.0
++Architecture: amd64
++Section: utils
++Source: libfoo
++`,
++	sources: []string{"libfoo_1.0"},
++}
++
++var logicSuite = patternSuite{
++	packages: `
++Package: alpha
++Version: 1.0
++Architecture: amd64
++Section: utils
++
++Package: alpha
++Version: 1.0
++Architecture: i386
++Section: utils
++
++Package: beta
++Version: 2.0
++Architecture: amd64
++Section: libs
++
++Package: gamma
++Version: 1.0
++Architecture: all
++Section: libs
++
++Package: delta
++Version: 3
++Architecture: arm64
++Section: admin
++`,
++	cases: []patternCase{
++		{"?and(?name(a$), ?section(libs))", []string{"beta_2.0_amd64", "gamma_1.0_all"}},
++		{"?or(?exact-name(alpha), ?exact-name(delta))", []string{"alpha_1.0_amd64", "alpha_1.0_i386", "delta_3_arm64"}},
++		{"?not(?name(^a))", []string{"beta_2.0_amd64", "delta_3_arm64", "gamma_1.0_all"}},
++		{"~nalpha | ~nbeta", []string{"alpha_1.0_amd64", "alpha_1.0_i386", "beta_2.0_amd64"}},
++		{"~na ~slibs", []string{"beta_2.0_amd64", "gamma_1.0_all"}},
++		{"?true !~n^a", []string{"beta_2.0_amd64", "delta_3_arm64", "gamma_1.0_all"}},
++		{"~ri386 (~nalpha | ~nbeta)", []string{"alpha_1.0_i386"}},
++		{"~nalpha ~ri386 | ~ndelta", []string{"alpha_1.0_i386", "delta_3_arm64"}},
++		{"?and()", []string{"alpha_1.0_amd64", "alpha_1.0_i386", "beta_2.0_amd64", "delta_3_arm64", "gamma_1.0_all"}},
++		{"?or()", []string{}},
++		{"~T", []string{"alpha_1.0_amd64", "alpha_1.0_i386", "beta_2.0_amd64", "delta_3_arm64", "gamma_1.0_all"}},
++		{"~F", []string{}},
++		{"?or(~nbeta,)", []string{"beta_2.0_amd64"}},
++	},
++}
++
++var wholePackageSuite = patternSuite{
++	packages: `
++Package: foo
++Version: 1.0
++Architecture: amd64
++
++Package: foo
++Version: 2.0
++Architecture: amd64
++
++Package: foo
++Version: 1.0
++Architecture: i386
++
++Package: bar
++Version: 1.5
++Architecture: amd64
++
++Package: baz
++Version: 2.0
++Architecture: all
++
++Package: baz
++Version: 1.0
++Architecture: amd64
++
++Package: qux
++Version: 3.0
++Architecture: amd64
++`,
++	cases: []patternCase{
++		{"?version(^2)", []string{"baz_1.0_amd64", "baz_2.0_all", "foo_1.0_amd64", "foo_2.0_amd64"}},
++		{"?any-version(?version(^2))", []string{"baz_1.0_amd64", "baz_2.0_all", "foo_1.0_amd64", "foo_2.0_amd64"}},
++		{"?all-versions(?version(^1))", []string{"bar_1.5_amd64", "foo_1.0_i386"}},
++		{"?and(?version(^1), ?version(^2))", []string{"baz_1.0_amd64", "baz_2.0_all", "foo_1.0_amd64", "foo_2.0_amd64"}},
++		{"?narrow(?version(^1), ?version(^2))", []string{}},
++		{"?narrow(?version(^2), ?architecture(i386))", []string{}},
++		{"?not(?version(^1))", []string{"qux_3.0_amd64"}},
++		{"~V^1\\.0$", []string{"baz_1.0_amd64", "baz_2.0_all", "foo_1.0_amd64", "foo_1.0_i386", "foo_2.0_amd64"}},
++	},
++}
++
++var nameAndFieldSuite = patternSuite{
++	packages: `
++Package: libfoo1
++Version: 1.2-3
++Architecture: amd64
++Section: libs
++Priority: optional
++Source: foo (1.2-1)
++
++Package: libfoo-dev
++Version: 1.2-3
++Architecture: amd64
++Section: libdevel
++Priority: Optional
++Source: foo
++
++Package: foo-tools
++Version: 1:1.2-3
++Architecture: arm64
++Section: utils
++Priority: extra
++
++Package: base-files
++Version: 12
++Architecture: amd64
++Section: admin
++Priority: required
++Essential: yes
++
++Package: mystery
++Version: 0.1
++Architecture: amd64
++
++Package: oddity
++Version: 1.0
++Architecture: amd64
++Section: non-free/net
++Priority: urgent
++
++Package: 1foo
++Version: 1.0
++Architecture: amd64
++`,
++	cases: []patternCase{
++		{"?name(FOO)", []string{"1foo_1.0_amd64", "foo-tools_1:1.2-3_arm64", "libfoo-dev_1.2-3_amd64", "libfoo1_1.2-3_amd64"}},
++		{"?name(^lib)", []string{"libfoo-dev_1.2-3_amd64", "libfoo1_1.2-3_amd64"}},
++		{"?name(^lib**foo)", []string{"libfoo-dev_1.2-3_amd64", "libfoo1_1.2-3_amd64"}},
++		{"?exact-name(libfoo1)", []string{"libfoo1_1.2-3_amd64"}},
++		{"?exact-name(LIBFOO1)", []string{}},
++		{"?exact-name(libfoo.*)", []string{}},
++		{"?section(^lib)", []string{"libfoo-dev_1.2-3_amd64", "libfoo1_1.2-3_amd64"}},
++		{"?section(.)", []string{"base-files_12_amd64", "foo-tools_1:1.2-3_arm64", "libfoo-dev_1.2-3_amd64", "libfoo1_1.2-3_amd64", "oddity_1.0_amd64"}},
++		{"?section(^non-free/)", []string{"oddity_1.0_amd64"}},
++		{"?priority(optional)", []string{"libfoo-dev_1.2-3_amd64", "libfoo1_1.2-3_amd64"}},
++		{"?priority(Optional)", []string{}},
++		{"?priority(opt)", []string{}},
++		{"~poptional", []string{"libfoo-dev_1.2-3_amd64", "libfoo1_1.2-3_amd64"}},
++		{"~e^foo$", []string{"libfoo-dev_1.2-3_amd64", "libfoo1_1.2-3_amd64"}},
++		{"?priority(extra)", []string{"foo-tools_1:1.2-3_arm64", "oddity_1.0_amd64"}},
++		{"?source-package(^foo$)", []string{"libfoo-dev_1.2-3_amd64", "libfoo1_1.2-3_amd64"}},
++		{"?source-version(^1\\.2-1$)", []string{"libfoo1_1.2-3_amd64"}},
++		{"?version(^1:)", []string{"foo-tools_1:1.2-3_arm64"}},
++		{"?essential", []string{"base-files_12_amd64"}},
++		{"?x-name-fnmatch(LIBFOO*)", []string{"libfoo-dev_1.2-3_amd64", "libfoo1_1.2-3_amd64"}},
++		{"?x-name-fnmatch([[:digit:]]*)", []string{"1foo_1.0_amd64"}},
++		{"?x-name-fnmatch(*[[:digit:]])", []string{"libfoo1_1.2-3_amd64"}},
++	},
++}
++
++var architectureSuite = patternSuite{
++	packages: `
++Package: tool
++Version: 1.0
++Architecture: amd64
++
++Package: tool
++Version: 1.0
++Architecture: i386
++
++Package: tool
++Version: 1.0
++Architecture: armhf
++
++Package: tool
++Version: 1.0
++Architecture: armel
++
++Package: tool-doc
++Version: 1.0
++Architecture: all
++
++Package: helper
++Version: 2.0
++Architecture: arm64
++
++Package: mixed
++Version: 1.0
++Architecture: all
++
++Package: mixed
++Version: 2.0
++Architecture: i386
++`,
++	cases: []patternCase{
++		{"?architecture(amd64)", []string{"mixed_1.0_all", "tool-doc_1.0_all", "tool_1.0_amd64"}},
++		{"?architecture(all)", []string{}},
++		{"?architecture(any-arm)", []string{"tool_1.0_armel", "tool_1.0_armhf"}},
++		{"?architecture(armhf)", []string{"tool_1.0_armhf"}},
++		{"?architecture(linux-any)", []string{"helper_2.0_arm64", "mixed_1.0_all", "mixed_2.0_i386", "tool-doc_1.0_all", "tool_1.0_amd64", "tool_1.0_armel", "tool_1.0_armhf", "tool_1.0_i386"}},
++		{"?architecture(any-i386)", []string{"mixed_2.0_i386", "tool_1.0_i386"}},
++		{"~rarm64", []string{"helper_2.0_arm64"}},
++		{"?architecture(native)", []string{}},
++		{"?exact-name(mixed) ?architecture(i386)", []string{"mixed_2.0_i386"}},
++	},
++}
++
++var relationScenario = `
++Package: app
++Version: 1.0
++Architecture: amd64
++Pre-Depends: base
++Depends: libx (>= 2), liby | libz, virt
++Recommends: rec
++Suggests: sug
++Conflicts: old
++Breaks: old (<< 1)
++Replaces: old
++Enhances: shell
++Obsoletes: old
++Optional: shell
++
++Package: app
++Version: 2.0
++Architecture: amd64
++Depends: liby
++
++Package: libx
++Version: 1.0
++Architecture: amd64
++
++Package: liby
++Version: 1.0
++Architecture: all
++
++Package: base
++Version: 1
++Architecture: amd64
++Essential: yes
++
++Package: prov
++Version: 1.0
++Architecture: amd64
++Provides: virt
++
++Package: rec
++Version: 1.0
++Architecture: amd64
++
++Package: old
++Version: 0.5
++Architecture: amd64
++
++Package: shell
++Version: 5
++Architecture: amd64
++
++Package: tool
++Version: 1.0
++Architecture: i386
++Depends: libx, liby, lib32
++
++Package: lib32
++Version: 1.0
++Architecture: i386
++`
++
++var dependsSuite = patternSuite{
++	packages: relationScenario,
++	cases: []patternCase{
++		{"?depends(?name(^libx$))", []string{"app_1.0_amd64", "app_2.0_amd64", "tool_1.0_i386"}},
++		{"?depends(?exact-name(libx) ?architecture(amd64))", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"?depends(?virtual)", []string{"app_1.0_amd64", "app_2.0_amd64", "tool_1.0_i386"}},
++		{"?depends(?name(libz))", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"?depends(?name(prov))", []string{}},
++		{"?depends(?version(^1))", []string{"app_1.0_amd64", "app_2.0_amd64", "tool_1.0_i386"}},
++		{"?depends(?essential)", []string{}},
++		{"?predepends(?name(base))", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"?recommends(?true)", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"?suggests(?virtual)", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"?conflicts(?name(old))", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"?breaks(?version(^0))", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"?replaces(?true)", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"?enhances(?exact-name(shell))", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"?obsoletes(?true)", []string{}},
++		{"?depends(?depends(?true))", []string{}},
++	},
++}
++
++var reverseSuite = patternSuite{
++	packages: relationScenario,
++	cases: []patternCase{
++		{"?reverse-depends(?true)", []string{"lib32_1.0_i386", "libx_1.0_amd64", "liby_1.0_all"}},
++		{"?reverse-depends(?name(app))", []string{"libx_1.0_amd64", "liby_1.0_all"}},
++		{"?reverse-depends(?version(^2))", []string{"liby_1.0_all"}},
++		{"?reverse-depends(?version(^1))", []string{"lib32_1.0_i386", "libx_1.0_amd64", "liby_1.0_all"}},
++		{"?reverse-depends(?architecture(i386))", []string{"lib32_1.0_i386"}},
++		{"?reverse-depends(?exact-name(tool))", []string{"lib32_1.0_i386"}},
++		{"?reverse-predepends(?name(app))", []string{"base_1_amd64"}},
++		{"?reverse-recommends(?true)", []string{"rec_1.0_amd64"}},
++		{"?reverse-conflicts(?version(^1))", []string{"old_0.5_amd64"}},
++		{"?reverse-breaks(?true)", []string{"old_0.5_amd64"}},
++		{"?reverse-enhances(?true)", []string{"shell_5_amd64"}},
++		{"?reverse-suggests(?true)", []string{}},
++		{"?reverse-obsoletes(?true)", []string{}},
++		{"?reverse-replaces(?true)", []string{"old_0.5_amd64"}},
++	},
++}
++
++var shortFormSuite = patternSuite{
++	packages: relationScenario,
++	cases: []patternCase{
++		{"~napp", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"~V^2", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"~E", []string{"base_1_amd64"}},
++		{"~v", []string{}},
++		{"~ri386", []string{"lib32_1.0_i386", "tool_1.0_i386"}},
++		{"~D~nlibz", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"~DDepends:~nlibx", []string{"app_1.0_amd64", "app_2.0_amd64", "tool_1.0_i386"}},
++		{"~DRecommends:~T", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"~DConflicts:~nold", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"~DSuggests:~T", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"~DReplaces:~nold", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"~DBreaks:~T", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"~DEnhances:~nshell", []string{"app_1.0_amd64", "app_2.0_amd64"}},
++		{"~DObsoletes:~T", []string{}},
++		{"~R~napp", []string{"libx_1.0_amd64", "liby_1.0_all"}},
++		{"~RDepends:~ntool", []string{"lib32_1.0_i386"}},
++		{"~RSuggests:~T", []string{}},
++		{"~RRecommends:~T", []string{"rec_1.0_amd64"}},
++		{"~RConflicts:~T", []string{"old_0.5_amd64"}},
++		{"~RReplaces:~T", []string{"old_0.5_amd64"}},
++		{"~RBreaks:~T", []string{"old_0.5_amd64"}},
++		{"~REnhances:~T", []string{"shell_5_amd64"}},
++		{"~RObsoletes:~T", []string{}},
++		{"~n^lib~ri386", []string{"lib32_1.0_i386"}},
++		{"~n\"li\"", []string{"lib32_1.0_i386", "libx_1.0_amd64", "liby_1.0_all"}},
++		{"?name( lib)", []string{"lib32_1.0_i386", "libx_1.0_amd64", "liby_1.0_all"}},
++		{"?name (rec)", []string{"rec_1.0_amd64"}},
++		{"?name(\"^l\")", []string{"lib32_1.0_i386", "libx_1.0_amd64", "liby_1.0_all"}},
++	},
++}
++
++var stateSuite = patternSuite{
++	packages: relationScenario,
++	cases: []patternCase{
++		{"?installed", []string{}},
++		{"?not(?installed)", []string{"app_1.0_amd64", "app_2.0_amd64", "base_1_amd64", "lib32_1.0_i386", "libx_1.0_amd64", "liby_1.0_all", "old_0.5_amd64", "prov_1.0_amd64", "rec_1.0_amd64", "shell_5_amd64", "tool_1.0_i386"}},
++		{"~U", []string{}},
++		{"?automatic", []string{}},
++		{"?garbage", []string{}},
++		{"?broken", []string{}},
++		{"?obsolete", []string{}},
++		{"?config-files", []string{}},
++		{"?upgradable", []string{}},
++		{"~M", []string{}},
++		{"~b", []string{}},
++		{"~c", []string{}},
++		{"~g", []string{}},
++		{"~i", []string{}},
++		{"~o", []string{}},
++	},
++}
++
++var sourceSuite = patternSuite{
++	packages: `
++Package: libfoo
++Version: 1.0
++Architecture: amd64
++Section: libs
++
++Package: foo-utils
++Version: 1.0
++Architecture: amd64
++Section: utils
++Source: libfoo
++
++Package: bar
++Version: 2.0
++Architecture: all
++`,
++	sources: []string{"libfoo_1.0", "bar_2.0"},
++	cases: []patternCase{
++		{"?true", []string{"bar_2.0_all", "foo-utils_1.0_amd64", "libfoo_1.0_amd64"}},
++		{"?not(?name(zzz))", []string{"bar_2.0_all", "foo-utils_1.0_amd64", "libfoo_1.0_amd64"}},
++		{"?exact-name(libfoo)", []string{"libfoo_1.0_amd64"}},
++		{"?source-package(^libfoo$)", []string{"foo-utils_1.0_amd64", "libfoo_1.0_amd64"}},
++		{"?architecture(any)", []string{"bar_2.0_all", "foo-utils_1.0_amd64", "libfoo_1.0_amd64"}},
++		{"?all-versions(?false)", []string{}},
++	},
++}
++
++var regexSuite = patternSuite{
++	packages: `
++Package: book
++Version: 1.0
++Architecture: amd64
++Section: a^b
++
++Package: beta
++Version: 1.0
++Architecture: amd64
++Section: a$b
++
++Package: aa
++Version: 1.0
++Architecture: amd64
++
++Package: foo-bar
++Version: 1.0
++Architecture: amd64
++
++Package: x-ray
++Version: 1.0
++Architecture: amd64
++Section: x)y
++
++Package: abcba
++Version: 1.0
++Architecture: amd64
++`,
++	cases: []patternCase{
++		{"?name(\"(.)\\1\")", []string{"aa_1.0_amd64", "book_1.0_amd64", "foo-bar_1.0_amd64"}},
++		{"?name(\"^(.).*\\1$\")", []string{"aa_1.0_amd64", "abcba_1.0_amd64"}},
++		{"?name(\"a{1001}\")", []string{}},
++		{"?name(\"^a{0,1001}b\")", []string{"abcba_1.0_amd64", "beta_1.0_amd64", "book_1.0_amd64"}},
++		{"?name(\"\\<-\")", []string{}},
++		{"?name(\"-\\>\")", []string{}},
++		{"?name(\"o\\<\")", []string{}},
++		{"?name(\"\\<r\")", []string{"x-ray_1.0_amd64"}},
++		{"?name(\"^[[:alpha:]]+-[[:alpha:]]+$\")", []string{"foo-bar_1.0_amd64", "x-ray_1.0_amd64"}},
++		{"?name(\"o{2}\")", []string{"book_1.0_amd64", "foo-bar_1.0_amd64"}},
++		{"?name(\"^.{4}$\")", []string{"beta_1.0_amd64", "book_1.0_amd64"}},
++		{"?section(\"a^b\")", []string{}},
++		{"?section(\"a\\^b\")", []string{"book_1.0_amd64"}},
++		{"?section(\"a$b\")", []string{}},
++		{"?section(\"a\\$b\")", []string{"beta_1.0_amd64"}},
++		{"?section(\")\")", []string{"x-ray_1.0_amd64"}},
++	},
++}
++
++func showKeys(output string) []string {
++	keys := []string{}
++	for _, stanza := range splitStanzas(output) {
++		if name := stanzaField(stanza, "Package"); name != "" {
++			keys = append(keys, name+"_"+stanzaField(stanza, "Version")+"_"+stanzaField(stanza, "Architecture"))
++		}
++	}
++	sort.Strings(keys)
++	return keys
++}
++
++func (e *aptlyEnv) snapshotKeys(name string) []string {
++	e.t.Helper()
++	return packageKeys(e.run("snapshot", "show", "-with-packages", name))
++}
++
++func (e *aptlyEnv) repoKeys(name string) []string {
++	e.t.Helper()
++	return packageKeys(e.run("repo", "show", "-with-packages", name))
++}
++
++func TestAptPatternLogicAndGrouping(t *testing.T) { logicSuite.check(t) }
++
++func TestAptPatternVersionPatternsSelectWholePackages(t *testing.T) { wholePackageSuite.check(t) }
++
++func TestAptPatternNamesAndFields(t *testing.T) { nameAndFieldSuite.check(t) }
++
++func TestAptPatternArchitectures(t *testing.T) { architectureSuite.check(t) }
++
++func TestAptPatternDependencies(t *testing.T) { dependsSuite.check(t) }
++
++func TestAptPatternReverseDependencies(t *testing.T) { reverseSuite.check(t) }
++
++func TestAptPatternShortForms(t *testing.T) { shortFormSuite.check(t) }
++
++func TestAptPatternNothingIsInstalled(t *testing.T) { stateSuite.check(t) }
++
++func TestAptPatternSourcePackagesAreNeverSelected(t *testing.T) { sourceSuite.check(t) }
++
++func TestAptPatternRegularExpressions(t *testing.T) { regexSuite.check(t) }
++
++func TestAptPatternPlainQueriesKeepTheirMeaning(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.repo("main", plainQuerySuite.packages, plainQuerySuite.sources...)
++	assertKeys(t, "Name (~ ^lib)", e.search("repo", "search", "main", "Name (~ ^lib)"),
++		"libfoo-dev_1.0_amd64", "libfoo_1.0_amd64", "libfoo_1.0_source")
++	assertKeys(t, "Name (~ ^LIB)", e.search("repo", "search", "main", "Name (~ ^LIB)"))
++	assertKeys(t, "?name(^LIB)", e.search("repo", "search", "main", "?name(^LIB)"),
++		"libfoo-dev_1.0_amd64", "libfoo_1.0_amd64")
++	assertKeys(t, "libfoo", e.search("repo", "search", "main", "libfoo"), "libfoo_1.0_amd64", "libfoo_1.0_source")
++	assertKeys(t, "$Source (libfoo)", e.search("repo", "search", "main", "$Source (libfoo)"),
++		"foo-tools_1.0_amd64", "libfoo_1.0_amd64")
++	e.assertFails("repo", "search", "main", "!~nlibfoo")
++}
++
++func TestAptPatternRejectedPatterns(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.repo("main", relationScenario)
++	assertKeys(t, "?name(\"(app)\")", e.search("repo", "search", "main", "?name(\"(app)\")"), "app_1.0_amd64", "app_2.0_amd64")
++	assertKeys(t, "~napp", e.search("repo", "search", "main", "~napp"), "app_1.0_amd64", "app_2.0_amd64")
++	for _, pattern := range []string{
++		"?phasing",
++		"?security",
++		"?NAME(app)",
++		"? name(app)",
++		"?true()",
++		"?name()",
++		"?name(app, rec)",
++		"?name(?true)",
++		"?depends(libx)",
++		"?and",
++		"~x",
++		"~napp ~v1",
++		"~n app",
++		"?name([)",
++		"?name(\"(?:app)\")",
++		"?all-versions(~napp, ~nrec)",
++		"?true (~napp",
++	} {
++		e.assertFails("repo", "search", "main", pattern)
++	}
++}
++
++func TestAptPatternPackageSearchUsesTheWholeDatabase(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.repo("first", `
++Package: foo
++Version: 1.0
++Architecture: amd64
++
++Package: bar
++Version: 1.0
++Architecture: amd64
++Depends: foo
++`, "foo_1.0")
++	e.repo("second", `
++Package: foo
++Version: 2.0
++Architecture: amd64
++
++Package: baz
++Version: 1.0
++Architecture: i386
++Depends: foo
++`)
++	assertKeys(t, "package search ?version(^2)", packageKeys(e.run("package", "search", "?version(^2)")),
++		"foo_1.0_amd64", "foo_2.0_amd64")
++	assertKeys(t, "repo search first ?version(^2)", e.search("repo", "search", "first", "?version(^2)"))
++	assertKeys(t, "package search ?reverse-depends(?true)", packageKeys(e.run("package", "search", "?reverse-depends(?true)")),
++		"foo_1.0_amd64", "foo_2.0_amd64")
++	assertKeys(t, "package search ?depends(?virtual)", packageKeys(e.run("package", "search", "?depends(?virtual)")),
++		"baz_1.0_i386")
++	assertKeys(t, "package search ?exact-name(foo)", packageKeys(e.run("package", "search", "?exact-name(foo)")),
++		"foo_1.0_amd64", "foo_2.0_amd64")
++	assertKeys(t, "package search foo", packageKeys(e.run("package", "search", "foo")),
++		"foo_1.0_amd64", "foo_1.0_source", "foo_2.0_amd64")
++	assertKeys(t, "package show ?depends(?virtual)", showKeys(e.run("package", "show", "?depends(?virtual)")), "baz_1.0_i386")
++}
++
++func TestAptPatternSnapshotFilter(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("src", wholePackageSuite.packages)
++	e.run("snapshot", "filter", "src", "dst", "?version(^2)")
++	assertKeys(t, "snapshot filter src dst ?version(^2)", e.snapshotKeys("dst"),
++		"baz_1.0_amd64", "baz_2.0_all", "foo_1.0_amd64", "foo_2.0_amd64")
++	e.run("snapshot", "filter", "src", "dst2", "?all-versions(?version(^1))", "~nqux")
++	assertKeys(t, "snapshot filter src dst2 ?all-versions(?version(^1)) ~nqux", e.snapshotKeys("dst2"),
++		"bar_1.5_amd64", "foo_1.0_i386", "qux_3.0_amd64")
++	e.snapshot("withsrc", "Package: foo\nVersion: 1.0\nArchitecture: amd64\n", "foo_1.0")
++	e.run("snapshot", "filter", "withsrc", "dst3", "?exact-name(foo)")
++	assertKeys(t, "snapshot filter withsrc dst3 ?exact-name(foo)", e.snapshotKeys("dst3"), "foo_1.0_amd64")
++	e.run("snapshot", "filter", "withsrc", "dst4", "foo")
++	assertKeys(t, "snapshot filter withsrc dst4 foo", e.snapshotKeys("dst4"), "foo_1.0_amd64", "foo_1.0_source")
++}
++
++func TestAptPatternSnapshotSearch(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("src", wholePackageSuite.packages)
++	assertKeys(t, "snapshot search src ?version(^2)", e.search("snapshot", "search", "src", "?version(^2)"),
++		"baz_1.0_amd64", "baz_2.0_all", "foo_1.0_amd64", "foo_2.0_amd64")
++	assertKeys(t, "snapshot search src ~nqux", e.search("snapshot", "search", "src", "~nqux"), "qux_3.0_amd64")
++	assertKeys(t, "snapshot search src Name (~ ^ba)", e.search("snapshot", "search", "src", "Name (~ ^ba)"),
++		"bar_1.5_amd64", "baz_1.0_amd64", "baz_2.0_all")
++	assertKeys(t, "snapshot search src $Version (>= 2.0)", e.search("snapshot", "search", "src", "$Version (>= 2.0)"),
++		"baz_2.0_all", "foo_2.0_amd64", "qux_3.0_amd64")
++	assertKeys(t, "snapshot search src foo (<< 2.0)", e.search("snapshot", "search", "src", "foo (<< 2.0)"),
++		"foo_1.0_amd64", "foo_1.0_i386")
++	assertKeys(t, "snapshot search src Name (% ba*)", e.search("snapshot", "search", "src", "Name (% ba*)"),
++		"bar_1.5_amd64", "baz_1.0_amd64", "baz_2.0_all")
++	assertKeys(t, "snapshot search src Name (~ ^ba), !Name (bar)", e.search("snapshot", "search", "src", "Name (~ ^ba), !Name (bar)"),
++		"baz_1.0_amd64", "baz_2.0_all")
++	assertKeys(t, "snapshot search src bar | qux", e.search("snapshot", "search", "src", "bar | qux"), "bar_1.5_amd64", "qux_3.0_amd64")
++	assertKeys(t, "snapshot search src foo {i386}", e.search("snapshot", "search", "src", "foo {i386}"), "foo_1.0_i386")
++	e.assertFails("snapshot", "search", "src", "?name(\"(?:foo)\")")
++}
++
++func TestAptPatternSnapshotFilterWithDependencies(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("src", relationScenario)
++	e.run("-architectures=amd64", "snapshot", "filter", "-with-deps", "src", "dst", "?reverse-recommends(?true) | ~nshell")
++	assertKeys(t, "snapshot filter -with-deps", e.snapshotKeys("dst"), "rec_1.0_amd64", "shell_5_amd64")
++	e.run("-architectures=amd64", "snapshot", "filter", "-with-deps", "src", "dst2", "?exact-name(app) ?version(^2)")
++	assertKeys(t, "snapshot filter -with-deps app", e.snapshotKeys("dst2"),
++		"app_1.0_amd64", "app_2.0_amd64", "base_1_amd64", "liby_1.0_all", "prov_1.0_amd64")
++}
++
++func TestAptPatternSnapshotPullUsesWholePackages(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("dest", `
++Package: foo
++Version: 0.5
++Architecture: amd64
++
++Package: keep
++Version: 1.0
++Architecture: amd64
++`)
++	e.snapshot("src", `
++Package: foo
++Version: 1.0
++Architecture: amd64
++
++Package: foo
++Version: 2.0
++Architecture: amd64
++
++Package: foo
++Version: 1.0
++Architecture: i386
++
++Package: bar
++Version: 1.0
++Architecture: amd64
++
++Package: bar
++Version: 3.0
++Architecture: i386
++`)
++	e.run("snapshot", "pull", "-no-deps", "dest", "src", "pulled", "?version(^1)")
++	assertKeys(t, "snapshot pull ?version(^1)", e.snapshotKeys("pulled"), "bar_1.0_amd64", "foo_2.0_amd64", "keep_1.0_amd64")
++	e.run("snapshot", "pull", "-no-deps", "-all-matches", "dest", "src", "all", "?version(^1)")
++	assertKeys(t, "snapshot pull -all-matches ?version(^1)", e.snapshotKeys("all"),
++		"bar_1.0_amd64", "foo_1.0_amd64", "foo_2.0_amd64", "keep_1.0_amd64")
++	e.run("-architectures=amd64,i386", "snapshot", "pull", "-no-deps", "dest", "src", "both", "?all-versions(?version(^[13]))")
++	assertKeys(t, "snapshot pull ?all-versions(?version(^[13]))", e.snapshotKeys("both"),
++		"bar_1.0_amd64", "bar_3.0_i386", "foo_0.5_amd64", "foo_1.0_i386", "keep_1.0_amd64")
++}
++
++func TestAptPatternRepoRemoveTakesWholePackages(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.repo("main", `
++Package: foo
++Version: 1.0
++Architecture: amd64
++
++Package: foo
++Version: 2.0
++Architecture: amd64
++
++Package: foo
++Version: 1.0
++Architecture: i386
++
++Package: bar
++Version: 1.5
++Architecture: amd64
++`, "foo_1.0")
++	e.run("repo", "remove", "main", "?version(^1\\.0$) ?architecture(amd64)")
++	assertKeys(t, "repo remove ?version(^1\\.0$) ?architecture(amd64)", e.repoKeys("main"),
++		"bar_1.5_amd64", "foo_1.0_i386", "foo_1.0_source")
++	e.run("repo", "remove", "main", "?not(?name(zzz))")
++	assertKeys(t, "repo remove ?not(?name(zzz))", e.repoKeys("main"), "foo_1.0_source")
++}
++
++func TestAptPatternRepoCopy(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.repo("src", relationScenario)
++	e.run("repo", "create", "dst")
++	e.run("repo", "copy", "src", "dst", "?reverse-depends(?name(^app$))")
++	assertKeys(t, "repo copy ?reverse-depends(?name(^app$))", e.repoKeys("dst"), "libx_1.0_amd64", "liby_1.0_all")
++	e.run("repo", "move", "src", "dst", "?reverse-depends(?exact-name(tool))")
++	assertKeys(t, "repo move ?reverse-depends(?exact-name(tool))", e.repoKeys("dst"), "lib32_1.0_i386", "libx_1.0_amd64", "liby_1.0_all")
++}
++
++type archiveRand struct{ state uint64 }
++
++func (r *archiveRand) next() uint64 {
++	r.state += 0x9E3779B97F4A7C15
++	z := r.state
++	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
++	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
++	return z ^ (z >> 31)
++}
++
++func (r *archiveRand) intn(n int) int { return int(r.next() % uint64(n)) }
++
++func (r *archiveRand) chance(percent int) bool { return r.intn(100) < percent }
++
++func (r *archiveRand) pick(choices ...string) string { return choices[r.intn(len(choices))] }
++
++var randomVersions = []string{"1.0", "1.0-1", "1.2", "1.2~rc1", "2.0", "2.0+b1", "1:0.5", "0.9", "3"}
++
++type randomArchive struct {
++	stanzas  string
++	names    []string
++	virtuals []string
++}
++
++func generateArchive(seed uint64) randomArchive {
++	r := &archiveRand{state: seed}
++	var archive randomArchive
++	for i := 4 + r.intn(5); i > 0; i-- {
++		archive.names = append(archive.names, fmt.Sprintf("p%d", len(archive.names)))
++	}
++	for i := 1 + r.intn(2); i > 0; i-- {
++		archive.virtuals = append(archive.virtuals, fmt.Sprintf("v%d", len(archive.virtuals)))
++	}
++	type planned struct{ name, version, arch string }
++	var plan []planned
++	present := map[string][]string{}
++	group := func(arch string) string {
++		if arch == "all" {
++			return "amd64"
++		}
++		return arch
++	}
++	for _, name := range archive.names {
++		seen := map[string]bool{}
++		for i := 1 + r.intn(3); i > 0; i-- {
++			version := randomVersions[r.intn(len(randomVersions))]
++			archs := []string{"all"}
++			if !r.chance(20) {
++				archs = nil
++				for _, arch := range []string{"amd64", "i386", "arm64", "armhf"} {
++					if r.chance(40) {
++						archs = append(archs, arch)
++					}
++				}
++				if len(archs) == 0 {
++					archs = []string{r.pick("amd64", "i386")}
++				}
++			}
++			for _, arch := range archs {
++				if seen[version+arch] {
++					continue
++				}
++				seen[version+arch] = true
++				plan = append(plan, planned{name, version, arch})
++				if names := present[group(arch)]; len(names) == 0 || names[len(names)-1] != name {
++					present[group(arch)] = append(names, name)
++				}
++			}
++		}
++	}
++	constraint := func() string {
++		if r.chance(30) {
++			return fmt.Sprintf(" (%s %s)", r.pick("<<", "<=", "=", ">=", ">>"), randomVersions[r.intn(len(randomVersions))])
++		}
++		return ""
++	}
++	target := func() string {
++		switch x := r.intn(100); {
++		case x < 65:
++			return archive.names[r.intn(len(archive.names))]
++		case x < 90:
++			return archive.virtuals[r.intn(len(archive.virtuals))]
++		default:
++			return "missing"
++		}
++	}
++	relation := func(arch string, negative bool) string {
++		var groups []string
++		for i := 1 + r.intn(2); i > 0; i-- {
++			if negative {
++				names := present[group(arch)]
++				groups = append(groups, names[r.intn(len(names))]+constraint())
++				continue
++			}
++			atoms := []string{target() + constraint()}
++			if r.chance(25) {
++				atoms = append(atoms, target()+constraint())
++			}
++			groups = append(groups, strings.Join(atoms, " | "))
++		}
++		return strings.Join(groups, ", ")
++	}
++	var stanzas []string
++	for _, p := range plan {
++		s := fmt.Sprintf("Package: %s\nVersion: %s\nArchitecture: %s\n", p.name, p.version, p.arch)
++		if r.chance(70) {
++			s += "Section: " + r.pick("libs", "utils", "admin", "non-free/net") + "\n"
++		}
++		if r.chance(70) {
++			s += "Priority: " + r.pick("required", "important", "standard", "optional", "extra") + "\n"
++		}
++		if r.chance(8) {
++			s += "Essential: yes\n"
++		}
++		switch r.intn(4) {
++		case 1:
++			s += fmt.Sprintf("Source: s%d\n", r.intn(3))
++		case 2:
++			s += fmt.Sprintf("Source: s%d (%s)\n", r.intn(3), randomVersions[r.intn(len(randomVersions))])
++		}
++		for _, field := range []struct {
++			name     string
++			percent  int
++			negative bool
++		}{{"Pre-Depends", 15, false}, {"Depends", 50, false}, {"Recommends", 25, false}, {"Suggests", 15, false},
++			{"Conflicts", 20, true}, {"Breaks", 15, true}, {"Replaces", 10, true}, {"Enhances", 10, false}} {
++			if r.chance(field.percent) {
++				s += field.name + ": " + relation(p.arch, field.negative) + "\n"
++			}
++		}
++		if r.chance(20) {
++			s += "Provides: " + archive.virtuals[r.intn(len(archive.virtuals))] + "\n"
++		}
++		stanzas = append(stanzas, s)
++	}
++	archive.stanzas = strings.Join(stanzas, "\n")
++	return archive
++}
++
++func checkRandomArchive(t *testing.T, seed uint64, cases []patternCase) {
++	t.Helper()
++	e := newAptlyEnv(t)
++	e.repo("main", generateArchive(seed).stanzas)
++	for _, c := range cases {
++		assertKeys(t, fmt.Sprintf("seed %d, repo search %s", seed, c.pattern), e.search("repo", "search", "main", c.pattern), c.want...)
++	}
++}
++
++var mirrorScenario = `
++Package: web
++Version: 1.0
++Architecture: amd64
++Section: httpd
++Depends: libssl, httpd-cgi
++
++Package: libssl
++Version: 3.0
++Architecture: amd64
++Section: libs
++Multi-Arch: same
++
++Package: libssl
++Version: 3.0
++Architecture: i386
++Section: libs
++Multi-Arch: same
++
++Package: cgi-helper
++Version: 1.0
++Architecture: i386
++Section: httpd
++Depends: libssl
++
++Package: web-doc
++Version: 1.0
++Architecture: all
++Section: doc
++`
++
++func (e *aptlyEnv) serveArchive(stanzas string) string {
++	e.t.Helper()
++	root := filepath.Join(e.dir, "archive")
++	indexes := map[string][]string{}
++	for _, stanza := range splitStanzas(stanzas) {
++		name, version, arch := stanzaField(stanza, "Package"), stanzaField(stanza, "Version"), stanzaField(stanza, "Architecture")
++		file := fmt.Sprintf("pool/main/%s_%s_%s.deb", name, version, arch)
++		if err := os.MkdirAll(filepath.Join(root, "pool", "main"), 0755); err != nil {
++			e.t.Fatal(err)
++		}
++		writeDeb(e.t, filepath.Join(root, file), stanza+"Maintainer: Test <test@example.com>\nDescription: test package\n")
++		content, err := os.ReadFile(filepath.Join(root, file))
++		if err != nil {
++			e.t.Fatal(err)
++		}
++		entry := fmt.Sprintf("%sMaintainer: Test <test@example.com>\nDescription: test package\nFilename: %s\nSize: %d\nMD5sum: %x\nSHA1: %x\nSHA256: %x\n",
++			stanza, file, len(content), md5.Sum(content), sha1.Sum(content), sha256.Sum256(content))
++		for _, index := range []string{"amd64", "i386"} {
++			if arch == index || arch == "all" {
++				indexes[index] = append(indexes[index], entry)
++			}
++		}
++	}
++	release := "Origin: test\nLabel: test\nSuite: test\nCodename: test\nArchitectures: amd64 i386\nComponents: main\n"
++	sums := map[string][]string{}
++	for _, index := range []string{"amd64", "i386"} {
++		path := "main/binary-" + index + "/Packages"
++		content := []byte(strings.Join(indexes[index], "\n"))
++		if err := os.MkdirAll(filepath.Join(root, "dists", "test", "main", "binary-"+index), 0755); err != nil {
++			e.t.Fatal(err)
++		}
++		if err := os.WriteFile(filepath.Join(root, "dists", "test", path), content, 0644); err != nil {
++			e.t.Fatal(err)
++		}
++		sums["MD5Sum"] = append(sums["MD5Sum"], fmt.Sprintf(" %x %d %s", md5.Sum(content), len(content), path))
++		sums["SHA1"] = append(sums["SHA1"], fmt.Sprintf(" %x %d %s", sha1.Sum(content), len(content), path))
++		sums["SHA256"] = append(sums["SHA256"], fmt.Sprintf(" %x %d %s", sha256.Sum256(content), len(content), path))
++	}
++	for _, kind := range []string{"MD5Sum", "SHA1", "SHA256"} {
++		release += kind + ":\n" + strings.Join(sums[kind], "\n") + "\n"
++	}
++	if err := os.WriteFile(filepath.Join(root, "dists", "test", "Release"), []byte(release), 0644); err != nil {
++		e.t.Fatal(err)
++	}
++	server := httptest.NewServer(http.FileServer(http.Dir(root)))
++	e.t.Cleanup(server.Close)
++	return server.URL + "/"
++}
++
++func TestAptPatternMirrorFilter(t *testing.T) {
++	e := newAptlyEnv(t)
++	url := e.serveArchive(mirrorScenario)
++	e.run("-architectures=amd64,i386", "mirror", "create", "-ignore-signatures", "-filter=?depends(?virtual) | ?section(^libs$)", "web", url, "test", "main")
++	e.run("mirror", "update", "-ignore-signatures", "web")
++	assertKeys(t, "mirror -filter ?depends(?virtual) | ?section(^libs$)", packageKeys(e.run("mirror", "show", "-with-packages", "web")),
++		"libssl_3.0_amd64", "libssl_3.0_i386", "web_1.0_amd64")
++	e.run("-architectures=amd64,i386", "mirror", "create", "-ignore-signatures", "-filter=?reverse-depends(?architecture(i386)) | ?architecture(amd64)", "cgi", url, "test", "main")
++	e.run("mirror", "update", "-ignore-signatures", "cgi")
++	assertKeys(t, "mirror -filter ?reverse-depends(?architecture(i386)) | ?architecture(amd64)", packageKeys(e.run("mirror", "show", "-with-packages", "cgi")),
++		"libssl_3.0_amd64", "libssl_3.0_i386", "web-doc_1.0_all", "web_1.0_amd64")
++	e.assertFails("-architectures=amd64,i386", "mirror", "create", "-ignore-signatures", "-filter=?true(web)", "bad", url, "test", "main")
++}
++
++func TestAptPatternMirrorSearchImportAndEdit(t *testing.T) {
++	e := newAptlyEnv(t)
++	url := e.serveArchive(mirrorScenario)
++	e.run("-architectures=amd64,i386", "mirror", "create", "-ignore-signatures", "-filter=?depends(?virtual) | ?section(^libs$)", "web", url, "test", "main")
++	e.run("mirror", "update", "-ignore-signatures", "web")
++	assertKeys(t, "mirror search web ?architecture(i386)", e.search("mirror", "search", "web", "?architecture(i386)"), "libssl_3.0_i386")
++	assertKeys(t, "mirror search web libssl {i386}", e.search("mirror", "search", "web", "libssl {i386}"), "libssl_3.0_i386")
++	assertKeys(t, "mirror search web !libssl", e.search("mirror", "search", "web", "!libssl"), "web_1.0_amd64")
++	assertKeys(t, "mirror search web Name (% *ss*) | web", e.search("mirror", "search", "web", "Name (% *ss*) | web"),
++		"libssl_3.0_amd64", "libssl_3.0_i386", "web_1.0_amd64")
++	e.run("repo", "create", "imported")
++	e.run("repo", "import", "web", "imported", "?architecture(amd64)")
++	assertKeys(t, "repo import web imported ?architecture(amd64)", e.repoKeys("imported"), "libssl_3.0_amd64", "web_1.0_amd64")
++	e.run("mirror", "edit", "-filter=?section(^httpd$)", "web")
++	e.run("mirror", "update", "-ignore-signatures", "web")
++	assertKeys(t, "mirror edit -filter=?section(^httpd$)", packageKeys(e.run("mirror", "show", "-with-packages", "web")),
++		"cgi-helper_1.0_i386", "web_1.0_amd64")
++	e.assertFails("mirror", "edit", "-filter=?nosuchpattern", "web")
++}
++
++func (e *aptlyEnv) serveAPI() *http.Client {
++	e.t.Helper()
++	socket := filepath.Join(e.dir, "api.sock")
++	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	listener.SetUnlinkOnClose(false)
++	file, err := listener.File()
++	_ = listener.Close()
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	log, err := os.Create(filepath.Join(e.dir, "api.log"))
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	cmd := exec.Command("sh", "-c", `LISTEN_PID=$$ LISTEN_FDS=1 exec "$0" "$@"`, aptlyBinary, "-config="+e.config, "api", "serve")
++	cmd.ExtraFiles = []*os.File{file}
++	cmd.Stdout, cmd.Stderr = log, log
++	err = cmd.Start()
++	_ = file.Close()
++	if err != nil {
++		e.t.Fatal(err)
++	}
++	e.t.Cleanup(func() {
++		_ = cmd.Process.Kill()
++		_ = cmd.Wait()
++		_ = log.Close()
++	})
++	return &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
++		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
++	}}}
++}
++
++func (e *aptlyEnv) apiSearch(client *http.Client, path, query string) ([]string, int) {
++	e.t.Helper()
++	resp, err := client.Get("http://aptly" + path + "?format=details&q=" + url.QueryEscape(query))
++	if err != nil {
++		output, _ := os.ReadFile(filepath.Join(e.dir, "api.log"))
++		e.t.Fatalf("GET %s: %v\n%s", path, err, output)
++	}
++	defer func() { _ = resp.Body.Close() }()
++	if resp.StatusCode != http.StatusOK {
++		return nil, resp.StatusCode
++	}
++	var packages []map[string]string
++	if err := json.NewDecoder(resp.Body).Decode(&packages); err != nil {
++		e.t.Fatal(err)
++	}
++	keys := []string{}
++	for _, p := range packages {
++		keys = append(keys, p["Package"]+"_"+p["Version"]+"_"+p["Architecture"])
++	}
++	sort.Strings(keys)
++	return keys, resp.StatusCode
++}
++
++func TestAptPatternHTTPAPI(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.repo("main", relationScenario)
++	archive := e.serveArchive(mirrorScenario)
++	e.run("-architectures=amd64,i386", "mirror", "create", "-ignore-signatures", "web", archive, "test", "main")
++	e.run("mirror", "update", "-ignore-signatures", "web")
++	client := e.serveAPI()
++	keys, _ := e.apiSearch(client, "/api/repos/main/packages", "?depends(?virtual)")
++	assertKeys(t, "GET /api/repos/main/packages ?depends(?virtual)", keys, "app_1.0_amd64", "app_2.0_amd64", "tool_1.0_i386")
++	keys, _ = e.apiSearch(client, "/api/repos/main/packages", "Name (~ ^lib)")
++	assertKeys(t, "GET /api/repos/main/packages Name (~ ^lib)", keys, "lib32_1.0_i386", "libx_1.0_amd64", "liby_1.0_all")
++	keys, _ = e.apiSearch(client, "/api/mirrors/web/packages", "~ri386")
++	assertKeys(t, "GET /api/mirrors/web/packages ~ri386", keys, "cgi-helper_1.0_i386", "libssl_3.0_i386")
++	if _, status := e.apiSearch(client, "/api/repos/main/packages", "?nosuchpattern"); status != http.StatusBadRequest {
++		t.Errorf("GET /api/repos/main/packages ?nosuchpattern: status %d, want %d", status, http.StatusBadRequest)
++	}
++}
++
++func TestAptPatternRandomArchive01(t *testing.T) {
++	checkRandomArchive(t, 41, []patternCase{
++		{"?true", []string{"p0_1.2_all", "p1_1.2~rc1_all", "p2_1:0.5_all", "p2_2.0_all", "p3_1.2_amd64", "p3_1.2_arm64", "p3_1.2_i386", "p4_0.9_arm64", "p4_1.2~rc1_amd64", "p4_1.2~rc1_arm64", "p4_1:0.5_all", "p5_1.0-1_arm64", "p5_2.0+b1_amd64", "p6_3_amd64", "p6_3_arm64", "p6_3_i386"}},
++		{"?not(?or(~n2, ~s2))", []string{"p0_1.2_all", "p1_1.2~rc1_all", "p3_1.2_amd64", "p3_1.2_arm64", "p3_1.2_i386", "p4_0.9_arm64", "p4_1.2~rc1_amd64", "p4_1.2~rc1_arm64", "p4_1:0.5_all", "p5_1.0-1_arm64", "p5_2.0+b1_amd64", "p6_3_amd64", "p6_3_arm64", "p6_3_i386"}},
++		{"?or(?reverse-enhances(?architecture(any-arm)), (?name(P2) ?version(^1)))", []string{"p2_1:0.5_all", "p2_2.0_all"}},
++		{"?priority(optional)", []string{"p0_1.2_all", "p2_1:0.5_all", "p2_2.0_all", "p3_1.2_i386", "p4_0.9_arm64", "p4_1.2~rc1_arm64"}},
++		{"?and(?and(?exact-name(v0), ?source-package(^p)), ?all-versions(~Vp2))", []string{}},
++		{"?depends(?reverse-depends(?source-package(s)))", []string{"p0_1.2_all", "p3_1.2_amd64", "p6_3_arm64"}},
++		{"?exact-name(p3)", []string{"p3_1.2_amd64", "p3_1.2_arm64", "p3_1.2_i386"}},
++		{"?any-version(?or(?version(^1:), ~Vrc))", []string{"p1_1.2~rc1_all", "p2_1:0.5_all", "p2_2.0_all", "p4_0.9_arm64", "p4_1.2~rc1_amd64", "p4_1.2~rc1_arm64", "p4_1:0.5_all"}},
++	})
++}
++
++func TestAptPatternRandomArchive02(t *testing.T) {
++	checkRandomArchive(t, 9, []patternCase{
++		{"?all-versions(?narrow(?version(rc), ?source-package(^p)))", []string{"p4_1.2~rc1_armhf"}},
++		{"~T (?reverse-recommends(~s1) | ?replaces(~np1))", []string{"p1_1:0.5_amd64"}},
++		{"~T (?priority(important) | ?reverse-breaks(?priority(optional)))", []string{"p3_1.0-1_i386", "p5_2.0+b1_arm64", "p5_2.0+b1_armhf", "p6_2.0+b1_armhf"}},
++		{"?architecture(i386)", []string{"p2_1.2_i386", "p3_1.0-1_i386", "p6_1.2_i386"}},
++		{"?or(?or(?essential, ?source-version(0\\.5)), ?all-versions(~s1))", []string{"p1_1:0.5_amd64", "p1_1:0.5_arm64"}},
++		{"?priority(important)", []string{"p3_1.0-1_i386", "p5_2.0+b1_arm64"}},
++		{"?and(?source-version(0\\.5), ?all-versions(~Vp2))", []string{}},
++		{"?depends(?not(?source-version(0\\.5)))", []string{"p0_1.0_all", "p2_1.2_i386", "p3_1.0-1_i386", "p4_1.2~rc1_amd64", "p4_2.0_all", "p6_1.2_i386"}},
++	})
++}
++
++func TestAptPatternRandomArchive03(t *testing.T) {
++	checkRandomArchive(t, 6, []patternCase{
++		{"?version(^1)", []string{"p0_1:0.5_all", "p1_1.0-1_all", "p1_1:0.5_all", "p1_3_amd64", "p2_1:0.5_all", "p2_2.0+b1_amd64", "p3_0.9_arm64", "p3_1.2~rc1_arm64", "p3_1.2~rc1_i386", "p3_3_arm64", "p4_1.0_arm64", "p4_1.0_armhf", "p4_1.0_i386", "p4_1:0.5_i386", "p4_2.0+b1_armhf", "p5_1.0_all"}},
++		{"?version(rc)", []string{"p3_0.9_arm64", "p3_1.2~rc1_arm64", "p3_1.2~rc1_i386", "p3_3_arm64"}},
++		{"?source-package(^s1$)", []string{"p1_3_arm64", "p2_1:0.5_all", "p2_2.0+b1_amd64", "p4_1.0_armhf", "p4_2.0+b1_armhf"}},
++		{"~T (?source-version(rc) ?source-version(rc))", []string{"p3_0.9_arm64", "p3_1.2~rc1_arm64", "p3_3_arm64", "p4_1.0_armhf", "p4_2.0+b1_armhf"}},
++		{"?narrow(?depends(~n1), ~V1)", []string{"p0_1:0.5_all", "p4_1.0_arm64", "p4_1.0_armhf", "p4_2.0+b1_armhf"}},
++		{"?and(~n2, ?any-version(?true))", []string{"p2_1:0.5_all", "p2_2.0+b1_amd64", "p2_2.0+b1_armhf", "p2_2.0+b1_i386"}},
++		{"~V1", []string{"p0_1:0.5_all", "p1_1.0-1_all", "p1_1:0.5_all", "p1_3_amd64", "p2_1:0.5_all", "p2_2.0+b1_amd64", "p2_2.0+b1_armhf", "p2_2.0+b1_i386", "p3_0.9_arm64", "p3_1.2~rc1_arm64", "p3_1.2~rc1_i386", "p3_3_arm64", "p4_1.0_arm64", "p4_1.0_armhf", "p4_1.0_i386", "p4_1:0.5_i386", "p4_2.0+b1_armhf", "p5_1.0_all", "p5_2.0+b1_i386"}},
++		{"?reverse-enhances(?depends(?architecture(amd64)))", []string{"p0_1:0.5_all", "p1_1.0-1_all", "p1_1:0.5_all", "p1_3_amd64", "p5_1.0_all"}},
++	})
++}
++
++func TestAptPatternRandomArchive04(t *testing.T) {
++	checkRandomArchive(t, 2, []patternCase{
++		{"?and(?any-version(?version(^1:)), ?exact-name(p2))", []string{"p2_1:0.5_armhf", "p2_3_armhf"}},
++		{"?any-version(?or(?priority(optional), ?source-package(^s1$)))", []string{"p1_1.2_all", "p1_2.0+b1_amd64", "p1_2.0+b1_arm64", "p1_2.0+b1_armhf", "p2_1:0.5_armhf", "p2_3_armhf"}},
++		{"?breaks(?depends(?priority(optional)))", []string{"p1_1.2_all", "p1_2.0+b1_amd64"}},
++		{"?and(?any-version(~n2), ?reverse-suggests(?source-version(^1)))", []string{"p2_1.0-1_amd64"}},
++		{"?enhances(?version(b1$))", []string{"p0_1.2~rc1_armhf"}},
++		{"?or(?any-version(?name(1$)), ?depends(?source-package(s)))", []string{"p0_1.2~rc1_armhf", "p1_1.2_all", "p1_2.0+b1_amd64", "p1_2.0+b1_arm64", "p1_2.0+b1_armhf", "p1_2.0+b1_i386", "p2_1.0-1_arm64", "p2_1:0.5_armhf", "p2_3_arm64", "p2_3_armhf", "p3_0.9_armhf"}},
++		{"?or(?or(?priority(important), ~np2), (?exact-name(p1) | ~F))", []string{"p1_1.2_all", "p1_2.0+b1_amd64", "p1_2.0+b1_arm64", "p1_2.0+b1_armhf", "p1_2.0+b1_i386", "p2_1.0-1_amd64", "p2_1.0-1_arm64", "p2_1:0.5_armhf", "p2_3_arm64", "p2_3_armhf"}},
++		{"~T (?all-versions(?exact-name(p3)) | ?depends(?name(P2)))", []string{"p1_1.2_all", "p1_2.0+b1_amd64", "p2_1.0-1_arm64", "p2_3_arm64", "p3_0.9_arm64", "p3_0.9_armhf", "p3_2.0+b1_all"}},
++	})
++}
++
++func TestAptPatternRandomArchive05(t *testing.T) {
++	checkRandomArchive(t, 21, []patternCase{
++		{"?not(~s1)", []string{"p0_1.2_arm64", "p0_1.2_armhf", "p0_2.0+b1_amd64", "p0_2.0+b1_arm64", "p0_2.0_amd64", "p1_0.9_amd64", "p1_0.9_arm64", "p1_0.9_i386", "p1_1.0-1_all", "p1_2.0_arm64", "p2_1.2_all", "p2_2.0+b1_all", "p2_3_amd64", "p3_1.2_arm64", "p3_1.2_armhf", "p3_1.2_i386", "p3_2.0+b1_all", "p4_0.9_amd64", "p4_0.9_i386", "p4_1.0_all", "p4_1.2_amd64", "p5_1.2_all", "p6_2.0_armhf"}},
++		{"?or(?any-version(~src), ?source-version(rc))", []string{"p4_0.9_i386"}},
++		{"?any-version(?exact-name(p4))", []string{"p4_0.9_amd64", "p4_0.9_i386", "p4_1.0_all", "p4_1.2_amd64"}},
++		{"?not(?version(rc))", []string{"p0_1.2_arm64", "p0_1.2_armhf", "p0_2.0+b1_amd64", "p0_2.0+b1_arm64", "p0_2.0_amd64", "p1_0.9_amd64", "p1_0.9_arm64", "p1_0.9_i386", "p1_1.0-1_all", "p1_2.0_arm64", "p2_1.2_all", "p2_2.0+b1_all", "p2_3_amd64", "p3_1.2_arm64", "p3_1.2_armhf", "p3_1.2_i386", "p3_2.0+b1_all", "p4_0.9_amd64", "p4_0.9_i386", "p4_1.0_all", "p4_1.2_amd64", "p5_1.2_all", "p6_2.0_armhf"}},
++		{"?source-package(^p)", []string{"p0_1.2_arm64", "p0_1.2_armhf", "p0_2.0+b1_arm64", "p1_0.9_arm64", "p1_0.9_i386", "p1_2.0_arm64", "p2_1.2_all", "p2_2.0+b1_all", "p2_3_amd64", "p3_1.2_arm64", "p3_1.2_armhf", "p3_2.0+b1_all", "p4_0.9_amd64", "p4_1.0_all", "p4_1.2_amd64", "p5_1.2_all"}},
++		{"?version(^1)", []string{"p0_1.2_arm64", "p0_1.2_armhf", "p0_2.0+b1_arm64", "p1_0.9_amd64", "p1_1.0-1_all", "p2_1.2_all", "p2_2.0+b1_all", "p2_3_amd64", "p3_1.2_arm64", "p3_1.2_armhf", "p3_1.2_i386", "p4_0.9_amd64", "p4_1.0_all", "p4_1.2_amd64", "p5_1.2_all"}},
++		{"?reverse-depends(?conflicts(?section(^non-free/)))", []string{}},
++		{"?all-versions(~n1)", []string{"p1_0.9_amd64", "p1_0.9_arm64", "p1_0.9_i386", "p1_1.0-1_all", "p1_2.0_arm64"}},
++	})
++}
++
++func TestAptPatternRandomArchive06(t *testing.T) {
++	checkRandomArchive(t, 60, []patternCase{
++		{"?all-versions(?or(?source-package(^p), ?version(rc)))", []string{"p0_1.0_i386", "p1_1.2_armhf", "p1_1.2~rc1_amd64", "p1_3_armhf", "p1_3_i386", "p3_1.0-1_armhf"}},
++		{"~T (?all-versions(~np2) | (~s2 | ?version(b1$)))", []string{"p2_0.9_all"}},
++		{"?suggests(~Vlibs)", []string{}},
++		{"~T (?any-version(~n1$) | ~n2)", []string{"p1_1.2_armhf", "p1_1.2~rc1_amd64", "p1_3_armhf", "p1_3_i386", "p2_0.9_all"}},
++		{"?priority(optional)", []string{"p0_1.0_i386", "p1_3_i386"}},
++		{"?reverse-depends(?and(~V2, ?source-package(s)))", []string{}},
++		{"~n1", []string{"p1_1.2_armhf", "p1_1.2~rc1_amd64", "p1_3_armhf", "p1_3_i386"}},
++		{"?narrow(?true, ?narrow(?name(^p[0-3]$), ?exact-name(p3)))", []string{"p3_1.0-1_armhf"}},
++	})
++}
++
++func TestAptPatternRandomArchive07(t *testing.T) {
++	checkRandomArchive(t, 57, []patternCase{
++		{"?priority(standard)", []string{"p2_1.0-1_arm64", "p4_1.2~rc1_i386", "p5_1.2_arm64"}},
++		{"?reverse-replaces(?or(?exact-name(p6), ?priority(required)))", []string{"p4_1.2~rc1_amd64"}},
++		{"?not(?reverse-depends(?exact-name(p4)))", []string{"p0_2.0_all", "p1_2.0+b1_all", "p1_2.0+b1_amd64", "p1_2.0_arm64", "p2_1.0-1_arm64", "p2_3_i386", "p3_1:0.5_amd64", "p4_1.2~rc1_amd64", "p4_1.2~rc1_i386", "p4_1:0.5_arm64", "p4_1:0.5_armhf", "p5_1.0-1_amd64", "p5_1.0_amd64", "p5_1.0_i386", "p5_1.2_amd64", "p5_1.2_arm64", "p6_1.0-1_arm64", "p6_1.0-1_armhf"}},
++		{"?narrow((?priority(important) ~n^v), ?all-versions(?source-version(^1)))", []string{}},
++		{"?version(^2\\.0$)", []string{"p0_2.0_all", "p1_2.0_arm64"}},
++		{"?and(?any-version(?source-version(^1)), (?source-package(^p) | ~F))", []string{"p2_1.0-1_arm64", "p4_1.2~rc1_i386", "p5_1.0-1_amd64", "p5_1.0_amd64", "p5_1.2_amd64", "p6_1.0-1_arm64", "p6_1.0-1_armhf"}},
++		{"?and(?depends(?name(1$)), ~n^p)", []string{"p4_1.2~rc1_i386"}},
++		{"~V1", []string{"p0_2.0+b1_i386", "p1_2.0+b1_all", "p1_2.0+b1_amd64", "p2_1.0-1_arm64", "p3_1:0.5_amd64", "p4_1.2~rc1_amd64", "p4_1.2~rc1_i386", "p4_1:0.5_arm64", "p4_1:0.5_armhf", "p5_1.0-1_amd64", "p5_1.0_amd64", "p5_1.0_i386", "p5_1.2_amd64", "p5_1.2_arm64", "p6_1.0-1_arm64", "p6_1.0-1_armhf"}},
++	})
++}
++
++func TestAptPatternRandomArchive08(t *testing.T) {
++	checkRandomArchive(t, 49, []patternCase{
++		{"~T (~sp2 | ?not(~V1))", []string{"p1_3_arm64", "p1_3_i386", "p2_0.9_arm64", "p2_0.9_i386", "p4_3_arm64", "p4_3_armhf"}},
++		{"?suggests((?source-package(s) | ~src))", []string{}},
++		{"?architecture(any-arm)", []string{"p1_2.0+b1_armhf", "p4_3_armhf", "p5_1.0-1_armhf", "p5_1:0.5_armhf", "p5_2.0+b1_armhf"}},
++		{"?not(?any-version(?source-version(0\\.5)))", []string{"p0_1.0_amd64", "p0_1.0_i386", "p1_1.0-1_amd64", "p1_2.0+b1_armhf", "p1_3_amd64", "p1_3_arm64", "p1_3_i386", "p2_0.9_arm64", "p2_0.9_i386", "p2_1.0_amd64", "p3_1.2_amd64", "p3_1.2_i386", "p4_1.2~rc1_all", "p4_2.0_all", "p4_3_amd64", "p4_3_arm64", "p4_3_armhf", "p5_1.0-1_amd64", "p5_1.0-1_arm64", "p5_2.0+b1_amd64", "p5_2.0+b1_arm64"}},
++		{"?all-versions(?source-version(rc))", []string{"p1_3_i386"}},
++		{"~T (?source-version(0\\.5) ?conflicts(?version(^1)))", []string{}},
++		{"?version(^1:)", []string{"p5_1.0-1_armhf", "p5_1:0.5_armhf", "p5_2.0+b1_armhf"}},
++		{"?priority(required)", []string{"p3_1.2_amd64", "p5_1.0-1_armhf", "p5_1:0.5_armhf", "p5_2.0+b1_armhf"}},
++	})
++}
++
++func TestAptPatternRandomArchive09(t *testing.T) {
++	checkRandomArchive(t, 27, []patternCase{
++		{"?conflicts(?reverse-breaks(~n1$))", []string{}},
++		{"?or(?and(?section(libs), ~n^p[0-3]$), (~V2 ?priority(extra)))", []string{"p0_1.0_i386", "p0_1.2~rc1_amd64", "p0_1.2~rc1_i386", "p0_1:0.5_amd64", "p1_2.0+b1_arm64", "p3_1.0-1_arm64"}},
++		{"?reverse-breaks(?all-versions(?name(^p[0-3]$)))", []string{"p0_1.0_armhf", "p0_1.2~rc1_amd64", "p0_1:0.5_amd64", "p0_1:0.5_armhf", "p3_1.0-1_armhf", "p7_1.2_i386", "p7_2.0+b1_i386"}},
++		{"?source-version(^1)", []string{"p0_1.0_armhf", "p0_1.0_i386", "p0_1.2~rc1_amd64", "p0_1.2~rc1_i386", "p0_1:0.5_amd64", "p0_1:0.5_armhf", "p2_1.0_amd64", "p2_1.0_arm64", "p2_1.0_armhf", "p3_1.0-1_arm64", "p3_1.0-1_armhf", "p5_1:0.5_arm64", "p5_1:0.5_i386", "p7_1.2_all", "p7_1.2_i386", "p7_2.0+b1_i386"}},
++		{"?architecture(any-arm)", []string{"p0_1.0_armhf", "p0_1:0.5_armhf", "p2_1.0_armhf", "p3_1.0-1_armhf", "p4_0.9_armhf", "p4_3_armhf"}},
++		{"?any-version(?and(~nlibs, ~nlibs))", []string{}},
++		{"?any-version(?not(~n1$))", []string{"p0_1.0_armhf", "p0_1.0_i386", "p0_1.2~rc1_amd64", "p0_1.2~rc1_i386", "p0_1:0.5_amd64", "p0_1:0.5_armhf", "p2_1.0_amd64", "p2_1.0_arm64", "p2_1.0_armhf", "p2_1.0_i386", "p3_1.0-1_arm64", "p3_1.0-1_armhf", "p3_1.2~rc1_amd64", "p3_2.0_all", "p4_0.9_armhf", "p4_3_amd64", "p4_3_armhf", "p4_3_i386", "p5_1:0.5_arm64", "p5_1:0.5_i386", "p6_3_i386", "p7_1.2_all", "p7_1.2_i386", "p7_2.0+b1_i386"}},
++		{"?not(~Vlibs)", []string{"p0_1.0_armhf", "p0_1.0_i386", "p0_1.2~rc1_amd64", "p0_1.2~rc1_i386", "p0_1:0.5_amd64", "p0_1:0.5_armhf", "p1_2.0+b1_arm64", "p2_1.0_amd64", "p2_1.0_arm64", "p2_1.0_armhf", "p2_1.0_i386", "p3_1.0-1_arm64", "p3_1.0-1_armhf", "p3_1.2~rc1_amd64", "p3_2.0_all", "p4_0.9_armhf", "p4_3_amd64", "p4_3_armhf", "p4_3_i386", "p5_1:0.5_arm64", "p5_1:0.5_i386", "p6_3_i386", "p7_1.2_all", "p7_1.2_i386", "p7_2.0+b1_i386"}},
++	})
++}
++
++func TestAptPatternRandomArchive10(t *testing.T) {
++	checkRandomArchive(t, 26, []patternCase{
++		{"?recommends((?architecture(armhf) ~s2))", []string{}},
++		{"?name(^p[0-3]$)", []string{"p0_0.9_armhf", "p0_0.9_i386", "p0_1.2~rc1_amd64", "p0_1.2~rc1_arm64", "p0_1:0.5_all", "p1_1.2_i386", "p2_1.2_all", "p3_1.2_amd64", "p3_1.2~rc1_armhf"}},
++		{"?any-version(~np1)", []string{"p1_1.2_i386"}},
++		{"?all-versions(?all-versions(?true))", []string{"p0_0.9_armhf", "p0_0.9_i386", "p0_1.2~rc1_amd64", "p0_1.2~rc1_arm64", "p0_1:0.5_all", "p1_1.2_i386", "p2_1.2_all", "p3_1.2_amd64", "p3_1.2~rc1_armhf", "p4_0.9_all", "p5_1.0_all", "p5_1.0_amd64", "p5_3_armhf", "p6_0.9_all", "p6_1.0-1_armhf", "p6_1.0-1_i386", "p7_1.0-1_amd64", "p7_1.0-1_arm64", "p7_1.2_arm64", "p7_1.2_armhf", "p7_1.2_i386"}},
++		{"?name(^v)", []string{}},
++		{"?source-package(s)", []string{"p0_0.9_armhf", "p1_1.2_i386", "p2_1.2_all", "p4_0.9_all", "p7_1.0-1_amd64", "p7_1.0-1_arm64", "p7_1.2_arm64", "p7_1.2_armhf"}},
++		{"?recommends(?all-versions(?version(^2\\.0$)))", []string{"p0_0.9_armhf", "p0_1.2~rc1_amd64", "p0_1:0.5_all", "p1_1.2_i386", "p7_1.0-1_arm64", "p7_1.2_arm64"}},
++		{"?any-version(?or(?section(\"admin|utils\"), ?section(\"admin|utils\")))", []string{"p1_1.2_i386", "p2_1.2_all", "p6_0.9_all", "p6_1.0-1_i386", "p7_1.0-1_arm64", "p7_1.2_arm64"}},
++	})
++}
++
++func TestAptPatternRandomArchive11(t *testing.T) {
++	checkRandomArchive(t, 20, []patternCase{
++		{"?reverse-enhances(?any-version(?name(^p[0-3]$)))", []string{"p6_2.0_all"}},
++		{"?suggests(?any-version(?version(^1:)))", []string{"p4_0.9_amd64", "p4_0.9_i386", "p4_2.0_i386"}},
++		{"?narrow(?breaks(?architecture(amd64)), ?all-versions(?exact-name(p4)))", []string{}},
++		{"?not(?source-version(rc))", []string{"p0_1:0.5_all", "p0_2.0_i386", "p1_3_amd64", "p1_3_arm64", "p1_3_armhf", "p2_1.2_arm64", "p2_1.2_i386", "p3_1.0_arm64", "p3_1.0_armhf", "p4_0.9_amd64", "p4_0.9_armhf", "p4_0.9_i386", "p4_2.0_armhf", "p4_2.0_i386", "p5_1.2~rc1_arm64", "p5_1:0.5_amd64", "p5_1:0.5_arm64", "p5_1:0.5_armhf", "p5_1:0.5_i386", "p6_2.0_all", "p7_1.0-1_amd64", "p7_1.0-1_i386"}},
++		{"?source-package(s)", []string{"p2_1.2_arm64", "p3_1.0_amd64", "p3_1.2~rc1_amd64", "p3_1:0.5_all", "p4_0.9_amd64", "p4_0.9_armhf", "p4_0.9_i386", "p4_2.0_armhf", "p4_2.0_i386", "p5_1.2~rc1_arm64", "p5_1:0.5_arm64", "p6_2.0_all", "p7_1.0-1_i386"}},
++		{"?not(?narrow(?source-version(0\\.5), ?exact-name(p7)))", []string{"p0_1:0.5_all", "p0_2.0_i386", "p1_1.2~rc1_i386", "p1_3_amd64", "p1_3_arm64", "p1_3_armhf", "p2_1.2_arm64", "p2_1.2_i386", "p3_1.0_amd64", "p3_1.0_arm64", "p3_1.0_armhf", "p3_1.2~rc1_amd64", "p3_1:0.5_all", "p4_0.9_amd64", "p4_0.9_armhf", "p4_0.9_i386", "p4_2.0_armhf", "p4_2.0_i386", "p5_1.2~rc1_arm64", "p5_1:0.5_amd64", "p5_1:0.5_arm64", "p5_1:0.5_armhf", "p5_1:0.5_i386", "p6_2.0_all", "p7_1.0-1_amd64", "p7_1.0-1_i386"}},
++		{"?any-version((?exact-name(p1) ~Vrc))", []string{"p1_1.2~rc1_i386"}},
++		{"?recommends(?narrow(?source-version(0\\.5), ?architecture(i386)))", []string{}},
++	})
++}
++
++func TestAptPatternRandomArchive12(t *testing.T) {
++	checkRandomArchive(t, 15, []patternCase{
++		{"?version(^2\\.0$)", []string{"p2_2.0_armhf", "p3_1.0-1_amd64", "p3_2.0_all"}},
++		{"~T (?and(~nlibs, ~src) ?all-versions(?version(b1$)))", []string{}},
++		{"?depends(?any-version(~n2))", []string{"p1_3_arm64"}},
++		{"?reverse-depends(?section(\"admin|utils\"))", []string{"p0_1.2_amd64", "p0_1.2~rc1_all", "p2_1.2~rc1_arm64", "p3_1.0-1_armhf"}},
++		{"~T (?and(~sp2, ?version(^1:)) (?exact-name(v0) | ?section(^non-free/)))", []string{}},
++		{"?conflicts(?source-package(s))", []string{"p1_1.0_all", "p2_1.2~rc1_arm64", "p4_1.2_all", "p4_1.2_amd64"}},
++		{"~slibs", []string{"p3_1.0-1_amd64", "p3_1.0-1_armhf", "p3_2.0_all"}},
++		{"?version(rc)", []string{"p0_1.2_amd64", "p0_1.2~rc1_all", "p2_1.2~rc1_arm64"}},
++	})
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..cc5cd759
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,191 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || { echo "missing value for --output_path" >&2; usage; }
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 2
++# main.go embeds VERSION, which the image writes and git ignores
++[ -f VERSION ] || printf '%s' 1.6.2 >VERSION
++
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++export GOPROXY=off
++for dir in /usr/local/go/bin /opt/go/bin /usr/local/bin; do
++  case ":$PATH:" in
++    *":$dir:"*) ;;
++    *) [ -d "$dir" ] && PATH="$dir:$PATH" ;;
++  esac
++done
++export PATH
++if ! go list -m all >/dev/null 2>&1 && [ -d /opt/go/pkg/mod ]; then
++  export GOPATH=/opt/go
++  export GOMODCACHE=/opt/go/pkg/mod
++fi
++GO_BUILD_CACHE="$(go env GOCACHE 2>/dev/null)"
++if [ -z "$GO_BUILD_CACHE" ] || ! mkdir -p "$GO_BUILD_CACHE" 2>/dev/null || [ ! -w "$GO_BUILD_CACHE" ]; then
++  GO_BUILD_CACHE="/tmp/go-build-$(id -u)"
++fi
++export GOCACHE="$GO_BUILD_CACHE"
++GOPATH="$(go env GOPATH)"
++GOMODCACHE="$(go env GOMODCACHE)"
++export GOPATH GOMODCACHE
++# the api and context suites keep their default aptly root (~/.aptly) under HOME, so every run gets a fresh one
++export HOME="$(mktemp -d)"
++
++NEW_PKG="github.com/aptly-dev/aptly/cmd"
++NEW_FILE="cmd/apt_pattern_queries_39db46_test.go"
++NEW_RUN='^TestAptPattern'
++LOG="$(mktemp)"
++LIST_ERR="$(mktemp)"
++trap 'rm -f "$LOG" "$LIST_ERR"' EXIT
++LIST_STATUS=0
++
++if [ "$MODE" = "base" ]; then
++  PKGS="$(go list ./... 2>"$LIST_ERR")"
++  LIST_STATUS=$?
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    PKGS="$(go list -e ./... 2>/dev/null)"
++  fi
++  cat "$LIST_ERR" >>"$LOG"
++  # database/etcddb: every test connects to an etcd server on 127.0.0.1:2379, which the image does not run
++  # files: DiskFullSuite needs a tiny filesystem, either loop-mounted (root with mount privileges) or already mounted at /smallfs
++  # http: the *ConnectError tests expect a DNS "no such host" error, while the offline sandbox reports "network is unreachable"
++  # pgp: Gnupg2VerifierSuite.TestVerifyClearsigned expects three good signing keys, the gpgv in the image reports two
++  # swift: each test binds its fake Swift server to a random port in 20000-29999 with no retry (swift/public_test.go:28), so a port already taken on the host fails it
++  PKGS="$(printf '%s\n' "$PKGS" | grep -v -e '^$' -e "^$NEW_PKG\$" \
++    -e '/database/etcddb$' -e '/files$' -e '/http$' -e '/pgp$' -e '/swift$' -e '/api$')"
++  if [ -n "$PKGS" ]; then
++    go test -v -count=1 -timeout 20m $PKGS >>"$LOG" 2>&1
++    STATUS=$?
++  else
++    STATUS=1
++  fi
++  # api: FilesUploadDiskFullSuite provokes permission errors, which never happen when the tests run as root
++  go test -v -count=1 -timeout 20m ./api/ \
++    -check.f '^(APISuite|GPGSuite|MiddlewareSuite|MirrorSuite|PackagesSuite|PublishedFileMissingSuite|ReposSuite|SnapshotsSuite)\.' >>"$LOG" 2>&1
++  API_STATUS=$?
++  [ "$API_STATUS" -ne 0 ] && STATUS="$API_STATUS"
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    echo "[setup failed] go list ./... exited with status $LIST_STATUS" >>"$LOG"
++    [ "$STATUS" -eq 0 ] && STATUS="$LIST_STATUS"
++  fi
++else
++  go test -v -count=1 -timeout 20m -run "$NEW_RUN" ./cmd/ >>"$LOG" 2>&1
++  STATUS=$?
++fi
++
++if ! grep -qE '^ *--- (PASS|FAIL|SKIP):' "$LOG"; then
++  echo "no tests were collected in mode $MODE" >>"$LOG"
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++cat "$LOG"
++
++expected_tests() {
++  grep -ho '^func TestAptPattern[A-Za-z0-9_]*' "$NEW_FILE" 2>/dev/null | sed 's/^func //'
++}
++
++xml_escape() {
++  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' | tr -d '\000-\010\013\014\016-\037'
++}
++
++add_failures() {
++  suite="$1"
++  message="$2"
++  detail="$3"
++  shift 3
++  grep -q '</testsuites>' "$OUTPUT_PATH" 2>/dev/null || printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++  EXTRA="$(mktemp)"
++  MERGED="$(mktemp)"
++  {
++    echo "<testsuite name=\"$suite\" tests=\"$#\" failures=\"$#\" errors=\"0\">"
++    for name in "$@"; do
++      echo "<testcase name=\"$name\" classname=\"$suite\"><failure message=\"$message\">$detail</failure></testcase>"
++    done
++    echo '</testsuite>'
++  } >"$EXTRA"
++  awk -v extra="$EXTRA" '/<\/testsuites>/ { while ((getline line < extra) > 0) print line } { print }' "$OUTPUT_PATH" >"$MERGED"
++  TESTS="$(grep -c '<testcase ' "$MERGED")"
++  FAILURES="$(grep -c '<failure' "$MERGED")"
++  ERRORS="$(grep -c '<error' "$MERGED")"
++  sed -E "1,/<testsuites/ s#<testsuites[^>]*>#<testsuites tests=\"$TESTS\" failures=\"$FAILURES\" errors=\"$ERRORS\">#" "$MERGED" >"$OUTPUT_PATH"
++  rm -f "$EXTRA" "$MERGED"
++}
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOG" | tr -d '\000-\010\013\014\016-\037' | go-junit-report >"$OUTPUT_PATH" 2>/dev/null || true
++  PANICKED="$(awk '/^--- FAIL: /{name=$3} /^panic: /{print name; exit}' "$LOG")"
++  RAN=0
++  NAMES=""
++  if [ "$MODE" = "new" ]; then
++    SUITE="$NEW_PKG"
++    for name in $(expected_tests); do
++      if grep -q "<testcase name=\"$name\"" "$OUTPUT_PATH" 2>/dev/null; then
++        RAN=1
++      else
++        NAMES="$NAMES $name"
++      fi
++    done
++  else
++    SUITE="github.com/aptly-dev/aptly"
++    if grep -q '<testcase ' "$OUTPUT_PATH" 2>/dev/null; then
++      RAN=1
++    else
++      NAMES="build"
++    fi
++  fi
++  if [ -n "$NAMES" ]; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    DETAIL="$(grep -E '^# |\.go:[0-9]+:[0-9]+: |\[(build|setup) failed\]|^panic|timed out' "$LOG" | head -n 40)"
++    [ -n "$DETAIL" ] || DETAIL="$(tail -n 40 "$LOG")"
++    DETAIL="$(printf '%s\n' "$DETAIL" | xml_escape)"
++    if [ "$RAN" -eq 1 ] && [ -n "$PANICKED" ]; then
++      MESSAGE="not run: the test binary exited after $PANICKED panicked"
++    elif [ "$RAN" -eq 1 ]; then
++      MESSAGE="not run: the test binary exited before reaching this test"
++    else
++      MESSAGE="the test package failed to build or run"
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++    fi
++    add_failures "$SUITE" "$MESSAGE" "$DETAIL" $NAMES
++  fi
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    DETAIL="$(head -n 40 "$LIST_ERR" | xml_escape)"
++    add_failures "$SUITE" "package discovery failed: go list ./... exited with status $LIST_STATUS" "$DETAIL" package_discovery
++  fi
++fi
++
++exit "$STATUS"

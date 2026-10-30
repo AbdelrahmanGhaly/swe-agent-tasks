@@ -1,0 +1,5553 @@
+diff --git a/Android.bp b/Android.bp
+index 5c516a2..cc53d22 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -45,6 +45,9 @@ rust_binary_host {
+     ],
+     target: {
+         linux: {
++            // Objects loaded with the load directive call the gmk_* functions
++            // rkati exports.
++            ld_flags: ["-rdynamic"],
+             rustlibs: [
+                 "libtikv_jemallocator",
+             ],
+diff --git a/Makefile.ckati b/Makefile.ckati
+index d585106..2a6de76 100644
+--- a/Makefile.ckati
++++ b/Makefile.ckati
+@@ -35,6 +35,7 @@ KATI_CXX_SRCS := \
+ 	flags.cc \
+ 	func.cc \
+ 	io.cc \
++	loadapi.cc \
+ 	log.cc \
+ 	main.cc \
+ 	ninja.cc \
+@@ -75,13 +76,16 @@ KATI_CXXFLAGS += -march=native
+ #KATI_CXXFLAGS += -pg
+ 
+ ifeq ($(shell uname),Linux)
+-KATI_LIBS := -lrt -lpthread
++KATI_LIBS := -lrt -lpthread -ldl
++# Objects loaded with the load directive call the gmk_* functions ckati
++# exports.
++KATI_LDFLAGS := -rdynamic
+ endif
+ 
+ # Rule to build ckati into KATI_BIN_PATH
+ $(KATI_BIN_PATH)/ckati: $(KATI_CXX_OBJS) $(KATI_CXX_GENERATED_OBJS)
+ 	@mkdir -p $(dir $@)
+-	$(KATI_LD) -std=c++17 $(KATI_CXXFLAGS) -o $@ $^ $(KATI_LIBS)
++	$(KATI_LD) -std=c++17 $(KATI_CXXFLAGS) $(KATI_LDFLAGS) -o $@ $^ $(KATI_LIBS)
+ 
+ # Rule to build normal source files into object files in KATI_INTERMEDIATES_PATH
+ $(KATI_CXX_OBJS) $(KATI_CXX_TEST_OBJS): $(KATI_INTERMEDIATES_PATH)/%.o: $(KATI_SRC_PATH)/%.cc
+diff --git a/build.rs b/build.rs
+new file mode 100644
+index 0000000..159fe62
+--- /dev/null
++++ b/build.rs
+@@ -0,0 +1,24 @@
++/*
++Copyright 2026 Google LLC
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++     https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++fn main() {
++    // Objects loaded with the load directive call the gmk_* functions rkati
++    // exports.
++    if std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "linux") {
++        println!("cargo:rustc-link-arg-bin=rkati=-rdynamic");
++    }
++    println!("cargo:rerun-if-changed=build.rs");
++}
+diff --git a/src-rs/command.rs b/src-rs/command.rs
+index 270d8b6..5c2ef29 100644
+--- a/src-rs/command.rs
++++ b/src-rs/command.rs
+@@ -273,17 +273,24 @@ impl<'a> CommandEvaluator<'a> {
+     pub fn eval(&mut self, n: &Arc<Mutex<DepNode>>) -> Result<Vec<Command>> {
+         let mut result: Vec<Command> = Vec::new();
+         let node_cmds;
++        let recipe_lines;
+         {
+             let node = n.lock();
+             self.ev.loc = node.loc.clone();
+             self.ev.current_scope = node.rule_vars.clone();
+             node_cmds = node.cmds.clone();
++            recipe_lines = node.recipe_lines.clone();
+         }
+         self.ev.is_evaluating_command = true;
+         *self.current_dep_node.lock() = Some(n.clone());
+         *self.found_new_inputs.lock() = false;
+-        for v in node_cmds {
++        for (i, v) in node_cmds.into_iter().enumerate() {
+             self.ev.loc = v.loc();
++            self.ev.loc_offset = self
++                .ev
++                .loc
++                .as_ref()
++                .map_or(0, |loc| loc.line - recipe_lines[i]);
+             let cmds_buf = v.eval_to_buf(self.ev)?;
+             let mut cmds = cmds_buf.clone();
+             let mut global_echo = !FLAGS.is_silent_mode;
+@@ -332,6 +339,7 @@ impl<'a> CommandEvaluator<'a> {
+         }
+ 
+         self.ev.current_scope = None;
++        self.ev.loc_offset = 0;
+         self.ev.is_evaluating_command = false;
+ 
+         Ok(result)
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 3f32205..4c68877 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -47,6 +47,8 @@ pub type NamedDepNode = (Symbol, Arc<Mutex<DepNode>>);
+ pub struct DepNode {
+     pub output: Symbol,
+     pub cmds: Vec<Arc<Value>>,
++    // For each command, the line its rule's recipe starts at.
++    pub recipe_lines: Vec<i32>,
+     pub deps: Vec<NamedDepNode>,
+     pub order_onlys: Vec<NamedDepNode>,
+     pub validations: Vec<NamedDepNode>,
+@@ -71,6 +73,7 @@ impl DepNode {
+         Arc::new(Mutex::new(Self {
+             output,
+             cmds: Vec::new(),
++            recipe_lines: Vec::new(),
+             deps: Vec::new(),
+             order_onlys: Vec::new(),
+             validations: Vec::new(),
+@@ -103,6 +106,17 @@ fn replace_suffix(s: Symbol, newsuf: &Symbol) -> Symbol {
+     intern(r.freeze())
+ }
+ 
++// Where a rule's recipe starts.
++fn recipe_loc(r: &Rule) -> Loc {
++    if !r.cmds.is_empty()
++        && !r.inline_recipe
++        && let Some(cmd_loc) = r.cmd_loc.clone()
++    {
++        return cmd_loc;
++    }
++    r.loc.clone()
++}
++
+ fn apply_output_pattern(r: &Rule, output: Symbol, inputs: &[Symbol]) -> Vec<Symbol> {
+     let mut ret = Vec::new();
+     if inputs.is_empty() {
+@@ -316,6 +330,8 @@ impl RuleMerger {
+     fn fill_dep_node_from_rule(&self, output: Symbol, r: &Rule, n: &mut DepNode) {
+         if self.is_double_colon {
+             n.cmds.extend(r.cmds.iter().cloned());
++            let line = recipe_loc(r).line;
++            n.recipe_lines.extend(r.cmds.iter().map(|_| line));
+         }
+ 
+         n.actual_inputs
+@@ -350,10 +366,12 @@ impl RuleMerger {
+             self.fill_dep_node_from_rule(output, primary_rule, &mut n);
+             self.fill_dep_node_loc(primary_rule, &mut n);
+             n.cmds = primary_rule.cmds.clone();
++            n.recipe_lines = vec![recipe_loc(primary_rule).line; n.cmds.len()];
+         } else if let Some(pattern_rule) = pattern_rule {
+             self.fill_dep_node_from_rule(output, pattern_rule, &mut n);
+             self.fill_dep_node_loc(pattern_rule, &mut n);
+             n.cmds = pattern_rule.cmds.clone();
++            n.recipe_lines = vec![recipe_loc(pattern_rule).line; n.cmds.len()];
+         }
+ 
+         for r in &self.rules {
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 6bb5651..807ccf1 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -19,7 +19,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
+ use std::ffi::{OsStr, OsString};
+ use std::io::BufWriter;
+ use std::os::unix::ffi::OsStringExt;
+-use std::sync::{Arc, LazyLock, Weak};
++use std::sync::{Arc, LazyLock, Weak, atomic::Ordering};
+ 
+ use anyhow::{Context, Result};
+ use bytes::{Buf, Bytes};
+@@ -33,8 +33,8 @@ use crate::loc::Loc;
+ use crate::parser::{parse_assign_statement, parse_buf_no_stats};
+ use crate::rule::{Rule, is_pattern_rule};
+ use crate::stmt::{
+-    AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt, IncludeStmt, RuleSep, RuleStmt,
+-    Statement,
++    AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt, IncludeStmt, LoadStmt, RuleSep,
++    RuleStmt, Statement,
+ };
+ use crate::strutil::{is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
+ use crate::symtab::{ALLOW_RULES_SYM, KATI_READONLY_SYM, MAKEFILE_LIST, SHELL_SYM, Symbol, intern};
+@@ -249,6 +249,16 @@ pub struct Evaluator {
+     pub current_scope: Option<Arc<Vars>>,
+ 
+     pub loc: Option<Loc>,
++    // Where the builtin function being evaluated was written.
++    pub func_loc: Option<Loc>,
++    // While a recipe is expanded, how many lines the current location is past
++    // the recipe's first line. Loaded objects are given that first line, as
++    // make gives them its recipe location without the offset it adds for
++    // errors.
++    pub loc_offset: i32,
++    // An included makefile that could not be found, reported once the
++    // makefiles are read.
++    pub waiting_include_error: Option<anyhow::Error>,
+     is_bootstrap: bool,
+     is_commandline: bool,
+ 
+@@ -295,6 +305,9 @@ impl Evaluator {
+             current_scope: None,
+ 
+             loc: None,
++            func_loc: None,
++            loc_offset: 0,
++            waiting_include_error: None,
+             is_bootstrap: false,
+             is_commandline: false,
+ 
+@@ -707,6 +720,7 @@ impl Evaluator {
+ 
+         if stmt.sep == RuleSep::Semicolon {
+             rule.cmds.push(stmt.rhs.clone().unwrap());
++            rule.inline_recipe = true;
+         }
+ 
+         for o in &rule.outputs {
+@@ -781,6 +795,9 @@ impl Evaluator {
+             }
+             CondOp::Ifeq | CondOp::Ifneq => {
+                 let lhs = stmt.lhs.eval_to_buf(self)?;
++                if let Some(msg) = stmt.warning {
++                    warn_loc!(Some(&stmt.loc()), "{msg}");
++                }
+                 let rhs = stmt
+                     .rhs
+                     .as_ref()
+@@ -829,10 +846,13 @@ impl Evaluator {
+                 None,
+             )?;
+         }
++        // A recipe being expanded does not offset the included makefile's lines.
++        let offset = std::mem::take(&mut self.loc_offset);
+         for stmt in mk.stmts.lock().iter() {
+             log!("{stmt:?}");
+             stmt.eval(self)?;
+         }
++        self.loc_offset = offset;
+ 
+         if !self.profiled_files.is_empty() {
+             for mk in std::mem::take(&mut self.profiled_files) {
+@@ -842,6 +862,17 @@ impl Evaluator {
+         Ok(())
+     }
+ 
++    // Reports an included makefile that cannot be found, unless its directive
++    // waits for the makefiles to be read.
++    fn missing_include(&mut self, stmt: &IncludeStmt, msg: String) -> Result<()> {
++        let err = crate::color_error_log(self.loc.as_ref(), msg);
++        if !stmt.missing_waits.load(Ordering::Relaxed) {
++            return Err(err);
++        }
++        self.waiting_include_error.get_or_insert(err);
++        Ok(())
++    }
++
+     pub fn eval_include(&mut self, stmt: &IncludeStmt) -> Result<()> {
+         self.loc = Some(stmt.loc());
+         self.in_rule = false;
+@@ -855,19 +886,17 @@ impl Evaluator {
+                 match files.as_ref() {
+                     Err(err) => {
+                         // TODO: Kati does not support building a missing include file.
+-                        error_loc!(
+-                            self.loc.as_ref(),
+-                            "{}: {err}",
+-                            String::from_utf8_lossy(&pat)
+-                        );
++                        self.missing_include(
++                            stmt,
++                            format!("{}: {err}", String::from_utf8_lossy(&pat)),
++                        )?;
+                     }
+                     Ok(files) => {
+                         if files.is_empty() {
+-                            error_loc!(
+-                                self.loc.as_ref(),
+-                                "{}: Not found",
+-                                String::from_utf8_lossy(&pat)
+-                            );
++                            self.missing_include(
++                                stmt,
++                                format!("{}: Not found", String::from_utf8_lossy(&pat)),
++                            )?;
+                         }
+                     }
+                 }
+@@ -898,6 +927,18 @@ impl Evaluator {
+         Ok(())
+     }
+ 
++    pub fn eval_load(&mut self, stmt: &LoadStmt) -> Result<()> {
++        self.loc = Some(stmt.loc());
++        self.in_rule = false;
++
++        let names = stmt.expr.eval_to_buf(self)?;
++        for name in word_scanner(&names) {
++            let name = names.slice_ref(name);
++            crate::loadapi::load_object(self, &name, stmt.noerror)?;
++        }
++        Ok(())
++    }
++
+     pub fn eval_export(&mut self, stmt: &ExportStmt) -> Result<()> {
+         self.loc = Some(stmt.loc());
+         self.in_rule = false;
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 8179bca..a423036 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -148,6 +148,7 @@ impl<'a> Executor<'a> {
+ 
+         let commands = self.ce.eval(n)?;
+         for command in commands {
++            crate::loadapi::flush_c_stdout();
+             self.num_commands += 1;
+             if command.echo {
+                 println!("{}", String::from_utf8_lossy(&command.cmd));
+@@ -189,6 +190,7 @@ pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
+         executor.exec_node(root, None)?;
+     }
+     if executor.num_commands == 0 {
++        crate::loadapi::flush_c_stdout();
+         for (sym, _) in roots {
+             println!("kati: Nothing to be done for `{sym}'.")
+         }
+diff --git a/src-rs/expr.rs b/src-rs/expr.rs
+index 64aaa33..f6cf4a8 100644
+--- a/src-rs/expr.rs
++++ b/src-rs/expr.rs
+@@ -14,17 +14,27 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-use std::sync::Arc;
++use std::cell::{Cell, RefCell};
++use std::ops::Range;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Weak};
+ 
+ use anyhow::Result;
+ use bytes::{BufMut, Bytes, BytesMut};
+ use memchr::memchr;
++use parking_lot::Mutex;
+ 
+ use crate::eval::{Evaluator, FrameType};
+ use crate::flags::FLAGS;
+ use crate::func::{FuncInfo, get_func_info};
++use crate::loadapi::{
++    LoadedFunc, call_loaded_func, find_loaded_func, is_loadable_func_name,
++    loaded_func_registrations,
++};
+ use crate::loc::Loc;
+-use crate::strutil::{Pattern, WordWriter, trim_right_space, trim_suffix, word_scanner};
++use crate::strutil::{
++    Pattern, WordWriter, trim_left_space, trim_right_space, trim_suffix, word_scanner,
++};
+ use crate::symtab::{Symbol, intern};
+ use crate::{error_loc, kati_warn_loc, log};
+ 
+@@ -60,6 +70,9 @@ pub enum ParseExprOpt {
+     Define,
+     Command,
+     Func,
++    // Text gmk_expand expands, which make expands as it is: nothing in it is a
++    // comment, a continued line or an escape.
++    Expand,
+ }
+ 
+ #[derive(Debug, PartialEq)]
+@@ -79,6 +92,526 @@ pub enum Value {
+         fi: &'static FuncInfo,
+         args: Vec<Arc<Value>>,
+     },
++    // A call to a function a loaded object registered, boxed to keep Value
++    // small.
++    LoadedFuncCall(Box<LoadedFuncCall>),
++    // An expression whose reading depends on loaded functions, boxed to keep
++    // Value small.
++    LazyCalls(Box<LazyCalls>),
++    // One side of a parenthesized ifeq whose first side is a LazyCalls.
++    ConditionSide {
++        cond: Arc<LazyCondition>,
++        side: usize,
++    },
++    // Text kati could not read, which fails with |msg| when it is expanded.
++    ReadError {
++        loc: Loc,
++        msg: String,
++    },
++}
++
++// A call to a function a loaded object registered.
++#[derive(Debug, PartialEq)]
++pub struct LoadedFuncCall {
++    loc: Loc,
++    name: Symbol,
++    expand_args: bool,
++    args: Vec<Arc<Value>>,
++    raw_args: Vec<Bytes>,
++}
++
++impl LoadedFuncCall {
++    fn eval(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
++        // A function stays registered once it is.
++        let func = find_loaded_func(self.name).unwrap();
++        let _frame = ev.enter(FrameType::FunCall, self.name.as_bytes(), self.loc.clone());
++        ev.eval_depth += 1;
++        let argv = if self.expand_args {
++            let mut argv = Vec::with_capacity(self.args.len());
++            for arg in &self.args {
++                argv.push(arg.eval_to_buf(ev)?);
++            }
++            argv
++        } else {
++            self.raw_args.clone()
++        };
++        call_loaded_func(ev, &self.loc, self.name, func, argv, out)?;
++        ev.eval_depth -= 1;
++        Ok(())
++    }
++}
++
++// An expression with ${name ...} references that a loaded object may register
++// a function under, or with an error left for its expansion. Like make, which
++// reads text when it expands it, it is read again whenever a function has been
++// registered since it was read, and an error its reading left is raised where
++// its expansion reaches the part holding it. The --warn warnings waiting for
++// its expansion are given when it is first expanded, or when the condition it
++// was read for is split again.
++#[derive(Debug, PartialEq)]
++pub struct LazyCalls {
++    loc: Loc,
++    text: Bytes,
++    terms: Option<Vec<u8>>,
++    opt: ParseExprOpt,
++    trim_right_sp: bool,
++    end_paren: bool,
++    value: Arc<Value>,
++    names: Vec<Symbol>,
++    error: Option<(Loc, String)>,
++    registrations: usize,
++    reread: Reread,
++    warnings: PendingWarnings,
++}
++
++impl LazyCalls {
++    fn eval(&self, ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
++        self.give_warnings();
++        if loaded_func_registrations() == self.registrations {
++            return self.value.eval(ev, out);
++        }
++        self.reread
++            .read(
++                &self.loc,
++                &self.text,
++                self.terms.as_deref(),
++                self.opt,
++                self.trim_right_sp,
++                self.end_paren,
++            )?
++            .eval(ev, out)
++    }
++
++    fn is_func(&self) -> bool {
++        self.value.is_func()
++            || self
++                .names
++                .iter()
++                .any(|name| find_loaded_func(*name).is_some())
++    }
++
++    // Gives the warnings waiting for its expansion, the first time it is
++    // called, leaving out those about calls whose names are functions by then.
++    fn give_warnings(&self) {
++        for w in std::mem::take(&mut *self.warnings.0.lock()) {
++            if w.name.is_none_or(|name| find_loaded_func(name).is_none()) {
++                kati_warn_loc!(Some(&w.loc), "{}", w.msg);
++            }
++        }
++    }
++}
++
++// Where make splits a parenthesized ifeq condition: at its first comma outside
++// parentheses, counting no other brackets.
++fn ifeq_comma(cond: &[u8]) -> Option<usize> {
++    let mut depth = 0;
++    for (i, &c) in cond.iter().enumerate() {
++        if c == b'(' {
++            depth += 1;
++        } else if c == b')' {
++            depth -= 1;
++        } else if c == b',' && depth <= 0 {
++            return Some(i);
++        }
++    }
++    None
++}
++
++// Both sides of a parenthesized ifeq whose first side depends on loaded
++// functions. A call there may hold the comma kati split at, so like make,
++// which splits the condition at that comma before expanding it, the condition
++// is split there and its sides are read again whenever a function has been
++// registered since kati read them.
++#[derive(Debug)]
++pub struct LazyCondition {
++    loc: Loc,
++    cond: Bytes,
++    comma: Option<usize>,
++    lhs: Arc<Value>,
++    // None when kati found no comma.
++    rhs: Option<Arc<Value>>,
++    registrations: usize,
++    split: Mutex<Option<Split>>,
++}
++
++// The latest split of a LazyCondition, with the number of registrations then.
++#[derive(Debug)]
++struct Split {
++    registrations: usize,
++    lhs: Arc<Value>,
++    rhs: Arc<Value>,
++}
++
++impl PartialEq for LazyCondition {
++    fn eq(&self, other: &Self) -> bool {
++        self.cond == other.cond && self.lhs == other.lhs && self.rhs == other.rhs
++    }
++}
++
++impl LazyCondition {
++    fn first_reading(&self, side: usize) -> Option<&Arc<Value>> {
++        if side == 0 {
++            Some(&self.lhs)
++        } else {
++            self.rhs.as_ref()
++        }
++    }
++
++    fn current(&self, side: usize) -> Result<Arc<Value>> {
++        let registrations = loaded_func_registrations();
++        if let Some(rhs) = &self.rhs
++            && registrations == self.registrations
++        {
++            return Ok(if side == 0 { &self.lhs } else { rhs }.clone());
++        }
++        // The sides as kati first read them are not expanded, so the warnings
++        // they keep for their expansion are given here. Reading the condition
++        // again gives none.
++        for reading in [Some(&self.lhs), self.rhs.as_ref()].into_iter().flatten() {
++            if let Value::LazyCalls(lazy) = &**reading {
++                lazy.give_warnings();
++            }
++        }
++        let Some(comma) = self.comma.filter(|_| registrations != self.registrations) else {
++            // Kati found no comma, and make finds none either or no function
++            // has been registered since kati read the condition, which then
++            // fails as it does in a makefile that loads nothing: with an error
++            // kati met reading the first side, if it met one.
++            if registrations == self.registrations
++                && let Value::LazyCalls(lazy) = &*self.lhs
++            {
++                raise_left_error(&lazy.error)?;
++            }
++            error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
++        };
++        let mut split = self.split.lock();
++        if !matches!(&*split, Some(split) if split.registrations == registrations) {
++            let (lhs, rhs) = read_again(|| -> Result<_> {
++                let mut loc = self.loc.clone();
++                let lhs = self.cond.slice_ref(trim_right_space(&self.cond[..comma]));
++                let (_, lhs) = parse_expr_impl(&mut loc, lhs, None, ParseExprOpt::Normal, false)?;
++                let rhs = self
++                    .cond
++                    .slice_ref(trim_left_space(&self.cond[comma + 1..]));
++                let (_, rhs) =
++                    parse_expr_impl_ext(&mut loc, rhs, None, ParseExprOpt::Normal, false, true)?;
++                Ok((lhs, rhs))
++            })?;
++            *split = Some(Split {
++                registrations,
++                lhs,
++                rhs,
++            });
++        }
++        let split = split.as_ref().unwrap();
++        Ok(if side == 0 {
++            split.lhs.clone()
++        } else {
++            split.rhs.clone()
++        })
++    }
++}
++
++/// |cond| is a parenthesized ifeq condition kati split into |lhs| and |rhs|,
++/// or into |lhs| alone, with |rhs| None, when it found no comma. If reading
++/// |lhs| depends on the functions loaded objects register, the sides become
++/// ones that split |cond| again the way make splits it. Returns whether the
++/// condition can be used.
++pub fn resplit_ifeq_later(
++    loc: &Loc,
++    cond: &Bytes,
++    lhs: &mut Arc<Value>,
++    rhs: &mut Option<Arc<Value>>,
++) -> bool {
++    if !objects_can_load() || !matches!(&**lhs, Value::LazyCalls(_)) {
++        return rhs.is_some();
++    }
++    let comma = ifeq_comma(cond);
++    // When neither kati nor make finds a comma, the condition fails when it is
++    // evaluated, so later errors in the text wait for it.
++    if rhs.is_none() && comma.is_none() {
++        TextErrors::set_left();
++    }
++    let lazy = Arc::new(LazyCondition {
++        loc: loc.clone(),
++        cond: cond.clone(),
++        comma,
++        lhs: lhs.clone(),
++        rhs: rhs.clone(),
++        registrations: loaded_func_registrations(),
++        split: Mutex::new(None),
++    });
++    *lhs = Arc::new(Value::ConditionSide {
++        cond: lazy.clone(),
++        side: 0,
++    });
++    *rhs = Some(Arc::new(Value::ConditionSide {
++        cond: lazy,
++        side: 1,
++    }));
++    true
++}
++
++// The latest reading of a text made again as loaded objects registered
++// functions, with the number of registrations then. An expansion still using
++// an earlier reading keeps it alive.
++#[derive(Debug, Default)]
++pub struct Reread(Mutex<Option<(usize, Arc<Value>)>>);
++
++// A cache, which equality ignores.
++impl PartialEq for Reread {
++    fn eq(&self, _: &Self) -> bool {
++        true
++    }
++}
++
++// A --warn warning waiting for the expansion of the expression it was met
++// reading. One about a call read as a variable reference has the call's |name|.
++#[derive(Debug)]
++struct WaitingWarning {
++    name: Option<Symbol>,
++    loc: Loc,
++    msg: String,
++}
++
++// The warnings a LazyCalls has not given yet, which equality ignores.
++#[derive(Debug, Default)]
++pub struct PendingWarnings(Mutex<Vec<WaitingWarning>>);
++
++impl PartialEq for PendingWarnings {
++    fn eq(&self, _: &Self) -> bool {
++        true
++    }
++}
++
++impl Reread {
++    fn read(
++        &self,
++        loc: &Loc,
++        text: &Bytes,
++        terms: Option<&[u8]>,
++        opt: ParseExprOpt,
++        trim_right_sp: bool,
++        end_paren: bool,
++    ) -> Result<Arc<Value>> {
++        let registrations = loaded_func_registrations();
++        let mut reread = self.0.lock();
++        if let Some((count, reading)) = &*reread
++            && *count == registrations
++        {
++            return Ok(reading.clone());
++        }
++        let mut loc = loc.clone();
++        let (_, reading) = read_again(|| {
++            parse_expr_impl_ext(&mut loc, text.clone(), terms, opt, trim_right_sp, end_paren)
++        })?;
++        *reread = Some((registrations, reading.clone()));
++        Ok(reading)
++    }
++}
++
++// What reading the expression being parsed found: the names of its
++// ${name ...} references that a loaded object may register a function under,
++// whether one of them was read as a variable reference because it was not a
++// function yet, and the first error its reading left for its expansion. |raw|
++// is whether the text is read as gmk_expand reads it, |comments| whether its
++// comments are read, |warnings| the --warn warnings waiting for its expansion,
++// |list_read| whether the reading has reached the list of its parts.
++#[derive(Default)]
++struct ExprCalls {
++    names: Vec<Symbol>,
++    has_unread: bool,
++    error: Option<(Loc, String)>,
++    raw: bool,
++    comments: bool,
++    warnings: Vec<WaitingWarning>,
++    list_read: bool,
++}
++
++thread_local! {
++    static EXPR_CALLS: RefCell<Option<ExprCalls>> = const { RefCell::new(None) };
++    // While makefile text is read, whether an expression read from it left its
++    // error for its expansion.
++    static TEXT_LEFT_ERROR: Cell<Option<bool>> = const { Cell::new(None) };
++    // While an expression is read again because a function has been registered
++    // since it was read. Its first reading gave its warnings.
++    static READING_AGAIN: Cell<bool> = const { Cell::new(false) };
++    // The expressions whose --warn warnings wait for their expansion, in the
++    // order they were read.
++    static WAITING_WARNINGS: RefCell<Vec<Weak<Value>>> = const { RefCell::new(Vec::new()) };
++}
++
++/// While one is alive, an error met reading an expression waits for the
++/// expression's expansion once an expression read earlier has left its error,
++/// as make reaches a line of a makefile only after expanding the lines before
++/// it. The parser keeps one while it reads a makefile's text.
++pub struct TextErrors {
++    saved: Option<bool>,
++}
++
++impl TextErrors {
++    pub fn start() -> Self {
++        TextErrors {
++            saved: TEXT_LEFT_ERROR.replace(Some(false)),
++        }
++    }
++
++    /// Whether an expression read so far left its error for its expansion.
++    pub fn left() -> bool {
++        TEXT_LEFT_ERROR.get() == Some(true)
++    }
++
++    /// Records that the text being read left an error for its expansion.
++    pub fn set_left() {
++        if TEXT_LEFT_ERROR.get().is_some() {
++            TEXT_LEFT_ERROR.set(Some(true));
++        }
++    }
++}
++
++impl Drop for TextErrors {
++    fn drop(&mut self) {
++        TEXT_LEFT_ERROR.set(self.saved);
++    }
++}
++
++static OBJECTS_CAN_LOAD: AtomicBool = AtomicBool::new(false);
++
++// Whether the "eval" at |i| in |text| calls eval: right after $( or ${, or as
++// the function $(call) is given.
++fn calls_eval_at(text: &[u8], i: usize) -> bool {
++    if text.get(i + 4).is_some_and(|c| !b" \t,)}".contains(c)) {
++        return false;
++    }
++    let opens = |b: usize| b >= 2 && b"({".contains(&text[b - 1]) && text[b - 2] == b'$';
++    if opens(i) {
++        return true;
++    }
++    let mut b = i;
++    while b > 0 && (text[b - 1] == b' ' || text[b - 1] == b'\t') {
++        b -= 1;
++    }
++    b < i && b >= 4 && &text[b - 4..b] == b"call" && opens(b - 4)
++}
++
++/// Whether `text` calls the eval function, whose text can load objects.
++pub fn calls_eval(text: &[u8]) -> bool {
++    text.windows(4)
++        .enumerate()
++        .any(|(i, w)| w == b"eval" && calls_eval_at(text, i))
++}
++
++/// Notes that a makefile about to be read can load an object: it has a load,
++/// -load or include directive, or calls the eval function. From then on, what
++/// rkati meets reading text that may call the functions objects register waits
++/// for the text's expansion. Until then rkati reads text as it does without
++/// loaded objects.
++pub fn note_objects_can_load() {
++    OBJECTS_CAN_LOAD.store(true, Ordering::Relaxed);
++}
++
++/// Whether a makefile read so far can load an object.
++pub fn objects_can_load() -> bool {
++    OBJECTS_CAN_LOAD.load(Ordering::Relaxed)
++}
++
++/// Gives the --warn warnings still waiting for the expansion of the expressions
++/// read so far, so that one never expanded does not keep them back.
++pub fn give_waiting_warnings() {
++    for lazy in WAITING_WARNINGS.take() {
++        if let Some(lazy) = lazy.upgrade()
++            && let Value::LazyCalls(lazy) = &*lazy
++        {
++            lazy.give_warnings();
++        }
++    }
++}
++
++// Whether the text being read is read as gmk_expand reads it.
++fn reading_raw() -> bool {
++    EXPR_CALLS.with(|calls| calls.borrow().as_ref().is_some_and(|calls| calls.raw))
++}
++
++fn raise_left_error(error: &Option<(Loc, String)>) -> Result<()> {
++    if let Some((loc, msg)) = error {
++        error_loc!(Some(loc), "{msg}");
++    }
++    Ok(())
++}
++
++// Reads text again with |read|, which then gives no warnings.
++fn read_again<T>(read: impl FnOnce() -> T) -> T {
++    let again = READING_AGAIN.replace(true);
++    let r = read();
++    READING_AGAIN.set(again);
++    r
++}
++
++// Gives a --warn warning met reading the text, the first time it is read and
++// unless the text has left an error, where base kati stops reading. When
++// objects can be loaded, once the expression has a call read as a variable
++// reference, the warning waits for its expansion, where one about such a call,
++// to |unread|, is given only if |unread| is still no function: a function that
++// a later load registers is not reported.
++fn read_warning(unread: Option<Symbol>, loc: &Loc, msg: String) {
++    if READING_AGAIN.get() || TextErrors::left() {
++        return;
++    }
++    let msg = EXPR_CALLS.with(|calls| match calls.borrow_mut().as_mut() {
++        Some(calls) if calls.error.is_some() => None,
++        Some(calls) if calls.has_unread && objects_can_load() => {
++            calls.warnings.push(WaitingWarning {
++                name: unread,
++                loc: loc.clone(),
++                msg,
++            });
++            None
++        }
++        _ => Some(msg),
++    });
++    if let Some(msg) = msg {
++        kati_warn_loc!(Some(loc), "{msg}");
++    }
++}
++
++// The error the expression being read left for its expansion.
++fn left_error() -> Option<(Loc, String)> {
++    EXPR_CALLS.with(|calls| {
++        calls
++            .borrow()
++            .as_ref()
++            .and_then(|calls| calls.error.clone())
++    })
++}
++
++// Leaves an error met reading the text for the expression's expansion.
++fn leave_parse_error(loc: &Loc, msg: String) {
++    EXPR_CALLS.with(|calls| {
++        if let Some(calls) = calls.borrow_mut().as_mut()
++            && calls.error.is_none()
++        {
++            calls.error = Some((loc.clone(), msg));
++            TextErrors::set_left();
++        }
++    });
++}
++
++// Reports an error in the text being read. While the text is read again, and
++// when objects can be loaded once the expression it belongs to has a call read
++// as a variable reference or an expression read earlier left its error, the
++// error waits for the expression's expansion, as make reads text only when it
++// expands it.
++fn parse_error(loc: &Loc, msg: String) -> Result<()> {
++    let waits = EXPR_CALLS.with(|calls| {
++        calls.borrow().as_ref().is_some_and(|calls| {
++            READING_AGAIN.get() || (objects_can_load() && (calls.has_unread || TextErrors::left()))
++        })
++    });
++    if !waits {
++        error_loc!(Some(loc), "{msg}");
++    }
++    leave_parse_error(loc, msg);
++    Ok(())
+ }
+ 
+ impl Evaluable for Value {
+@@ -147,9 +680,25 @@ impl Evaluable for Value {
+                     args
+                 );
+                 ev.eval_depth += 1;
+-                (fi.func)(args, ev, out)?;
++                let saved_func_loc = ev.func_loc.replace(loc.clone());
++                let r = (fi.func)(args, ev, out);
++                ev.func_loc = saved_func_loc;
++                r?;
+                 ev.eval_depth -= 1;
+             }
++            Value::LoadedFuncCall(call) => call.eval(ev, out)?,
++            Value::LazyCalls(lazy) => lazy.eval(ev, out)?,
++            Value::ConditionSide { cond, side } => cond.current(*side)?.eval(ev, out)?,
++            // Like make, an error in text read without a file name is
++            // reported where it is expanded.
++            Value::ReadError { loc, msg } => {
++                let loc = if loc.has_file() {
++                    Some(loc.clone())
++                } else {
++                    ev.loc.clone()
++                };
++                error_loc!(loc.as_ref(), "{msg}")
++            }
+         }
+         Ok(())
+     }
+@@ -157,6 +706,11 @@ impl Evaluable for Value {
+     fn is_func(&self) -> bool {
+         match self {
+             Value::Func { .. } => true,
++            Value::LoadedFuncCall(_) => true,
++            Value::LazyCalls(lazy) => lazy.is_func(),
++            Value::ConditionSide { cond, side } => {
++                cond.first_reading(*side).is_some_and(|v| v.is_func())
++            }
+             Value::List(_, list) => list.iter().any(|v| v.is_func()),
+             Value::SymRef(_, sym) => {
+                 // This is a heuristic, where say that if a variable has positional
+@@ -172,7 +726,7 @@ impl Evaluable for Value {
+             Value::VarSubst {
+                 name, pat, subst, ..
+             } => name.is_func() || pat.is_func() || subst.is_func(),
+-            Value::Literal(_, _) => false,
++            Value::Literal(_, _) | Value::ReadError { .. } => false,
+         }
+     }
+ }
+@@ -186,6 +740,10 @@ impl Value {
+             Value::VarRef(loc, _) => Some(loc.clone()),
+             Value::VarSubst { loc, .. } => Some(loc.clone()),
+             Value::Func { loc, .. } => Some(loc.clone()),
++            Value::LoadedFuncCall(call) => Some(call.loc.clone()),
++            Value::LazyCalls(lazy) => Some(lazy.loc.clone()),
++            Value::ConditionSide { cond, .. } => Some(cond.loc.clone()),
++            Value::ReadError { loc, .. } => Some(loc.clone()),
+         }
+     }
+ }
+@@ -199,7 +757,10 @@ fn close_paren(c: u8) -> Option<u8> {
+ }
+ 
+ fn should_handle_comments(opt: ParseExprOpt) -> bool {
+-    !matches!(opt, ParseExprOpt::Define | ParseExprOpt::Command)
++    !matches!(
++        opt,
++        ParseExprOpt::Define | ParseExprOpt::Command | ParseExprOpt::Expand
++    )
+ }
+ 
+ fn skip_spaces(loc: &mut Loc, s: &[u8], terms: &[u8]) -> usize {
+@@ -212,7 +773,8 @@ fn skip_spaces(loc: &mut Loc, s: &[u8], terms: &[u8]) -> usize {
+         }
+ 
+         if !c.is_ascii_whitespace() {
+-            if !remaining.starts_with(b"\\\r") && !remaining.starts_with(b"\\\n") {
++            let continued = remaining.starts_with(b"\\\r") || remaining.starts_with(b"\\\n");
++            if !continued || reading_raw() {
+                 return i;
+             }
+ 
+@@ -254,7 +816,7 @@ fn parse_func(
+                 }
+ 
+                 let t = &s[i..];
+-                if t.starts_with(b"\\\r") || t.starts_with(b"\\\n") {
++                if (t.starts_with(b"\\\r") || t.starts_with(b"\\\n")) && !reading_raw() {
+                     loc.line += 1;
+                     i += 1;
+                     continue;
+@@ -276,12 +838,15 @@ fn parse_func(
+         args.push(val);
+         i += n;
+         if i == s.len() {
+-            error_loc!(
+-                Some(&start_loc),
+-                "*** unterminated call to function '{}': missing '{}'.",
+-                String::from_utf8_lossy(fi.name),
+-                char::from(terms[0])
+-            );
++            parse_error(
++                &start_loc,
++                format!(
++                    "*** unterminated call to function '{}': missing '{}'.",
++                    String::from_utf8_lossy(fi.name),
++                    char::from(terms[0])
++                ),
++            )?;
++            return Ok((i, args));
+         }
+         nargs += 1;
+         if s[i] == terms[0] {
+@@ -295,17 +860,170 @@ fn parse_func(
+     }
+ 
+     if nargs <= fi.min_arity {
+-        error_loc!(
+-            Some(&start_loc),
+-            "*** insufficient number of arguments ({}) to function `{}'.",
+-            nargs - 1,
+-            String::from_utf8_lossy(fi.name)
+-        );
++        parse_error(
++            &start_loc,
++            format!(
++                "*** insufficient number of arguments ({}) to function `{}'.",
++                nargs - 1,
++                String::from_utf8_lossy(fi.name)
++            ),
++        )?;
+     }
+ 
+     Ok((i, args))
+ }
+ 
++// The text an unexpanded argument passes. Outside gmk_expand text, a
++// backslash-newline and the blanks around it read as one space, as make reads
++// them. \# reads as # on the lines whose comments kati reads, as kati's
++// builtins read it there (make does so on assignment and directive lines);
++// recipes and define bodies keep it.
++fn raw_arg_text(s: &[u8]) -> Bytes {
++    if reading_raw() {
++        return Bytes::copy_from_slice(s);
++    }
++    let comments =
++        EXPR_CALLS.with(|calls| calls.borrow().as_ref().is_some_and(|calls| calls.comments));
++    let mut r = BytesMut::new();
++    let mut i = 0;
++    while i < s.len() {
++        let c = s[i];
++        if c == b'\\' && i + 1 < s.len() {
++            let n = s[i + 1];
++            if n == b'\\' || (n == b'#' && comments) {
++                if n == b'\\' {
++                    r.put_u8(c);
++                }
++                r.put_u8(n);
++                i += 2;
++                continue;
++            }
++            if n == b'\r' || n == b'\n' {
++                let kept = trim_right_space(&r).len();
++                r.truncate(kept);
++                r.put_u8(b' ');
++                i += 2;
++                if n == b'\r' && s.get(i) == Some(&b'\n') {
++                    i += 1;
++                }
++                while i < s.len() {
++                    let t = &s[i..];
++                    if t.starts_with(b"\\\r") || t.starts_with(b"\\\n") {
++                        i += 2;
++                        continue;
++                    }
++                    if t[0] != b' ' && t[0] != b'\t' {
++                        break;
++                    }
++                    i += 1;
++                }
++                continue;
++            }
++        }
++        r.put_u8(c);
++        i += 1;
++    }
++    r.freeze()
++}
++
++// Where the arguments in |s|, the text of a call between its brackets, lie in
++// it. Like make, it is split at each comma outside brackets of the call's own
++// kind, |open| and |close|, until there are |max_args| arguments, if that is
++// not 0. Brackets of the other kind are not counted: GNU make splits
++// $(f ${a,b}) into ${a and b}.
++fn split_args(s: &[u8], open: u8, close: u8, max_args: usize) -> Vec<Range<usize>> {
++    let mut args = Vec::new();
++    let mut depth = 0;
++    let mut b = 0;
++    for (i, &c) in s.iter().enumerate() {
++        if max_args > 0 && args.len() + 1 >= max_args {
++            break;
++        }
++        if c == open {
++            depth += 1;
++        } else if c == close {
++            depth -= 1;
++        } else if c == b',' && depth == 0 {
++            args.push(b..i);
++            b = i + 1;
++        }
++    }
++    args.push(b..s.len());
++    args
++}
++
++// Parses ${name ...} for |func|, the function a loaded object registered
++// under |name|. Like make, the call ends at the first unmatched bracket of its
++// kind, and its text is split at commas outside brackets of that kind before
++// anything in it is read, the last argument it takes getting the rest. The
++// text of arguments it does not expand is never parsed.
++fn parse_loaded_func_call(
++    loc: &mut Loc,
++    s: &Bytes,
++    mut i: usize,
++    cp: u8,
++    name: Symbol,
++    func: LoadedFunc,
++    start_loc: &Loc,
++) -> Result<(usize, Arc<Value>)> {
++    i += skip_spaces(loc, &s[i..], &[cp, b',']);
++    let mut depth = 0;
++    for (n, &c) in s[i..].iter().enumerate() {
++        if c == s[1] {
++            depth += 1;
++        } else if c == cp {
++            depth -= 1;
++            if depth < 0 {
++                let text = s.slice(i..i + n);
++                let pieces = split_args(&text, s[1], cp, func.max_args as usize);
++                let mut call = LoadedFuncCall {
++                    loc: start_loc.clone(),
++                    name,
++                    expand_args: func.expand_args,
++                    args: Vec::new(),
++                    raw_args: Vec::new(),
++                };
++                if func.expand_args {
++                    for piece in pieces {
++                        let arg = text.slice(piece);
++                        let (n, mut value) = parse_expr_impl(
++                            loc,
++                            arg.clone(),
++                            Some(&[]),
++                            ParseExprOpt::Func,
++                            false,
++                        )?;
++                        // Text the reader leaves at the end, like a $ that make
++                        // expands to itself, stays as it is.
++                        if n < arg.len() {
++                            value = Arc::new(Value::List(
++                                Some(loc.clone()),
++                                vec![value, Arc::new(Value::Literal(None, arg.slice(n..)))],
++                            ));
++                        }
++                        call.args.push(value);
++                    }
++                } else {
++                    loc.line += text.iter().filter(|&&c| c == b'\n').count() as i32;
++                    call.raw_args = pieces
++                        .into_iter()
++                        .map(|piece| raw_arg_text(&text[piece]))
++                        .collect();
++                }
++                return Ok((i + n + 1, Arc::new(Value::LoadedFuncCall(Box::new(call)))));
++            }
++        }
++    }
++    parse_error(
++        start_loc,
++        format!(
++            "*** unterminated call to function '{name}': missing '{}'.",
++            char::from(cp)
++        ),
++    )?;
++    Ok((s.len(), Arc::new(Value::Literal(None, Bytes::new()))))
++}
++
+ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<Value>)> {
+     assert!(s.len() >= 2);
+     assert!(s.starts_with(b"$"));
+@@ -320,8 +1038,9 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
+         ));
+     };
+ 
+-    let mut terms = vec![cp, b':', b' '];
++    let mut terms = vec![cp, b':', b' ', b'\t', b'\n', 0x0b, 0x0c, b'\r'];
+     let mut i = 2;
++    let mut unread = None;
+     loop {
+         let (n, vname) =
+             parse_expr_impl(loc, s.slice(i..), Some(&terms), ParseExprOpt::Normal, false)?;
+@@ -334,23 +1053,47 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
+                 if FLAGS.enable_kati_warnings
+                     && let Some(found) = sym.to_string().find([' ', '(', '{'])
+                 {
+-                    kati_warn_loc!(
+-                        Some(&start_loc),
+-                        "*warning*: variable lookup with '{}': {}",
+-                        &sym.to_string()[found..found + 1],
+-                        String::from_utf8_lossy(&s)
+-                    )
++                    read_warning(
++                        unread,
++                        &start_loc,
++                        format!(
++                            "*warning*: variable lookup with '{}': {}",
++                            &sym.to_string()[found..found + 1],
++                            String::from_utf8_lossy(&s)
++                        ),
++                    );
+                 }
+                 return Ok((i + 1, Arc::new(Value::SymRef(start_loc, sym))));
+             }
+             return Ok((i + 1, Arc::new(Value::VarRef(start_loc, vname))));
+         }
+ 
+-        if t.first() == Some(&b' ') || t.first() == Some(&b'\\') {
++        // Like make, which ends a function name at any whitespace, a tab or a
++        // newline may also end the name of a function a loaded object
++        // registered. rkati's own functions keep needing a space.
++        let other_space = t.first().is_some_and(|c| b"\t\n\x0b\x0c\r".contains(c));
++        if t.first() == Some(&b' ') || t.first() == Some(&b'\\') || other_space {
+             // ${func ...}
+             if let Value::Literal(_, lit) = &*vname {
+-                if let Some(fi) = get_func_info(lit) {
++                let fi = get_func_info(lit);
++                if let Some(fi) = fi.filter(|_| !other_space) {
+                     let (idx, args) = parse_func(loc, fi, s, i + 1, terms)?;
++                    if args.is_empty() {
++                        // A call left open before its first argument fails
++                        // only when it is expanded, as make reads text when it
++                        // expands it.
++                        return Ok((
++                            idx,
++                            Arc::new(Value::ReadError {
++                                loc: start_loc,
++                                msg: format!(
++                                    "*** unterminated call to function '{}': missing '{}'.",
++                                    String::from_utf8_lossy(fi.name),
++                                    char::from(cp)
++                                ),
++                            }),
++                        ));
++                    }
+                     return Ok((
+                         idx,
+                         Arc::new(Value::Func {
+@@ -359,19 +1102,38 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
+                             args,
+                         }),
+                     ));
+-                } else {
+-                    kati_warn_loc!(
+-                        Some(&start_loc),
+-                        "*warning*: unknown make function {lit:?}: {}",
+-                        String::from_utf8_lossy(&s)
++                }
++                let name = intern(lit.clone());
++                let loaded = fi.is_none().then(|| find_loaded_func(name)).flatten();
++                if fi.is_none() && is_loadable_func_name(lit) {
++                    EXPR_CALLS.with(|calls| {
++                        if let Some(calls) = calls.borrow_mut().as_mut() {
++                            calls.names.push(name);
++                            calls.has_unread |= loaded.is_none();
++                            unread = loaded.is_none().then_some(name);
++                        }
++                    });
++                }
++                if let Some(func) = loaded {
++                    return parse_loaded_func_call(loc, &s, i + 1, cp, name, func, &start_loc);
++                }
++                if FLAGS.enable_kati_warnings && !other_space {
++                    read_warning(
++                        unread,
++                        &start_loc,
++                        format!(
++                            "*warning*: unknown make function {lit:?}: {}",
++                            String::from_utf8_lossy(&s)
++                        ),
+                     );
+                 }
+             }
+ 
+             // Not a function. Drop ' ' from |terms| and parse it
+             // again. This is inefficient, but this code path should be
+-            // rarely used.
+-            terms.truncate(2);
++            // rarely used. A name another space ended is read again up to a
++            // ' ', as rkati reads it.
++            terms.truncate(if other_space { 3 } else { 2 });
+             i = 2;
+             continue;
+         }
+@@ -403,6 +1165,21 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
+                     )),
+                 ));
+             }
++            if i >= s.len() {
++                parse_error(
++                    &start_loc,
++                    "*** unterminated variable reference.".to_string(),
++                )?;
++                return Ok((
++                    s.len(),
++                    Arc::new(Value::VarSubst {
++                        loc: start_loc,
++                        name: vname,
++                        pat,
++                        subst: Arc::new(Value::Literal(None, Bytes::new())),
++                    }),
++                ));
++            }
+ 
+             terms.truncate(1);
+             let (n, subst) = parse_expr_impl(
+@@ -413,8 +1190,10 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
+                 false,
+             )?;
+             i += 1 + n;
++            // A substitution left open ends with the text, so callers never
++            // read past it.
+             return Ok((
+-                i + 1,
++                (i + 1).min(s.len()),
+                 Arc::new(Value::VarSubst {
+                     loc: start_loc,
+                     name: vname,
+@@ -427,18 +1206,37 @@ fn parse_dollar(loc: &mut Loc, s: Bytes, end_paren: bool) -> Result<(usize, Arc<
+         // GNU make accepts expressions like $((). See unmatched_paren*.mk
+         // for detail.
+         if let Some(found) = memchr(cp, &s) {
+-            kati_warn_loc!(
+-                Some(&start_loc),
+-                "*warning*: unmatched parentheses: {}",
+-                String::from_utf8_lossy(&s)
+-            );
++            if FLAGS.enable_kati_warnings {
++                read_warning(
++                    None,
++                    &start_loc,
++                    format!(
++                        "*warning*: unmatched parentheses: {}",
++                        String::from_utf8_lossy(&s)
++                    ),
++                );
++            }
+             return Ok((
+                 s.len(),
+                 Arc::new(Value::SymRef(start_loc.clone(), intern(s.slice(2..found)))),
+             ));
+         }
+ 
+-        error_loc!(Some(&start_loc), "*** unterminated variable reference.");
++        let mut msg = "*** unterminated variable reference.".to_string();
++        if let Value::Literal(_, name) = &*vname
++            && find_loaded_func(intern(name.clone())).is_some()
++        {
++            // As make does, the name of a function registered when the text is
++            // read, left open, is reported as an unterminated call. Builtins
++            // keep kati's message.
++            msg = format!(
++                "*** unterminated call to function '{}': missing '{}'.",
++                String::from_utf8_lossy(name),
++                char::from(cp)
++            );
++        }
++        parse_error(&start_loc, msg)?;
++        return Ok((s.len(), Arc::new(Value::VarRef(start_loc, vname))));
+     }
+ }
+ 
+@@ -461,9 +1259,67 @@ pub fn parse_expr_impl_ext(
+     // This is for compatibility with a read-past-end in ckati
+     end_paren: bool,
+ ) -> Result<(usize, Arc<Value>)> {
+-    let list_loc = loc.clone();
++    if EXPR_CALLS.with(|calls| calls.borrow().is_some()) {
++        return parse_expr_list(loc, s, terms, opt, trim_right_sp, end_paren);
++    }
++
++    let start_loc = loc.clone();
++    EXPR_CALLS.with(|calls| {
++        *calls.borrow_mut() = Some(ExprCalls {
++            raw: opt == ParseExprOpt::Expand,
++            comments: should_handle_comments(opt),
++            ..Default::default()
++        })
++    });
++    let parsed = parse_expr_list(loc, s.clone(), terms, opt, trim_right_sp, end_paren);
++    let calls = EXPR_CALLS.with(|calls| calls.borrow_mut().take().unwrap_or_default());
++    let (n, value) = parsed?;
++    if calls.names.is_empty() && calls.error.is_none() {
++        return Ok((n, value));
++    }
++    let waits = !calls.warnings.is_empty();
++    let lazy = Arc::new(Value::LazyCalls(Box::new(LazyCalls {
++        loc: start_loc,
++        text: s.slice(..n.min(s.len())),
++        terms: terms.map(|t| t.to_vec()),
++        opt,
++        trim_right_sp,
++        end_paren,
++        value,
++        names: calls.names,
++        error: calls.error,
++        registrations: loaded_func_registrations(),
++        reread: Reread::default(),
++        warnings: PendingWarnings(Mutex::new(calls.warnings)),
++    })));
++    if waits {
++        WAITING_WARNINGS.with_borrow_mut(|waiting| waiting.push(Arc::downgrade(&lazy)));
++    }
++    Ok((n, lazy))
++}
+ 
+-    let s = s.slice_ref(trim_suffix(&s, b"\r"));
++fn parse_expr_list(
++    loc: &mut Loc,
++    s: Bytes,
++    terms: Option<&[u8]>,
++    opt: ParseExprOpt,
++    trim_right_sp: bool,
++    end_paren: bool,
++) -> Result<(usize, Arc<Value>)> {
++    let list_loc = loc.clone();
++    let raw = reading_raw();
++    let parts = EXPR_CALLS.with(|calls| {
++        calls
++            .borrow_mut()
++            .as_mut()
++            .is_some_and(|calls| !std::mem::replace(&mut calls.list_read, true))
++    });
++
++    let s = if raw {
++        s
++    } else {
++        s.slice_ref(trim_suffix(&s, b"\r"))
++    };
+ 
+     let mut b = 0usize;
+     let mut save_paren: Option<u8> = None;
+@@ -502,6 +1358,10 @@ pub fn parse_expr_impl_ext(
+ 
+         if c == b'$' {
+             if i + 1 >= s.len() {
++                // As make does, gmk_expand keeps a $ that ends the text.
++                if raw {
++                    i += 1;
++                }
+                 break;
+             }
+ 
+@@ -527,7 +1387,16 @@ pub fn parse_expr_impl_ext(
+                 return Ok((i + 1, Arc::new(Value::List(Some(item_loc), list))));
+             }
+ 
++            let had_error = parts && left_error().is_some();
+             let (n, v) = parse_dollar(loc, s.slice(i..), end_paren)?;
++            // The expansion raises an error left reading this part when it
++            // reaches the part, after expanding the ones before it.
++            if parts
++                && !had_error
++                && let Some((loc, msg)) = left_error()
++            {
++                list.push(Arc::new(Value::ReadError { loc, msg }));
++            }
+             list.push(v);
+             i += n;
+             b = i;
+@@ -558,7 +1427,7 @@ pub fn parse_expr_impl_ext(
+             }
+         }
+ 
+-        if c == b'\\' && i + 1 < s.len() && opt != ParseExprOpt::Command {
++        if c == b'\\' && i + 1 < s.len() && opt != ParseExprOpt::Command && !raw {
+             let n = remaining[1];
+             if n == b'\\' {
+                 i += 2;
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 0ab7def..e3608a1 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -37,6 +37,7 @@ use crate::{
+     find::FindCommand,
+     flags::FLAGS,
+     kati_warn_loc,
++    loadapi::{call_loaded_func, find_loaded_func},
+     loc::Loc,
+     log,
+     parser::parse_buf,
+@@ -720,6 +721,25 @@ fn call_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> R
+     let func_name_buf = args[0].eval_to_buf(ev)?;
+     let func_name_buf = func_name_buf.slice_ref(trim_space(&func_name_buf));
+     let func_sym = intern(func_name_buf.clone());
++    // Like make, which finds a function by the first word of the name.
++    let first_word = match func_name_buf
++        .iter()
++        .position(|c| b" \t\n\x0b\x0c\r".contains(c))
++    {
++        Some(end) => intern(func_name_buf.slice(..end)),
++        None => func_sym,
++    };
++    // Like make, a loaded function runs as a builtin does, without the numbered
++    // variables a call of a variable sets, so gmk_expand and gmk_eval in it see
++    // the caller's $(1).
++    if let Some(loaded) = find_loaded_func(first_word) {
++        let mut call_args = Vec::with_capacity(args.len() - 1);
++        for arg in &args[1..] {
++            call_args.push(arg.eval_to_buf(ev)?);
++        }
++        let loc = ev.func_loc.clone().unwrap_or_default();
++        return call_loaded_func(ev, &loc, first_word, loaded, call_args, out);
++    }
+     let func = ev.lookup_var(func_sym)?;
+     if let Some(func) = &func {
+         let func = func.read();
+@@ -824,18 +844,31 @@ fn info_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) ->
+         s.put_u8(b'"');
+         ev.delayed_output_commands.push(s.freeze());
+     } else {
++        // What an object printed without a newline comes first, as in make's
++        // single stream.
++        crate::loadapi::flush_c_stdout();
+         println!("{}", String::from_utf8_lossy(&a));
+     }
+     Ok(())
+ }
+ 
++// The location a warning or an error starts with. Like make, a location without
++// a file name has none.
++fn loc_prefix(loc: Option<&Loc>) -> String {
++    let loc = loc.cloned().unwrap_or_default();
++    if loc.has_file() {
++        format!("{loc}: ")
++    } else {
++        String::new()
++    }
++}
++
+ fn warning_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
+     let a = args[0].eval_to_buf(ev)?;
+     if ev.avoid_io {
+         let mut s = BytesMut::new();
+         s.put_slice(b"echo -e \"");
+-        s.put_slice(ev.loc.clone().unwrap_or_default().to_string().as_bytes());
+-        s.put_slice(b": ");
++        s.put_slice(loc_prefix(ev.loc.as_ref()).as_bytes());
+         s.put_slice(&echo_escape(&a));
+         s.put_slice(b"\" 2>&1");
+         ev.delayed_output_commands.push(s.freeze());
+@@ -850,8 +883,8 @@ fn error_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) ->
+     if ev.avoid_io {
+         let mut s = BytesMut::new();
+         s.put_slice(b"echo -e \"");
+-        s.put_slice(ev.loc.clone().unwrap_or_default().to_string().as_bytes());
+-        s.put_slice(b": *** ");
++        s.put_slice(loc_prefix(ev.loc.as_ref()).as_bytes());
++        s.put_slice(b"*** ");
+         s.put_slice(&echo_escape(&a));
+         s.put_slice(b".\" 2>&1 && false");
+         ev.delayed_output_commands.push(s.freeze());
+@@ -1286,6 +1319,7 @@ fn visibility_prefix_func(
+ fn debug_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) -> Result<()> {
+     let a = args[0].eval_to_buf(ev)?;
+     let loc = ev.loc.clone().unwrap_or_default();
++    crate::loadapi::flush_c_stdout();
+     for tok in word_scanner(&a) {
+         let tok = a.slice_ref(tok);
+         let tok = intern(tok);
+diff --git a/src-rs/lib.rs b/src-rs/lib.rs
+index 7e56e22..1b3e550 100644
+--- a/src-rs/lib.rs
++++ b/src-rs/lib.rs
+@@ -36,6 +36,7 @@ pub mod find;
+ pub mod flags;
+ pub mod func;
+ pub mod io;
++pub mod loadapi;
+ pub mod loc;
+ pub mod ninja;
+ pub mod parser;
+@@ -117,7 +118,7 @@ const MAGENTA: &str = "\x1b[35m";
+ const RED: &str = "\x1b[31m";
+ 
+ fn color_error_log(loc: Option<&crate::loc::Loc>, msg: String) -> anyhow::Error {
+-    let Some(loc) = loc else {
++    let Some(loc) = loc.filter(|loc| loc.has_file()) else {
+         return anyhow::format_err!("{msg}");
+     };
+ 
+@@ -131,7 +132,7 @@ fn color_error_log(loc: Option<&crate::loc::Loc>, msg: String) -> anyhow::Error
+ }
+ 
+ fn color_warn_log(loc: Option<&crate::loc::Loc>, msg: String) {
+-    let Some(loc) = loc else {
++    let Some(loc) = loc.filter(|loc| loc.has_file()) else {
+         eprintln!("{msg}");
+         return;
+     };
+diff --git a/src-rs/loadapi.rs b/src-rs/loadapi.rs
+new file mode 100644
+index 0000000..5c1db7b
+--- /dev/null
++++ b/src-rs/loadapi.rs
+@@ -0,0 +1,656 @@
++/*
++Copyright 2026 Google LLC
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++     https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++//! The load directive and the interface GNU make offers to loaded objects.
++
++use std::cell::{Cell, RefCell};
++use std::collections::HashMap;
++use std::ffi::{CStr, CString, OsStr, c_char, c_int, c_uint, c_ulong, c_void};
++use std::io::Write;
++use std::os::unix::ffi::OsStrExt;
++use std::sync::LazyLock;
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++use anyhow::Result;
++use bytes::{BufMut, Bytes, BytesMut};
++use parking_lot::Mutex;
++
++use crate::eval::Evaluator;
++use crate::expr::{Evaluable, ParseExprOpt, parse_expr};
++use crate::file_cache::add_extra_file_dep;
++use crate::fileutil::glob;
++use crate::loc::Loc;
++use crate::parser::parse_buf;
++use crate::symtab::{Symbol, intern};
++use crate::var::{VarOrigin, Variable};
++use crate::{error_loc, warn_loc};
++
++const NO_EXPAND: c_uint = 1;
++const MAX_FUNC_NAME_LEN: usize = 255;
++const MAX_ARG_COUNT: c_uint = 255;
++
++#[repr(C)]
++struct GmkFloc {
++    filenm: *const c_char,
++    lineno: c_ulong,
++}
++
++type GmkFunc = unsafe extern "C" fn(*const c_char, c_uint, *mut *mut c_char) -> *mut c_char;
++type SetupFunc = unsafe extern "C" fn(*const GmkFloc) -> c_int;
++
++#[derive(Clone, Copy)]
++pub struct LoadedFunc {
++    func: Option<GmkFunc>,
++    min_args: c_uint,
++    pub max_args: c_uint,
++    pub expand_args: bool,
++}
++
++static LOADED_FUNCS: LazyLock<Mutex<HashMap<Symbol, LoadedFunc>>> =
++    LazyLock::new(|| Mutex::new(HashMap::new()));
++
++// How many times loaded objects have registered a function, counting a name
++// registered again. Makefiles that load nothing never take the lock.
++static REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
++
++// Names handed to setup functions, which may keep them.
++static FILENAMES: LazyLock<Mutex<HashMap<Symbol, CString>>> =
++    LazyLock::new(|| Mutex::new(HashMap::new()));
++
++thread_local! {
++    // The evaluator a loaded object is calling back into, and where the text of
++    // the call to the function it runs was read, if it runs one.
++    static CALLBACK_EV: Cell<*mut Evaluator> = const { Cell::new(std::ptr::null_mut()) };
++    static CALLBACK_CALL_LOC: RefCell<Option<Loc>> = const { RefCell::new(None) };
++}
++
++pub fn find_loaded_func(name: Symbol) -> Option<LoadedFunc> {
++    if REGISTRATIONS.load(Ordering::Relaxed) == 0 {
++        return None;
++    }
++    LOADED_FUNCS.lock().get(&name).copied()
++}
++
++/// How many times loaded objects have registered a function, counting a name
++/// registered again.
++pub fn loaded_func_registrations() -> usize {
++    REGISTRATIONS.load(Ordering::Relaxed)
++}
++
++fn is_func_name_char(c: u8) -> bool {
++    c.is_ascii_alphanumeric() || c == b'.' || c == b'-' || c == b'_'
++}
++
++/// Whether a loaded object could register a function with this name.
++pub fn is_loadable_func_name(name: &[u8]) -> bool {
++    !name.is_empty()
++        && name[0] != b'.'
++        && name.len() <= MAX_FUNC_NAME_LEN
++        && name.iter().all(|&c| is_func_name_char(c))
++}
++
++unsafe extern "C" {
++    // C's standard output, which loaded objects print to.
++    #[cfg_attr(target_os = "macos", link_name = "__stdoutp")]
++    static mut stdout: *mut libc::FILE;
++}
++
++// Whether an object may have written to C's stdout.
++static C_STDOUT_USED: AtomicBool = AtomicBool::new(false);
++
++// Like make, which line-buffers its output, so that what an object prints
++// comes out a line at a time among rkati's own messages.
++fn line_buffer_c_stdout() {
++    static ONCE: std::sync::Once = std::sync::Once::new();
++    ONCE.call_once(|| {
++        // Given a buffer of its own, glibc line-buffers a stream that was
++        // already written to.
++        let buffer: &'static mut [c_char] = Box::leak(vec![0; 8192].into_boxed_slice());
++        // SAFETY: stdout is C's open standard output, and the buffer lives as
++        // long as the process.
++        unsafe {
++            libc::fflush(stdout);
++            libc::setvbuf(stdout, buffer.as_mut_ptr(), libc::_IOLBF, buffer.len());
++        }
++        C_STDOUT_USED.store(true, Ordering::Relaxed);
++    });
++}
++
++/// Writes out a line an object has started on C's stdout, which make's single
++/// stream would show before whatever rkati prints next.
++pub fn flush_c_stdout() {
++    if !C_STDOUT_USED.load(Ordering::Relaxed) {
++        return;
++    }
++    // SAFETY: fflush(NULL) flushes every C output stream and takes no pointer
++    // from us.
++    unsafe {
++        libc::fflush(std::ptr::null_mut());
++    }
++}
++
++// Runs a call into a loaded object, which may call back into |ev|, for the
++// call read at |call_loc| if it runs a function.
++fn with_callback<R>(ev: &mut Evaluator, call_loc: Option<&Loc>, f: impl FnOnce() -> R) -> R {
++    // What rkati has printed comes first, as in make's single stream.
++    let _ = std::io::stdout().flush();
++    let saved_loc = ev.loc.clone();
++    let ptr: *mut Evaluator = ev;
++    let saved = CALLBACK_EV.with(|c| c.replace(ptr));
++    let saved_call_loc = CALLBACK_CALL_LOC.replace(call_loc.cloned());
++    let r = f();
++    CALLBACK_CALL_LOC.set(saved_call_loc);
++    CALLBACK_EV.with(|c| c.set(saved));
++    ev.loc = saved_loc;
++    r
++}
++
++// Like make, an error inside a call back stops at once: the object never sees
++// the call return.
++fn fatal(err: anyhow::Error) -> ! {
++    let _ = std::io::stdout().flush();
++    for cause in err.chain() {
++        eprintln!("{cause}");
++    }
++    std::process::exit(1)
++}
++
++fn enter_callback<T>(f: impl FnOnce(&mut Evaluator) -> Result<T>) -> Option<T> {
++    let ptr = CALLBACK_EV.with(|c| c.get());
++    if ptr.is_null() {
++        return None;
++    }
++    // SAFETY: the pointer was set by with_callback from a live &mut
++    // Evaluator that is not used until the loaded object returns.
++    let ev = unsafe { &mut *ptr };
++    match f(ev) {
++        Ok(v) => Some(v),
++        Err(err) => fatal(err),
++    }
++}
++
++fn c_string(s: &[u8]) -> CString {
++    let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
++    CString::new(&s[..end]).unwrap_or_default()
++}
++
++// Like make, which exits when it runs out of memory.
++fn allocate(len: usize) -> *mut c_char {
++    // SAFETY: malloc has no preconditions.
++    let p = unsafe { libc::malloc(len) } as *mut c_char;
++    if p.is_null() {
++        fatal(anyhow::anyhow!("*** virtual memory exhausted."));
++    }
++    p
++}
++
++fn malloc_string(s: &[u8]) -> *mut c_char {
++    let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
++    let p = allocate(end + 1).cast::<u8>();
++    // SAFETY: the buffer was allocated with room for the bytes and the NUL
++    // that are written into it.
++    unsafe {
++        std::ptr::copy_nonoverlapping(s.as_ptr(), p, end);
++        *p.add(end) = 0;
++    }
++    p.cast::<c_char>()
++}
++
++fn dlerror_string() -> String {
++    // SAFETY: dlerror returns NULL or a NUL-terminated message.
++    unsafe {
++        let err = libc::dlerror();
++        if err.is_null() {
++            String::new()
++        } else {
++            CStr::from_ptr(err).to_string_lossy().into_owned()
++        }
++    }
++}
++
++fn dlsym(handle: *mut c_void, symbol: &CStr) -> *mut c_void {
++    // SAFETY: handle came from dlopen or is RTLD_DEFAULT, and symbol is
++    // NUL-terminated.
++    unsafe { libc::dlsym(handle, symbol.as_ptr()) }
++}
++
++// Opens the object the way make does: a name without a slash is looked up
++// in the current directory first, then where the dynamic loader searches.
++fn open_object(file: &[u8]) -> *mut c_void {
++    let mut handle = std::ptr::null_mut();
++    if !file.contains(&b'/') {
++        let mut local = b"./".to_vec();
++        local.extend_from_slice(file);
++        let local = c_string(&local);
++        // SAFETY: local is NUL-terminated.
++        handle = unsafe { libc::dlopen(local.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL) };
++    }
++    if handle.is_null() {
++        let file = c_string(file);
++        // SAFETY: file is NUL-terminated.
++        handle = unsafe { libc::dlopen(file.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL) };
++    }
++    handle
++}
++
++fn setup_symbol(file: &[u8]) -> Vec<u8> {
++    let base = match file.iter().rposition(|&c| c == b'/') {
++        Some(i) => &file[i + 1..],
++        None => file,
++    };
++    let mut symbol: Vec<u8> = base
++        .iter()
++        .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
++        .copied()
++        .collect();
++    symbol.extend_from_slice(b"_gmk_setup");
++    symbol
++}
++
++fn loaded_sym() -> Symbol {
++    intern(".LOADED")
++}
++
++// Like make, only the first place the name appears in .LOADED is checked.
++fn is_already_loaded(loaded: &[u8], file: &[u8]) -> bool {
++    let Some(found) = memchr::memmem::find(loaded, file) else {
++        return false;
++    };
++    let end = found + file.len();
++    (found == 0 || loaded[found - 1] == b' ') && (end == loaded.len() || loaded[end] == b' ')
++}
++
++// The value a load last gave .LOADED.
++static LAST_LOADED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
++
++// Like make, which defines .LOADED with a default origin, a value the
++// makefile, the environment or the command line gave it is kept: one with
++// another origin, or one changed since a load set it, as rkati's += keeps the
++// origin a variable had. The name is added to the value .LOADED had before
++// the object was set up.
++fn add_loaded(loc: &Option<Loc>, loaded: &[u8], file: &[u8]) -> Result<()> {
++    let mut last_set = LAST_LOADED.lock();
++    if let Some(var) = loaded_sym().get_global_var() {
++        let var = var.read();
++        if var.origin() != VarOrigin::Default || var.string()?[..] != last_set[..] {
++            return Ok(());
++        }
++    }
++    let mut value = BytesMut::from(loaded);
++    if !value.is_empty() {
++        value.put_u8(b' ');
++    }
++    value.put_slice(file);
++    *last_set = value.to_vec();
++    loaded_sym().set_global_var(
++        Variable::with_simple_string(value.freeze(), VarOrigin::Default, None, loc.clone()),
++        false,
++        None,
++    )
++}
++
++fn floc_filename(name: Symbol) -> *const c_char {
++    FILENAMES
++        .lock()
++        .entry(name)
++        .or_insert_with(|| c_string(&name.as_bytes()))
++        .as_ptr()
++}
++
++// The home directory the password entry of |user| gives, if there is one.
++fn password_home(user: &CStr) -> Vec<u8> {
++    // SAFETY: user is a NUL-terminated name.
++    let pw = unsafe { libc::getpwnam(user.as_ptr()) };
++    if pw.is_null() {
++        return Vec::new();
++    }
++    // SAFETY: an entry getpwnam returned holds a NUL-terminated directory.
++    unsafe { CStr::from_ptr((*pw).pw_dir) }.to_bytes().to_vec()
++}
++
++// Like make, a leading "~" or "~user" names a home directory. For "~" that is
++// the value of HOME, or when it is empty, the one the environment or the
++// login's password entry gives.
++fn tilde_expand(ev: &mut Evaluator, name: &Bytes) -> Result<Bytes> {
++    let slash = name.iter().position(|&c| c == b'/').unwrap_or(name.len());
++    let user = &name[1..slash];
++    let mut home = if user.is_empty() {
++        let mut home = ev.eval_var(intern("HOME"))?.to_vec();
++        if home.is_empty() {
++            home = std::env::var_os("HOME").map_or_else(Vec::new, |h| h.as_bytes().to_vec());
++        }
++        if home.is_empty() {
++            // SAFETY: getlogin has no preconditions.
++            let login = unsafe { libc::getlogin() };
++            if !login.is_null() {
++                // SAFETY: getlogin gave a NUL-terminated name.
++                home = password_home(unsafe { CStr::from_ptr(login) });
++            }
++        }
++        home
++    } else {
++        password_home(&c_string(user))
++    };
++    if home.is_empty() {
++        return Ok(name.clone());
++    }
++    home.extend_from_slice(&name[slash..]);
++    Ok(Bytes::from(home))
++}
++
++// The names a word of a load line stands for. As make does, "./" and the
++// slashes after it are dropped, a name left empty becomes "./", and then a
++// leading "~" is expanded. A pattern is replaced by the files it matches, or
++// kept when it matches none, the way kati globs include names.
++fn load_names(ev: &mut Evaluator, word: &Bytes) -> Result<Vec<Bytes>> {
++    let mut name = word.clone();
++    while name.len() > 2 && name.starts_with(b"./") {
++        name = name.slice(2..);
++        while name.first() == Some(&b'/') {
++            name = name.slice(1..);
++        }
++    }
++    if name.is_empty() {
++        name = Bytes::from_static(b"./");
++    }
++    if name.first() == Some(&b'~') {
++        name = tilde_expand(ev, &name)?;
++    }
++    Ok(match &*glob(name.clone()) {
++        Ok(files) if !files.is_empty() => files.clone(),
++        _ => vec![name],
++    })
++}
++
++fn load_one(ev: &mut Evaluator, spec: &Bytes, noerror: bool) -> Result<()> {
++    let loc = ev.loc.clone();
++    let mut file = spec.clone();
++    let mut symbol = None;
++    if let Some(open) = spec.iter().position(|&c| c == b'(')
++        && let Some(close) = spec[open + 1..].iter().position(|&c| c == b')')
++        && open + 1 + close == spec.len() - 1
++    {
++        if close == 0 {
++            error_loc!(
++                loc.as_ref(),
++                "*** Empty symbol name for load: {}.",
++                String::from_utf8_lossy(spec)
++            );
++        }
++        file = spec.slice(..open);
++        symbol = Some(spec[open + 1..spec.len() - 1].to_vec());
++    }
++
++    // Like make, .LOADED is read once, before the object is set up.
++    let loaded = ev.eval_var(loaded_sym())?;
++    if is_already_loaded(&loaded, &file) {
++        return Ok(());
++    }
++    let symbol = c_string(&symbol.unwrap_or_else(|| setup_symbol(&file)));
++    let file_name = String::from_utf8_lossy(&file).into_owned();
++    let floc = loc.clone().unwrap_or_default();
++    let floc = GmkFloc {
++        filenm: if floc.has_file() {
++            floc_filename(floc.filename)
++        } else {
++            std::ptr::null()
++        },
++        lineno: (floc.line - ev.loc_offset) as c_ulong,
++    };
++
++    line_buffer_c_stdout();
++    let r = with_callback(ev, None, || -> Result<Option<c_int>> {
++        // Like GNU make 4.2.1, the setup function is looked up in rkati and the
++        // objects already loaded first, and the file is opened only when none
++        // defines it.
++        let mut setup = dlsym(libc::RTLD_DEFAULT, &symbol);
++        if setup.is_null() {
++            let handle = open_object(&file);
++            if handle.is_null() {
++                if noerror {
++                    return Ok(None);
++                }
++                warn_loc!(loc.as_ref(), "{}", dlerror_string());
++                error_loc!(loc.as_ref(), "*** {file_name}: failed to load.");
++            }
++            if dlsym(handle, c"plugin_is_GPL_compatible").is_null() {
++                error_loc!(
++                    loc.as_ref(),
++                    "*** Loaded object {file_name} is not declared to be GPL compatible."
++                );
++            }
++            setup = dlsym(handle, &symbol);
++            if setup.is_null() {
++                error_loc!(
++                    loc.as_ref(),
++                    "*** Failed to load symbol {} from {file_name}: {}.",
++                    symbol.to_string_lossy(),
++                    dlerror_string()
++                );
++            }
++        }
++        // Like the makefiles rkati reads, the object is checked by --regen.
++        // SAFETY: an all-zero Dl_info is valid, and dladdr only fills it in.
++        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
++        // SAFETY: setup is the address of a symbol, and info outlives the
++        // call.
++        if unsafe { libc::dladdr(setup, &mut info) } != 0 && !info.dli_fname.is_null() {
++            // SAFETY: dladdr gave a NUL-terminated file name.
++            let fname = unsafe { CStr::from_ptr(info.dli_fname) };
++            add_extra_file_dep(OsStr::from_bytes(fname.to_bytes()).to_os_string());
++        }
++        // SAFETY: make calls the setup symbol as a function taking a
++        // location, so a loaded object defines it that way.
++        let setup: SetupFunc = unsafe { std::mem::transmute(setup) };
++        // SAFETY: floc points at a live location whose name is NUL-terminated
++        // or null.
++        Ok(Some(unsafe { setup(&floc) }))
++    })?;
++
++    // Like make 4.2.1, which records only a positive result in .LOADED. A
++    // negative one succeeds too, so loading the object again sets it up again.
++    match r {
++        Some(r) if r > 0 => add_loaded(&loc, &loaded, &file)?,
++        Some(0) if !noerror => {
++            error_loc!(loc.as_ref(), "*** {file_name}: failed to load.");
++        }
++        _ => {}
++    }
++    Ok(())
++}
++
++pub fn load_object(ev: &mut Evaluator, word: &Bytes, noerror: bool) -> Result<()> {
++    for name in load_names(ev, word)? {
++        load_one(ev, &name, noerror)?;
++    }
++    Ok(())
++}
++
++pub fn call_loaded_func(
++    ev: &mut Evaluator,
++    loc: &Loc,
++    name: Symbol,
++    func: LoadedFunc,
++    args: Vec<Bytes>,
++    out: &mut dyn BufMut,
++) -> Result<()> {
++    if args.len() < func.min_args as usize {
++        error_loc!(
++            Some(loc),
++            "*** insufficient number of arguments ({}) to function '{name}'.",
++            args.len()
++        );
++    }
++    let Some(fptr) = func.func else {
++        error_loc!(
++            Some(loc),
++            "*** unimplemented on this platform: function '{name}'."
++        );
++    };
++    let name = c_string(&name.as_bytes());
++    let mut argv: Vec<*mut c_char> = args.iter().map(|a| malloc_string(a)).collect();
++    argv.push(std::ptr::null_mut());
++    let argc = args.len() as c_uint;
++
++    // SAFETY: the function was registered for this name, and every argument
++    // is a NUL-terminated buffer it may write into.
++    let result = with_callback(ev, Some(loc), || unsafe {
++        fptr(name.as_ptr(), argc, argv.as_mut_ptr())
++    });
++
++    for p in argv {
++        // SAFETY: each argument was allocated with malloc above.
++        unsafe { libc::free(p as *mut c_void) };
++    }
++    if !result.is_null() {
++        // SAFETY: a loaded function returns NULL or a NUL-terminated string
++        // from gmk_alloc, which we now own.
++        unsafe {
++            out.put_slice(CStr::from_ptr(result).to_bytes());
++            libc::free(result as *mut c_void);
++        }
++    }
++    Ok(())
++}
++
++fn register_function(
++    loc: Option<Loc>,
++    name: &[u8],
++    func: Option<GmkFunc>,
++    min_args: c_uint,
++    max_args: c_uint,
++    flags: c_uint,
++) -> Result<()> {
++    let shown = String::from_utf8_lossy(name);
++    let len = name.iter().take_while(|&&c| is_func_name_char(c)).count();
++    if len == 0 {
++        error_loc!(loc.as_ref(), "*** Empty function name.");
++    }
++    if name[0] == b'.' || len != name.len() {
++        error_loc!(loc.as_ref(), "*** Invalid function name: {shown}.");
++    }
++    if len > MAX_FUNC_NAME_LEN {
++        error_loc!(loc.as_ref(), "*** Function name too long: {shown}.");
++    }
++    if min_args > MAX_ARG_COUNT {
++        error_loc!(
++            loc.as_ref(),
++            "*** Invalid minimum argument count ({min_args}) for function {shown}."
++        );
++    }
++    if max_args > MAX_ARG_COUNT || (max_args != 0 && max_args < min_args) {
++        error_loc!(
++            loc.as_ref(),
++            "*** Invalid maximum argument count ({max_args}) for function {shown}."
++        );
++    }
++    LOADED_FUNCS.lock().insert(
++        intern(name.to_vec()),
++        LoadedFunc {
++            func,
++            min_args,
++            max_args,
++            expand_args: flags & NO_EXPAND == 0,
++        },
++    );
++    REGISTRATIONS.fetch_add(1, Ordering::Relaxed);
++    Ok(())
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn gmk_free(s: *mut c_char) {
++    // SAFETY: the object frees a buffer kati allocated with malloc.
++    unsafe { libc::free(s as *mut c_void) };
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn gmk_alloc(len: c_uint) -> *mut c_char {
++    allocate((len as usize).max(1))
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn gmk_eval(buffer: *const c_char, floc: *const GmkFloc) {
++    // SAFETY: the object passes a NUL-terminated buffer and NULL or a valid
++    // location.
++    let (text, floc) = unsafe { (CStr::from_ptr(buffer).to_bytes(), floc.as_ref()) };
++    let text = Bytes::copy_from_slice(text);
++    // Like make, a location without a file name is shown without one.
++    let loc = floc.map(|f| {
++        if f.filenm.is_null() {
++            Loc::without_file(f.lineno as i32)
++        } else {
++            Loc {
++                // SAFETY: a location's name is NUL-terminated.
++                filename: intern(unsafe { CStr::from_ptr(f.filenm) }.to_bytes().to_vec()),
++                line: f.lineno as i32,
++            }
++        }
++    });
++    enter_callback(|ev| {
++        let caller_loc = ev.loc.clone();
++        let caller_offset = ev.loc_offset;
++        if loc.is_some() {
++            // Like make, a location given here has no recipe offset.
++            ev.loc_offset = 0;
++        }
++        let loc = loc.or_else(|| ev.loc.clone()).unwrap_or_default();
++        let stmts = parse_buf(&text, loc)?;
++        let stmts = stmts.lock();
++        for stmt in stmts.iter() {
++            stmt.eval(ev)?;
++        }
++        // Like make, later errors in the same call point at the caller again.
++        ev.loc = caller_loc;
++        ev.loc_offset = caller_offset;
++        Ok(())
++    });
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn gmk_expand(s: *const c_char) -> *mut c_char {
++    // SAFETY: the object passes a NUL-terminated string.
++    let text = Bytes::copy_from_slice(unsafe { CStr::from_ptr(s) }.to_bytes());
++    let result = enter_callback(|ev| {
++        // Like make, which reports what it meets reading the text at the
++        // variable being expanded or at the line being read, the text is read
++        // where the call was read.
++        let mut loc = CALLBACK_CALL_LOC
++            .with_borrow(|loc| loc.clone())
++            .or_else(|| ev.loc.clone())
++            .unwrap_or_default();
++        parse_expr(&mut loc, text, ParseExprOpt::Expand)?.eval_to_buf(ev)
++    });
++    malloc_string(&result.unwrap_or_default())
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn gmk_add_function(
++    name: *const c_char,
++    func: Option<GmkFunc>,
++    min_args: c_uint,
++    max_args: c_uint,
++    flags: c_uint,
++) {
++    // SAFETY: the object passes a NUL-terminated name.
++    let name = unsafe { CStr::from_ptr(name) }.to_bytes().to_vec();
++    let loc = CALLBACK_EV.with(|c| c.get());
++    // SAFETY: the pointer is NULL or was set by with_callback from a live
++    // evaluator that is not used until the loaded object returns.
++    let loc = unsafe { loc.as_ref() }.and_then(|ev| ev.loc.clone());
++    if let Err(err) = register_function(loc, &name, func, min_args, max_args, flags) {
++        fatal(err);
++    }
++}
+diff --git a/src-rs/loc.rs b/src-rs/loc.rs
+index 69cafb7..32093c8 100644
+--- a/src-rs/loc.rs
++++ b/src-rs/loc.rs
+@@ -24,8 +24,30 @@ pub struct Loc {
+     pub line: i32,
+ }
+ 
++// The file name of a location without one, which no real file name can be.
++static NO_FILE: LazyLock<Symbol> = LazyLock::new(|| intern("\0\0"));
++
++impl Loc {
++    /// A location without a file name, which a loaded object can give
++    /// gmk_eval.
++    pub fn without_file(line: i32) -> Loc {
++        Loc {
++            filename: *NO_FILE,
++            line,
++        }
++    }
++
++    pub fn has_file(&self) -> bool {
++        self.filename != *NO_FILE
++    }
++}
++
+ impl Display for Loc {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        if !self.has_file() {
++            // As kati shows a location it knows no file for.
++            return write!(f, "<unknown>:{}", self.line);
++        }
+         write!(f, "{}:{}", self.filename, self.line)
+     }
+ }
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index 6703bef..674db9c 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -42,7 +42,7 @@ use kati::regen::needs_regen;
+ use kati::regen_dump::stamp_dump_main;
+ 
+ use kati::eval::FrameType;
+-use kati::expr::{Evaluable, Value};
++use kati::expr::{Evaluable, Value, give_waiting_warnings};
+ use kati::loc::Loc;
+ use kati::stmt::Stmt;
+ use kati::var::{VarOrigin, Variable};
+@@ -142,6 +142,12 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+         false,
+         None,
+     )?;
++    // Like make, which defines it before reading the environment.
++    intern(".LOADED").set_global_var(
++        Variable::with_simple_string(Bytes::new(), VarOrigin::Default, None, None),
++        false,
++        None,
++    )?;
+     for (k, v) in std::env::vars_os() {
+         let v = Bytes::from(v.as_bytes().to_vec());
+         let val = Arc::new(Value::Literal(None, v.clone()));
+@@ -217,6 +223,10 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+             log!("{stmt:?}");
+             stmt.eval(&mut ev)?;
+         }
++        give_waiting_warnings();
++        if let Some(err) = ev.waiting_include_error.take() {
++            return Err(err);
++        }
+     }
+ 
+     if let Some(filename) = &FLAGS.dump_include_graph {
+diff --git a/src-rs/parser.rs b/src-rs/parser.rs
+index 6c3e20d..61765a1 100644
+--- a/src-rs/parser.rs
++++ b/src-rs/parser.rs
+@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-use std::sync::Arc;
++use std::sync::{Arc, atomic::Ordering};
+ 
+ use anyhow::Result;
+ use bytes::{Buf, Bytes};
+@@ -23,11 +23,14 @@ use parking_lot::Mutex;
+ 
+ use crate::{
+     collect_stats, error_loc,
+-    expr::{ParseExprOpt, Value, parse_expr, parse_expr_impl, parse_expr_impl_ext},
++    expr::{
++        ParseExprOpt, TextErrors, Value, calls_eval, note_objects_can_load, objects_can_load,
++        parse_expr, parse_expr_impl, parse_expr_impl_ext, resplit_ifeq_later,
++    },
+     loc::Loc,
+     stmt::{
+         AssignDirective, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt,
+-        IncludeStmt, RuleSep, RuleStmt, Stmt,
++        IncludeStmt, LoadStmt, ParseErrorStmt, ParseWarningStmt, RuleSep, RuleStmt, Stmt,
+     },
+     strutil::{
+         find_end_of_line, find_outside_paren, trim_left_space, trim_right_space, trim_space,
+@@ -60,9 +63,13 @@ struct Parser {
+ 
+     orig_line_with_directives: Option<Bytes>,
+     current_directive: Option<AssignDirective>,
++    // Whether the line being parsed is an else or endif, whose errors make
++    // reports even in a branch it skips.
++    branch_line: bool,
+ 
+     num_if_nest: i32,
+     if_stack: Vec<IfState>,
++    includes: Vec<Arc<IncludeStmt>>,
+ 
+     loc: Loc,
+     fixed_lineno: bool,
+@@ -85,9 +92,11 @@ impl Parser {
+ 
+             orig_line_with_directives: None,
+             current_directive: None,
++            branch_line: false,
+ 
+             num_if_nest: 0,
+             if_stack: Vec::new(),
++            includes: Vec::new(),
+ 
+             loc,
+             fixed_lineno,
+@@ -95,6 +104,7 @@ impl Parser {
+     }
+ 
+     fn parse(&mut self) -> Result<()> {
++        let _text_errors = TextErrors::start();
+         self.l = 0;
+         let buf = self.buf.clone();
+ 
+@@ -109,7 +119,20 @@ impl Parser {
+                 line.truncate(line.len() - 1);
+             }
+             self.orig_line_with_directives = Some(line.clone());
+-            self.parse_line(line)?;
++            if let Err(err) = self.parse_line(line) {
++                // Once an expression read earlier left its error for its
++                // expansion, this one waits too, as make may stop at that one
++                // first. A misplaced else or endif also waits after the
++                // conditional, as make reports it even in a branch it skips.
++                if !TextErrors::left() {
++                    return Err(err);
++                }
++                let stmt: Stmt = ParseErrorStmt::new(self.loc.clone(), err);
++                self.out_stmts.lock().push(stmt.clone());
++                if self.branch_line && !Arc::ptr_eq(&self.out_stmts, &self.stmts) {
++                    self.stmts.lock().push(stmt);
++                }
++            }
+             if !self.fixed_lineno {
+                 self.loc.line += eol.lf_cnt - 1;
+             }
+@@ -122,18 +145,160 @@ impl Parser {
+         if !self.if_stack.is_empty() {
+             let mut loc = self.loc.clone();
+             loc.line += 1;
+-            error_loc!(Some(&loc), "*** missing `endif'.");
++            self.end_error(loc, "*** missing `endif'.")?;
+         }
+         if self.define_name.is_some() {
+             let mut loc = self.loc.clone();
+             loc.line = self.define_start_line;
+-            error_loc!(Some(&loc), "*** missing `endef', unterminated `define'.",);
++            self.end_error(loc, "*** missing `endef', unterminated `define'.")?;
++        }
++        if TextErrors::left() {
++            for stmt in &self.includes {
++                stmt.missing_waits.store(true, Ordering::Relaxed);
++            }
+         }
+ 
+         Ok(())
+     }
+ 
++    // Whether |buf| has a load, -load, include, -include or sinclude directive
++    // rkati may read; an included makefile can load objects too. Lines are told
++    // apart as parse tells them, so a define's body, a comment, a recipe line of
++    // a rule and an assignment to a variable named load hold no directive. A
++    // line starting with a tab that follows no rule for sure counts: rkati reads
++    // it again as an ordinary line when it evaluates the makefile and finds no
++    // rule for it.
++    fn reads_load_or_include(buf: &Bytes) -> bool {
++        let mut after_rule = false;
++        let mut in_rule = false;
++        let mut rule_depth = 0;
++        let mut if_depth = 0;
++        let mut define_nest = 0;
++        let mut l = 0;
++        while l < buf.len() {
++            let eol = find_end_of_line(&buf.slice(l..));
++            l += eol.line.len() + 1;
++            let mut line = &eol.line[..];
++            if line.ends_with(b"\r") {
++                line = &line[..line.len() - 1];
++            }
++            let mut text = trim_left_space(line);
++            let mut directive = Parser::get_directive(text);
++            if define_nest > 0 {
++                if directive == b"define" {
++                    define_nest += 1;
++                } else if directive == b"endef" {
++                    define_nest -= 1;
++                }
++                continue;
++            }
++            if text.is_empty() || text.starts_with(b"#") {
++                continue;
++            }
++            let command = line.starts_with(b"\t") && after_rule;
++            if command && in_rule {
++                continue;
++            }
++            let mut rest = trim_left_space(&text[directive.len()..]);
++            match directive {
++                b"include" | b"-include" | b"sinclude" => return true,
++                b"load" | b"-load" if !starts_with_assign_op(rest) => return true,
++                _ => {}
++            }
++            if command {
++                continue;
++            }
++            let mut prefixed = false;
++            let mut exported = false;
++            while directive == b"override" || directive == b"export" {
++                prefixed = true;
++                exported |= directive == b"export";
++                text = rest;
++                directive = Parser::get_directive(text);
++                rest = trim_left_space(&text[directive.len()..]);
++            }
++            if directive == b"define" {
++                define_nest = 1;
++                after_rule = false;
++                in_rule = false;
++                continue;
++            }
++            if !prefixed {
++                match directive {
++                    b"ifdef" | b"ifndef" | b"ifeq" | b"ifneq" => {
++                        if_depth += 1;
++                        continue;
++                    }
++                    b"else" | b"endif" => {
++                        if if_depth <= rule_depth {
++                            in_rule = false;
++                        }
++                        if directive == b"endif" && if_depth > 0 {
++                            if_depth -= 1;
++                        }
++                        continue;
++                    }
++                    b"unexport" => {
++                        in_rule = false;
++                        continue;
++                    }
++                    _ => {}
++                }
++            }
++            let sep = find_outside_paren(text, b":=;");
++            let assign = sep.is_some_and(|sep| {
++                let s = &text[sep..];
++                !s.starts_with(b";") && (s.starts_with(b"=") || s[1..].starts_with(b"="))
++            });
++            if assign {
++                after_rule = false;
++            } else if !exported && !line.starts_with(b"\t") {
++                after_rule = true;
++            }
++            in_rule = false;
++            if let Some(sep) = sep
++                && !prefixed
++                && !assign
++                && !line.starts_with(b"\t")
++                && text[sep] == b':'
++            {
++                let s = &text[sep + 1..];
++                in_rule = find_outside_paren(s, b"=;").is_none_or(|found| s[found] == b';');
++                rule_depth = if_depth;
++            }
++        }
++        false
++    }
++
++    // Reports an error found at the end of the text: right away, unless an
++    // expression read earlier left its error for its expansion, which make may
++    // stop at first.
++    fn end_error(&self, loc: Loc, msg: &str) -> Result<()> {
++        let err = crate::color_error_log(Some(&loc), msg.to_string());
++        if !TextErrors::left() {
++            return Err(err);
++        }
++        self.stmts.lock().push(ParseErrorStmt::new(loc, err));
++        Ok(())
++    }
++
++    // Prints a warning about the line being read: right away, unless an
++    // expression read earlier left its error for its expansion, which make may
++    // stop at before it reads the line. Then the warning waits in each of
++    // |lists|.
++    fn line_warning(&self, msg: &'static str, lists: &[Arc<Mutex<Vec<Stmt>>>]) {
++        if !TextErrors::left() {
++            warn_loc!(Some(&self.loc), "{msg}");
++            return;
++        }
++        for list in lists {
++            list.lock()
++                .push(ParseWarningStmt::new(self.loc.clone(), msg));
++        }
++    }
++
+     fn parse_line(&mut self, line: Bytes) -> Result<()> {
++        self.branch_line = false;
+         if self.define_name.is_some() {
+             return self.parse_inside_define(line);
+         }
+@@ -293,12 +458,23 @@ impl Parser {
+     }
+ 
+     fn parse_include(&mut self, line: Bytes, directive: &[u8]) -> Result<()> {
++        let loc = self.loc.clone();
++        let mut mutable_loc = loc.clone();
++        let expr = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
++        let stmt = IncludeStmt::new(loc, expr, directive.starts_with(b"i"));
++        self.out_stmts.lock().push(stmt.clone());
++        self.includes.push(stmt);
++        self.after_rule = false;
++        Ok(())
++    }
++
++    fn parse_load(&mut self, line: Bytes, directive: &[u8]) -> Result<()> {
+         let loc = self.loc.clone();
+         let mut mutable_loc = loc.clone();
+         let expr = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
+         self.out_stmts
+             .lock()
+-            .push(IncludeStmt::new(loc, expr, directive.starts_with(b"i")));
++            .push(LoadStmt::new(loc, expr, directive.starts_with(b"-")));
+         self.after_rule = false;
+         Ok(())
+     }
+@@ -334,7 +510,10 @@ impl Parser {
+             &line["endef".len()..],
+         )));
+         if !rest.is_empty() {
+-            warn_loc!(Some(&self.loc), "extraneous text after `endef' directive");
++            self.line_warning(
++                "extraneous text after `endef' directive",
++                std::slice::from_ref(&self.out_stmts),
++            );
+         }
+ 
+         let assign_loc = Loc {
+@@ -386,7 +565,7 @@ impl Parser {
+         };
+         let mut mutable_loc = loc.clone();
+         let lhs = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
+-        let stmt = IfStmt::new(loc, op, lhs, None);
++        let stmt = IfStmt::new(loc, op, lhs, None, None);
+         self.out_stmts.lock().push(stmt.clone());
+         self.enter_if(stmt);
+         Ok(())
+@@ -405,10 +584,11 @@ impl Parser {
+         }
+ 
+         let mut mutable_loc = loc.clone();
+-        let lhs;
++        let mut lhs;
+         let rhs;
+         if line.first() == Some(&b'(') && line.last() == Some(&b')') {
+             line = line.slice(1..line.len() - 1);
++            let cond = line.clone();
+             let terms = vec![b','];
+             let mut n;
+             (n, lhs) = parse_expr_impl(
+@@ -419,19 +599,25 @@ impl Parser {
+                 true,
+             )?;
+             line.advance(n);
+-            if line.first() != Some(&b',') {
++            let mut kati_rhs = None;
++            if line.first() == Some(&b',') {
++                line = line.slice_ref(trim_left_space(&line[1..]));
++                let rest;
++                (n, rest) = parse_expr_impl_ext(
++                    &mut mutable_loc,
++                    line.clone(),
++                    None,
++                    ParseExprOpt::Normal,
++                    false,
++                    true,
++                )?;
++                line = line.slice_ref(trim_left_space(&line[n.min(line.len())..]));
++                kati_rhs = Some(rest);
++            }
++            if !resplit_ifeq_later(&loc, &cond, &mut lhs, &mut kati_rhs) {
+                 error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+             }
+-            line = line.slice_ref(trim_left_space(&line[1..]));
+-            (n, rhs) = parse_expr_impl_ext(
+-                &mut mutable_loc,
+-                line.clone(),
+-                None,
+-                ParseExprOpt::Normal,
+-                false,
+-                true,
+-            )?;
+-            line = line.slice_ref(trim_left_space(&line[n.min(line.len())..]));
++            rhs = kati_rhs.unwrap();
+         } else {
+             if line.is_empty() {
+                 error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+@@ -451,35 +637,71 @@ impl Parser {
+ 
+             line = line.slice_ref(trim_left_space(&line[end + 2..]));
+ 
+-            if line.is_empty() {
+-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+-            }
+-            let quote = line[0];
+-            if quote != b'\'' && quote != b'"' {
++            let second = line
++                .first()
++                .filter(|&&quote| quote == b'\'' || quote == b'"')
++                .and_then(|&quote| memchr(quote, &line[1..]));
++            if let Some(end) = second {
++                rhs = parse_expr(
++                    &mut mutable_loc,
++                    line.slice(1..end + 1),
++                    ParseExprOpt::Normal,
++                )?;
++                line = line.slice_ref(trim_left_space(&line[end + 2..]));
++            } else if objects_can_load() && matches!(&*lhs, Value::LazyCalls(_)) {
++                // make expands the first side before it reads the second, so
++                // when the second fails and the first depends on loaded
++                // functions, the condition fails only after its first side is
++                // expanded, and later errors in the text wait for it.
++                rhs = Arc::new(Value::ReadError {
++                    loc: self.loc.clone(),
++                    msg: "*** invalid syntax in conditional.".to_string(),
++                });
++                TextErrors::set_left();
++                line = Bytes::new();
++            } else {
+                 error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+             }
+-            let Some(end) = memchr(quote, &line[1..]) else {
+-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
+-            };
+-            rhs = parse_expr(
+-                &mut mutable_loc,
+-                line.slice(1..end + 1),
+-                ParseExprOpt::Normal,
+-            )?;
+-            line = line.slice_ref(trim_left_space(&line[end + 2..]));
+         }
+ 
++        let mut warning = None;
+         if !line.is_empty() {
+-            warn_loc!(Some(&self.loc), "extraneous text after `ifeq' directive")
++            let msg = "extraneous text after `ifeq' directive";
++            // make warns once it has expanded the first side.
++            if TextErrors::left() {
++                warning = Some(msg);
++            } else {
++                warn_loc!(Some(&self.loc), "{msg}");
++            }
+         }
+-
+-        let stmt = IfStmt::new(loc, op, lhs, Some(rhs));
++        let stmt = IfStmt::new(loc, op, lhs, Some(rhs), warning);
+         self.out_stmts.lock().push(stmt.clone());
+         self.enter_if(stmt);
+         Ok(())
+     }
+ 
++    // Where a warning about a conditional line waits so that it is given once,
++    // where make gives it, which reads such lines in branches it skips too: in
++    // both branches of the innermost conditional, and in the branch of each
++    // enclosing one that does not hold the conditional inside it.
++    fn conditional_line_lists(&self) -> Vec<Arc<Mutex<Vec<Stmt>>>> {
++        let mut lists = Vec::new();
++        for (i, st) in self.if_stack.iter().enumerate() {
++            let (current, other) = if st.is_in_else {
++                (&st.stmt.false_stmts, &st.stmt.true_stmts)
++            } else {
++                (&st.stmt.true_stmts, &st.stmt.false_stmts)
++            };
++            lists.push(other.clone());
++            if i + 1 == self.if_stack.len() {
++                lists.push(current.clone());
++            }
++        }
++        lists
++    }
++
+     fn parse_else(&mut self, line: Bytes) -> Result<()> {
++        self.branch_line = true;
+         self.check_if_stack("else")?;
+         let st = self.if_stack.last_mut().unwrap();
+         if st.is_in_else {
+@@ -495,13 +717,17 @@ impl Parser {
+ 
+         self.num_if_nest = st.num_nest + 1;
+         if !self.handle_else_if_directive(&line.slice_ref(next_if))? {
+-            warn_loc!(Some(&self.loc), "extraneous text after `else' directive");
++            self.line_warning(
++                "extraneous text after `else' directive",
++                &self.conditional_line_lists(),
++            );
+         }
+         self.num_if_nest = 0;
+         Ok(())
+     }
+ 
+     fn parse_endif(&mut self, line: Bytes) -> Result<()> {
++        self.branch_line = true;
+         self.check_if_stack("endif")?;
+         if !line.is_empty() {
+             error_loc!(Some(&self.loc), "extraneous text after `endif` directive");
+@@ -604,6 +830,14 @@ impl Parser {
+             b"override" => self.parse_override(rest)?,
+             b"export" => self.parse_export(rest)?,
+             b"unexport" => self.parse_unexport(&rest)?,
++            b"load" | b"-load" => {
++                // Like make, read "load := x" as an assignment to a variable
++                // named load.
++                if starts_with_assign_op(&rest) {
++                    return Ok(false);
++                }
++                self.parse_load(rest, directive)?
++            }
+             _ => return Ok(false),
+         }
+         Ok(true)
+@@ -637,8 +871,17 @@ impl Parser {
+     }
+ }
+ 
++fn starts_with_assign_op(s: &[u8]) -> bool {
++    [&b"="[..], b":=", b"::=", b"+=", b"?=", b"!="]
++        .iter()
++        .any(|op| s.starts_with(op))
++}
++
+ pub fn parse_file(buf: &Bytes, filename: Symbol) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+     collect_stats!("parse file time");
++    if !objects_can_load() && (Parser::reads_load_or_include(buf) || calls_eval(buf)) {
++        note_objects_can_load();
++    }
+     let loc = Loc { filename, line: 0 };
+     parse_buf_no_stats_impl(buf, loc, false)
+ }
+diff --git a/src-rs/rule.rs b/src-rs/rule.rs
+index f6a3c03..fe51406 100644
+--- a/src-rs/rule.rs
++++ b/src-rs/rule.rs
+@@ -40,6 +40,8 @@ pub struct Rule {
+     pub cmds: Vec<Arc<Value>>,
+     pub loc: Loc,
+     pub cmd_loc: Option<Loc>,
++    // Whether the recipe starts on the rule's own line, after a ';'.
++    pub inline_recipe: bool,
+ }
+ 
+ impl Rule {
+@@ -55,6 +57,7 @@ impl Rule {
+             cmds: Vec::new(),
+             loc,
+             cmd_loc: None,
++            inline_recipe: false,
+         }
+     }
+ 
+diff --git a/src-rs/stmt.rs b/src-rs/stmt.rs
+index 16a904f..0afb75f 100644
+--- a/src-rs/stmt.rs
++++ b/src-rs/stmt.rs
+@@ -17,7 +17,10 @@ limitations under the License.
+ use anyhow::Result;
+ use bytes::Bytes;
+ use parking_lot::Mutex;
+-use std::{fmt::Debug, sync::Arc};
++use std::{
++    fmt::Debug,
++    sync::{Arc, atomic::AtomicBool},
++};
+ 
+ use crate::{
+     error_loc,
+@@ -26,6 +29,7 @@ use crate::{
+     loc::Loc,
+     strutil::no_line_break,
+     symtab::{Symbol, intern},
++    warn_loc,
+ };
+ 
+ pub type Stmt = Arc<dyn Statement + Send + Sync>;
+@@ -239,6 +243,10 @@ pub struct IfStmt {
+     pub rhs: Option<Arc<Value>>,
+     pub true_stmts: Arc<Mutex<Vec<Stmt>>>,
+     pub false_stmts: Arc<Mutex<Vec<Stmt>>>,
++    // A warning about the line that waits, because the text holding it left an
++    // error for its expansion, until the first side is expanded, where make
++    // gives it.
++    pub warning: Option<&'static str>,
+ }
+ 
+ impl Statement for IfStmt {
+@@ -269,7 +277,13 @@ impl Debug for IfStmt {
+ }
+ 
+ impl IfStmt {
+-    pub fn new(loc: Loc, op: CondOp, lhs: Arc<Value>, rhs: Option<Arc<Value>>) -> Arc<IfStmt> {
++    pub fn new(
++        loc: Loc,
++        op: CondOp,
++        lhs: Arc<Value>,
++        rhs: Option<Arc<Value>>,
++        warning: Option<&'static str>,
++    ) -> Arc<IfStmt> {
+         Arc::new(IfStmt {
+             loc,
+             orig: Bytes::new(),
+@@ -278,6 +292,7 @@ impl IfStmt {
+             rhs,
+             true_stmts: Arc::new(Mutex::new(Vec::new())),
+             false_stmts: Arc::new(Mutex::new(Vec::new())),
++            warning,
+         })
+     }
+ }
+@@ -288,6 +303,10 @@ pub struct IncludeStmt {
+ 
+     pub expr: Arc<Value>,
+     pub should_exist: bool,
++    // Whether a makefile it names that cannot be found is reported once the
++    // makefiles are read, as make reports it, because the text holding the
++    // directive left an error for its expansion, which may come first.
++    pub missing_waits: AtomicBool,
+ }
+ 
+ impl Statement for IncludeStmt {
+@@ -315,10 +334,117 @@ impl IncludeStmt {
+             orig: Bytes::new(),
+             expr,
+             should_exist,
++            missing_waits: AtomicBool::new(false),
++        })
++    }
++}
++
++pub struct LoadStmt {
++    loc: Loc,
++    orig: Bytes,
++
++    pub expr: Arc<Value>,
++    pub noerror: bool,
++}
++
++impl Statement for LoadStmt {
++    fn loc(&self) -> Loc {
++        self.loc.clone()
++    }
++    fn orig(&self) -> Bytes {
++        self.orig.clone()
++    }
++    fn eval(&self, ev: &mut Evaluator) -> Result<()> {
++        ev.eval_load(self)
++    }
++}
++
++impl Debug for LoadStmt {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(
++            f,
++            "LoadStmt({:?}, {}, loc={})",
++            self.expr, self.noerror, self.loc
++        )
++    }
++}
++
++impl LoadStmt {
++    pub fn new(loc: Loc, expr: Arc<Value>, noerror: bool) -> Arc<LoadStmt> {
++        Arc::new(LoadStmt {
++            loc,
++            orig: Bytes::new(),
++            expr,
++            noerror,
++        })
++    }
++}
++
++// An error the parser met once an expression read earlier had left its error
++// for its expansion, raised when the evaluation gets to it.
++pub struct ParseErrorStmt {
++    loc: Loc,
++    msg: String,
++}
++
++impl Statement for ParseErrorStmt {
++    fn loc(&self) -> Loc {
++        self.loc.clone()
++    }
++    fn orig(&self) -> Bytes {
++        Bytes::new()
++    }
++    fn eval(&self, _ev: &mut Evaluator) -> Result<()> {
++        Err(anyhow::format_err!("{}", self.msg))
++    }
++}
++
++impl Debug for ParseErrorStmt {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "ParseErrorStmt({}, loc={})", self.msg, self.loc)
++    }
++}
++
++impl ParseErrorStmt {
++    pub fn new(loc: Loc, err: anyhow::Error) -> Arc<ParseErrorStmt> {
++        Arc::new(ParseErrorStmt {
++            loc,
++            msg: err.to_string(),
+         })
+     }
+ }
+ 
++// A warning about a line of the text, given when the evaluation gets there.
++pub struct ParseWarningStmt {
++    loc: Loc,
++    msg: &'static str,
++}
++
++impl Statement for ParseWarningStmt {
++    fn loc(&self) -> Loc {
++        self.loc.clone()
++    }
++    fn orig(&self) -> Bytes {
++        Bytes::new()
++    }
++    fn eval(&self, _ev: &mut Evaluator) -> Result<()> {
++        warn_loc!(Some(&self.loc), "{}", self.msg);
++        Ok(())
++    }
++}
++
++impl Debug for ParseWarningStmt {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "ParseWarningStmt({}, loc={})", self.msg, self.loc)
++    }
++}
++
++impl ParseWarningStmt {
++    pub fn new(loc: Loc, msg: &'static str) -> Arc<ParseWarningStmt> {
++        Arc::new(ParseWarningStmt { loc, msg })
++    }
++}
++
+ pub struct ExportStmt {
+     loc: Loc,
+     orig: Bytes,
+diff --git a/src/Android.bp b/src/Android.bp
+index 82c5cdc..f25efe4 100644
+--- a/src/Android.bp
++++ b/src/Android.bp
+@@ -45,6 +45,7 @@ cc_library_host_static {
+         "flags.cc",
+         "func.cc",
+         "io.cc",
++        "loadapi.cc",
+         "log.cc",
+         "ninja.cc",
+         "parser.cc",
+@@ -70,7 +71,13 @@ cc_binary_host {
+     ],
+     whole_static_libs: ["libckati"],
+     target: {
++        linux: {
++            // Objects loaded with the load directive call the gmk_* functions
++            // ckati exports.
++            ldflags: ["-rdynamic"],
++        },
+         linux_glibc: {
++            host_ldlibs: ["-ldl"],
+             shared_libs: ["libjemalloc5"],
+         },
+     },
+diff --git a/src/command.cc b/src/command.cc
+index cc58616..8e19ef7 100644
+--- a/src/command.cc
++++ b/src/command.cc
+@@ -230,8 +230,10 @@ std::vector<Command> CommandEvaluator::Eval(const DepNode& n) {
+   ev_->SetEvaluatingCommand(true);
+   current_dep_node_ = &n;
+   found_new_inputs_ = false;
+-  for (Value* v : n.cmds) {
++  for (size_t i = 0; i < n.cmds.size(); i++) {
++    Value* v = n.cmds[i];
+     ev_->set_loc(v->Location());
++    ev_->set_loc_offset(v->Location().lineno - n.recipe_lines[i]);
+     const std::string&& cmds_buf = v->Eval(ev_);
+     std::string_view cmds = cmds_buf;
+     bool global_echo = !g_flags.is_silent_mode;
+@@ -279,6 +281,7 @@ std::vector<Command> CommandEvaluator::Eval(const DepNode& n) {
+   }
+ 
+   ev_->set_current_scope(NULL);
++  ev_->set_loc_offset(0);
+   ev_->SetEvaluatingCommand(false);
+ 
+   return result;
+diff --git a/src/dep.cc b/src/dep.cc
+index 5b6e5d0..2cb5042 100644
+--- a/src/dep.cc
++++ b/src/dep.cc
+@@ -209,8 +209,11 @@ struct RuleMerger {
+   }
+ 
+   void FillDepNodeFromRule(Symbol output, const Rule* r, DepNode* n) const {
+-    if (is_double_colon)
++    if (is_double_colon) {
+       copy(r->cmds.begin(), r->cmds.end(), back_inserter(n->cmds));
++      n->recipe_lines.insert(n->recipe_lines.end(), r->cmds.size(),
++                             RecipeLine(r));
++    }
+ 
+     ApplyOutputPattern(*r, output, r->inputs, &n->actual_inputs);
+     ApplyOutputPattern(*r, output, r->order_only_inputs,
+@@ -222,6 +225,12 @@ struct RuleMerger {
+     }
+   }
+ 
++  static int RecipeLine(const Rule* r) {
++    return !r->cmds.empty() && r->cmd_lineno && !r->inline_recipe
++               ? r->cmd_lineno
++               : r->loc.lineno;
++  }
++
+   void FillDepNodeLoc(const Rule* r, DepNode* n) const {
+     n->loc = r->loc;
+     if (!r->cmds.empty() && r->cmd_lineno)
+@@ -234,10 +243,12 @@ struct RuleMerger {
+       FillDepNodeFromRule(output, primary_rule, n);
+       FillDepNodeLoc(primary_rule, n);
+       n->cmds = primary_rule->cmds;
++      n->recipe_lines.assign(n->cmds.size(), RecipeLine(primary_rule));
+     } else if (pattern_rule) {
+       FillDepNodeFromRule(output, pattern_rule, n);
+       FillDepNodeLoc(pattern_rule, n);
+       n->cmds = pattern_rule->cmds;
++      n->recipe_lines.assign(n->cmds.size(), RecipeLine(pattern_rule));
+     }
+ 
+     for (const Rule* r : rules) {
+diff --git a/src/dep.h b/src/dep.h
+index 594674c..5a58215 100644
+--- a/src/dep.h
++++ b/src/dep.h
+@@ -38,6 +38,8 @@ struct DepNode {
+ 
+   Symbol output;
+   std::vector<Value*> cmds;
++  // For each command, the line its rule's recipe starts at.
++  std::vector<int> recipe_lines;
+   std::vector<NamedDepNode> deps;
+   std::vector<NamedDepNode> order_onlys;
+   std::vector<NamedDepNode> validations;
+diff --git a/src/eval.cc b/src/eval.cc
+index 61a0588..0fff3de 100644
+--- a/src/eval.cc
++++ b/src/eval.cc
+@@ -27,6 +27,7 @@
+ #include "file.h"
+ #include "file_cache.h"
+ #include "fileutil.h"
++#include "loadapi.h"
+ #include "parser.h"
+ #include "rule.h"
+ #include "stats.h"
+@@ -523,6 +524,7 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
+ 
+   if (stmt->sep == RuleStmt::SEP_SEMICOLON) {
+     rule->cmds.push_back(stmt->rhs);
++    rule->inline_recipe = true;
+   }
+ 
+   for (Symbol o : rule->outputs) {
+@@ -588,6 +590,8 @@ void Evaluator::EvalIf(const IfStmt* stmt) {
+     case CondOp::IFEQ:
+     case CondOp::IFNEQ: {
+       const std::string&& lhs = stmt->lhs->Eval(this);
++      if (stmt->warning)
++        WARN_LOC(stmt->loc(), "%s", stmt->warning);
+       const std::string&& rhs = stmt->rhs->Eval(this);
+       is_true = ((lhs == rhs) == (stmt->op == CondOp::IFEQ));
+       break;
+@@ -621,10 +625,14 @@ void Evaluator::DoInclude(const std::string& fname) {
+   Var* var_list = LookupVar(Intern("MAKEFILE_LIST"));
+   var_list->AppendVar(
+       this, Value::NewLiteral(Intern(TrimLeadingCurdir(fname)).str()));
++  // A recipe being expanded does not offset the included makefile's lines.
++  const int offset = loc_offset_;
++  loc_offset_ = 0;
+   for (Stmt* stmt : mk.stmts()) {
+     LOG("%s", stmt->DebugString().c_str());
+     stmt->Eval(this);
+   }
++  loc_offset_ = offset;
+ 
+   for (auto& mk : profiled_files_) {
+     stats.MarkInteresting(mk);
+@@ -643,8 +651,16 @@ void Evaluator::EvalInclude(const IncludeStmt* stmt) {
+ 
+     if (stmt->should_exist) {
+       if (files.empty()) {
++        std::string msg = StringPrintf("%s: %s", pat.data(), strerror(errno));
++        if (stmt->missing_waits) {
++          if (waiting_include_error_.empty()) {
++            waiting_include_loc_ = loc_;
++            waiting_include_error_ = msg;
++          }
++          continue;
++        }
+         // TODO: Kati does not support building a missing include file.
+-        Error(StringPrintf("%s: %s", pat.data(), strerror(errno)));
++        Error(msg);
+       }
+     }
+ 
+@@ -665,6 +681,23 @@ void Evaluator::EvalInclude(const IncludeStmt* stmt) {
+   }
+ }
+ 
++void Evaluator::RaiseWaitingIncludeError() {
++  if (waiting_include_error_.empty())
++    return;
++  loc_ = waiting_include_loc_;
++  Error(waiting_include_error_);
++}
++
++void Evaluator::EvalLoad(const LoadStmt* stmt) {
++  loc_ = stmt->loc();
++  last_rule_ = NULL;
++
++  const std::string&& names = stmt->expr->Eval(this);
++  for (std::string_view name : WordScanner(names)) {
++    LoadObject(this, name, stmt->noerror);
++  }
++}
++
+ void Evaluator::EvalExport(const ExportStmt* stmt) {
+   loc_ = stmt->loc();
+   last_rule_ = NULL;
+diff --git a/src/eval.h b/src/eval.h
+index 6c4199f..e796a7d 100644
+--- a/src/eval.h
++++ b/src/eval.h
+@@ -131,6 +131,7 @@ class Evaluator {
+   void EvalCommand(const CommandStmt* stmt);
+   void EvalIf(const IfStmt* stmt);
+   void EvalInclude(const IncludeStmt* stmt);
++  void EvalLoad(const LoadStmt* stmt);
+   void EvalExport(const ExportStmt* stmt);
+ 
+   Var* LookupVarForEval(Symbol name);
+@@ -147,6 +148,21 @@ class Evaluator {
+   const Loc& loc() const { return loc_; }
+   void set_loc(const Loc& loc) { loc_ = loc; }
+ 
++  // Where the builtin function being evaluated was written.
++  const Loc& func_loc() const { return func_loc_; }
++  void set_func_loc(const Loc& loc) { func_loc_ = loc; }
++
++  // While a recipe is expanded, how many lines the current location is past
++  // the recipe's first line. Loaded objects are given that first line, as
++  // make gives them its recipe location without the offset it adds for
++  // errors.
++  int loc_offset() const { return loc_offset_; }
++  void set_loc_offset(int offset) { loc_offset_ = offset; }
++
++  // Reports an included makefile that could not be found and waited for the
++  // makefiles to be read.
++  void RaiseWaitingIncludeError();
++
+   const std::vector<const Rule*>& rules() const { return rules_; }
+   const std::unordered_map<Symbol, Vars*>& rule_vars() const {
+     return rule_vars_;
+@@ -252,6 +268,10 @@ class Evaluator {
+   Vars* current_scope_;
+ 
+   Loc loc_;
++  Loc func_loc_;
++  int loc_offset_ = 0;
++  Loc waiting_include_loc_;
++  std::string waiting_include_error_;
+   bool is_bootstrap_;
+   bool is_commandline_;
+ 
+diff --git a/src/exec.cc b/src/exec.cc
+index 1539369..65bf115 100644
+--- a/src/exec.cc
++++ b/src/exec.cc
+@@ -32,6 +32,7 @@
+ #include "expr.h"
+ #include "fileutil.h"
+ #include "flags.h"
++#include "loadapi.h"
+ #include "log.h"
+ #include "strutil.h"
+ #include "symtab.h"
+@@ -99,6 +100,7 @@ class Executor {
+ 
+     auto commands = ce_.Eval(n);
+     for (const Command& command : commands) {
++      FlushObjectOutput();
+       num_commands_ += 1;
+       if (command.echo) {
+         printf("%s\n", command.cmd.c_str());
+diff --git a/src/expr.cc b/src/expr.cc
+index 102bfdf..af61d20 100644
+--- a/src/expr.cc
++++ b/src/expr.cc
+@@ -16,10 +16,13 @@
+ 
+ #include "expr.h"
+ 
++#include <algorithm>
++#include <memory>
+ #include <vector>
+ 
+ #include "eval.h"
+ #include "func.h"
++#include "loadapi.h"
+ #include "log.h"
+ #include "stringprintf.h"
+ #include "strutil.h"
+@@ -246,11 +249,19 @@ class Func : public Value {
+   virtual bool IsFunc(Evaluator*) const override { return true; }
+ 
+   virtual void Eval(Evaluator* ev, std::string* s) const override {
++    if (unterminated_) {
++      ERROR_LOC(Location(),
++                "*** unterminated call to function '%s': missing '%c'.", name(),
++                unterminated_);
++    }
+     ScopedFrame frame(ev->Enter(FrameType::FUNCALL, fi_->name, Location()));
+     ev->CheckStack();
+     LOG("Invoke func %s(%s)", name(), JoinValues(args_, ",").c_str());
+     ev->IncrementEvalDepth();
++    const Loc saved_func_loc = ev->func_loc();
++    ev->set_func_loc(Location());
+     fi_->func(args_, ev, s);
++    ev->set_func_loc(saved_func_loc);
+     ev->DecrementEvalDepth();
+   }
+ 
+@@ -260,6 +271,10 @@ class Func : public Value {
+   }
+ 
+   void AddArg(Value* v) { args_.push_back(v); }
++  // Marks a call left open before its first argument, which fails when it is
++  // expanded, as make reads text only when it expands it. |close| is the
++  // bracket it misses.
++  void set_unterminated(char close) { unterminated_ = close; }
+ 
+   const char* name() const { return fi_->name; }
+   int arity() const { return fi_->arity; }
+@@ -270,8 +285,484 @@ class Func : public Value {
+  private:
+   const FuncInfo* fi_;
+   std::vector<Value*> args_;
++  char unterminated_ = 0;
++};
++
++// Text kati could not read, which fails when it is expanded.
++class ReadError : public Value {
++ public:
++  ReadError(const Loc& loc, std::string msg)
++      : Value(loc), msg_(std::move(msg)) {}
++
++  virtual bool IsFunc(Evaluator*) const override { return false; }
++
++  virtual void Eval(Evaluator* ev, std::string*) const override {
++    // Like make, an error in text read without a file name is reported where
++    // it is expanded.
++    ERROR_LOC(Location().filename ? Location() : ev->loc(), "%s", msg_.c_str());
++  }
++
++  virtual std::string DebugString_() const override {
++    return StringPrintf("ReadError(%s)", msg_.c_str());
++  }
++
++ private:
++  std::string msg_;
++};
++
++// A call to a function a loaded object registered.
++class LoadedFuncCall : public Value {
++ public:
++  LoadedFuncCall(const Loc& loc,
++                 Symbol name,
++                 const LoadedFunc* func,
++                 std::vector<Value*> args,
++                 std::vector<std::string> raw_args)
++      : Value(loc),
++        name_(name),
++        func_(func),
++        expand_args_(func->expand_args),
++        args_(std::move(args)),
++        raw_args_(std::move(raw_args)) {}
++
++  ~LoadedFuncCall() {
++    for (Value* a : args_)
++      delete a;
++  }
++
++  virtual bool IsFunc(Evaluator*) const override { return true; }
++
++  virtual void Eval(Evaluator* ev, std::string* s) const override {
++    ScopedFrame frame(ev->Enter(FrameType::FUNCALL, name_.str(), Location()));
++    ev->CheckStack();
++    ev->IncrementEvalDepth();
++    std::vector<std::string> argv;
++    if (expand_args_) {
++      for (Value* a : args_)
++        argv.push_back(a->Eval(ev));
++    } else {
++      argv = raw_args_;
++    }
++    CallLoadedFunc(ev, Location(), func_, std::move(argv), s);
++    ev->DecrementEvalDepth();
++  }
++
++  virtual std::string DebugString_() const override {
++    return StringPrintf("LoadedFuncCall(%s %s)", name_.c_str(),
++                        JoinValues(args_, ",").c_str());
++  }
++
++ private:
++  Symbol name_;
++  const LoadedFunc* func_;
++  bool expand_args_;
++  std::vector<Value*> args_;
++  std::vector<std::string> raw_args_;
++};
++
++void ExprError::Raise() const {
++  if (!msg.empty())
++    ERROR_LOC(loc, "%s", msg.c_str());
++}
++
++// A --warn warning waiting for the expansion of the expression it was met
++// reading. One about a call read as a variable reference has the call's |name|;
++// the others have none that is valid.
++struct WaitingWarning {
++  Symbol name;
++  Loc loc;
++  std::string msg;
++};
++
++// What reading the expression being parsed found: the names of its
++// ${name ...} references that a loaded object may register a function under,
++// whether one of them was read as a variable reference because it was not a
++// function yet, and the first error its reading left for its expansion. |raw|
++// is whether the text is read as gmk_expand reads it, |comments| whether its
++// comments are read, |warnings| the --warn warnings waiting for its expansion,
++// |list_read| whether the reading has reached the list of its parts.
++struct ExprCalls {
++  std::vector<Symbol> names;
++  bool has_unread = false;
++  ExprError error;
++  bool raw = false;
++  bool comments = true;
++  std::vector<WaitingWarning> warnings;
++  bool list_read = false;
++};
++
++static ExprCalls* g_expr_calls;
++static TextErrors* g_text_errors;
++// While an expression is read again because a function has been registered
++// since it was read. Its first reading gave its warnings.
++static bool g_reading_again;
++static bool g_objects_can_load;
++
++TextErrors::TextErrors() : saved_(g_text_errors) {
++  g_text_errors = this;
++}
++
++TextErrors::~TextErrors() {
++  g_text_errors = saved_;
++}
++
++// Whether the "eval" at |i| in |text| calls eval: right after $( or ${, or as
++// the function $(call) is given.
++static bool CallsEvalAt(std::string_view text, size_t i) {
++  if (i + 4 < text.size() &&
++      std::string_view(" \t,)}").find(text[i + 4]) == std::string_view::npos) {
++    return false;
++  }
++  auto opens = [&](size_t b) {
++    return b >= 2 && (text[b - 1] == '(' || text[b - 1] == '{') &&
++           text[b - 2] == '$';
++  };
++  if (opens(i))
++    return true;
++  size_t b = i;
++  while (b > 0 && (text[b - 1] == ' ' || text[b - 1] == '\t'))
++    b--;
++  return b < i && b >= 4 && text.substr(b - 4, 4) == "call" && opens(b - 4);
++}
++
++bool CallsEval(std::string_view text) {
++  for (size_t i = text.find("eval"); i != std::string_view::npos;
++       i = text.find("eval", i + 1)) {
++    if (CallsEvalAt(text, i))
++      return true;
++  }
++  return false;
++}
++
++void NoteObjectsCanLoad() {
++  g_objects_can_load = true;
++}
++
++bool ObjectsCanLoad() {
++  return g_objects_can_load;
++}
++
++// Whether the text being read is read as gmk_expand reads it.
++static bool ReadingRaw() {
++  return g_expr_calls && g_expr_calls->raw;
++}
++
++// Gives a --warn warning met reading the text, the first time it is read and
++// unless the text has left an error, where base kati stops reading. When
++// objects can be loaded, once the expression has a call read as a variable
++// reference, the warning waits for its expansion, where one about such a call,
++// |unread| to |name|, is given only if |name| is still no function: a
++// function that a later load registers is not reported.
++static void ReadWarning(bool unread,
++                        Symbol name,
++                        const Loc& loc,
++                        std::string msg) {
++  if (g_reading_again || (g_text_errors && g_text_errors->left()))
++    return;
++  if (g_expr_calls && !g_expr_calls->error.msg.empty())
++    return;
++  if (g_objects_can_load && g_expr_calls && g_expr_calls->has_unread) {
++    g_expr_calls->warnings.push_back(
++        {unread ? name : Symbol(), loc, std::move(msg)});
++    return;
++  }
++  KATI_WARN_LOC(loc, "%s", msg.c_str());
++}
++
++// Leaves an error met reading the text for the expression's expansion.
++static void LeaveParseError(const Loc& loc, const std::string& msg) {
++  if (!g_expr_calls->error.msg.empty())
++    return;
++  g_expr_calls->error = {loc, msg};
++  if (g_text_errors)
++    g_text_errors->set_left();
++}
++
++// Reports an error in the text being read. While the text is read again, and
++// when objects can be loaded once the expression it belongs to has a call read
++// as a variable reference or an expression read earlier left its error, the
++// error waits for the expression's expansion, as make reads text only when it
++// expands it.
++static void ParseError(const Loc& loc, const std::string& msg) {
++  if (g_expr_calls &&
++      (g_reading_again ||
++       (g_objects_can_load && (g_expr_calls->has_unread ||
++                               (g_text_errors && g_text_errors->left()))))) {
++    LeaveParseError(loc, msg);
++    return;
++  }
++  ERROR_LOC(loc, "%s", msg.c_str());
++}
++
++class LazyCalls;
++
++// The expressions whose --warn warnings wait for their expansion, in the order
++// they were read.
++static std::vector<const LazyCalls*>* g_waiting_warnings;
++
++// An expression with ${name ...} references that a loaded object may register
++// a function under, or with an error left for its expansion. Like make, which
++// reads text when it expands it, it is read again whenever a function has been
++// registered since it was read, and an error its reading left is raised where
++// its expansion reaches the part holding it. The --warn warnings waiting for
++// its expansion are given when it is first expanded, or when the condition it
++// was read for is split again.
++class LazyCalls : public Value {
++ public:
++  LazyCalls(const Loc& loc,
++            std::string_view text,
++            const char* terms,
++            ParseExprOpt opt,
++            bool trim_right_space,
++            Value* value,
++            ExprCalls calls)
++      : Value(loc),
++        text_(text),
++        has_terms_(terms != nullptr),
++        terms_(terms ? terms : ""),
++        opt_(opt),
++        trim_right_space_(trim_right_space),
++        value_(value),
++        calls_(std::move(calls)),
++        registrations_(LoadedFuncRegistrations()) {
++    if (!calls_.warnings.empty()) {
++      if (!g_waiting_warnings)
++        g_waiting_warnings = new std::vector<const LazyCalls*>();
++      g_waiting_warnings->push_back(this);
++    }
++  }
++
++  ~LazyCalls() {
++    delete value_;
++    if (g_waiting_warnings) {
++      auto found = std::find(g_waiting_warnings->begin(),
++                             g_waiting_warnings->end(), this);
++      if (found != g_waiting_warnings->end())
++        g_waiting_warnings->erase(found);
++    }
++  }
++
++  virtual bool IsFunc(Evaluator* ev) const override {
++    if (value_->IsFunc(ev))
++      return true;
++    for (Symbol name : calls_.names) {
++      if (FindLoadedFunc(name))
++        return true;
++    }
++    return false;
++  }
++
++  virtual bool DependsOnLoadedFuncs() const override { return true; }
++
++  virtual void Eval(Evaluator* ev, std::string* s) const override {
++    GiveWarnings();
++    const size_t registrations = LoadedFuncRegistrations();
++    if (registrations == registrations_) {
++      value_->Eval(ev, s);
++      return;
++    }
++    if (!reread_ || reread_registrations_ != registrations) {
++      Loc loc = Location();
++      size_t n;
++      g_reading_again = true;
++      reread_.reset(ParseExprImpl(&loc, text_,
++                                  has_terms_ ? terms_.c_str() : nullptr, opt_,
++                                  &n, trim_right_space_));
++      g_reading_again = false;
++      reread_registrations_ = registrations;
++    }
++    // An expansion still using this reading keeps it alive.
++    std::shared_ptr<const Value> reading = reread_;
++    reading->Eval(ev, s);
++  }
++
++  virtual std::string DebugString_() const override {
++    return Value::DebugString(value_);
++  }
++
++  const ExprError& error() const { return calls_.error; }
++
++  // Gives the warnings waiting for its expansion, the first time it is called,
++  // leaving out those about calls whose names are functions by then.
++  void GiveWarnings() const {
++    if (warned_)
++      return;
++    warned_ = true;
++    for (const WaitingWarning& w : calls_.warnings) {
++      if (!w.name.IsValid() || !FindLoadedFunc(w.name))
++        KATI_WARN_LOC(w.loc, "%s", w.msg.c_str());
++    }
++  }
++
++ private:
++  std::string_view text_;
++  bool has_terms_;
++  std::string terms_;
++  ParseExprOpt opt_;
++  bool trim_right_space_;
++  Value* value_;
++  ExprCalls calls_;
++  size_t registrations_;
++  mutable bool warned_ = false;
++  // The latest reading of the text, and the registrations there were then.
++  mutable std::shared_ptr<const Value> reread_;
++  mutable size_t reread_registrations_ = 0;
++};
++
++// Where make splits a parenthesized ifeq condition: at its first comma outside
++// parentheses, counting no other brackets.
++static size_t IfEqComma(std::string_view cond) {
++  int depth = 0;
++  for (size_t i = 0; i < cond.size(); i++) {
++    if (cond[i] == '(')
++      depth++;
++    else if (cond[i] == ')')
++      depth--;
++    else if (cond[i] == ',' && depth <= 0)
++      return i;
++  }
++  return std::string_view::npos;
++}
++
++// Both sides of a parenthesized ifeq whose first side depends on loaded
++// functions. A call there may hold the comma kati split at, so like make,
++// which splits the condition at that comma before expanding it, the condition
++// is split there and its sides are read again whenever a function has been
++// registered since kati read them.
++class LazyCondition {
++ public:
++  LazyCondition(const Loc& loc,
++                std::string_view cond,
++                size_t comma,
++                Value* lhs,
++                Value* rhs)
++      : loc_(loc),
++        cond_(cond),
++        comma_(comma),
++        lhs_(lhs),
++        rhs_(rhs),
++        registrations_(LoadedFuncRegistrations()) {}
++
++  ~LazyCondition() {
++    delete lhs_;
++    delete rhs_;
++  }
++
++  // A side as kati first read it. The second is nullptr when kati found no
++  // comma.
++  const Value* FirstReading(int side) const { return side ? rhs_ : lhs_; }
++
++  void Eval(int side, Evaluator* ev, std::string* s) const {
++    if (rhs_ && LoadedFuncRegistrations() == registrations_) {
++      FirstReading(side)->Eval(ev, s);
++      return;
++    }
++    // The sides as kati first read them are not expanded, so the warnings they
++    // keep for their expansion are given here. Reading the condition again
++    // gives none.
++    for (const Value* v : {lhs_, rhs_}) {
++      if (v && v->DependsOnLoadedFuncs())
++        static_cast<const LazyCalls*>(v)->GiveWarnings();
++    }
++    // An expansion still using this split keeps it alive.
++    std::shared_ptr<const Split> split = Current();
++    (side ? split->rhs : split->lhs)->Eval(ev, s);
++  }
++
++ private:
++  struct Split {
++    size_t registrations;
++    std::unique_ptr<Value> lhs;
++    std::unique_ptr<Value> rhs;
++  };
++
++  std::shared_ptr<const Split> Current() const {
++    const size_t registrations = LoadedFuncRegistrations();
++    if (!split_ || split_->registrations != registrations) {
++      if (comma_ == std::string_view::npos || registrations == registrations_) {
++        // Kati found no comma, and make finds none either or no function has
++        // been registered since kati read the condition, which then fails as it
++        // does in a makefile that loads nothing: with an error kati met
++        // reading the first side, if it met one.
++        if (registrations == registrations_)
++          static_cast<const LazyCalls*>(lhs_)->error().Raise();
++        ERROR_LOC(loc_, "*** invalid syntax in conditional.");
++      }
++      auto split = std::make_shared<Split>();
++      split->registrations = registrations;
++      Loc loc = loc_;
++      size_t n;
++      g_reading_again = true;
++      split->lhs.reset(ParseExprImpl(&loc,
++                                     TrimRightSpace(cond_.substr(0, comma_)),
++                                     nullptr, ParseExprOpt::NORMAL, &n));
++      split->rhs.reset(ParseExprImpl(&loc,
++                                     TrimLeftSpace(cond_.substr(comma_ + 1)),
++                                     nullptr, ParseExprOpt::NORMAL, &n));
++      g_reading_again = false;
++      split_ = std::move(split);
++    }
++    return split_;
++  }
++
++  Loc loc_;
++  std::string_view cond_;
++  size_t comma_;
++  Value* lhs_;
++  Value* rhs_;
++  size_t registrations_;
++  mutable std::shared_ptr<const Split> split_;
+ };
+ 
++class ConditionSide : public Value {
++ public:
++  ConditionSide(const Loc& loc, std::shared_ptr<LazyCondition> cond, int side)
++      : Value(loc), cond_(std::move(cond)), side_(side) {}
++
++  virtual bool IsFunc(Evaluator* ev) const override {
++    const Value* v = cond_->FirstReading(side_);
++    return v && v->IsFunc(ev);
++  }
++
++  virtual void Eval(Evaluator* ev, std::string* s) const override {
++    cond_->Eval(side_, ev, s);
++  }
++
++  virtual std::string DebugString_() const override {
++    return Value::DebugString(cond_->FirstReading(side_));
++  }
++
++ private:
++  std::shared_ptr<LazyCondition> cond_;
++  int side_;
++};
++
++void GiveWaitingWarnings() {
++  if (!g_waiting_warnings)
++    return;
++  std::vector<const LazyCalls*> waiting;
++  waiting.swap(*g_waiting_warnings);
++  for (const LazyCalls* lazy : waiting)
++    lazy->GiveWarnings();
++}
++
++bool ResplitIfEqLater(const Loc& loc,
++                      std::string_view cond,
++                      Value** lhs,
++                      Value** rhs) {
++  if (!ObjectsCanLoad() || !(*lhs)->DependsOnLoadedFuncs())
++    return *rhs != nullptr;
++  const size_t comma = IfEqComma(cond);
++  // When neither kati nor make finds a comma, the condition fails when it is
++  // evaluated, so later errors in the text wait for it.
++  if (!*rhs && comma == std::string_view::npos && g_text_errors)
++    g_text_errors->set_left();
++  auto lazy = std::make_shared<LazyCondition>(loc, cond, comma, *lhs, *rhs);
++  *lhs = new ConditionSide(loc, lazy, 0);
++  *rhs = new ConditionSide(loc, lazy, 1);
++  return true;
++}
++
+ static char CloseParen(char c) {
+   switch (c) {
+     case '(':
+@@ -290,7 +781,7 @@ static size_t SkipSpaces(Loc* loc, std::string_view s, const char* terms) {
+     }
+ 
+     if (!isspace(c)) {
+-      if (c != '\\') {
++      if (c != '\\' || ReadingRaw()) {
+         return i;
+       }
+ 
+@@ -326,8 +817,13 @@ Value* Value::NewLiteral(std::string_view s) {
+   return new Literal(s);
+ }
+ 
++Value* Value::NewReadError(const Loc& loc, std::string msg) {
++  return new ReadError(loc, std::move(msg));
++}
++
+ bool ShouldHandleComments(ParseExprOpt opt) {
+-  return opt != ParseExprOpt::DEFINE && opt != ParseExprOpt::COMMAND;
++  return opt != ParseExprOpt::DEFINE && opt != ParseExprOpt::COMMAND &&
++         opt != ParseExprOpt::EXPAND;
+ }
+ 
+ void ParseFunc(Loc* loc,
+@@ -341,6 +837,7 @@ void ParseFunc(Loc* loc,
+   terms[2] = '\0';
+   i += SkipSpaces(loc, s.substr(i), terms);
+   if (i == s.size()) {
++    f->set_unterminated(terms[0]);
+     *index_out = i;
+     return;
+   }
+@@ -357,7 +854,7 @@ void ParseFunc(Loc* loc,
+           continue;
+         }
+ 
+-        if (s[i] == '\\') {
++        if (s[i] == '\\' && !ReadingRaw()) {
+           char c = i + 1 < s.size() ? s[i + 1] : 0;
+           if (c == '\r' || c == '\n') {
+             loc->lineno++;
+@@ -378,10 +875,11 @@ void ParseFunc(Loc* loc,
+     f->AddArg(v);
+     i += n;
+     if (i == s.size()) {
+-      ERROR_LOC(start_loc,
+-                "*** unterminated call to function '%s': "
+-                "missing '%c'.",
+-                f->name(), terms[0]);
++      ParseError(start_loc, StringPrintf("*** unterminated call to function "
++                                         "'%s': missing '%c'.",
++                                         f->name(), terms[0]));
++      *index_out = i;
++      return;
+     }
+     nargs++;
+     if (s[i] == terms[0]) {
+@@ -394,15 +892,139 @@ void ParseFunc(Loc* loc,
+   }
+ 
+   if (nargs <= f->min_arity()) {
+-    ERROR_LOC(start_loc,
+-              "*** insufficient number of arguments (%d) to function `%s'.",
+-              nargs - 1, f->name());
++    ParseError(
++        start_loc,
++        StringPrintf(
++            "*** insufficient number of arguments (%d) to function `%s'.",
++            nargs - 1, f->name()));
+   }
+ 
+   *index_out = i;
+   return;
+ }
+ 
++// The text an unexpanded argument passes. Outside gmk_expand text, a
++// backslash-newline and the blanks around it read as one space, as make reads
++// them. \# reads as # on the lines whose comments kati reads, as kati's
++// builtins read it there (make does so on assignment and directive lines);
++// recipes and define bodies keep it.
++static std::string RawArgText(std::string_view s) {
++  if (ReadingRaw())
++    return std::string(s);
++  const bool comments = g_expr_calls->comments;
++  std::string r;
++  for (size_t i = 0; i < s.size(); i++) {
++    char c = s[i];
++    if (c == '\\' && i + 1 < s.size()) {
++      char n = s[i + 1];
++      if (n == '\\' || (n == '#' && comments)) {
++        if (n == '\\')
++          r += c;
++        r += n;
++        i++;
++        continue;
++      }
++      if (n == '\r' || n == '\n') {
++        r.resize(TrimRightSpace(r).size());
++        r += ' ';
++        i += 2;
++        if (n == '\r' && i < s.size() && s[i] == '\n')
++          i++;
++        for (; i < s.size(); i++) {
++          if (s[i] == '\\' && i + 1 < s.size() &&
++              (s[i + 1] == '\r' || s[i + 1] == '\n')) {
++            i++;
++            continue;
++          }
++          if (s[i] != ' ' && s[i] != '\t')
++            break;
++        }
++        i--;
++        continue;
++      }
++    }
++    r += c;
++  }
++  return r;
++}
++
++// The arguments in |s|, the text of a call between its brackets. Like make, it
++// is split at each comma outside brackets of the call's own kind, |open| and
++// |close|, until there are |max_args| arguments, if that is not 0. Brackets of
++// the other kind are not counted: GNU make splits $(f ${a,b}) into ${a and b}.
++static std::vector<std::string_view> SplitArgs(std::string_view s,
++                                               char open,
++                                               char close,
++                                               unsigned int max_args) {
++  std::vector<std::string_view> args;
++  int depth = 0;
++  size_t b = 0;
++  for (size_t i = 0; i < s.size() && (!max_args || args.size() + 1 < max_args);
++       i++) {
++    if (s[i] == open) {
++      depth++;
++    } else if (s[i] == close) {
++      depth--;
++    } else if (s[i] == ',' && depth == 0) {
++      args.push_back(s.substr(b, i - b));
++      b = i + 1;
++    }
++  }
++  args.push_back(s.substr(b));
++  return args;
++}
++
++// Parses ${name ...} for |func|, the function a loaded object registered under
++// |name|. Like make, the call ends at the first unmatched bracket of its kind,
++// and its text is split at commas outside brackets of that kind before
++// anything in it is read, the last argument it takes getting the rest. The
++// text of arguments it does not expand is never parsed.
++static Value* ParseLoadedFuncCall(Loc* loc,
++                                  std::string_view s,
++                                  size_t i,
++                                  char cp,
++                                  Symbol name,
++                                  const LoadedFunc* func,
++                                  const Loc& start_loc,
++                                  size_t* index_out) {
++  const char terms[] = {cp, ',', '\0'};
++  i += SkipSpaces(loc, s.substr(i), terms);
++  int depth = 0;
++  for (size_t end = i; end < s.size(); end++) {
++    if (s[end] == s[1]) {
++      depth++;
++    } else if (s[end] == cp && --depth < 0) {
++      *index_out = end + 1;
++      const std::string_view text = s.substr(i, end - i);
++      if (!func->expand_args) {
++        loc->lineno += std::count(text.begin(), text.end(), '\n');
++        std::vector<std::string> raw_args;
++        for (std::string_view arg : SplitArgs(text, s[1], cp, func->max_args))
++          raw_args.push_back(RawArgText(arg));
++        return new LoadedFuncCall(start_loc, name, func, {},
++                                  std::move(raw_args));
++      }
++      std::vector<Value*> args;
++      for (std::string_view arg : SplitArgs(text, s[1], cp, func->max_args)) {
++        size_t n;
++        Value* v = ParseExprImpl(loc, arg, "", ParseExprOpt::FUNC, &n);
++        // Text the reader leaves at the end, like a $ that make expands to
++        // itself, stays as it is.
++        if (n < arg.size())
++          v = Value::NewExpr(*loc, v, Value::NewLiteral(arg.substr(n)));
++        args.push_back(v);
++      }
++      return new LoadedFuncCall(start_loc, name, func, std::move(args), {});
++    }
++  }
++  ParseError(
++      start_loc,
++      StringPrintf("*** unterminated call to function '%s': missing '%c'.",
++                   name.c_str(), cp));
++  *index_out = s.size();
++  return new Literal("");
++}
++
+ Value* ParseDollar(Loc* loc, std::string_view s, size_t* index_out) {
+   CHECK(s.size() >= 2);
+   CHECK(s[0] == '$');
+@@ -416,23 +1038,28 @@ Value* ParseDollar(Loc* loc, std::string_view s, size_t* index_out) {
+     return new SymRef(start_loc, Intern(s.substr(1, 1)));
+   }
+ 
+-  char terms[] = {cp, ':', ' ', 0};
++  char terms[] = {cp, ':', ' ', '\t', '\n', '\v', '\f', '\r', 0};
++  bool unread = false;
++  Symbol unread_name;
+   for (size_t i = 2;;) {
+     size_t n;
+     Value* vname =
+         ParseExprImpl(loc, s.substr(i), terms, ParseExprOpt::NORMAL, &n);
+     i += n;
+     if (s[i] == cp) {
+-      *index_out = i + 1;
++      // The bracket may lie just past the text, as it does for the second
++      // side of a parenthesized ifeq. The reference then ends with the text.
++      *index_out = std::min(i + 1, s.size());
+       if (vname->IsLiteral()) {
+         Literal* lit = static_cast<Literal*>(vname);
+         Symbol sym = Intern(lit->val());
+         if (g_flags.enable_kati_warnings) {
+           size_t found = sym.str().find_first_of(" ({");
+           if (found != std::string::npos) {
+-            KATI_WARN_LOC(start_loc,
+-                          "*warning*: variable lookup with '%c': %.*s",
+-                          sym.str()[found], SPF(s));
++            ReadWarning(
++                unread, unread_name, start_loc,
++                StringPrintf("*warning*: variable lookup with '%c': %.*s",
++                             sym.str()[found], SPF(s)));
+           }
+         }
+         Value* r = new SymRef(start_loc, sym);
+@@ -442,32 +1069,54 @@ Value* ParseDollar(Loc* loc, std::string_view s, size_t* index_out) {
+       return new VarRef(start_loc, vname);
+     }
+ 
+-    if (s[i] == ' ' || s[i] == '\\') {
++    // Like make, which ends a function name at any whitespace, a tab or a
++    // newline may also end the name of a function a loaded object registered.
++    // kati's own functions keep needing a space.
++    const bool other_space = i < s.size() && s[i] != ' ' &&
++                             isspace(static_cast<unsigned char>(s[i]));
++    if (i < s.size() && (s[i] == ' ' || s[i] == '\\' || other_space)) {
+       // ${func ...}
+       if (vname->IsLiteral()) {
+         Literal* lit = static_cast<Literal*>(vname);
+-        if (const FuncInfo* fi = GetFuncInfo(lit->val())) {
++        const FuncInfo* fi = GetFuncInfo(lit->val());
++        if (fi && !other_space) {
+           delete lit;
+           Func* func = new Func(start_loc, fi);
+           ParseFunc(loc, func, s, i + 1, terms, index_out);
+           return func;
+-        } else {
+-          KATI_WARN_LOC(start_loc,
+-                        "*warning*: unknown make function '%.*s': %.*s",
+-                        SPF(lit->val()), SPF(s));
++        }
++        Symbol name = Intern(lit->val());
++        const LoadedFunc* loaded = fi ? nullptr : FindLoadedFunc(name);
++        if (!fi && g_expr_calls && IsLoadableFuncName(lit->val())) {
++          g_expr_calls->names.push_back(name);
++          g_expr_calls->has_unread |= !loaded;
++          unread = !loaded;
++          unread_name = name;
++        }
++        if (loaded) {
++          delete lit;
++          return ParseLoadedFuncCall(loc, s, i + 1, cp, name, loaded, start_loc,
++                                     index_out);
++        }
++        if (g_flags.enable_kati_warnings && !other_space) {
++          ReadWarning(
++              unread, name, start_loc,
++              StringPrintf("*warning*: unknown make function '%.*s': %.*s",
++                           SPF(lit->val()), SPF(s)));
+         }
+       }
+ 
+       // Not a function. Drop ' ' from |terms| and parse it
+       // again. This is inefficient, but this code path should be
+-      // rarely used.
++      // rarely used. A name another space ended is read again up to a ' ',
++      // as kati reads it.
+       delete vname;
+-      terms[2] = 0;
++      terms[other_space ? 3 : 2] = 0;
+       i = 2;
+       continue;
+     }
+ 
+-    if (s[i] == ':') {
++    if (i < s.size() && s[i] == ':') {
+       terms[2] = '\0';
+       terms[1] = '=';
+       size_t n;
+@@ -475,16 +1124,23 @@ Value* ParseDollar(Loc* loc, std::string_view s, size_t* index_out) {
+           ParseExprImpl(loc, s.substr(i + 1), terms, ParseExprOpt::NORMAL, &n);
+       i += 1 + n;
+       if (s[i] == cp) {
+-        *index_out = i + 1;
++        *index_out = std::min(i + 1, s.size());
+         return new VarRef(
+             start_loc, Value::NewExpr(start_loc, vname, new Literal(":"), pat));
+       }
++      if (i >= s.size()) {
++        ParseError(start_loc, "*** unterminated variable reference.");
++        *index_out = s.size();
++        return new VarSubst(start_loc, vname, pat, new Literal(""));
++      }
+ 
+       terms[1] = '\0';
+       Value* subst =
+           ParseExprImpl(loc, s.substr(i + 1), terms, ParseExprOpt::NORMAL, &n);
+       i += 1 + n;
+-      *index_out = i + 1;
++      // A substitution left open ends with the text, so callers never read
++      // past it.
++      *index_out = i < s.size() ? i + 1 : s.size();
+       return new VarSubst(start_loc, vname, pat, subst);
+     }
+ 
+@@ -492,24 +1148,73 @@ Value* ParseDollar(Loc* loc, std::string_view s, size_t* index_out) {
+     // for detail.
+     size_t found = s.find(cp);
+     if (found != std::string::npos) {
+-      KATI_WARN_LOC(start_loc, "*warning*: unmatched parentheses: %.*s",
+-                    SPF(s));
++      if (g_flags.enable_kati_warnings) {
++        ReadWarning(
++            false, Symbol(), start_loc,
++            StringPrintf("*warning*: unmatched parentheses: %.*s", SPF(s)));
++      }
+       *index_out = s.size();
+       return new SymRef(start_loc, Intern(s.substr(2, found - 2)));
+     }
+-    ERROR_LOC(start_loc, "*** unterminated variable reference.");
++    std::string msg = "*** unterminated variable reference.";
++    if (vname->IsLiteral()) {
++      // As make does, the name of a function registered when the text is read,
++      // left open, is reported as an unterminated call. Builtins keep kati's
++      // message.
++      std::string_view name = static_cast<Literal*>(vname)->val();
++      if (FindLoadedFunc(Intern(name))) {
++        msg = StringPrintf(
++            "*** unterminated call to function '%.*s': missing '%c'.",
++            SPF(name), cp);
++      }
++    }
++    ParseError(start_loc, msg);
++    *index_out = s.size();
++    return new VarRef(start_loc, vname);
+   }
+ }
+ 
++static Value* ParseExprList(Loc* loc,
++                            std::string_view s,
++                            const char* terms,
++                            ParseExprOpt opt,
++                            size_t* index_out,
++                            bool trim_right_space);
++
+ Value* ParseExprImpl(Loc* loc,
+                      std::string_view s,
+                      const char* terms,
+                      ParseExprOpt opt,
+                      size_t* index_out,
+                      bool trim_right_space) {
++  if (g_expr_calls)
++    return ParseExprList(loc, s, terms, opt, index_out, trim_right_space);
++
++  ExprCalls calls;
++  calls.raw = opt == ParseExprOpt::EXPAND;
++  calls.comments = ShouldHandleComments(opt);
++  g_expr_calls = &calls;
++  const Loc start_loc = *loc;
++  Value* v = ParseExprList(loc, s, terms, opt, index_out, trim_right_space);
++  g_expr_calls = nullptr;
++  if (calls.names.empty() && calls.error.msg.empty())
++    return v;
++  return new LazyCalls(start_loc, s.substr(0, *index_out), terms, opt,
++                       trim_right_space, v, std::move(calls));
++}
++
++static Value* ParseExprList(Loc* loc,
++                            std::string_view s,
++                            const char* terms,
++                            ParseExprOpt opt,
++                            size_t* index_out,
++                            bool trim_right_space) {
+   Loc list_loc = *loc;
++  const bool raw = ReadingRaw();
++  const bool parts = !g_expr_calls->list_read;
++  g_expr_calls->list_read = true;
+ 
+-  if (!s.empty() && s.back() == '\r')
++  if (!raw && !s.empty() && s.back() == '\r')
+     s.remove_suffix(1);
+ 
+   size_t b = 0;
+@@ -539,6 +1244,9 @@ Value* ParseExprImpl(Loc* loc,
+ 
+     if (c == '$') {
+       if (i + 1 >= s.size()) {
++        // As make does, gmk_expand keeps a $ that ends the text.
++        if (raw)
++          i++;
+         break;
+       }
+ 
+@@ -559,7 +1267,15 @@ Value* ParseExprImpl(Loc* loc,
+       }
+ 
+       size_t n;
+-      list.push_back(ParseDollar(loc, s.substr(i), &n));
++      const bool had_error = !g_expr_calls->error.msg.empty();
++      Value* v = ParseDollar(loc, s.substr(i), &n);
++      // The expansion raises an error left reading this part when it reaches
++      // the part, after expanding the ones before it.
++      if (parts && !had_error && !g_expr_calls->error.msg.empty()) {
++        list.push_back(Value::NewReadError(g_expr_calls->error.loc,
++                                           g_expr_calls->error.msg));
++      }
++      list.push_back(v);
+       i += n;
+       b = i;
+       i--;
+@@ -586,7 +1302,7 @@ Value* ParseExprImpl(Loc* loc,
+       }
+     }
+ 
+-    if (c == '\\' && i + 1 < s.size() && opt != ParseExprOpt::COMMAND) {
++    if (c == '\\' && i + 1 < s.size() && opt != ParseExprOpt::COMMAND && !raw) {
+       char n = s[i + 1];
+       if (n == '\\') {
+         i++;
+diff --git a/src/expr.h b/src/expr.h
+index b57018f..cef5f5b 100644
+--- a/src/expr.h
++++ b/src/expr.h
+@@ -56,10 +56,15 @@ class Value : public Evaluable {
+   static Value* NewExpr(const Loc& loc, std::vector<Value*>* values);
+ 
+   static Value* NewLiteral(std::string_view s);
++  // A value whose expansion fails with |msg|.
++  static Value* NewReadError(const Loc& loc, std::string msg);
+   virtual ~Value();
+   virtual bool IsLiteral() const { return false; }
+   // Only safe after IsLiteral() returns true.
+   virtual std::string_view GetLiteralValueUnsafe() const { return ""; }
++  // Whether reading it depends on the functions loaded objects registered, so
++  // that it is read again when they register more.
++  virtual bool DependsOnLoadedFuncs() const { return false; }
+ 
+   static std::string DebugString(const Value*);
+ 
+@@ -73,6 +78,9 @@ enum struct ParseExprOpt {
+   DEFINE,
+   COMMAND,
+   FUNC,
++  // Text gmk_expand expands, which make expands as it is: nothing in it is a
++  // comment, a continued line or an escape.
++  EXPAND,
+ };
+ 
+ Value* ParseExprImpl(Loc* loc,
+@@ -85,6 +93,59 @@ Value* ParseExpr(Loc* loc,
+                  std::string_view s,
+                  ParseExprOpt opt = ParseExprOpt::NORMAL);
+ 
++// |cond| is a parenthesized ifeq condition kati split into |lhs| and |rhs|, or
++// into |lhs| alone, with |rhs| nullptr, when it found no comma. If reading
++// |lhs| depends on the functions loaded objects register, the sides become
++// ones that split |cond| again the way make splits it. Returns whether the
++// condition can be used.
++bool ResplitIfEqLater(const Loc& loc,
++                      std::string_view cond,
++                      Value** lhs,
++                      Value** rhs);
++
++// An error met reading an expression, left for its expansion.
++struct ExprError {
++  void Raise() const;
++
++  Loc loc;
++  std::string msg;
++};
++
++// While one is alive, an error met reading an expression waits for the
++// expression's expansion once an expression read earlier has left its error,
++// as make reaches a line of a makefile only after expanding the lines before
++// it. The parser keeps one while it reads a makefile's text.
++class TextErrors {
++ public:
++  TextErrors();
++  ~TextErrors();
++
++  // Whether an expression read so far left its error for its expansion.
++  bool left() const { return left_; }
++  void set_left() { left_ = true; }
++
++ private:
++  TextErrors* saved_;
++  bool left_ = false;
++};
++
++// Whether |text| calls the eval function, whose text can load objects.
++bool CallsEval(std::string_view text);
++
++// Notes that a makefile about to be read can load an object: it has a load,
++// -load or include directive, or calls the eval function. From then on, what
++// kati meets reading text that may call the functions objects register waits
++// for the text's expansion. Until then kati reads text as it does without
++// loaded objects.
++void NoteObjectsCanLoad();
++
++// Whether a makefile read so far can load an object.
++bool ObjectsCanLoad();
++
++// Gives the --warn warnings still waiting for the expansion of the expressions
++// read so far, so that one never expanded does not keep them back.
++void GiveWaitingWarnings();
++
+ std::string JoinValues(const std::vector<Value*>& vals, const char* sep);
+ 
+ #endif  // EXPR_H_
+diff --git a/src/func.cc b/src/func.cc
+index b3e544c..5e979db 100644
+--- a/src/func.cc
++++ b/src/func.cc
+@@ -34,6 +34,7 @@
+ #include "file_cache.h"
+ #include "fileutil.h"
+ #include "find.h"
++#include "loadapi.h"
+ #include "loc.h"
+ #include "log.h"
+ #include "parser.h"
+@@ -718,6 +719,21 @@ void CallFunc(const std::vector<Value*>& args, Evaluator* ev, std::string* s) {
+   ev->CheckStack();
+   const std::string&& func_name_buf = args[0]->Eval(ev);
+   Symbol func_sym = Intern(TrimSpace(func_name_buf));
++  // Like make, which finds a function by the first word of the name.
++  std::string_view first_word = TrimSpace(func_name_buf);
++  first_word = first_word.substr(0, first_word.find_first_of(" \t\n\v\f\r"));
++  // Like make, a loaded function runs as a builtin does, without the numbered
++  // variables a call of a variable sets, so gmk_expand and gmk_eval in it see
++  // the caller's $(1).
++  if (const LoadedFunc* loaded = FindLoadedFunc(
++          first_word.size() == func_sym.str().size() ? func_sym
++                                                     : Intern(first_word))) {
++    std::vector<std::string> call_args;
++    for (size_t i = 1; i < args.size(); i++)
++      call_args.push_back(args[i]->Eval(ev));
++    CallLoadedFunc(ev, ev->func_loc(), loaded, std::move(call_args), s);
++    return;
++  }
+   Var* func = ev->LookupVar(func_sym);
+   func->Used(ev, func_sym);
+   if (!func->IsDefined()) {
+@@ -826,11 +842,18 @@ void InfoFunc(const std::vector<Value*>& args, Evaluator* ev, std::string*) {
+   fflush(stdout);
+ }
+ 
++// The location a warning or an error starts with. Like make, a location without
++// a file name has none.
++static std::string LocPrefix(const Loc& loc) {
++  return loc.filename ? StringPrintf("%s:%d: ", LOCF(loc)) : std::string();
++}
++
+ void WarningFunc(const std::vector<Value*>& args, Evaluator* ev, std::string*) {
+   const std::string&& a = args[0]->Eval(ev);
+   if (ev->avoid_io()) {
+-    ev->add_delayed_output_command(StringPrintf(
+-        "echo -e \"%s:%d: %s\" 2>&1", LOCF(ev->loc()), EchoEscape(a).c_str()));
++    ev->add_delayed_output_command(StringPrintf("echo -e \"%s%s\" 2>&1",
++                                                LocPrefix(ev->loc()).c_str(),
++                                                EchoEscape(a).c_str()));
+     return;
+   }
+   WARN_LOC(ev->loc(), "%s", a.c_str());
+@@ -840,8 +863,8 @@ void ErrorFunc(const std::vector<Value*>& args, Evaluator* ev, std::string*) {
+   const std::string&& a = args[0]->Eval(ev);
+   if (ev->avoid_io()) {
+     ev->add_delayed_output_command(
+-        StringPrintf("echo -e \"%s:%d: *** %s.\" 2>&1 && false",
+-                     LOCF(ev->loc()), EchoEscape(a).c_str()));
++        StringPrintf("echo -e \"%s*** %s.\" 2>&1 && false",
++                     LocPrefix(ev->loc()).c_str(), EchoEscape(a).c_str()));
+     return;
+   }
+   ev->Error(StringPrintf("*** %s.", a.c_str()));
+diff --git a/src/loadapi.cc b/src/loadapi.cc
+new file mode 100644
+index 0000000..13f0e45
+--- /dev/null
++++ b/src/loadapi.cc
+@@ -0,0 +1,429 @@
++// Copyright 2026 Google Inc. All rights reserved
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "loadapi.h"
++
++#include <ctype.h>
++#include <dlfcn.h>
++#include <pwd.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <memory>
++#include <unordered_map>
++
++#include "eval.h"
++#include "expr.h"
++#include "file_cache.h"
++#include "fileutil.h"
++#include "log.h"
++#include "parser.h"
++#include "stmt.h"
++#include "var.h"
++
++namespace {
++
++typedef int (*SetupFunc)(const gmk_floc* floc);
++
++const unsigned int kNoExpand = 1;
++const size_t kMaxFuncNameLen = 255;
++const unsigned int kMaxArgCount = 255;
++
++std::unordered_map<Symbol, LoadedFunc>* g_loaded_funcs;
++size_t g_loaded_func_registrations;
++
++// The evaluator a loaded object is calling back into, and where the text of
++// the call to the function it runs was read, if it runs one.
++Evaluator* g_callback_ev;
++const Loc* g_callback_call_loc;
++
++// The buffer stdout has had since an object was loaded.
++char* g_stdout_buffer;
++
++class ScopedCallback {
++ public:
++  explicit ScopedCallback(Evaluator* ev, const Loc* call_loc = nullptr)
++      : ev_(ev),
++        saved_ev_(g_callback_ev),
++        saved_call_loc_(g_callback_call_loc),
++        saved_loc_(ev->loc()) {
++    g_callback_ev = ev;
++    g_callback_call_loc = call_loc;
++  }
++
++  ~ScopedCallback() {
++    ev_->set_loc(saved_loc_);
++    g_callback_ev = saved_ev_;
++    g_callback_call_loc = saved_call_loc_;
++  }
++
++ private:
++  Evaluator* ev_;
++  Evaluator* saved_ev_;
++  const Loc* saved_call_loc_;
++  Loc saved_loc_;
++};
++
++bool IsFuncNameChar(char c) {
++  return isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' ||
++         c == '_';
++}
++
++Loc CallbackLoc(Evaluator* ev) {
++  return ev ? ev->loc() : Loc();
++}
++
++// Like make, which exits when it runs out of memory.
++char* Allocate(size_t len) {
++  char* r = static_cast<char*>(malloc(len));
++  if (!r)
++    ERROR("*** virtual memory exhausted.");
++  return r;
++}
++
++char* CopyToMalloc(std::string_view s) {
++  char* r = Allocate(s.size() + 1);
++  memcpy(r, s.data(), s.size());
++  r[s.size()] = '\0';
++  return r;
++}
++
++std::string SetupSymbol(std::string_view file) {
++  size_t slash = file.rfind('/');
++  std::string_view base =
++      slash == std::string::npos ? file : file.substr(slash + 1);
++  size_t len = 0;
++  while (len < base.size() &&
++         (isalnum(static_cast<unsigned char>(base[len])) || base[len] == '_')) {
++    len++;
++  }
++  return std::string(base.substr(0, len)) + "_gmk_setup";
++}
++
++// Like make, only the first place the name appears in .LOADED is checked.
++bool IsAlreadyLoaded(std::string_view loaded, std::string_view file) {
++  size_t found = loaded.find(file);
++  if (found == std::string::npos)
++    return false;
++  size_t end = found + file.size();
++  return (found == 0 || loaded[found - 1] == ' ') &&
++         (end == loaded.size() || loaded[end] == ' ');
++}
++
++// Like make, which defines .LOADED with a default origin, a value the
++// makefile, the environment or the command line gave it is kept: one with
++// another origin, or one changed since a load set it, as kati's += keeps the
++// origin a variable had. The name is added to the value .LOADED had before
++// the object was set up.
++void AddLoaded(const Loc& loc, std::string loaded, std::string_view file) {
++  static std::string* last_set = new std::string();
++  Symbol sym = Intern(".LOADED");
++  Var* var = sym.GetGlobalVar();
++  if (var->IsDefined() &&
++      (var->Origin() != VarOrigin::DEFAULT || var->String() != *last_set)) {
++    return;
++  }
++  if (!loaded.empty())
++    loaded += ' ';
++  loaded.append(file);
++  *last_set = loaded;
++  sym.SetGlobalVar(new SimpleVar(loaded, VarOrigin::DEFAULT, nullptr, loc));
++}
++
++// Like make, a leading "~" or "~user" names a home directory. For "~" that is
++// the value of HOME, or when it is empty, the one the environment or the
++// login's password entry gives.
++std::string TildeExpand(Evaluator* ev, std::string_view name) {
++  const size_t slash = std::min(name.find('/'), name.size());
++  const std::string user(name.substr(1, slash - 1));
++  std::string home;
++  if (user.empty()) {
++    home = ev->EvalVar(Intern("HOME"));
++    if (home.empty()) {
++      const char* env = getenv("HOME");
++      home = env ? env : "";
++    }
++    if (home.empty()) {
++      const char* login = getlogin();
++      const passwd* pw = login ? getpwnam(login) : nullptr;
++      if (pw)
++        home = pw->pw_dir;
++    }
++  } else if (const passwd* pw = getpwnam(user.c_str())) {
++    home = pw->pw_dir;
++  }
++  if (home.empty())
++    return std::string(name);
++  return home + std::string(name.substr(slash));
++}
++
++// The names a word of a load line stands for. As make does, "./" and the
++// slashes after it are dropped, a name left empty becomes "./", and then a
++// leading "~" is expanded. A pattern is replaced by the files it matches, or
++// kept when it matches none, the way kati globs include names.
++std::vector<std::string> LoadNames(Evaluator* ev, std::string_view word) {
++  while (word.size() > 2 && word[0] == '.' && word[1] == '/') {
++    word.remove_prefix(2);
++    while (!word.empty() && word[0] == '/')
++      word.remove_prefix(1);
++  }
++  std::string name = word.empty() ? "./" : std::string(word);
++  if (name[0] == '~')
++    name = TildeExpand(ev, name);
++  const std::vector<std::string>& files = Glob(name.c_str());
++  if (files.empty())
++    return {name};
++  return files;
++}
++
++// Like make, which line-buffers its output, so that what an object prints
++// comes out a line at a time among kati's own messages.
++void LineBufferStdout() {
++  if (g_stdout_buffer)
++    return;
++  // Given a buffer of its own, glibc line-buffers a stream that was already
++  // written to.
++  g_stdout_buffer = new char[BUFSIZ];
++  fflush(stdout);
++  setvbuf(stdout, g_stdout_buffer, _IOLBF, BUFSIZ);
++}
++
++// Opens the object the way make does: a name without a slash is looked up
++// in the current directory first, then where the dynamic loader searches.
++void* OpenObject(const std::string& file) {
++  void* handle = nullptr;
++  if (file.find('/') == std::string::npos)
++    handle = dlopen(("./" + file).c_str(), RTLD_LAZY | RTLD_GLOBAL);
++  if (!handle)
++    handle = dlopen(file.c_str(), RTLD_LAZY | RTLD_GLOBAL);
++  return handle;
++}
++
++}  // namespace
++
++void FlushObjectOutput() {
++  if (g_stdout_buffer)
++    fflush(stdout);
++}
++
++bool IsLoadableFuncName(std::string_view name) {
++  if (name.empty() || name[0] == '.' || name.size() > kMaxFuncNameLen)
++    return false;
++  for (char c : name) {
++    if (!IsFuncNameChar(c))
++      return false;
++  }
++  return true;
++}
++
++const LoadedFunc* FindLoadedFunc(Symbol name) {
++  if (!g_loaded_funcs)
++    return nullptr;
++  auto found = g_loaded_funcs->find(name);
++  if (found == g_loaded_funcs->end())
++    return nullptr;
++  return &found->second;
++}
++
++size_t LoadedFuncRegistrations() {
++  return g_loaded_func_registrations;
++}
++
++void CallLoadedFunc(Evaluator* ev,
++                    const Loc& loc,
++                    const LoadedFunc* func,
++                    std::vector<std::string> args,
++                    std::string* s) {
++  if (args.size() < func->min_args) {
++    ERROR_LOC(loc,
++              "*** insufficient number of arguments (%zu) to function '%s'.",
++              args.size(), func->name.c_str());
++  }
++  if (!func->func) {
++    ERROR_LOC(loc, "*** unimplemented on this platform: function '%s'.",
++              func->name.c_str());
++  }
++  const std::string name = func->name;
++  const gmk_func_ptr fptr = func->func;
++  std::vector<char*> argv;
++  for (std::string& arg : args)
++    argv.push_back(arg.data());
++  argv.push_back(nullptr);
++
++  char* result;
++  {
++    ScopedCallback callback(ev, &loc);
++    result = fptr(name.c_str(), args.size(), argv.data());
++  }
++  if (result) {
++    s->append(result);
++    free(result);
++  }
++}
++
++static void LoadOne(Evaluator* ev, std::string_view spec, bool noerror) {
++  const Loc loc = ev->loc();
++  std::string file(spec);
++  std::string symbol;
++  size_t open = spec.find('(');
++  if (open != std::string::npos) {
++    size_t close = spec.find(')', open + 1);
++    if (close == spec.size() - 1) {
++      if (close == open + 1)
++        ERROR_LOC(loc, "*** Empty symbol name for load: %.*s.", SPF(spec));
++      file = std::string(spec.substr(0, open));
++      symbol = std::string(spec.substr(open + 1, close - open - 1));
++    }
++  }
++
++  // Like make, .LOADED is read once, before the object is set up.
++  const std::string loaded = ev->EvalVar(Intern(".LOADED"));
++  if (IsAlreadyLoaded(loaded, file))
++    return;
++  if (symbol.empty())
++    symbol = SetupSymbol(file);
++
++  LineBufferStdout();
++  ScopedCallback callback(ev);
++  // Like GNU make 4.2.1, the setup function is looked up in kati and the
++  // objects already loaded first, and the file is opened only when none defines
++  // it.
++  static void* global = dlopen(nullptr, RTLD_NOW | RTLD_GLOBAL);
++  SetupFunc setup = reinterpret_cast<SetupFunc>(dlsym(global, symbol.c_str()));
++  if (!setup) {
++    void* handle = OpenObject(file);
++    if (!handle) {
++      if (noerror)
++        return;
++      WARN_LOC(loc, "%s", dlerror());
++      ERROR_LOC(loc, "*** %s: failed to load.", file.c_str());
++    }
++    if (!dlsym(handle, "plugin_is_GPL_compatible")) {
++      ERROR_LOC(loc,
++                "*** Loaded object %s is not declared to be GPL compatible.",
++                file.c_str());
++    }
++    setup = reinterpret_cast<SetupFunc>(dlsym(handle, symbol.c_str()));
++    if (!setup) {
++      const char* err = dlerror();
++      ERROR_LOC(loc, "*** Failed to load symbol %s from %s: %s.",
++                symbol.c_str(), file.c_str(), err);
++    }
++  }
++  // Like the makefiles kati reads, the object is checked by --regen.
++  Dl_info info;
++  if (dladdr(reinterpret_cast<void*>(setup), &info) && info.dli_fname)
++    MakefileCacheManager::Get().AddExtraFileDep(info.dli_fname);
++
++  gmk_floc floc = {loc.filename,
++                   static_cast<unsigned long>(loc.lineno - ev->loc_offset())};
++  int r = setup(&floc);
++  // Like make 4.2.1, which records only a positive result in .LOADED. A
++  // negative one succeeds too, so loading the object again sets it up again.
++  if (r > 0) {
++    AddLoaded(loc, loaded, file);
++  } else if (r == 0 && !noerror) {
++    ERROR_LOC(loc, "*** %s: failed to load.", file.c_str());
++  }
++}
++
++void LoadObject(Evaluator* ev, std::string_view word, bool noerror) {
++  for (const std::string& name : LoadNames(ev, word))
++    LoadOne(ev, name, noerror);
++}
++
++extern "C" {
++
++void gmk_free(char* str) {
++  free(str);
++}
++
++char* gmk_alloc(unsigned int len) {
++  return Allocate(len ? len : 1);
++}
++
++void gmk_eval(const char* buffer, const gmk_floc* floc) {
++  Evaluator* ev = g_callback_ev;
++  if (!ev)
++    return;
++  const Loc caller_loc = ev->loc();
++  const int caller_offset = ev->loc_offset();
++  Loc loc = caller_loc;
++  if (floc) {
++    loc = Loc(floc->filenm ? Intern(floc->filenm).c_str() : nullptr,
++              static_cast<int>(floc->lineno));
++    // Like make, a location given here has no recipe offset.
++    ev->set_loc_offset(0);
++  }
++  // The statements keep pointing into the text, as with $(eval).
++  std::string* text = new std::string(buffer);
++  std::vector<Stmt*> stmts;
++  Parse(*text, loc, &stmts);
++  for (Stmt* stmt : stmts) {
++    stmt->Eval(ev);
++  }
++  // Like make, later errors in the same call point at the caller again.
++  ev->set_loc(caller_loc);
++  ev->set_loc_offset(caller_offset);
++}
++
++char* gmk_expand(const char* str) {
++  std::string result;
++  if (Evaluator* ev = g_callback_ev) {
++    const std::string text(str);
++    // Like make, which reports what it meets reading the text at the variable
++    // being expanded or at the line being read, the text is read where the
++    // call was read.
++    Loc loc = g_callback_call_loc ? *g_callback_call_loc : ev->loc();
++    std::unique_ptr<Value> v(ParseExpr(&loc, text, ParseExprOpt::EXPAND));
++    v->Eval(ev, &result);
++  }
++  return CopyToMalloc(result);
++}
++
++void gmk_add_function(const char* name,
++                      gmk_func_ptr func,
++                      unsigned int min_args,
++                      unsigned int max_args,
++                      unsigned int flags) {
++  const Loc loc = CallbackLoc(g_callback_ev);
++  const std::string_view n(name);
++  size_t len = 0;
++  while (len < n.size() && IsFuncNameChar(n[len]))
++    len++;
++  if (len == 0)
++    ERROR_LOC(loc, "*** Empty function name.");
++  if (n[0] == '.' || len != n.size())
++    ERROR_LOC(loc, "*** Invalid function name: %s.", name);
++  if (len > kMaxFuncNameLen)
++    ERROR_LOC(loc, "*** Function name too long: %s.", name);
++  if (min_args > kMaxArgCount) {
++    ERROR_LOC(loc, "*** Invalid minimum argument count (%u) for function %s.",
++              min_args, name);
++  }
++  if (max_args > kMaxArgCount || (max_args && max_args < min_args)) {
++    ERROR_LOC(loc, "*** Invalid maximum argument count (%u) for function %s.",
++              max_args, name);
++  }
++
++  if (!g_loaded_funcs)
++    g_loaded_funcs = new std::unordered_map<Symbol, LoadedFunc>();
++  (*g_loaded_funcs)[Intern(n)] = LoadedFunc{std::string(n), func, min_args,
++                                            max_args, !(flags & kNoExpand)};
++  g_loaded_func_registrations++;
++}
++
++}  // extern "C"
+diff --git a/src/loadapi.h b/src/loadapi.h
+new file mode 100644
+index 0000000..3626c23
+--- /dev/null
++++ b/src/loadapi.h
+@@ -0,0 +1,77 @@
++// Copyright 2026 Google Inc. All rights reserved
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef LOADAPI_H_
++#define LOADAPI_H_
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "loc.h"
++#include "symtab.h"
++
++class Evaluator;
++
++// The interface GNU make offers to objects loaded with the load directive.
++extern "C" {
++
++struct gmk_floc {
++  const char* filenm;
++  unsigned long lineno;
++};
++
++typedef char* (*gmk_func_ptr)(const char* nm, unsigned int argc, char** argv);
++
++void gmk_free(char* str);
++char* gmk_alloc(unsigned int len);
++void gmk_eval(const char* buffer, const gmk_floc* floc);
++char* gmk_expand(const char* str);
++void gmk_add_function(const char* name,
++                      gmk_func_ptr func,
++                      unsigned int min_args,
++                      unsigned int max_args,
++                      unsigned int flags);
++}
++
++struct LoadedFunc {
++  std::string name;
++  gmk_func_ptr func;
++  unsigned int min_args;
++  unsigned int max_args;
++  bool expand_args;
++};
++
++// Whether a loaded object could register a function with this name.
++bool IsLoadableFuncName(std::string_view name);
++
++const LoadedFunc* FindLoadedFunc(Symbol name);
++
++// How many times loaded objects have registered a function, counting a name
++// registered again.
++size_t LoadedFuncRegistrations();
++
++void CallLoadedFunc(Evaluator* ev,
++                    const Loc& loc,
++                    const LoadedFunc* func,
++                    std::vector<std::string> args,
++                    std::string* s);
++
++void LoadObject(Evaluator* ev, std::string_view word, bool noerror);
++
++// Writes out a line an object has started on stdout, as make does before it
++// runs a command.
++void FlushObjectOutput();
++
++#endif  // LOADAPI_H_
+diff --git a/src/main.cc b/src/main.cc
+index f6dcc7c..6e84509 100644
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -233,6 +233,9 @@ static int Run(const std::vector<Symbol>& targets,
+       .SetGlobalVar(new SimpleVar(StringPrintf(" %s", g_flags.makefile),
+                                   VarOrigin::FILE, ev.CurrentFrame(),
+                                   ev.loc()));
++  // Like make, which defines it before reading the environment.
++  Intern(".LOADED").SetGlobalVar(
++      new SimpleVar(std::string(), VarOrigin::DEFAULT, nullptr, Loc()));
+   for (char** p = environ; *p; p++) {
+     SetVar(*p, VarOrigin::ENVIRONMENT, nullptr, Loc());
+   }
+@@ -273,6 +276,8 @@ static int Run(const std::vector<Symbol>& targets,
+       LOG("%s", stmt->DebugString().c_str());
+       stmt->Eval(&ev);
+     }
++    GiveWaitingWarnings();
++    ev.RaiseWaitingIncludeError();
+   }
+ 
+   for (ParseErrorStmt* err : GetParseErrors()) {
+diff --git a/src/ninja.cc b/src/ninja.cc
+index acfef40..ba7313b 100644
+--- a/src/ninja.cc
++++ b/src/ninja.cc
+@@ -723,7 +723,7 @@ class NinjaGenerator {
+       DumpString(fp, cr->shellflag);
+       DumpString(fp, cr->cmd);
+       DumpString(fp, cr->result);
+-      DumpString(fp, cr->loc.filename);
++      DumpString(fp, cr->loc.filename ? cr->loc.filename : "");
+       DumpInt(fp, cr->loc.lineno);
+ 
+       if (cr->op == CommandOp::FIND) {
+diff --git a/src/parser.cc b/src/parser.cc
+index 5f2016d..621bd14 100644
+--- a/src/parser.cc
++++ b/src/parser.cc
+@@ -16,9 +16,9 @@
+ 
+ #include "parser.h"
+ 
+-#include <stack>
+ #include <string_view>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include "expr.h"
+ #include "file.h"
+@@ -55,6 +55,8 @@ class Parser {
+         fixed_lineno_(true) {}
+ 
+   void Parse() {
++    TextErrors text_errors;
++    text_errors_ = &text_errors;
+     l_ = 0;
+ 
+     for (l_ = 0; l_ < buf_.size();) {
+@@ -76,10 +78,110 @@ class Parser {
+     }
+ 
+     if (!if_stack_.empty())
+-      ERROR_LOC(Loc(loc_.filename, loc_.lineno + 1), "*** missing `endif'.");
++      EndError(Loc(loc_.filename, loc_.lineno + 1), "*** missing `endif'.");
+     if (!define_name_.empty())
+-      ERROR_LOC(Loc(loc_.filename, define_start_line_),
+-                "*** missing `endef', unterminated `define'.");
++      EndError(Loc(loc_.filename, define_start_line_),
++               "*** missing `endef', unterminated `define'.");
++    if (text_errors.left()) {
++      for (IncludeStmt* stmt : includes_)
++        stmt->missing_waits = true;
++    }
++    text_errors_ = nullptr;
++  }
++
++  // Whether |buf| has a load, -load, include, -include or sinclude directive
++  // kati may read; an included makefile can load objects too. Lines are told
++  // apart as Parse tells them, so a define's body, a comment, a recipe line of
++  // a rule and an assignment to a variable named load hold no directive. A
++  // line starting with a tab that follows no rule for sure counts: kati reads
++  // it again as an ordinary line when it evaluates the makefile and finds no
++  // rule for it.
++  static bool ReadsLoadOrInclude(std::string_view buf) {
++    bool after_rule = false;
++    bool in_rule = false;
++    int rule_depth = 0;
++    int if_depth = 0;
++    int define_nest = 0;
++    for (size_t l = 0; l < buf.size();) {
++      size_t lf_cnt = 0;
++      size_t e = ::FindEndOfLine(buf, l, &lf_cnt);
++      std::string_view line = buf.substr(l, e - l);
++      l = e + 1;
++      if (!line.empty() && line.back() == '\r')
++        line.remove_suffix(1);
++      std::string_view text = TrimLeftSpace(line);
++      std::string_view directive = GetDirective(text);
++      if (define_nest > 0) {
++        if (directive == "define")
++          define_nest++;
++        else if (directive == "endef")
++          define_nest--;
++        continue;
++      }
++      if (text.empty() || text[0] == '#')
++        continue;
++      bool command = line[0] == '\t' && after_rule;
++      if (command && in_rule)
++        continue;
++      std::string_view rest = TrimLeftSpace(text.substr(directive.size()));
++      if (directive == "include" || directive == "-include" ||
++          directive == "sinclude" ||
++          ((directive == "load" || directive == "-load") &&
++           !StartsWithAssignOp(rest))) {
++        return true;
++      }
++      if (command)
++        continue;
++      bool prefixed = false;
++      bool exported = false;
++      while (directive == "override" || directive == "export") {
++        prefixed = true;
++        exported = exported || directive == "export";
++        text = rest;
++        directive = GetDirective(text);
++        rest = TrimLeftSpace(text.substr(directive.size()));
++      }
++      if (directive == "define") {
++        define_nest = 1;
++        after_rule = false;
++        in_rule = false;
++        continue;
++      }
++      if (!prefixed) {
++        if (directive == "ifdef" || directive == "ifndef" ||
++            directive == "ifeq" || directive == "ifneq") {
++          if_depth++;
++          continue;
++        }
++        if (directive == "else" || directive == "endif") {
++          if (if_depth <= rule_depth)
++            in_rule = false;
++          if (directive == "endif" && if_depth > 0)
++            if_depth--;
++          continue;
++        }
++        if (directive == "unexport") {
++          in_rule = false;
++          continue;
++        }
++      }
++      size_t sep = FindThreeOutsideParen(text, ':', '=', ';');
++      bool assign =
++          sep != std::string::npos && text[sep] != ';' &&
++          (text[sep] == '=' || (sep + 1 < text.size() && text[sep + 1] == '='));
++      if (assign)
++        after_rule = false;
++      else if (!exported && line[0] != '\t')
++        after_rule = true;
++      in_rule = false;
++      if (!prefixed && !assign && line[0] != '\t' && sep != std::string::npos &&
++          text[sep] == ':') {
++        size_t found = FindTwoOutsideParen(text.substr(sep + 1), '=', ';');
++        in_rule = found == std::string::npos || text[sep + 1 + found] == ';';
++        rule_depth = if_depth;
++      }
++    }
++    return false;
+   }
+ 
+   static std::vector<ParseErrorStmt*> parse_errors;
+@@ -93,6 +195,49 @@ class Parser {
+     parse_errors.push_back(stmt);
+   }
+ 
++  // Reports an error found at the end of the text: right away, unless an
++  // expression read earlier left its error for its expansion, which make may
++  // stop at first.
++  void EndError(const Loc& loc, const char* msg) {
++    if (!text_errors_->left())
++      ERROR_LOC(loc, "%s", msg);
++    ParseErrorStmt* stmt = new ParseErrorStmt();
++    stmt->set_loc(loc);
++    stmt->msg = msg;
++    stmts_->push_back(stmt);
++  }
++
++  // Reports an error in an else or endif line. Once an expression read earlier
++  // left its error for its expansion, the error also waits after the
++  // conditional, as make reports it even in a branch it skips.
++  void BranchError(const std::string& msg) {
++    Error(msg);
++    if (text_errors_->left() && out_stmts_ != stmts_) {
++      ParseErrorStmt* stmt = new ParseErrorStmt();
++      stmt->set_loc(loc_);
++      stmt->msg = msg;
++      stmts_->push_back(stmt);
++    }
++  }
++
++  // Prints a warning about the line being read: right away, unless an
++  // expression read earlier left its error for its expansion, which make may
++  // stop at before it reads the line. Then the warning waits in each of
++  // |lists|.
++  void LineWarning(const char* msg,
++                   const std::vector<std::vector<Stmt*>*>& lists) {
++    if (!text_errors_->left()) {
++      WARN_LOC(loc_, "%s", msg);
++      return;
++    }
++    for (std::vector<Stmt*>* list : lists) {
++      ParseWarningStmt* stmt = new ParseWarningStmt();
++      stmt->set_loc(loc_);
++      stmt->msg = msg;
++      list->push_back(stmt);
++    }
++  }
++
+   size_t FindEndOfLine(size_t* lf_cnt) {
+     return ::FindEndOfLine(buf_, l_, lf_cnt);
+   }
+@@ -245,6 +390,17 @@ class Parser {
+     stmt->expr = ParseExpr(&mutable_loc, line);
+     stmt->should_exist = directive[0] == 'i';
+     out_stmts_->push_back(stmt);
++    includes_.push_back(stmt);
++    after_rule_ = false;
++  }
++
++  void ParseLoad(std::string_view line, std::string_view directive) {
++    LoadStmt* stmt = new LoadStmt();
++    stmt->set_loc(loc_);
++    Loc mutable_loc(loc_);
++    stmt->expr = ParseExpr(&mutable_loc, line);
++    stmt->noerror = directive[0] == '-';
++    out_stmts_->push_back(stmt);
+     after_rule_ = false;
+   }
+ 
+@@ -276,7 +432,7 @@ class Parser {
+     std::string_view rest = TrimRightSpace(
+         RemoveComment(TrimLeftSpace(line.substr(sizeof("endef") - 1))));
+     if (!rest.empty()) {
+-      WARN_LOC(loc_, "extraneous text after `endef' directive");
++      LineWarning("extraneous text after `endef' directive", {out_stmts_});
+     }
+ 
+     AssignStmt* stmt = new AssignStmt();
+@@ -300,7 +456,7 @@ class Parser {
+     st.stmt = stmt;
+     st.is_in_else = false;
+     st.num_nest = num_if_nest_;
+-    if_stack_.push(st);
++    if_stack_.push_back(st);
+     out_stmts_ = &stmt->true_stmts;
+   }
+ 
+@@ -325,24 +481,28 @@ class Parser {
+       s = s.substr(1, s.size() - 2);
+       char terms[] = {',', '\0'};
+       size_t n;
++      const std::string_view cond = s;
+       stmt->lhs =
+           ParseExprImpl(&mutable_loc, s, terms, ParseExprOpt::NORMAL, &n, true);
+-      if (s[n] != ',')
+-        return false;
++      if (s[n] != ',') {
++        stmt->rhs = nullptr;
++        return ResplitIfEqLater(loc_, cond, &stmt->lhs, &stmt->rhs);
++      }
+       s = TrimLeftSpace(s.substr(n + 1));
+       stmt->rhs =
+           ParseExprImpl(&mutable_loc, s, NULL, ParseExprOpt::NORMAL, &n);
+       s = TrimLeftSpace(s.substr(std::min(n, s.size())));
++      ResplitIfEqLater(loc_, cond, &stmt->lhs, &stmt->rhs);
+     } else {
+       for (int i = 0; i < 2; i++) {
+         if (s.empty())
+-          return false;
++          return SecondSideUnread(i, stmt);
+         char quote = s[0];
+         if (quote != '\'' && quote != '"')
+-          return false;
++          return SecondSideUnread(i, stmt);
+         size_t end = s.find(quote, 1);
+         if (end == std::string::npos)
+-          return false;
++          return SecondSideUnread(i, stmt);
+         Value* v =
+             ParseExpr(&mutable_loc, s.substr(1, end - 1), ParseExprOpt::NORMAL);
+         if (i == 0)
+@@ -353,12 +513,29 @@ class Parser {
+       }
+     }
+     if (!s.empty()) {
+-      WARN_LOC(loc_, "extraneous text after `ifeq' directive");
+-      return true;
++      const char* msg = "extraneous text after `ifeq' directive";
++      // make warns once it has expanded the first side.
++      if (text_errors_->left())
++        stmt->warning = msg;
++      else
++        WARN_LOC(loc_, "%s", msg);
+     }
+     return true;
+   }
+ 
++  // Whether a quoted condition whose side |i| kati cannot read can still be
++  // used. make expands the first side before it reads the second, so when the
++  // second fails and the first depends on loaded functions, the condition
++  // fails only after its first side is expanded, and later errors in the text
++  // wait for it.
++  bool SecondSideUnread(int i, IfStmt* stmt) {
++    if (i == 0 || !ObjectsCanLoad() || !stmt->lhs->DependsOnLoadedFuncs())
++      return false;
++    stmt->rhs = Value::NewReadError(loc_, "*** invalid syntax in conditional.");
++    text_errors_->set_left();
++    return true;
++  }
++
+   void ParseIfeq(std::string_view line, std::string_view directive) {
+     IfStmt* stmt = new IfStmt();
+     stmt->set_loc(loc_);
+@@ -373,12 +550,28 @@ class Parser {
+     EnterIf(stmt);
+   }
+ 
++  // Where a warning about a conditional line waits so that it is given once,
++  // where make gives it, which reads such lines in branches it skips too: in
++  // both branches of the innermost conditional, and in the branch of each
++  // enclosing one that does not hold the conditional inside it.
++  std::vector<std::vector<Stmt*>*> ConditionalLineLists() {
++    std::vector<std::vector<Stmt*>*> lists;
++    for (size_t i = 0; i < if_stack_.size(); i++) {
++      IfStmt* stmt = if_stack_[i].stmt;
++      const bool in_else = if_stack_[i].is_in_else;
++      lists.push_back(in_else ? &stmt->true_stmts : &stmt->false_stmts);
++      if (i + 1 == if_stack_.size())
++        lists.push_back(in_else ? &stmt->false_stmts : &stmt->true_stmts);
++    }
++    return lists;
++  }
++
+   void ParseElse(std::string_view line, std::string_view) {
+     if (!CheckIfStack("else"))
+       return;
+-    IfState& st = if_stack_.top();
++    IfState& st = if_stack_.back();
+     if (st.is_in_else) {
+-      Error("*** only one `else' per conditional.");
++      BranchError("*** only one `else' per conditional.");
+       return;
+     }
+     st.is_in_else = true;
+@@ -390,7 +583,8 @@ class Parser {
+ 
+     num_if_nest_ = st.num_nest + 1;
+     if (!HandleDirective(next_if, else_if_directives_)) {
+-      WARN_LOC(loc_, "extraneous text after `else' directive");
++      LineWarning("extraneous text after `else' directive",
++                  ConditionalLineLists());
+     }
+     num_if_nest_ = 0;
+   }
+@@ -399,17 +593,17 @@ class Parser {
+     if (!CheckIfStack("endif"))
+       return;
+     if (!line.empty()) {
+-      Error("extraneous text after `endif` directive");
++      BranchError("extraneous text after `endif` directive");
+       return;
+     }
+-    int num_nest = if_stack_.top().num_nest;
++    int num_nest = if_stack_.back().num_nest;
+     for (int i = 0; i <= num_nest; i++) {
+-      if_stack_.pop();
++      if_stack_.pop_back();
+     }
+     if (if_stack_.empty()) {
+       out_stmts_ = stmts_;
+     } else {
+-      const IfState& st = if_stack_.top();
++      const IfState& st = if_stack_.back();
+       if (st.is_in_else)
+         out_stmts_ = &st.stmt->false_stmts;
+       else
+@@ -471,7 +665,7 @@ class Parser {
+     return line.substr(0, i);
+   }
+ 
+-  std::string_view GetDirective(std::string_view line) {
++  static std::string_view GetDirective(std::string_view line) {
+     if (line.size() < shortest_directive_len_)
+       return std::string_view();
+     std::string_view prefix = line.substr(0, longest_directive_len_ + 1);
+@@ -488,10 +682,21 @@ class Parser {
+ 
+     std::string_view rest = TrimRightSpace(
+         RemoveComment(TrimLeftSpace(line.substr(directive.size()))));
++    // Like make, read "load := x" as an assignment to a variable named load.
++    if (found->second == &Parser::ParseLoad && StartsWithAssignOp(rest))
++      return false;
+     (this->*found->second)(rest, directive);
+     return true;
+   }
+ 
++  static bool StartsWithAssignOp(std::string_view s) {
++    for (std::string_view op : {"=", ":=", "::=", "+=", "?=", "!="}) {
++      if (HasPrefix(s, op))
++        return true;
++    }
++    return false;
++  }
++
+   std::string_view buf_;
+   size_t l_;
+   // Represents if we just parsed a rule or an expression.
+@@ -511,10 +716,12 @@ class Parser {
+   AssignDirective current_directive_;
+ 
+   int num_if_nest_ = 0;
+-  std::stack<IfState> if_stack_;
++  std::vector<IfState> if_stack_;
+ 
+   Loc loc_;
+   bool fixed_lineno_;
++  TextErrors* text_errors_ = nullptr;
++  std::vector<IncludeStmt*> includes_;
+ 
+   const static DirectiveMap make_directives_;
+   const static DirectiveMap else_if_directives_;
+@@ -525,6 +732,10 @@ class Parser {
+ 
+ void Parse(Makefile* mk) {
+   COLLECT_STATS("parse file time");
++  if (!ObjectsCanLoad() &&
++      (Parser::ReadsLoadOrInclude(mk->buf()) || CallsEval(mk->buf()))) {
++    NoteObjectsCanLoad();
++  }
+   Parser parser(mk->buf(), mk->filename().c_str(), mk->mutable_stmts());
+   parser.Parse();
+ }
+@@ -550,7 +761,8 @@ const Parser::DirectiveMap Parser::make_directives_ = {
+     {"ifeq", &Parser::ParseIfeq},         {"ifneq", &Parser::ParseIfeq},
+     {"else", &Parser::ParseElse},         {"endif", &Parser::ParseEndif},
+     {"override", &Parser::ParseOverride}, {"export", &Parser::ParseExport},
+-    {"unexport", &Parser::ParseUnexport}};
++    {"unexport", &Parser::ParseUnexport}, {"load", &Parser::ParseLoad},
++    {"-load", &Parser::ParseLoad}};
+ 
+ const Parser::DirectiveMap Parser::else_if_directives_ = {
+     {"ifdef", &Parser::ParseIfdef},
+diff --git a/src/rule.h b/src/rule.h
+index 59f6de6..dc5e39c 100644
+--- a/src/rule.h
++++ b/src/rule.h
+@@ -55,6 +55,8 @@ class Rule {
+   std::vector<Value*> cmds;
+   Loc loc;
+   int cmd_lineno;
++  // Whether the recipe starts on the rule's own line, after a ';'.
++  bool inline_recipe = false;
+ 
+  private:
+   void Error(const std::string& msg) { ERROR_LOC(loc, "%s", msg.c_str()); }
+diff --git a/src/stmt.cc b/src/stmt.cc
+index 7c7d4f4..3fa8132 100644
+--- a/src/stmt.cc
++++ b/src/stmt.cc
+@@ -18,6 +18,7 @@
+ 
+ #include "eval.h"
+ #include "expr.h"
++#include "log.h"
+ #include "stringprintf.h"
+ #include "strutil.h"
+ 
+@@ -116,6 +117,11 @@ std::string IncludeStmt::DebugString() const {
+                       Value::DebugString(expr).c_str(), LOCF(loc()));
+ }
+ 
++std::string LoadStmt::DebugString() const {
++  return StringPrintf("LoadStmt(%s, %d, loc=%s:%d)",
++                      Value::DebugString(expr).c_str(), noerror, LOCF(loc()));
++}
++
+ std::string ExportStmt::DebugString() const {
+   return StringPrintf("ExportStmt(%s, %d, loc=%s:%d)",
+                       Value::DebugString(expr).c_str(), is_export, LOCF(loc()));
+@@ -126,6 +132,11 @@ std::string ParseErrorStmt::DebugString() const {
+                       LOCF(loc()));
+ }
+ 
++std::string ParseWarningStmt::DebugString() const {
++  return StringPrintf("ParseWarningStmt(%s, loc=%s:%d)", msg.c_str(),
++                      LOCF(loc()));
++}
++
+ RuleStmt::~RuleStmt() {
+   delete lhs;
+   delete rhs;
+@@ -169,6 +180,14 @@ void IncludeStmt::EvalStatement(Evaluator* ev) const {
+   ev->EvalInclude(this);
+ }
+ 
++LoadStmt::~LoadStmt() {
++  delete expr;
++}
++
++void LoadStmt::EvalStatement(Evaluator* ev) const {
++  ev->EvalLoad(this);
++}
++
+ ExportStmt::~ExportStmt() {
+   delete expr;
+ }
+@@ -183,3 +202,9 @@ void ParseErrorStmt::EvalStatement(Evaluator* ev) const {
+   ev->set_loc(loc());
+   ev->Error(msg);
+ }
++
++ParseWarningStmt::~ParseWarningStmt() {}
++
++void ParseWarningStmt::EvalStatement(Evaluator*) const {
++  WARN_LOC(loc(), "%s", msg.c_str());
++}
+diff --git a/src/stmt.h b/src/stmt.h
+index 1173f1b..bbbbdaa 100644
+--- a/src/stmt.h
++++ b/src/stmt.h
+@@ -123,6 +123,10 @@ struct IfStmt : public Stmt {
+   Value* rhs;
+   std::vector<Stmt*> true_stmts;
+   std::vector<Stmt*> false_stmts;
++  // A warning about the line that waits, because the text holding it left an
++  // error for its expansion, until the first side is expanded, where make
++  // gives it.
++  const char* warning = nullptr;
+ 
+   virtual ~IfStmt();
+ 
+@@ -134,6 +138,10 @@ struct IfStmt : public Stmt {
+ struct IncludeStmt : public Stmt {
+   Value* expr;
+   bool should_exist;
++  // Whether a makefile it names that cannot be found is reported once the
++  // makefiles are read, as make reports it, because the text holding the
++  // directive left an error for its expansion, which may come first.
++  bool missing_waits = false;
+ 
+   virtual ~IncludeStmt();
+ 
+@@ -142,6 +150,17 @@ struct IncludeStmt : public Stmt {
+   virtual std::string DebugString() const;
+ };
+ 
++struct LoadStmt : public Stmt {
++  Value* expr;
++  bool noerror;
++
++  virtual ~LoadStmt();
++
++  virtual void EvalStatement(Evaluator* ev) const;
++
++  virtual std::string DebugString() const;
++};
++
+ struct ExportStmt : public Stmt {
+   Value* expr;
+   bool is_export;
+@@ -163,4 +182,14 @@ struct ParseErrorStmt : public Stmt {
+   virtual std::string DebugString() const;
+ };
+ 
++struct ParseWarningStmt : public Stmt {
++  std::string msg;
++
++  virtual ~ParseWarningStmt();
++
++  virtual void EvalStatement(Evaluator* ev) const;
++
++  virtual std::string DebugString() const;
++};
++
+ #endif  // STMT_H_
+diff --git a/src/var.cc b/src/var.cc
+index 9907409..3ca11d4 100644
+--- a/src/var.cc
++++ b/src/var.cc
+@@ -102,7 +102,7 @@ void Var::CheckCurrentReferencingFile(Loc loc, const char* name) {
+   }
+   bool valid = false;
+   for (const std::string& prefix : prefixes) {
+-    if (HasPathPrefix(loc.filename, prefix)) {
++    if (loc.filename && HasPathPrefix(loc.filename, prefix)) {
+       valid = true;
+       break;
+     }

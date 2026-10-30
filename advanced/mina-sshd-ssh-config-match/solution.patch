@@ -1,0 +1,1338 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index df758e1a2..6b364b808 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -40,9 +40,16 @@
+ ## New Features
+ 
+ * [GH-904](https://github.com/apache/mina-sshd/issues/904) Log local port in `ClientSessionImpl.toString()` to be able to distinguish multiple sessions to the same host in logs
++* `HostConfigEntry` handles `Match` blocks and `Include` files in ssh config files the way OpenSSH does
+ 
+ ## Potential Compatibility Issues
+ 
++* In an ssh config file, the first value given for a keyword now also wins within one `Host` block, as in OpenSSH;
++previously the last one did. A keyword now ends at the first blank or `=`, as in OpenSSH, so an `=` in a value no
++longer splits the line, quoted arguments are read without their quotes, a `#` starts a comment only where an
++argument would start, and `IdentityFile` and `CertificateFile` paths are no longer split at commas.
++* `HostConfigEntry.writeHostConfigEntries` writes an entry read from an ssh config file as its lines in file order,
++`Include` lines included and arguments quoted where needed, instead of host name, port, user and identities first.
+ 
+ ## Major Code Re-factoring
+ 
+diff --git a/docs/internals.md b/docs/internals.md
+index 1e116d177..414e55961 100644
+--- a/docs/internals.md
++++ b/docs/internals.md
+@@ -151,6 +151,14 @@ the user's original parameters. The `DefaultConfigFileHostEntryResolver` instanc
+ client instance follows the [SSH config file](https://www.digitalocean.com/community/tutorials/how-to-configure-custom-connection-options-for-your-ssh-client)
+ standards, but the interface can be replaced so as to implement whatever proprietary logic is required.
+ 
++The config file is evaluated the way OpenSSH evaluates it: `Host` and `Match` blocks apply in file order and the first
++value obtained for a keyword wins. `Match` supports the `all`, `host`, `originalhost`, `user` and `final` criteria;
++`exec`, `localnetwork`, `localuser` and `canonical` are not supported. `Include` files are read in place when a host is
++resolved, so edits to them take effect on the next connection; relative `Include` paths are taken from the `.ssh`
++folder of the user's home (see `PathUtils#getUserHomeFolder`). Unlike OpenSSH, the permissions of included files are
++not checked. Host names and patterns are compared without regard to case; the `HostName` keeps the case it was given,
++as before, unless a `Match final` makes a second pass, which fixes the resolved name in lower case as OpenSSH does.
++
+ ```java
+     SshClient client = SshClient.setUpDefaultClient();
+     client.setHostConfigEntryResolver(new MyHostConfigEntryResolver());
+diff --git a/sshd-common/src/main/java/org/apache/sshd/client/config/hosts/HostConfigEntry.java b/sshd-common/src/main/java/org/apache/sshd/client/config/hosts/HostConfigEntry.java
+index 205dedce6..c4f1df3bf 100644
+--- a/sshd-common/src/main/java/org/apache/sshd/client/config/hosts/HostConfigEntry.java
++++ b/sshd-common/src/main/java/org/apache/sshd/client/config/hosts/HostConfigEntry.java
+@@ -34,6 +34,7 @@ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.OpenOption;
+ import java.nio.file.Path;
++import java.util.AbstractMap.SimpleImmutableEntry;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+@@ -45,7 +46,6 @@ import java.util.NavigableSet;
+ import java.util.Objects;
+ import java.util.TreeMap;
+ 
+-import org.apache.sshd.common.SshConstants;
+ import org.apache.sshd.common.auth.MutableUserHolder;
+ import org.apache.sshd.common.config.ConfigFileReaderSupport;
+ import org.apache.sshd.common.config.keys.PublicKeyEntry;
+@@ -74,13 +74,14 @@ public class HostConfigEntry extends HostPatternsHolder implements MutableUserHo
+     public static final String STD_CONFIG_FILENAME = "config";
+ 
+     public static final String HOST_CONFIG_PROP = "Host";
+-    public static final String MATCH_CONFIG_PROP = "Match";  // currently not handled
++    public static final String MATCH_CONFIG_PROP = "Match";
++    public static final String INCLUDE_CONFIG_PROP = "Include";
+     public static final String HOST_NAME_CONFIG_PROP = "HostName";
+     public static final String PORT_CONFIG_PROP = ConfigFileReaderSupport.PORT_CONFIG_PROP;
+     public static final String USER_CONFIG_PROP = "User";
+     public static final String PROXY_JUMP_CONFIG_PROP = "ProxyJump";
+     public static final String IDENTITY_FILE_CONFIG_PROP = "IdentityFile";
+-    public static final String CERTIFICATE_FILE_CONFIG_PROP = "CertificateFile";  // currently not handled
++    public static final String CERTIFICATE_FILE_CONFIG_PROP = "CertificateFile";
+     /**
+      * Use only the identities specified in the host entry (if any)
+      */
+@@ -145,6 +146,10 @@ public class HostConfigEntry extends HostPatternsHolder implements MutableUserHo
+     protected final Collection<String> identities = new ArrayList<>();
+     protected final Map<String, String> properties = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+ 
++    protected List<String> matchCriteria;
++    // The keyword lines of an entry read from a file, in file order
++    protected final List<Map.Entry<String, List<String>>> configLines = new ArrayList<>();
++
+     public HostConfigEntry() {
+         super();
+     }
+@@ -211,6 +216,18 @@ public class HostConfigEntry extends HostPatternsHolder implements MutableUserHo
+         return host;
+     }
+ 
++    /**
++     * @return The criteria following the {@code Match} keyword if this entry was read from a {@code Match} line,
++     *         {@code null} otherwise
++     */
++    public List<String> getMatchCriteria() {
++        return matchCriteria;
++    }
++
++    List<Map.Entry<String, List<String>>> getConfigLines() {
++        return configLines;
++    }
++
+     public void setHost(String host) {
+         this.host = host;
+         setPatterns(parsePatterns(parseConfigValue(host)));
+@@ -461,9 +478,44 @@ public class HostConfigEntry extends HostPatternsHolder implements MutableUserHo
+         }
+     }
+ 
++    /**
++     * Appends this entry as a {@code Host} or {@code Match} block. An entry read from a file keeps its lines in their
++     * order, each with the value the entry holds now, so that its {@code Include} lines stay in place and every
++     * argument reads back the same. An entry built in code lists its host name, port, user and identities, then the
++     * other properties.
++     *
++     * @param  <A>         The {@link Appendable} type
++     * @param  sb          The target appender
++     * @return             The target appender after having appended the entry
++     * @throws IOException If failed to append the data
++     */
+     public <A extends Appendable> A append(A sb) throws IOException {
+-        sb.append(HOST_CONFIG_PROP).append(' ').append(ValidateUtils.checkNotNullAndNotEmpty(getHost(), "No host pattern"))
+-                .append(IoUtils.EOL);
++        if (GenericUtils.isEmpty(matchCriteria)) {
++            sb.append(HOST_CONFIG_PROP).append(' ')
++                    .append(ValidateUtils.checkNotNullAndNotEmpty(getHost(), "No host pattern"));
++        } else {
++            sb.append(MATCH_CONFIG_PROP);
++            for (String criterion : matchCriteria) {
++                sb.append(' ').append(quoteArgument(criterion));
++            }
++        }
++        sb.append(IoUtils.EOL);
++        if (!configLines.isEmpty()) {
++            for (Map.Entry<String, List<String>> line : HostConfigEntryEvaluator.getCurrentLines(this)) {
++                // An Include whose only argument was a comment names no file
++                if (line.getValue().isEmpty()) {
++                    continue;
++                }
++
++                sb.append("    ").append(line.getKey());
++                for (String value : line.getValue()) {
++                    sb.append(' ').append(quoteArgument(value));
++                }
++                sb.append(IoUtils.EOL);
++            }
++            return sb;
++        }
++
+         appendNonEmptyProperty(sb, HOST_NAME_CONFIG_PROP, getHostName());
+         appendNonEmptyPort(sb, PORT_CONFIG_PROP, getPort());
+         appendNonEmptyProperty(sb, USER_CONFIG_PROP, getUsername());
+@@ -478,7 +530,9 @@ public class HostConfigEntry extends HostPatternsHolder implements MutableUserHo
+ 
+     @Override
+     public String toString() {
+-        return getHost() + ": " + getUsername() + "@" + getHostName() + ":" + getPort();
++        String header = GenericUtils.isEmpty(matchCriteria)
++                ? getHost() : MATCH_CONFIG_PROP + " " + GenericUtils.join(matchCriteria, ' ');
++        return header + ": " + getUsername() + "@" + getHostName() + ":" + getPort();
+     }
+ 
+     /**
+@@ -623,6 +677,11 @@ public class HostConfigEntry extends HostPatternsHolder implements MutableUserHo
+     }
+ 
+     /**
++     * Builds a resolver that evaluates the entries the way OpenSSH evaluates its configuration files: {@code Host} and
++     * {@code Match} blocks apply in order and the first value obtained for each keyword wins, {@code Include} files are
++     * read in place when resolving, and a {@code Match} line using {@code final} makes the entries be evaluated a
++     * second time with the resolved host name.
++     *
+      * @param  entries The entries - ignored if {@code null}/empty
+      * @return         A {@link HostConfigEntryResolver} wrapper using the entries
+      */
+@@ -630,57 +689,8 @@ public class HostConfigEntry extends HostPatternsHolder implements MutableUserHo
+         if (GenericUtils.isEmpty(entries)) {
+             return HostConfigEntryResolver.EMPTY;
+         } else {
+-            return (host, port, lclAddress, username, proxyJump, ctx) -> {
+-                List<HostConfigEntry> matches = findMatchingEntries(host, entries);
+-                int numMatches = GenericUtils.size(matches);
+-                if (numMatches <= 0) {
+-                    return null;
+-                }
+-
+-                // Collate attributes from all matching entries.
+-                HostConfigEntry entry = new HostConfigEntry(host, null, port, username);
+-                for (HostConfigEntry m : matches) {
+-                    entry.collate(m);
+-                }
+-
+-                // Apply standard defaults.
+-                String temp = entry.getHostName();  // Remember that this was null above.
+-                if (temp == null || temp.isEmpty()) {
+-                    entry.setHostName(host);
+-                } else {
+-                    entry.setHostName(substituteHostName(temp, host));
+-                }
+-                temp = entry.getUsername();
+-                if (temp == null || temp.isEmpty()) {
+-                    entry.setUsername(OsUtils.getCurrentUser());
+-                }
+-                if (entry.getPort() < 1) {
+-                    entry.setPort(SshConstants.DEFAULT_PORT);
+-                }
+-
+-                // Resolve file names
+-                Collection<String> identities = entry.getIdentities();
+-                if (!GenericUtils.isEmpty(identities)) {
+-                    identities = new ArrayList<>(identities);
+-                    entry.setIdentities(Collections.emptyList());
+-                    for (String id : identities) {
+-                        entry.addIdentity(
+-                                resolveIdentityFilePath(id, entry.getHostName(), entry.getPort(), entry.getUsername()));
+-                    }
+-                }
+-                // Same for CertificateFile
+-                String certificateFiles = entry.getProperty(CERTIFICATE_FILE_CONFIG_PROP);
+-                if (!GenericUtils.isEmpty(certificateFiles)) {
+-                    entry.removeProperty(CERTIFICATE_FILE_CONFIG_PROP);
+-                    String[] split = certificateFiles.split(",");
+-                    List<String> resolved = new ArrayList<>(split.length);
+-                    for (String raw : split) {
+-                        resolved.add(resolveIdentityFilePath(raw, entry.getHostName(), entry.getPort(), entry.getUsername()));
+-                    }
+-                    entry.processProperty(CERTIFICATE_FILE_CONFIG_PROP, resolved);
+-                }
+-                return entry;
+-            };
++            return (host, port, lclAddress, username, proxyJump, ctx) -> new HostConfigEntryEvaluator(host, port, username)
++                    .resolve(entries);
+         }
+     }
+ 
+@@ -723,42 +733,56 @@ public class HostConfigEntry extends HostPatternsHolder implements MutableUserHo
+         int lineNumber = 1;
+         for (String line = rdr.readLine(); line != null; line = rdr.readLine(), lineNumber++) {
+             line = GenericUtils.replaceWhitespaceAndTrim(line);
+-            if (GenericUtils.isEmpty(line)) {
++            if (GenericUtils.isEmpty(line) || (line.charAt(0) == ConfigFileReaderSupport.COMMENT_CHAR)) {
+                 continue;
+             }
+ 
+-            // Strip off comments
+-            int pos = line.indexOf(ConfigFileReaderSupport.COMMENT_CHAR);
+-            if (pos == 0) {
+-                continue;
++            /*
++             * As in OpenSSH, the keyword ends at the first blank or '=' and the value may follow an '='. A comment starts
++             * only where an argument could. Host, Match and Include arguments and quoted values are split the OpenSSH way,
++             * Host patterns also at commas as before, a value given with '=' is kept whole, and IdentityFile and
++             * CertificateFile paths are split at blanks only.
++             */
++            int pos = 0;
++            while ((pos < line.length()) && (line.charAt(pos) != ' ') && (line.charAt(pos) != '=')) {
++                pos++;
+             }
+-            if (pos > 0) {
+-                line = line.substring(0, pos);
+-                line = line.trim();
++            if ((pos <= 0) || (pos >= line.length())) {
++                throw new StreamCorruptedException("No configuration value delimiter at line " + lineNumber + ": " + line);
++            }
++
++            String key = line.substring(0, pos);
++            String value = line.substring(pos).trim();
++            boolean equalsDelimited = value.startsWith("=");
++            if (equalsDelimited) {
++                value = value.substring(1).trim();
++            }
++            value = stripComment(value);
++            if (value.isEmpty() && !HOST_CONFIG_PROP.equalsIgnoreCase(key) && !MATCH_CONFIG_PROP.equalsIgnoreCase(key)
++                    && !INCLUDE_CONFIG_PROP.equalsIgnoreCase(key)) {
++                throw new StreamCorruptedException("No configuration value at line " + lineNumber + ": " + line);
+             }
+ 
+-            /*
+-             * Some options use '=' as delimiter, others use ' '
+-             * TODO: This version treats '=' as taking precedence, but that means '=' can't show up
+-             * in a file name. A better approach is to break the line into tokens, possibly quoted,
+-             * then detect '='.
+-             */
+-            String key;
+-            String value;
+             List<String> valsList;
+-            pos = line.indexOf('=');
+-            if (pos > 0) {
+-                key = line.substring(0, pos).trim();
+-                value = line.substring(pos + 1);
++            if (MATCH_CONFIG_PROP.equalsIgnoreCase(key)) {
++                valsList = splitMatchArguments(value, lineNumber);
++            } else if (INCLUDE_CONFIG_PROP.equalsIgnoreCase(key)) {
++                valsList = splitArguments(value, lineNumber);
++            } else if (HOST_CONFIG_PROP.equalsIgnoreCase(key) || (value.indexOf('"') >= 0) || (value.indexOf('\'') >= 0)) {
++                valsList = new ArrayList<>();
++                for (String arg : splitArguments(value, lineNumber)) {
++                    if (HOST_CONFIG_PROP.equalsIgnoreCase(key)) {
++                        valsList.addAll(GenericUtils.filterToNotBlank(Arrays.asList(GenericUtils.split(arg, ','))));
++                    } else {
++                        valsList.add(arg);
++                    }
++                }
++            } else if (equalsDelimited) {
+                 valsList = new ArrayList<>(1);
+                 valsList.add(value);
++            } else if (isAdditiveProperty(key)) {
++                valsList = splitArguments(value, lineNumber);
+             } else {
+-                pos = line.indexOf(' ');
+-                if (pos < 0) {
+-                    throw new StreamCorruptedException("No configuration value delimiter at line " + lineNumber + ": " + line);
+-                }
+-                key = line.substring(0, pos);
+-                value = line.substring(pos + 1);
+                 valsList = GenericUtils.filterToNotBlank(parseConfigValue(value));
+             }
+ 
+@@ -774,15 +798,37 @@ public class HostConfigEntry extends HostPatternsHolder implements MutableUserHo
+                 curEntry = new HostConfigEntry();
+                 curEntry.setHost(valsList);
+             } else if (MATCH_CONFIG_PROP.equalsIgnoreCase(key)) {
+-                throw new StreamCorruptedException("Currently not able to process Match sections");
+-            } else if (curEntry == null) {
+-                // Properties that occur before the first Host or Match keyword are a kind of global entry.
++                valsList = HostConfigEntryEvaluator.validateMatchCriteria(valsList, lineNumber);
++                if (curEntry != null) {
++                    entries.add(curEntry);
++                }
+                 curEntry = new HostConfigEntry();
+-                curEntry.setHost(Collections.singletonList(ALL_HOSTS_PATTERN));
++                curEntry.matchCriteria = Collections.unmodifiableList(new ArrayList<>(valsList));
++                continue;
++            } else {
++                if (curEntry == null) {
++                    // Properties that occur before the first Host or Match keyword are a kind of global entry.
++                    curEntry = new HostConfigEntry();
++                    curEntry.setHost(Collections.singletonList(ALL_HOSTS_PATTERN));
++                }
++                curEntry.configLines.add(new SimpleImmutableEntry<>(key, valsList));
++                // As in OpenSSH, the first value obtained for a keyword wins.
++                if (!isAdditiveProperty(key) && !INCLUDE_CONFIG_PROP.equalsIgnoreCase(key)
++                        && curEntry.properties.containsKey(key)) {
++                    continue;
++                }
+             }
+ 
+             String joinedValue = GenericUtils.join(valsList, ',');
+-            curEntry.appendPropertyValue(key, joinedValue);
++            if (INCLUDE_CONFIG_PROP.equalsIgnoreCase(key)) {
++                // Every Include line applies, so the property lists the paths of all of them
++                curEntry.appendPropertyValue(key, joinedValue);
++                continue;
++            }
++            if (!isAdditiveProperty(key)) {
++                // processProperty already appends the IdentityFile and CertificateFile values
++                curEntry.appendPropertyValue(key, joinedValue);
++            }
+             curEntry.processProperty(key, valsList);
+         }
+ 
+@@ -876,8 +922,8 @@ public class HostConfigEntry extends HostPatternsHolder implements MutableUserHo
+ 
+             for (int curPos = 0; curPos < elem.length(); curPos++) {
+                 char ch = elem.charAt(curPos);
+-                if (ch == PathUtils.HOME_TILDE_CHAR) {
+-                    ValidateUtils.checkTrue((curPos == 0) && (index == 0), "Home tilde must be first: %s", id);
++                if ((ch == PathUtils.HOME_TILDE_CHAR) && (curPos == 0) && (index == 0)) {
++                    // As in OpenSSH, only a leading tilde stands for the home folder
+                     PathUtils.appendUserHome(sb);
+                 } else if (ch == PATH_MACRO_CHAR) {
+                     curPos++;
+@@ -921,7 +967,188 @@ public class HostConfigEntry extends HostPatternsHolder implements MutableUserHo
+         return sb.toString();
+     }
+ 
+-    private static String substituteHostName(String host, String originalHostName) {
++    /**
++     * Splits arguments the way OpenSSH does: blanks separate them, single or double quotes group characters and are
++     * removed, and a backslash escapes a quote, a backslash or (outside quotes) a blank.
++     *
++     * @param  value                    The text following the keyword
++     * @param  lineNumber               The line number, for error messages
++     * @return                          The arguments
++     * @throws StreamCorruptedException If a quote is not closed
++     */
++    static List<String> splitArguments(String value, int lineNumber) throws StreamCorruptedException {
++        List<String> args = new ArrayList<>();
++        StringBuilder arg = null;
++        char quote = 0;
++        for (int index = 0; index < value.length(); index++) {
++            char ch = value.charAt(index);
++            if ((quote == 0) && (ch == ' ')) {
++                if (arg != null) {
++                    args.add(arg.toString());
++                    arg = null;
++                }
++                continue;
++            }
++
++            if (arg == null) {
++                arg = new StringBuilder();
++            }
++            char next = (index + 1 < value.length()) ? value.charAt(index + 1) : 0;
++            if ((ch == '\\') && ((next == '\'') || (next == '"') || (next == '\\') || ((quote == 0) && (next == ' ')))) {
++                arg.append(next);
++                index++;
++            } else if ((quote == 0) && ((ch == '"') || (ch == '\''))) {
++                quote = ch;
++            } else if ((quote != 0) && (ch == quote)) {
++                quote = 0;
++            } else {
++                arg.append(ch);
++            }
++        }
++        if (quote != 0) {
++            throw new StreamCorruptedException("Invalid quotes at line " + lineNumber + ": " + value);
++        }
++        if (arg != null) {
++            args.add(arg.toString());
++        }
++        return args;
++    }
++
++    /**
++     * Removes a comment from the arguments of a line the way OpenSSH does: a {@code '#'} starts a comment where an
++     * argument would start, outside quotes, and is a plain character anywhere else.
++     *
++     * @param  value The text following the keyword
++     * @return       The text before the comment
++     */
++    private static String stripComment(String value) {
++        char quote = 0;
++        boolean argStart = true;
++        for (int index = 0; index < value.length(); index++) {
++            char ch = value.charAt(index);
++            if ((quote == 0) && (ch == ' ')) {
++                argStart = true;
++                continue;
++            }
++            if (argStart && (quote == 0) && (ch == ConfigFileReaderSupport.COMMENT_CHAR)) {
++                return value.substring(0, index).trim();
++            }
++
++            argStart = false;
++            if (ch == '\\') {
++                index++;
++            } else if ((quote == 0) && ((ch == '"') || (ch == '\''))) {
++                quote = ch;
++            } else if (ch == quote) {
++                quote = 0;
++            }
++        }
++        return value;
++    }
++
++    /**
++     * Quotes an argument for a written configuration line unless it reads back unchanged as it is: an empty argument,
++     * one starting a comment, and one with a blank, an {@code '='}, a quote or a backslash are put in double quotes,
++     * with backslashes and double quotes escaped.
++     *
++     * @param  arg The argument
++     * @return     The argument as it is to be written
++     */
++    private static String quoteArgument(String arg) {
++        boolean plain = !arg.isEmpty() && (arg.charAt(0) != ConfigFileReaderSupport.COMMENT_CHAR);
++        for (int index = 0; plain && (index < arg.length()); index++) {
++            char ch = arg.charAt(index);
++            plain = (ch != ' ') && (ch != '=') && (ch != '"') && (ch != '\'') && (ch != '\\');
++        }
++        if (plain) {
++            return arg;
++        }
++
++        StringBuilder sb = new StringBuilder(arg.length() + 2).append('"');
++        for (int index = 0; index < arg.length(); index++) {
++            char ch = arg.charAt(index);
++            if ((ch == '"') || (ch == '\\')) {
++                sb.append('\\');
++            }
++            sb.append(ch);
++        }
++        return sb.append('"').toString();
++    }
++
++    /**
++     * Splits the arguments of a {@code Match} line the way OpenSSH reads them: blanks or one {@code '='} separate them,
++     * and a pair of double quotes groups characters and ends the argument. A backslash escapes a quote, a backslash or
++     * (outside quotes) a blank as on any other line, single quotes are kept, and every quote must be closed. An
++     * unquoted {@code '#'} where an argument starts begins a comment.
++     *
++     * @param  value                    The text following the keyword
++     * @param  lineNumber               The line number, for error messages
++     * @return                          The arguments, including empty ones given as {@code ""}
++     * @throws StreamCorruptedException If a quote is not closed
++     */
++    static List<String> splitMatchArguments(String value, int lineNumber) throws StreamCorruptedException {
++        splitArguments(value, lineNumber);
++
++        List<String> args = new ArrayList<>();
++        int len = value.length();
++        int pos = 0;
++        while ((pos < len) && (value.charAt(pos) != ConfigFileReaderSupport.COMMENT_CHAR)) {
++            StringBuilder arg = new StringBuilder();
++            char delim = 0;
++            boolean quoted = false;
++            for (; pos < len; pos++) {
++                char ch = value.charAt(pos);
++                char next = (pos + 1 < len) ? value.charAt(pos + 1) : 0;
++                if ((ch == '\\') && ((next == '\'') || (next == '"') || (next == '\\') || (!quoted && (next == ' ')))) {
++                    arg.append(next);
++                    pos++;
++                } else if (quoted) {
++                    if (ch == '"') {
++                        delim = ch;
++                        break;
++                    }
++                    arg.append(ch);
++                } else if (ch == '"') {
++                    quoted = true;
++                } else if ((ch == ' ') || (ch == '=')) {
++                    delim = ch;
++                    break;
++                } else {
++                    arg.append(ch);
++                }
++            }
++            if (quoted && (pos >= len)) {
++                break;
++            }
++
++            args.add(arg.toString());
++            if (delim == 0) {
++                break;
++            }
++
++            pos++;
++            while ((pos < len) && (value.charAt(pos) == ' ')) {
++                pos++;
++            }
++            if ((delim == ' ') && (pos < len) && (value.charAt(pos) == '=')) {
++                pos++;
++                while ((pos < len) && (value.charAt(pos) == ' ')) {
++                    pos++;
++                }
++            }
++        }
++        return args;
++    }
++
++    /**
++     * @param  key The keyword
++     * @return     {@code true} if every value given for the keyword is kept, not just the first one
++     */
++    static boolean isAdditiveProperty(String key) {
++        return IDENTITY_FILE_CONFIG_PROP.equalsIgnoreCase(key) || CERTIFICATE_FILE_CONFIG_PROP.equalsIgnoreCase(key);
++    }
++
++    static String substituteHostName(String host, String originalHostName) {
+         int len = host.length();
+         int j = host.indexOf(PATH_MACRO_CHAR);
+         if (j < 0) {
+diff --git a/sshd-common/src/main/java/org/apache/sshd/client/config/hosts/HostConfigEntryEvaluator.java b/sshd-common/src/main/java/org/apache/sshd/client/config/hosts/HostConfigEntryEvaluator.java
+new file mode 100644
+index 000000000..50596d6c2
+--- /dev/null
++++ b/sshd-common/src/main/java/org/apache/sshd/client/config/hosts/HostConfigEntryEvaluator.java
+@@ -0,0 +1,691 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements. See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.sshd.client.config.hosts;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.StreamCorruptedException;
++import java.nio.file.DirectoryStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.AbstractMap.SimpleImmutableEntry;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
++import java.util.regex.Pattern;
++import java.util.stream.Collectors;
++import java.util.stream.Stream;
++
++import org.apache.sshd.common.SshConstants;
++import org.apache.sshd.common.config.keys.PublicKeyEntry;
++import org.apache.sshd.common.util.GenericUtils;
++import org.apache.sshd.common.util.OsUtils;
++import org.apache.sshd.common.util.io.PathUtils;
++
++/**
++ * Evaluates the entries read from an ssh config file for one connection the way OpenSSH does: {@code Host} and
++ * {@code Match} blocks apply in file order, the first value obtained for a keyword wins, {@code Include} files are read
++ * in place, and a {@code Match} using {@code final} makes the entries be evaluated a second time with the resolved host
++ * name.
++ *
++ * @author <a href="mailto:dev@mina.apache.org">Apache MINA SSHD Project</a>
++ * @see    <A HREF="https://man.openbsd.org/ssh_config">ssh_config(5)</A>
++ */
++public class HostConfigEntryEvaluator {
++    /**
++     * Maximum nesting of {@code Include} directives, as in OpenSSH
++     */
++    public static final int MAX_INCLUDE_DEPTH = 16;
++
++    public static final String MATCH_ALL = "all";
++    public static final String MATCH_FINAL = "final";
++    public static final String MATCH_HOST = "host";
++    public static final String MATCH_ORIGINAL_HOST = "originalhost";
++    public static final String MATCH_USER = "user";
++
++    private static final int QUOTED_GLOB_CHAR = 0x10000;
++    private static final Map<String, String> CHARACTER_CLASSES = Collections.unmodifiableMap(
++            Stream.of("Alnum", "Alpha", "Blank", "Cntrl", "Digit", "Graph", "Lower", "Print", "Punct", "Space", "Upper",
++                    "XDigit").collect(Collectors.toMap(name -> name.toLowerCase(Locale.ROOT), name -> "\\p{" + name + "}")));
++
++    private final String host;
++    private final HostConfigEntry entry;
++    private final List<String> certificateFiles = new ArrayList<>();
++    private String passHost;
++    private String resolvedHostName;
++    private boolean finalPass;
++    private boolean finalPassRequested;
++    private boolean matched;
++
++    /**
++     * @param host     The requested host
++     * @param port     The requested port - if positive it takes precedence over the configuration
++     * @param username The requested user - if not {@code null}/empty it takes precedence over the configuration
++     */
++    public HostConfigEntryEvaluator(String host, int port, String username) {
++        this.host = host;
++        this.passHost = host;
++        this.entry = new HostConfigEntry(host, null, port, username);
++    }
++
++    /**
++     * @param  entries     The entries in file order
++     * @return             The effective entry, or {@code null} if no block applied
++     * @throws IOException If an included file cannot be read or is invalid
++     */
++    public HostConfigEntry resolve(Collection<? extends HostConfigEntry> entries) throws IOException {
++        evaluate(entries, true, 0);
++        if (finalPassRequested) {
++            String name = entry.getHostName();
++            String resolved = (GenericUtils.isEmpty(name) ? host : HostConfigEntry.substituteHostName(name, host))
++                    .toLowerCase(Locale.ROOT);
++            // Like OpenSSH: the resolved name is fixed now, so HostName lines of the final pass have no effect.
++            resolvedHostName = resolved;
++            entry.setHostName(resolved);
++            passHost = resolved;
++            finalPass = true;
++            evaluate(entries, true, 0);
++        }
++
++        if (!matched) {
++            return null;
++        }
++
++        applyDefaults();
++        return entry;
++    }
++
++    protected void evaluate(Collection<? extends HostConfigEntry> entries, boolean enabled, int depth) throws IOException {
++        for (HostConfigEntry e : entries) {
++            List<String> criteria = e.getMatchCriteria();
++            boolean active;
++            if (GenericUtils.isEmpty(criteria)) {
++                active = enabled && e.isHostMatch(passHost, 0);
++            } else {
++                // A Match line is always evaluated, so that a "final" in a block that does not apply is still seen.
++                active = isMatch(criteria) && enabled;
++            }
++            matched |= active;
++
++            if (GenericUtils.isEmpty(criteria) && GenericUtils.isEmpty(e.getConfigLines())) {
++                if (active) {
++                    String certificates = e.getProperty(HostConfigEntry.CERTIFICATE_FILE_CONFIG_PROP);
++                    if (GenericUtils.isNotEmpty(certificates)) {
++                        certificateFiles.addAll(Arrays.asList(GenericUtils.split(certificates, ',')));
++                    }
++                    entry.collate(e);
++                }
++                continue;
++            }
++
++            if (active && GenericUtils.isNotEmpty(e.getHost())) {
++                entry.getProperties().putIfAbsent(HostConfigEntry.HOST_CONFIG_PROP, e.getHost());
++            }
++
++            for (Map.Entry<String, List<String>> line : getCurrentLines(e)) {
++                String keyword = line.getKey();
++                if (HostConfigEntry.INCLUDE_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++                    includeFiles(line.getValue(), active, depth + 1);
++                } else if (active) {
++                    apply(keyword, line.getValue());
++                }
++            }
++        }
++    }
++
++    /**
++     * Gives the lines of an entry read from a file with the values the entry holds now, so that a value changed through
++     * its setters after it was read is the one evaluated. Every keyword takes its current value in the place of its
++     * first line, and {@code Include} lines keep their place. Identity and certificate files keep the values of each of
++     * their lines while they are unchanged, since every such line adds values in its own place. Keywords that only the
++     * setters gave come after the lines.
++     *
++     * @param  e The entry
++     * @return   The lines to evaluate, in order
++     */
++    protected static List<Map.Entry<String, List<String>>> getCurrentLines(HostConfigEntry e) {
++        List<Map.Entry<String, List<String>>> recorded = e.getConfigLines();
++        Set<String> keywords = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
++        List<String> identities = new ArrayList<>();
++        List<String> certificates = new ArrayList<>();
++        for (Map.Entry<String, List<String>> line : recorded) {
++            String keyword = line.getKey();
++            keywords.add(keyword);
++            if (HostConfigEntry.IDENTITY_FILE_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++                identities.addAll(line.getValue());
++            } else if (HostConfigEntry.CERTIFICATE_FILE_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++                certificates.addAll(line.getValue());
++            }
++        }
++        boolean identitiesUnchanged = identities.equals(new ArrayList<>(e.getIdentities()));
++        boolean certificatesUnchanged = GenericUtils.join(certificates, ',')
++                .equals(e.getProperty(HostConfigEntry.CERTIFICATE_FILE_CONFIG_PROP, ""));
++
++        List<Map.Entry<String, List<String>>> lines = new ArrayList<>(recorded.size());
++        Set<String> placed = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
++        for (Map.Entry<String, List<String>> line : recorded) {
++            String keyword = line.getKey();
++            if (HostConfigEntry.INCLUDE_CONFIG_PROP.equalsIgnoreCase(keyword)
++                    || (identitiesUnchanged && HostConfigEntry.IDENTITY_FILE_CONFIG_PROP.equalsIgnoreCase(keyword))
++                    || (certificatesUnchanged && HostConfigEntry.CERTIFICATE_FILE_CONFIG_PROP.equalsIgnoreCase(keyword))) {
++                lines.add(line);
++            } else if (placed.add(keyword)) {
++                addCurrentLine(lines, e, keyword);
++            }
++        }
++
++        for (String keyword : e.getProperties().keySet()) {
++            if (!keywords.contains(keyword) && !HostConfigEntry.HOST_CONFIG_PROP.equalsIgnoreCase(keyword)
++                    && !HostConfigEntry.INCLUDE_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++                addCurrentLine(lines, e, keyword);
++            }
++        }
++        return lines;
++    }
++
++    /**
++     * Reads the files that the paths of an {@code Include} line name, in order, each in place.
++     *
++     * @param  paths       The paths given on the line
++     * @param  enabled     Whether the {@code Include} line applies
++     * @param  depth       The nesting depth of the files
++     * @throws IOException If a file cannot be read, is invalid or nested too deep
++     * @see                #expandIncludePath(String)
++     */
++    protected void includeFiles(List<String> paths, boolean enabled, int depth) throws IOException {
++        for (String path : paths) {
++            for (Path file : expandIncludePath(path)) {
++                include(file, enabled, depth);
++            }
++        }
++    }
++
++    /**
++     * Reads an included file in place. Its lines take effect only if {@code enabled}, but it is read in any case, as
++     * OpenSSH does, so that errors and a {@code Match final} in it are seen.
++     *
++     * @param  file        The included file
++     * @param  enabled     Whether the {@code Include} line applies
++     * @param  depth       The nesting depth of the file
++     * @throws IOException If the file cannot be read, is invalid or nested too deep
++     */
++    protected void include(Path file, boolean enabled, int depth) throws IOException {
++        if (depth > MAX_INCLUDE_DEPTH) {
++            throw new StreamCorruptedException("Too many recursive configuration includes at " + file);
++        }
++        if (!Files.isRegularFile(file)) {
++            return;
++        }
++
++        evaluate(HostConfigEntry.readHostConfigEntries(file), enabled, depth);
++    }
++
++    protected void apply(String keyword, List<String> values) {
++        // Each certificate file is kept as given, since a quoted path may contain a comma
++        if (HostConfigEntry.CERTIFICATE_FILE_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++            certificateFiles.addAll(values);
++            return;
++        }
++
++        boolean set;
++        if (HostConfigEntry.HOST_NAME_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++            set = GenericUtils.isEmpty(entry.getHostName());
++        } else if (HostConfigEntry.PORT_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++            set = entry.getPort() <= 0;
++        } else if (HostConfigEntry.USER_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++            set = GenericUtils.isEmpty(entry.getUsername());
++        } else if (HostConfigEntry.PROXY_JUMP_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++            set = GenericUtils.isEmpty(entry.getProxyJump());
++        } else if (HostConfigEntry.EXCLUSIVE_IDENTITIES_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++            set = entry.exclusiveIdentites == null;
++        } else if (HostConfigEntry.isAdditiveProperty(keyword)) {
++            set = true;
++        } else {
++            set = !entry.getProperties().containsKey(keyword);
++        }
++
++        if (set) {
++            entry.processProperty(keyword, values);
++        }
++    }
++
++    protected boolean isMatch(List<String> criteria) {
++        boolean result = true;
++        for (int index = 0; index < criteria.size(); index++) {
++            String attribute = criteria.get(index);
++            boolean negated = attribute.startsWith(String.valueOf(HostPatternsHolder.NEGATION_CHAR_PATTERN));
++            String name = getCriterionName(attribute);
++            if (MATCH_ALL.equals(name)) {
++                return result && !negated;
++            }
++
++            boolean value;
++            if (MATCH_FINAL.equals(name)) {
++                finalPassRequested = true;
++                value = finalPass;
++            } else {
++                index++;
++                String patterns = criteria.get(index);
++                switch (name) {
++                    case MATCH_HOST:
++                        value = HostPatternsHolder.isPatternListMatch(getMatchHost(), patterns, true);
++                        break;
++                    case MATCH_ORIGINAL_HOST:
++                        value = HostPatternsHolder.isPatternListMatch(host, patterns, true);
++                        break;
++                    case MATCH_USER:
++                        value = HostPatternsHolder.isPatternListMatch(getMatchUser(), patterns, false);
++                        break;
++                    default:
++                        throw new IllegalStateException("Unsupported Match attribute " + attribute);
++                }
++            }
++
++            if (value == negated) {
++                result = false;
++            }
++        }
++        return result;
++    }
++
++    /**
++     * @return The host name a {@code Match host} checks: the host name obtained so far with {@code %h} substituted, or
++     *         the requested host, and the resolved host name during the final pass
++     */
++    protected String getMatchHost() {
++        if (finalPass) {
++            return passHost;
++        }
++
++        String name = entry.getHostName();
++        return GenericUtils.isEmpty(name) ? host : HostConfigEntry.substituteHostName(name, host);
++    }
++
++    /**
++     * @return The user a {@code Match user} checks: the user obtained so far, or the local user
++     */
++    protected String getMatchUser() {
++        String user = entry.getUsername();
++        return GenericUtils.isEmpty(user) ? OsUtils.getCurrentUser() : user;
++    }
++
++    protected void applyDefaults() throws IOException {
++        if (resolvedHostName == null) {
++            // Host names are only compared without regard to case, so without a final pass the HostName keeps its case
++            String name = entry.getHostName();
++            entry.setHostName(GenericUtils.isEmpty(name) ? host : HostConfigEntry.substituteHostName(name, host));
++        }
++        if (GenericUtils.isEmpty(entry.getUsername())) {
++            entry.setUsername(OsUtils.getCurrentUser());
++        }
++        if (entry.getPort() < 1) {
++            entry.setPort(SshConstants.DEFAULT_PORT);
++        }
++
++        Collection<String> identities = entry.getIdentities();
++        if (!GenericUtils.isEmpty(identities)) {
++            Set<String> resolved = new LinkedHashSet<>();
++            for (String id : identities) {
++                resolved.add(HostConfigEntry.resolveIdentityFilePath(id, entry.getHostName(), entry.getPort(),
++                        entry.getUsername()));
++            }
++            entry.setIdentities(resolved);
++        }
++
++        entry.removeProperty(HostConfigEntry.CERTIFICATE_FILE_CONFIG_PROP);
++        if (!certificateFiles.isEmpty()) {
++            Set<String> resolved = new LinkedHashSet<>();
++            for (String raw : certificateFiles) {
++                resolved.add(HostConfigEntry.resolveIdentityFilePath(raw, entry.getHostName(), entry.getPort(),
++                        entry.getUsername()));
++            }
++            entry.processProperty(HostConfigEntry.CERTIFICATE_FILE_CONFIG_PROP, resolved);
++        }
++    }
++
++    /**
++     * Checks the criteria of a {@code Match} line as ssh_config(5) describes them: every criterion except {@code all}
++     * and {@code final} takes patterns, and {@code all} must appear alone or right after {@code final}. As in OpenSSH,
++     * the criteria end at an empty argument, which must be the last one. A comment was cut off before, so a quoted
++     * {@code '#'} here is plain text.
++     *
++     * @param  criteria                 The arguments following the {@code Match} keyword
++     * @param  lineNumber               The line number, for error messages
++     * @return                          The criteria, without what closes them
++     * @throws StreamCorruptedException If OpenSSH would refuse the line, or it uses an unsupported criterion
++     */
++    public static List<String> validateMatchCriteria(List<String> criteria, int lineNumber)
++            throws StreamCorruptedException {
++        int count = criteria.size();
++        List<String> result = new ArrayList<>(count);
++        for (int index = 0; index < count; index++) {
++            String attribute = criteria.get(index);
++            if (attribute.isEmpty()) {
++                if (index < count - 1) {
++                    throw new StreamCorruptedException("Extra arguments for Match at line " + lineNumber);
++                }
++                break;
++            }
++
++            String name = getCriterionName(attribute);
++            result.add(attribute);
++            if (MATCH_ALL.equals(name)) {
++                boolean afterFinal = (index == 1) && MATCH_FINAL.equals(getCriterionName(criteria.get(0)));
++                boolean last = (index == count - 1) || ((index == count - 2) && criteria.get(index + 1).isEmpty());
++                if (!last || ((index > 0) && !afterFinal)) {
++                    throw new StreamCorruptedException(
++                            "'" + attribute + "' cannot be combined with other Match attributes at line " + lineNumber);
++                }
++                break;
++            }
++
++            if (MATCH_FINAL.equals(name)) {
++                continue;
++            }
++            if (!MATCH_HOST.equals(name) && !MATCH_ORIGINAL_HOST.equals(name) && !MATCH_USER.equals(name)) {
++                throw new StreamCorruptedException("Unsupported Match attribute " + attribute + " at line " + lineNumber);
++            }
++
++            index++;
++            if ((index >= count) || criteria.get(index).isEmpty()) {
++                throw new StreamCorruptedException("Missing Match criteria for " + name + " at line " + lineNumber);
++            }
++            result.add(criteria.get(index));
++        }
++
++        if (result.isEmpty()) {
++            throw new StreamCorruptedException("One or more attributes required for Match at line " + lineNumber);
++        }
++        return result;
++    }
++
++    /**
++     * Expands an {@code Include} argument to the existing files it names, in lexical order. A relative path is taken
++     * relative to the {@code .ssh} folder of the user's home, and a leading {@code ~/} stands for the user's home.
++     * Wildcards follow {@code glob(7)}, where a leading dot is matched only when given explicitly.
++     *
++     * @param  path        The {@code Include} argument
++     * @return             The matching paths, sorted
++     * @throws IOException If a folder cannot be listed
++     * @see                PathUtils#getUserHomeFolder()
++     */
++    public static List<Path> expandIncludePath(String path) throws IOException {
++        if (GenericUtils.isEmpty(path)) {
++            return Collections.emptyList();
++        }
++
++        Path home = PathUtils.getUserHomeFolder();
++        String root = getRoot(path);
++        String rest;
++        List<Path> current = new ArrayList<>();
++        if (path.charAt(0) == PathUtils.HOME_TILDE_CHAR) {
++            if ((path.length() > 1) && !isSeparator(path.charAt(1))) {
++                throw new StreamCorruptedException("Unsupported include path " + path);
++            }
++            current.add(home);
++            rest = path.substring(1);
++        } else if (root != null) {
++            current.add(Paths.get(root));
++            rest = path.substring(root.length());
++        } else {
++            current.add(home.resolve(PublicKeyEntry.STD_KEYFILE_FOLDER_NAME));
++            rest = path;
++        }
++
++        for (String name : rest.split((File.separatorChar == '/') ? "/" : "[/\\\\]")) {
++            if (name.isEmpty()) {
++                continue;
++            }
++
++            boolean wildcard = (name.indexOf('*') >= 0) || (name.indexOf('?') >= 0) || (name.indexOf('[') >= 0)
++                    || (name.indexOf('\\') >= 0);
++            Pattern glob = wildcard ? toGlobPattern(name) : null;
++            boolean hidden = name.startsWith(".") || name.startsWith("\\.");
++            List<Path> next = new ArrayList<>();
++            for (Path parent : current) {
++                if (!wildcard) {
++                    next.add(parent.resolve(name));
++                } else if ((glob != null) && Files.isDirectory(parent)) {
++                    next.addAll(listMatching(parent, glob, hidden));
++                }
++            }
++            current = next;
++        }
++
++        List<Path> result = new ArrayList<>(current.size());
++        for (Path p : current) {
++            if (Files.exists(p)) {
++                result.add(p);
++            }
++        }
++        result.sort(Comparator.comparing(Path::toString));
++        return result;
++    }
++
++    /**
++     * @param  folder      The folder to list
++     * @param  glob        The expression the names must match
++     * @param  hidden      Whether names starting with a dot may match
++     * @return             The entries of the folder whose names match
++     * @throws IOException If the folder cannot be listed
++     */
++    protected static List<Path> listMatching(Path folder, Pattern glob, boolean hidden) throws IOException {
++        List<Path> matches = new ArrayList<>();
++        try (DirectoryStream<Path> children = Files.newDirectoryStream(folder)) {
++            for (Path child : children) {
++                String childName = child.getFileName().toString();
++                if ((hidden || !childName.startsWith(".")) && glob.matcher(childName).matches()) {
++                    matches.add(child);
++                }
++            }
++        }
++        return matches;
++    }
++
++    /**
++     * Converts one element of an {@code Include} path to a regular expression the way the glob(3) of OpenSSH reads it:
++     * {@code *}, {@code ?}, and bracket expressions with ranges, a leading {@code !} and classes such as
++     * {@code [:digit:]}, where a {@code ]} right after the opening bracket is a member. A backslash quotes the next
++     * character, and braces are not special.
++     *
++     * @param  glob The path element
++     * @return      The expression, or {@code null} if it names an unknown class and so matches nothing
++     */
++    protected static Pattern toGlobPattern(String glob) {
++        int len = glob.length();
++        int[] chars = new int[len + 2];
++        int count = 0;
++        for (int index = 0; index < len; index++) {
++            char ch = glob.charAt(index);
++            if ((ch == '\\') && (index + 1 < len)) {
++                index++;
++                chars[count] = glob.charAt(index) | QUOTED_GLOB_CHAR;
++            } else {
++                chars[count] = ch;
++            }
++            count++;
++        }
++        Arrays.fill(chars, count, chars.length, -1);
++
++        StringBuilder regex = new StringBuilder(len + Long.SIZE);
++        for (int index = 0; index < count; index++) {
++            int ch = chars[index];
++            if (ch == '*') {
++                regex.append(".*");
++            } else if (ch == '?') {
++                regex.append('.');
++            } else if (ch != '[') {
++                regex.append(Pattern.quote(String.valueOf((char) ch)));
++            } else {
++                int end = appendBracketExpression(chars, index, count, regex);
++                if (end >= count) {
++                    return null;
++                }
++                if (end < 0) {
++                    regex.append("\\[");
++                } else {
++                    index = end;
++                }
++            }
++        }
++        return Pattern.compile(regex.toString(), Pattern.DOTALL);
++    }
++
++    /**
++     * Appends a glob(3) bracket expression as a character class: its members, ranges and classes such as
++     * {@code [:digit:]}, negated by a leading {@code !}, where a {@code ]} right after the opening bracket or after the
++     * {@code !} is a member. As in glob(3), the bracket is a plain character unless a later {@code ]} closes the
++     * expression.
++     *
++     * @param  chars The pattern characters, a quoted one with an extra high bit so it is never special, followed by -1
++     * @param  start The index of the opening bracket
++     * @param  count The number of pattern characters
++     * @param  regex The expression to append to
++     * @return       The index of the closing bracket, -1 if the opening bracket is a plain character, or {@code count}
++     *               if nothing can match because the expression names an unknown class or a class takes its closing
++     *               bracket
++     */
++    protected static int appendBracketExpression(int[] chars, int start, int count, StringBuilder regex) {
++        int c = start + 1;
++        boolean negated = chars[c] == '!';
++        if (negated) {
++            c++;
++        }
++        int end = c + 1;
++        while ((end < count) && (chars[end] != ']')) {
++            end++;
++        }
++        if ((chars[c] < 0) || (end >= count)) {
++            return -1;
++        }
++
++        StringBuilder set = new StringBuilder();
++        boolean afterClass = false;
++        while (true) {
++            int colon = ((chars[c] == '[') && (chars[c + 1] == ':')) ? findClassNameEnd(chars, c + 2) : -1;
++            if (colon >= 0) {
++                StringBuilder name = new StringBuilder(colon - c);
++                for (int k = c + 2; k < colon; k++) {
++                    name.append((char) chars[k]);
++                }
++                String cls = CHARACTER_CLASSES.get(name.toString());
++                if (cls == null) {
++                    return count;
++                }
++                set.append(cls);
++                afterClass = true;
++                c = colon + 2;
++                continue;
++            }
++            if ((chars[c] < 0) || (afterClass && (chars[c] == ']'))) {
++                break;
++            }
++
++            afterClass = false;
++            int q = c + 1;
++            char lo = (char) chars[c];
++            if ((chars[q] == '-') && (chars[q + 1] >= 0) && (chars[q + 1] != ']')) {
++                char hi = (char) chars[q + 1];
++                if (lo <= hi) {
++                    set.append(Character.isLetterOrDigit(lo) ? "" : "\\").append(lo).append('-');
++                    set.append(Character.isLetterOrDigit(hi) ? "" : "\\").append(hi);
++                }
++                q += 2;
++            } else {
++                set.append(Character.isLetterOrDigit(lo) ? "" : "\\").append(lo);
++            }
++            c = q;
++            if ((chars[c] < 0) || (chars[c] == ']')) {
++                break;
++            }
++        }
++        if (chars[c] < 0) {
++            return count;
++        }
++
++        if (set.length() == 0) {
++            regex.append(negated ? "." : "(?!)");
++        } else {
++            regex.append('[').append(negated ? "^" : "").append(set).append(']');
++        }
++        return c;
++    }
++
++    private static void addCurrentLine(List<Map.Entry<String, List<String>>> lines, HostConfigEntry e, String keyword) {
++        List<String> values;
++        if (HostConfigEntry.IDENTITY_FILE_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++            values = new ArrayList<>(e.getIdentities());
++        } else {
++            String value = e.getProperty(keyword);
++            if (GenericUtils.isEmpty(value)) {
++                values = Collections.emptyList();
++            } else if (HostConfigEntry.CERTIFICATE_FILE_CONFIG_PROP.equalsIgnoreCase(keyword)) {
++                values = Arrays.asList(GenericUtils.split(value, ','));
++            } else {
++                values = Collections.singletonList(value);
++            }
++        }
++
++        if (!values.isEmpty()) {
++            lines.add(new SimpleImmutableEntry<>(keyword, values));
++        }
++    }
++
++    /**
++     * @param  chars The pattern characters, followed by -1
++     * @param  from  Where the name of a character class starts, after its {@code [:}
++     * @return       The index of the {@code :} that ends the name if a {@code ]} follows it, -1 otherwise
++     */
++    private static int findClassNameEnd(int[] chars, int from) {
++        int colon = from;
++        while ((chars[colon] >= 0) && (chars[colon] != ':')) {
++            colon++;
++        }
++        return ((chars[colon] >= 0) && (chars[colon + 1] == ']')) ? colon : -1;
++    }
++
++    private static String getRoot(String path) {
++        if (isSeparator(path.charAt(0))) {
++            return path.substring(0, 1);
++        }
++        if (OsUtils.isWin32() && (path.length() > 2) && (path.charAt(1) == ':') && isSeparator(path.charAt(2))) {
++            return path.substring(0, 3);
++        }
++        return null;
++    }
++
++    private static boolean isSeparator(char ch) {
++        return (ch == '/') || (ch == File.separatorChar);
++    }
++
++    private static String getCriterionName(String attribute) {
++        String name = attribute.startsWith(String.valueOf(HostPatternsHolder.NEGATION_CHAR_PATTERN))
++                ? attribute.substring(1) : attribute;
++        return name.toLowerCase(Locale.ROOT);
++    }
++}
+diff --git a/sshd-common/src/main/java/org/apache/sshd/client/config/hosts/HostPatternsHolder.java b/sshd-common/src/main/java/org/apache/sshd/client/config/hosts/HostPatternsHolder.java
+index 558a2f93c..1bf561aa3 100644
+--- a/sshd-common/src/main/java/org/apache/sshd/client/config/hosts/HostPatternsHolder.java
++++ b/sshd-common/src/main/java/org/apache/sshd/client/config/hosts/HostPatternsHolder.java
+@@ -25,6 +25,7 @@ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.LinkedList;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Objects;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+@@ -181,6 +182,64 @@ public abstract class HostPatternsHolder {
+         return m.matches();
+     }
+ 
++    /**
++     * Checks a value against a comma-separated pattern list, as given to the criteria of an ssh config {@code Match}
++     * line: {@link #WILDCARD_PATTERN} and {@link #SINGLE_CHAR_PATTERN} are wildcards, and a pattern starting with
++     * {@link #NEGATION_CHAR_PATTERN} rejects the value if it matches.
++     *
++     * @param  value      The value to check
++     * @param  patterns   The comma-separated patterns
++     * @param  ignoreCase Whether to compare without regard to case
++     * @return            {@code true} if a pattern matches and no negated one does
++     */
++    public static boolean isPatternListMatch(String value, String patterns, boolean ignoreCase) {
++        String s = ignoreCase ? value.toLowerCase(Locale.ROOT) : value;
++        boolean matchFound = false;
++        for (String p : GenericUtils.split(patterns, ',')) {
++            boolean negated = (p.length() > 0) && (p.charAt(0) == NEGATION_CHAR_PATTERN);
++            String pattern = negated ? p.substring(1) : p;
++            if (ignoreCase) {
++                pattern = pattern.toLowerCase(Locale.ROOT);
++            }
++            if (isWildcardMatch(s, pattern)) {
++                if (negated) {
++                    return false;
++                }
++                matchFound = true;
++            }
++        }
++        return matchFound;
++    }
++
++    // Without recursion: on a mismatch only the most recent '*' takes one more character, so the time stays bounded
++    private static boolean isWildcardMatch(String s, String pattern) {
++        int i = 0;
++        int p = 0;
++        int star = -1;
++        int starMatch = 0;
++        while (i < s.length()) {
++            char ch = (p < pattern.length()) ? pattern.charAt(p) : 0;
++            if ((p < pattern.length()) && (ch != WILDCARD_PATTERN) && ((ch == SINGLE_CHAR_PATTERN) || (ch == s.charAt(i)))) {
++                i++;
++                p++;
++            } else if ((p < pattern.length()) && (ch == WILDCARD_PATTERN)) {
++                star = p;
++                starMatch = i;
++                p++;
++            } else if (star >= 0) {
++                starMatch++;
++                i = starMatch;
++                p = star + 1;
++            } else {
++                return false;
++            }
++        }
++        while ((p < pattern.length()) && (pattern.charAt(p) == WILDCARD_PATTERN)) {
++            p++;
++        }
++        return p == pattern.length();
++    }
++
+     public static List<HostPatternValue> parsePatterns(CharSequence... patterns) {
+         return parsePatterns(GenericUtils.isEmpty(patterns) ? Collections.emptyList() : Arrays.asList(patterns));
+     }

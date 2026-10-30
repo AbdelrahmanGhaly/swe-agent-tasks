@@ -1,0 +1,1032 @@
+diff --git a/cmd/snapshot_verify.go b/cmd/snapshot_verify.go
+index f815f29c..c1c6ce2a 100644
+--- a/cmd/snapshot_verify.go
++++ b/cmd/snapshot_verify.go
+@@ -5,7 +5,9 @@ import (
+ 	"sort"
+ 
+ 	"github.com/aptly-dev/aptly/deb"
++	"github.com/aptly-dev/aptly/utils"
+ 	"github.com/smira/commander"
++	"github.com/smira/flag"
+ )
+ 
+ func aptlySnapshotVerify(cmd *commander.Command, args []string) error {
+@@ -57,12 +59,14 @@ func aptlySnapshotVerify(cmd *commander.Command, args []string) error {
+ 
+ 	sourcePackageList.PrepareIndex()
+ 
++	installable := context.Flags().Lookup("installable").Value.Get().(bool)
++
+ 	var architecturesList []string
+ 
+ 	if len(context.ArchitecturesList()) > 0 {
+ 		architecturesList = context.ArchitecturesList()
+ 	} else {
+-		architecturesList = packageList.Architectures(true)
++		architecturesList = packageList.Architectures(!installable)
+ 	}
+ 
+ 	if len(architecturesList) == 0 {
+@@ -71,6 +75,10 @@ func aptlySnapshotVerify(cmd *commander.Command, args []string) error {
+ 
+ 	context.Progress().Printf("Verifying...\n")
+ 
++	if installable {
++		return aptlySnapshotVerifyInstallable(packageList, sourcePackageList, architecturesList)
++	}
++
+ 	missing, err := packageList.VerifyDependencies(context.DependencyOptions(), architecturesList, sourcePackageList, context.Progress())
+ 	if err != nil {
+ 		return fmt.Errorf("unable to verify dependencies: %s", err)
+@@ -97,6 +105,38 @@ func aptlySnapshotVerify(cmd *commander.Command, args []string) error {
+ 	return err
+ }
+ 
++func aptlySnapshotVerifyInstallable(packageList, sourcePackageList *deb.PackageList, architecturesList []string) error {
++	architecturesList = utils.StrSliceDeduplicate(append([]string(nil), architecturesList...))
++
++	var uninstallable []string
++	for _, native := range architecturesList {
++		var foreign []string
++		for _, arch := range architecturesList {
++			if arch != native {
++				foreign = append(foreign, arch)
++			}
++		}
++
++		packages, err := packageList.Uninstallable(native, foreign, sourcePackageList, context.Progress())
++		if err != nil {
++			return fmt.Errorf("unable to verify installability: %s", err)
++		}
++
++		for _, p := range packages {
++			uninstallable = append(uninstallable, fmt.Sprintf("%s [%s]", p.GetFullName(), native))
++		}
++	}
++
++	sort.Strings(uninstallable)
++
++	context.Progress().Printf("Uninstallable packages (%d):\n", len(uninstallable))
++	for _, line := range uninstallable {
++		context.Progress().Printf("  %s\n", line)
++	}
++
++	return nil
++}
++
+ func makeCmdSnapshotVerify() *commander.Command {
+ 	cmd := &commander.Command{
+ 		Run:       aptlySnapshotVerify,
+@@ -107,11 +147,19 @@ Verify does dependency resolution in snapshot <name>, possibly using additional
+ snapshots <source> as dependency sources. All unsatisfied dependencies are
+ printed.
+ 
++With -installable, each architecture is checked as the native architecture of
++a system which has the other architectures enabled as foreign ones, and packages
++of snapshot <name> which can't be installed on such a system are printed instead,
++taking conflicts, breaks and Essential packages into account.
++
+ Example:
+ 
+     $ aptly snapshot verify wheezy-main wheezy-contrib wheezy-non-free
+ `,
++		Flag: *flag.NewFlagSet("aptly-snapshot-verify", flag.ExitOnError),
+ 	}
+ 
++	cmd.Flag.Bool("installable", false, "print packages which can't be installed instead of missing dependencies")
++
+ 	return cmd
+ }
+diff --git a/completion.d/_aptly b/completion.d/_aptly
+index 6a70dfe3..579e7cc9 100644
+--- a/completion.d/_aptly
++++ b/completion.d/_aptly
+@@ -377,6 +377,7 @@ local keyring="*-keyring=[gpg keyring to use when verifying Release file (could
+                         ;;
+                     verify)
+                         _arguments '1:: :' \
++                            "-installable=[print packages which can’t be installed instead of missing dependencies]:$bool" \
+                             "(-)2:snapshot name:$snapshots" "*::more snapshots:$snapshots"
+                         ;;
+                     pull)
+diff --git a/completion.d/aptly b/completion.d/aptly
+index bdfbe722..59f58a67 100644
+--- a/completion.d/aptly
++++ b/completion.d/aptly
+@@ -539,7 +539,11 @@ _aptly()
+           ;;
+           "verify")
+             if [[ $numargs -eq 0 ]]; then
+-              COMPREPLY=($(compgen -W "$(__aptly_snapshot_list)" -- ${cur}))
++              if [[ "$cur" == -* ]]; then
++                COMPREPLY=($(compgen -W "-installable" -- ${cur}))
++              else
++                COMPREPLY=($(compgen -W "$(__aptly_snapshot_list)" -- ${cur}))
++              fi
+               return 0
+             fi
+           ;;
+diff --git a/deb/installability.go b/deb/installability.go
+new file mode 100644
+index 00000000..9e9910a9
+--- /dev/null
++++ b/deb/installability.go
+@@ -0,0 +1,738 @@
++package deb
++
++import (
++	"fmt"
++	"regexp"
++	"sort"
++	"strings"
++
++	"github.com/aptly-dev/aptly/aptly"
++	"github.com/aptly-dev/aptly/utils"
++)
++
++// Multi-Arch field values
++const (
++	multiArchNo      = "no"
++	multiArchSame    = "same"
++	multiArchForeign = "foreign"
++	multiArchAllowed = "allowed"
++)
++
++var relationRegexp = regexp.MustCompile(`^([^\s:(]+)(?::([^\s(]+))?\s*(?:\(\s*(<<|<=|>=|>>|=|<|>)\s*([^\s)]+)\s*\))?$`)
++
++type relationAtom struct {
++	name     string
++	archQual string
++	relation int
++	version  string
++}
++
++type providedName struct {
++	node    int
++	version string
++}
++
++type installableNode struct {
++	pkg       *Package
++	arch      string
++	multiArch string
++	depends   [][]int
++}
++
++// installabilityChecker answers installability queries with a SAT solver (unit propagation,
++// conflict-driven clause learning and backjumping): a variable per package, a clause per
++// dependency group, conflicting pair and Essential package name
++type installabilityChecker struct {
++	native        string
++	archs         []string
++	nodes         []installableNode
++	byName        map[string][]int
++	providers     map[string][]providedName
++	essential     [][]int
++	clauses       [][]int
++	watches       [][]int
++	value         []int8
++	level         []int
++	reason        []int
++	seen          []bool
++	trail         []int
++	trailLim      []int
++	cursorLim     []int
++	cursor        int
++	qhead         int
++	installable   []bool
++	contradiction bool
++}
++
++func parseRelationAtom(s string) (relationAtom, error) {
++	m := relationRegexp.FindStringSubmatch(strings.TrimSpace(s))
++	if m == nil {
++		return relationAtom{}, fmt.Errorf("unable to parse relation: %s", s)
++	}
++
++	atom := relationAtom{name: m[1], archQual: m[2], version: m[4]}
++	switch m[3] {
++	case "":
++		atom.relation = VersionDontCare
++	case "<<":
++		atom.relation = VersionLess
++	case "<=", "<":
++		atom.relation = VersionLessOrEqual
++	case "=":
++		atom.relation = VersionEqual
++	case ">=", ">":
++		atom.relation = VersionGreaterOrEqual
++	case ">>":
++		atom.relation = VersionGreater
++	}
++	return atom, nil
++}
++
++func parseRelationField(value string) ([][]relationAtom, error) {
++	var groups [][]relationAtom
++	for _, group := range strings.Split(value, ",") {
++		if strings.TrimSpace(group) == "" {
++			continue
++		}
++		var alternatives []relationAtom
++		for _, alternative := range strings.Split(group, "|") {
++			atom, err := parseRelationAtom(alternative)
++			if err != nil {
++				return nil, err
++			}
++			alternatives = append(alternatives, atom)
++		}
++		groups = append(groups, alternatives)
++	}
++	return groups, nil
++}
++
++func packageMultiArch(p *Package) string {
++	switch strings.ToLower(strings.TrimSpace(p.GetField("Multi-Arch"))) {
++	case multiArchSame:
++		return multiArchSame
++	case multiArchForeign:
++		return multiArchForeign
++	case multiArchAllowed:
++		return multiArchAllowed
++	}
++	return multiArchNo
++}
++
++func positive(node int) int { return 2 * node }
++
++func negative(node int) int { return 2*node + 1 }
++
++func newInstallabilityChecker(native string, foreign []string, archive *PackageList) (*installabilityChecker, error) {
++	c := &installabilityChecker{
++		native:    native,
++		archs:     append([]string{native}, foreign...),
++		byName:    make(map[string][]int),
++		providers: make(map[string][]providedName),
++	}
++
++	if err := c.addNodes(archive); err != nil {
++		return nil, err
++	}
++
++	conflicts := make([]map[int]bool, len(c.nodes))
++	for i := range conflicts {
++		conflicts[i] = make(map[int]bool)
++	}
++	for i := range c.nodes {
++		if err := c.resolveDependencies(i); err != nil {
++			return nil, err
++		}
++
++		explicit, err := c.conflictsOf(i)
++		if err != nil {
++			return nil, err
++		}
++		for _, j := range explicit {
++			conflicts[i][j] = true
++			conflicts[j][i] = true
++		}
++
++		for _, j := range c.byName[c.nodes[i].pkg.Name] {
++			if j != i && !c.coinstallable(i, j) {
++				conflicts[i][j] = true
++			}
++		}
++	}
++
++	n := len(c.nodes)
++	c.watches = make([][]int, 2*n)
++	c.value = make([]int8, n)
++	c.level = make([]int, n)
++	c.reason = make([]int, n)
++	c.seen = make([]bool, n)
++	c.installable = make([]bool, n)
++	for i := range c.reason {
++		c.reason[i] = -1
++	}
++
++	for i := range c.nodes {
++		for _, candidates := range c.nodes[i].depends {
++			clause := []int{negative(i)}
++			for _, candidate := range candidates {
++				clause = append(clause, positive(candidate))
++			}
++			c.addClause(clause)
++		}
++
++		var others []int
++		for j := range conflicts[i] {
++			if j > i {
++				others = append(others, j)
++			}
++		}
++		sort.Ints(others)
++		for _, j := range others {
++			c.addClause([]int{negative(i), negative(j)})
++		}
++	}
++	for _, candidates := range c.essential {
++		var clause []int
++		for _, candidate := range candidates {
++			clause = append(clause, positive(candidate))
++		}
++		c.addClause(clause)
++	}
++
++	if c.propagate() != -1 {
++		c.contradiction = true
++	}
++	return c, nil
++}
++
++// addNodes collects binary packages of the system's architectures (and "all") from archive
++func (c *installabilityChecker) addNodes(archive *PackageList) error {
++	var packages []*Package
++	_ = archive.ForEach(func(p *Package) error {
++		if !p.IsSource && (p.Architecture == ArchitectureAll || utils.StrSliceHasItem(c.archs, p.Architecture)) {
++			packages = append(packages, p)
++		}
++		return nil
++	})
++	sort.Slice(packages, func(i, j int) bool {
++		if packages[i].Name != packages[j].Name {
++			return packages[i].Name < packages[j].Name
++		}
++		if r := compareVersionsDpkg(packages[i].Version, packages[j].Version); r != 0 {
++			return r > 0
++		}
++		return packages[i].Architecture < packages[j].Architecture
++	})
++
++	essential := make(map[string][]int)
++	var essentialNames []string
++	c.nodes = make([]installableNode, len(packages))
++	for i, p := range packages {
++		arch := p.Architecture
++		if arch == ArchitectureAll {
++			arch = c.native
++		}
++		c.nodes[i] = installableNode{pkg: p, arch: arch, multiArch: packageMultiArch(p)}
++		c.byName[p.Name] = append(c.byName[p.Name], i)
++
++		for _, provided := range p.Provides {
++			atom, err := parseRelationAtom(provided)
++			if err != nil {
++				return fmt.Errorf("unable to process package %s: %s", p, err)
++			}
++			c.providers[atom.name] = append(c.providers[atom.name], providedName{node: i, version: atom.version})
++		}
++
++		if strings.EqualFold(strings.TrimSpace(p.GetField("Essential")), "yes") {
++			if _, ok := essential[p.Name]; !ok {
++				essentialNames = append(essentialNames, p.Name)
++			}
++			essential[p.Name] = append(essential[p.Name], i)
++		}
++	}
++
++	sort.Strings(essentialNames)
++	for _, name := range essentialNames {
++		c.essential = append(c.essential, essential[name])
++	}
++	return nil
++}
++
++// resolveDependencies turns Pre-Depends and Depends of a node into groups of candidate nodes
++func (c *installabilityChecker) resolveDependencies(i int) error {
++	node := &c.nodes[i]
++	deps := node.pkg.Deps()
++
++	for _, field := range [][]string{deps.PreDepends, deps.Depends} {
++		groups, err := parseRelationField(strings.Join(field, ", "))
++		if err != nil {
++			return fmt.Errorf("unable to process package %s: %s", node.pkg, err)
++		}
++		for _, alternatives := range groups {
++			var candidates []int
++			for _, atom := range alternatives {
++				candidates = appendUnique(candidates, c.dependencyCandidates(node, atom)...)
++			}
++			node.depends = append(node.depends, candidates)
++		}
++	}
++	return nil
++}
++
++// conflictsOf lists nodes matched by Conflicts and Breaks of a node, other than packages of its own name
++func (c *installabilityChecker) conflictsOf(i int) ([]int, error) {
++	var result []int
++	for _, field := range []string{"Conflicts", "Breaks"} {
++		groups, err := parseRelationField(c.nodes[i].pkg.GetField(field))
++		if err != nil {
++			return nil, fmt.Errorf("unable to process package %s: %s", c.nodes[i].pkg, err)
++		}
++		for _, alternatives := range groups {
++			for _, atom := range alternatives {
++				for _, j := range c.conflictCandidates(atom) {
++					if c.nodes[j].pkg.Name != c.nodes[i].pkg.Name {
++						result = append(result, j)
++					}
++				}
++			}
++		}
++	}
++	return result, nil
++}
++
++// coinstallable reports whether two packages of one name are Multi-Arch: same ones of one version on different architectures
++func (c *installabilityChecker) coinstallable(i, j int) bool {
++	a, b := &c.nodes[i], &c.nodes[j]
++	return a.multiArch == multiArchSame && b.multiArch == multiArchSame && a.arch != b.arch &&
++		compareVersionsDpkg(a.pkg.Version, b.pkg.Version) == 0
++}
++
++func appendUnique(list []int, items ...int) []int {
++	for _, item := range items {
++		found := false
++		for _, existing := range list {
++			if existing == item {
++				found = true
++				break
++			}
++		}
++		if !found {
++			list = append(list, item)
++		}
++	}
++	return list
++}
++
++func versionMatches(version string, atom relationAtom) bool {
++	r := compareVersionsDpkg(version, atom.version)
++	switch atom.relation {
++	case VersionLess:
++		return r < 0
++	case VersionLessOrEqual:
++		return r <= 0
++	case VersionEqual:
++		return r == 0
++	case VersionGreaterOrEqual:
++		return r >= 0
++	case VersionGreater:
++		return r > 0
++	}
++	return true
++}
++
++// provideMatches checks a provided name against a relation, versioned relations need versioned provides
++func provideMatches(provided providedName, atom relationAtom) bool {
++	if atom.relation == VersionDontCare {
++		return true
++	}
++	return provided.version != "" && versionMatches(provided.version, atom)
++}
++
++// archMatches reports whether a dependency of a package of architecture arch can be met by node: without an
++// architecture qualifier by a package of that architecture or a Multi-Arch: foreign one, with a qualifier only
++// by a package of the architecture it names
++func (c *installabilityChecker) archMatches(arch, archQual string, node *installableNode) bool {
++	if archQual != "" {
++		return node.arch == c.qualifiedArch(archQual)
++	}
++	return node.arch == arch || node.multiArch == multiArchForeign
++}
++
++// qualifiedArch returns the architecture an architecture qualifier names, "native" names the native one
++func (c *installabilityChecker) qualifiedArch(archQual string) string {
++	if archQual == "native" {
++		return c.native
++	}
++	return archQual
++}
++
++func (c *installabilityChecker) dependencyCandidates(from *installableNode, atom relationAtom) []int {
++	var result []int
++
++	if atom.archQual == ArchitectureAny {
++		for _, i := range c.byName[atom.name] {
++			if c.nodes[i].multiArch == multiArchAllowed && versionMatches(c.nodes[i].pkg.Version, atom) {
++				result = append(result, i)
++			}
++		}
++		for _, provided := range c.providers[atom.name] {
++			if c.nodes[provided.node].multiArch == multiArchAllowed && provideMatches(provided, atom) {
++				result = append(result, provided.node)
++			}
++		}
++		return result
++	}
++
++	for _, i := range c.byName[atom.name] {
++		if c.archMatches(from.arch, atom.archQual, &c.nodes[i]) && versionMatches(c.nodes[i].pkg.Version, atom) {
++			result = append(result, i)
++		}
++	}
++	for _, provided := range c.providers[atom.name] {
++		if c.archMatches(from.arch, atom.archQual, &c.nodes[provided.node]) && provideMatches(provided, atom) {
++			result = append(result, provided.node)
++		}
++	}
++	return result
++}
++
++func (c *installabilityChecker) conflictCandidates(atom relationAtom) []int {
++	var result []int
++
++	matchesArch := func(node *installableNode) bool {
++		return atom.archQual == "" || atom.archQual == ArchitectureAny || node.arch == c.qualifiedArch(atom.archQual)
++	}
++
++	for _, i := range c.byName[atom.name] {
++		if matchesArch(&c.nodes[i]) && versionMatches(c.nodes[i].pkg.Version, atom) {
++			result = append(result, i)
++		}
++	}
++	for _, provided := range c.providers[atom.name] {
++		node := &c.nodes[provided.node]
++		if matchesArch(node) && (atom.archQual != ArchitectureAny || node.multiArch == multiArchAllowed) && provideMatches(provided, atom) {
++			result = append(result, provided.node)
++		}
++	}
++	return result
++}
++
++// addClause adds a clause of literals (2*node for "installed", 2*node+1 for "not installed"): a tautology is
++// dropped, a unit clause assigns its literal at once or records a contradiction, and any other clause is
++// stored and watched
++func (c *installabilityChecker) addClause(clause []int) {
++	for _, lit := range clause[1:] {
++		if lit == clause[0]^1 {
++			return
++		}
++	}
++	if len(clause) == 1 {
++		switch c.litValue(clause[0]) {
++		case -1:
++			c.contradiction = true
++		case 0:
++			c.enqueue(clause[0], -1)
++		}
++		return
++	}
++	c.clauses = append(c.clauses, clause)
++	c.watches[clause[0]] = append(c.watches[clause[0]], len(c.clauses)-1)
++	c.watches[clause[1]] = append(c.watches[clause[1]], len(c.clauses)-1)
++}
++
++func (c *installabilityChecker) litValue(lit int) int8 {
++	if lit&1 == 1 {
++		return -c.value[lit>>1]
++	}
++	return c.value[lit>>1]
++}
++
++func (c *installabilityChecker) enqueue(lit, reason int) {
++	node := lit >> 1
++	c.value[node] = 1 - 2*int8(lit&1)
++	c.level[node] = len(c.trailLim)
++	c.reason[node] = reason
++	c.trail = append(c.trail, lit)
++}
++
++// propagate assigns literals of unit clauses and returns a falsified clause, or -1
++func (c *installabilityChecker) propagate() int {
++	for c.qhead < len(c.trail) {
++		falseLit := c.trail[c.qhead] ^ 1
++		c.qhead++
++
++		watching := c.watches[falseLit]
++		kept := 0
++		for i := 0; i < len(watching); i++ {
++			index := watching[i]
++			clause := c.clauses[index]
++			if clause[0] == falseLit {
++				clause[0], clause[1] = clause[1], clause[0]
++			}
++			if c.litValue(clause[0]) == 1 {
++				watching[kept] = index
++				kept++
++				continue
++			}
++
++			moved := false
++			for k := 2; k < len(clause); k++ {
++				if c.litValue(clause[k]) != -1 {
++					clause[1], clause[k] = clause[k], clause[1]
++					c.watches[clause[1]] = append(c.watches[clause[1]], index)
++					moved = true
++					break
++				}
++			}
++			if moved {
++				continue
++			}
++
++			watching[kept] = index
++			kept++
++			if c.litValue(clause[0]) == -1 {
++				kept += copy(watching[kept:], watching[i+1:])
++				c.watches[falseLit] = watching[:kept]
++				return index
++			}
++			c.enqueue(clause[0], index)
++		}
++		c.watches[falseLit] = watching[:kept]
++	}
++	return -1
++}
++
++// analyze derives a clause from a conflict (first unique implication point) and the level to backjump to
++func (c *installabilityChecker) analyze(conflict int) ([]int, int) {
++	learnt := []int{0}
++	current := len(c.trailLim)
++	pending := 0
++	lit := -1
++	index := len(c.trail) - 1
++	clause := c.clauses[conflict]
++
++	for {
++		start := 0
++		if lit != -1 {
++			start = 1
++		}
++		for _, q := range clause[start:] {
++			node := q >> 1
++			if !c.seen[node] && c.level[node] > 0 {
++				c.seen[node] = true
++				if c.level[node] == current {
++					pending++
++				} else {
++					learnt = append(learnt, q)
++				}
++			}
++		}
++
++		for !c.seen[c.trail[index]>>1] {
++			index--
++		}
++		lit = c.trail[index]
++		index--
++		c.seen[lit>>1] = false
++		pending--
++		if pending == 0 {
++			break
++		}
++		clause = c.clauses[c.reason[lit>>1]]
++	}
++	learnt[0] = lit ^ 1
++
++	backjump, at := 0, 1
++	for i := 1; i < len(learnt); i++ {
++		node := learnt[i] >> 1
++		c.seen[node] = false
++		if c.level[node] > backjump {
++			backjump, at = c.level[node], i
++		}
++	}
++	if len(learnt) > 1 {
++		learnt[1], learnt[at] = learnt[at], learnt[1]
++	}
++	return learnt, backjump
++}
++
++func (c *installabilityChecker) learn(clause []int) {
++	if len(clause) == 1 {
++		c.enqueue(clause[0], -1)
++		return
++	}
++	c.clauses = append(c.clauses, clause)
++	index := len(c.clauses) - 1
++	c.watches[clause[0]] = append(c.watches[clause[0]], index)
++	c.watches[clause[1]] = append(c.watches[clause[1]], index)
++	c.enqueue(clause[0], index)
++}
++
++func (c *installabilityChecker) decide(lit int) {
++	c.trailLim = append(c.trailLim, len(c.trail))
++	c.cursorLim = append(c.cursorLim, c.cursor)
++	c.enqueue(lit, -1)
++}
++
++func (c *installabilityChecker) backjump(level int) {
++	if len(c.trailLim) <= level {
++		return
++	}
++	for _, lit := range c.trail[c.trailLim[level]:] {
++		c.value[lit>>1] = 0
++		c.reason[lit>>1] = -1
++	}
++	c.trail = c.trail[:c.trailLim[level]]
++	c.cursor = c.cursorLim[level]
++	c.trailLim = c.trailLim[:level]
++	c.cursorLim = c.cursorLim[:level]
++	c.qhead = len(c.trail)
++}
++
++func (c *installabilityChecker) groupSatisfied(candidates []int) bool {
++	for _, candidate := range candidates {
++		if c.value[candidate] == 1 {
++			return true
++		}
++	}
++	return false
++}
++
++// openGroup returns an unsatisfied group, packages before cursor in the trail have theirs satisfied
++func (c *installabilityChecker) openGroup() []int {
++	for ; c.cursor < len(c.trail); c.cursor++ {
++		lit := c.trail[c.cursor]
++		if lit&1 == 1 {
++			continue
++		}
++		for _, candidates := range c.nodes[lit>>1].depends {
++			if !c.groupSatisfied(candidates) {
++				return candidates
++			}
++		}
++	}
++	for _, candidates := range c.essential {
++		if !c.groupSatisfied(candidates) {
++			return candidates
++		}
++	}
++	return nil
++}
++
++// candidate picks a package to install for an open group, preferring the native architecture
++func (c *installabilityChecker) candidate(candidates []int) int {
++	pick := -1
++	for _, candidate := range candidates {
++		if c.value[candidate] == 0 {
++			if c.nodes[candidate].arch == c.native {
++				return candidate
++			}
++			if pick == -1 {
++				pick = candidate
++			}
++		}
++	}
++	return pick
++}
++
++// check finds out whether some installation contains the node, remembering every package
++// of a found installation as installable
++func (c *installabilityChecker) check(node int) bool {
++	if c.contradiction || c.value[node] == -1 {
++		return false
++	}
++	if c.installable[node] {
++		return true
++	}
++
++	c.cursor = 0
++	assumed := 0
++	for {
++		if conflict := c.propagate(); conflict != -1 {
++			if len(c.trailLim) == 0 {
++				c.contradiction = true
++				return false
++			}
++			learnt, level := c.analyze(conflict)
++			if len(c.trailLim) == assumed {
++				c.backjump(0)
++				c.learn(learnt)
++				if c.propagate() != -1 {
++					c.contradiction = true
++				}
++				return false
++			}
++			c.backjump(level)
++			c.learn(learnt)
++			continue
++		}
++
++		if len(c.trailLim) == 0 {
++			switch c.value[node] {
++			case -1:
++				return false
++			case 0:
++				c.decide(positive(node))
++				assumed = 1
++				continue
++			}
++			assumed = 0
++		}
++
++		candidates := c.openGroup()
++		if candidates == nil {
++			for _, lit := range c.trail {
++				if lit&1 == 0 {
++					c.installable[lit>>1] = true
++				}
++			}
++			c.backjump(0)
++			return true
++		}
++		c.decide(positive(c.candidate(candidates)))
++	}
++}
++
++// Uninstallable returns packages of architecture native or "all" from the list which can't be
++// installed from archive (which should include the list) on a system with native architecture native
++// and foreign architectures foreign: no set of packages containing it satisfies every Pre-Depends and
++// Depends, avoids Conflicts, Breaks and two packages of one name (apart from Multi-Arch: same ones of
++// one version) and holds an Essential package of each Essential package name.
++func (l *PackageList) Uninstallable(native string, foreign []string, archive *PackageList, progress aptly.Progress) ([]*Package, error) {
++	checker, err := newInstallabilityChecker(native, foreign, archive)
++	if err != nil {
++		return nil, err
++	}
++
++	index := make(map[string]int, len(checker.nodes))
++	for i := range checker.nodes {
++		index[string(checker.nodes[i].pkg.Key(""))] = i
++	}
++
++	var checked []int
++	_ = l.ForEach(func(p *Package) error {
++		if !p.IsSource && (p.Architecture == native || p.Architecture == ArchitectureAll) {
++			if i, ok := index[string(p.Key(""))]; ok {
++				checked = append(checked, i)
++			}
++		}
++		return nil
++	})
++	sort.Ints(checked)
++
++	if progress != nil {
++		progress.InitBar(int64(len(checked)), false, aptly.BarGeneralVerifyDependencies)
++		defer progress.ShutdownBar()
++	}
++
++	var result []*Package
++	for _, i := range checked {
++		if progress != nil {
++			progress.AddBar(1)
++		}
++		if !checker.check(i) {
++			result = append(result, checker.nodes[i].pkg)
++		}
++	}
++	return result, nil
++}
+diff --git a/deb/version.go b/deb/version.go
+index 4b915038..1a9c3ed2 100644
+--- a/deb/version.go
++++ b/deb/version.go
+@@ -12,30 +12,52 @@ import (
+ 
+ // CompareVersions compares two package versions
+ func CompareVersions(ver1, ver2 string) int {
+-	e1, u1, d1 := parseVersion(ver1)
+-	e2, u2, d2 := parseVersion(ver2)
++	return compareVersionsWith(ver1, ver2, parseVersion, compareVersionPart)
++}
++
++// compareVersionsDpkg compares two package versions like dpkg does: the Debian revision follows the
++// last hyphen of the version and numbers of any length compare by value
++func compareVersionsDpkg(ver1, ver2 string) int {
++	return compareVersionsWith(ver1, ver2, parseVersionDpkg, compareVersionPartDpkg)
++}
++
++// compareVersionsWith compares epochs, upstream versions and Debian revisions in turn
++func compareVersionsWith(ver1, ver2 string, parse func(string) (string, string, string), comparePart func(string, string) int) int {
++	e1, u1, d1 := parse(ver1)
++	e2, u2, d2 := parse(ver2)
+ 
+-	r := compareVersionPart(e1, e2)
++	r := comparePart(e1, e2)
+ 	if r != 0 {
+ 		return r
+ 	}
+ 
+-	r = compareVersionPart(u1, u2)
++	r = comparePart(u1, u2)
+ 	if r != 0 {
+ 		return r
+ 	}
+ 
+-	return compareVersionPart(d1, d2)
++	return comparePart(d1, d2)
+ }
+ 
+ // parseVersions breaks down full version to components (possibly empty)
+ func parseVersion(ver string) (epoch, upstream, debian string) {
++	return splitVersion(ver, strings.Index)
++}
++
++// parseVersionDpkg breaks down full version to components like parseVersion, taking the Debian revision
++// after the last hyphen
++func parseVersionDpkg(ver string) (epoch, upstream, debian string) {
++	return splitVersion(ver, strings.LastIndex)
++}
++
++// splitVersion breaks down full version to components, revision locates the hyphen before the Debian revision
++func splitVersion(ver string, revision func(string, string) int) (epoch, upstream, debian string) {
+ 	i := strings.Index(ver, ":")
+ 	if i != -1 {
+ 		epoch, ver = ver[:i], ver[i+1:]
+ 	}
+ 
+-	i = strings.Index(ver, "-")
++	i = revision(ver, "-")
+ 	if i != -1 {
+ 		debian, ver = ver[i+1:], ver[:i]
+ 	}
+@@ -118,6 +140,16 @@ func compareLexicographic(s1, s2 string) int {
+ // These two steps (comparing and removing initial non-digit strings and initial digit strings) are
+ // repeated until a difference is found or both strings are exhausted."
+ func compareVersionPart(part1, part2 string) int {
++	return compareVersionPartWith(part1, part2, compareNumbers)
++}
++
++// compareVersionPartDpkg compares parts of full version like compareVersionPart, numbers of any length compare by value
++func compareVersionPartDpkg(part1, part2 string) int {
++	return compareVersionPartWith(part1, part2, compareNumbersDpkg)
++}
++
++// compareVersionPartWith compares parts of full version like compareVersionPart, numbers compares digit runs
++func compareVersionPartWith(part1, part2 string, numbers func(string, string) int) int {
+ 	i1, i2 := 0, 0
+ 	l1, l2 := len(part1), len(part2)
+ 
+@@ -148,14 +180,9 @@ func compareVersionPart(part1, part2 string) int {
+ 		}
+ 
+ 		s1, s2 = part1[i1:j1], part2[i2:j2]
+-		n1, _ := strconv.Atoi(s1)
+-		n2, _ := strconv.Atoi(s2)
+-
+-		if n1 < n2 {
+-			return -1
+-		}
+-		if n1 > n2 {
+-			return 1
++		r = numbers(s1, s2)
++		if r != 0 {
++			return r
+ 		}
+ 
+ 		i1, i2 = j1, j2
+@@ -167,6 +194,32 @@ func compareVersionPart(part1, part2 string) int {
+ 	return 0
+ }
+ 
++// compareNumbers compares runs of digits as int values
++func compareNumbers(s1, s2 string) int {
++	n1, _ := strconv.Atoi(s1)
++	n2, _ := strconv.Atoi(s2)
++
++	if n1 < n2 {
++		return -1
++	}
++	if n1 > n2 {
++		return 1
++	}
++	return 0
++}
++
++// compareNumbersDpkg compares runs of digits by value whatever their length
++func compareNumbersDpkg(s1, s2 string) int {
++	s1, s2 = strings.TrimLeft(s1, "0"), strings.TrimLeft(s2, "0")
++	if len(s1) != len(s2) {
++		if len(s1) < len(s2) {
++			return -1
++		}
++		return 1
++	}
++	return strings.Compare(s1, s2)
++}
++
+ // Version relations
+ const (
+ 	VersionDontCare = iota
+diff --git a/man/aptly.1 b/man/aptly.1
+index 67351d7a..fbfa9790 100644
+--- a/man/aptly.1
++++ b/man/aptly.1
+@@ -1322,6 +1322,9 @@ show list of packages
+ Verify does dependency resolution in snapshot \fIname\fR, possibly using additional snapshots \fIsource\fR as dependency sources\. All unsatisfied dependencies are printed\.
+ .
+ .P
++With \-installable, each architecture is checked as the native architecture of a system which has the other architectures enabled as foreign ones, and packages of snapshot \fIname\fR which can\(cqt be installed on such a system are printed instead, taking conflicts, breaks and Essential packages into account\.
++.
++.P
+ Example:
+ .
+ .IP "" 4
+@@ -1334,6 +1337,13 @@ $ aptly snapshot verify wheezy\-main wheezy\-contrib wheezy\-non\-free
+ .
+ .IP "" 0
+ .
++.P
++Options:
++.
++.TP
++\-\fBinstallable\fR
++print packages which can\(cqt be installed instead of missing dependencies
++.
+ .SH "PULL PACKAGES FROM ANOTHER SNAPSHOT"
+ \fBaptly\fR \fBsnapshot\fR \fBpull\fR \fIname\fR \fIsource\fR \fIdestination\fR \fIpackage\-query\fR \fB\|\.\|\.\|\.\fR
+ .

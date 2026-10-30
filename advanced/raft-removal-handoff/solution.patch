@@ -1,0 +1,132 @@
+diff --git a/raft.go b/raft.go
+index 5d92f7b..77d5feb 100644
+--- a/raft.go
++++ b/raft.go
+@@ -286,6 +286,15 @@ type Config struct {
+ 	// https://github.com/etcd-io/raft/issues/83
+ 	StepDownOnRemoval bool
+ 
++	// TransferLeadershipOnRemoval makes a leader that is removed from the group
++	// or demoted to a learner hand its leadership to the voter that has
++	// acknowledged the most of its log (the lowest ID on ties) instead of
++	// leaving the group without a working leader. Proposals are dropped while
++	// the handoff is in progress, and the leader steps down if no new leader
++	// took over within an election timeout, whether or not StepDownOnRemoval is
++	// set.
++	TransferLeadershipOnRemoval bool
++
+ 	// raft state tracer
+ 	TraceLogger TraceLogger
+ }
+@@ -422,6 +431,8 @@ type raft struct {
+ 	disableProposalForwarding bool
+ 	stepDownOnRemoval         bool
+ 
++	transferLeadershipOnRemoval bool
++
+ 	tick func()
+ 	step stepFunc
+ 
+@@ -463,6 +474,7 @@ func newRaft(c *Config) *raft {
+ 		disableProposalForwarding:   c.DisableProposalForwarding,
+ 		disableConfChangeValidation: c.DisableConfChangeValidation,
+ 		stepDownOnRemoval:           c.StepDownOnRemoval,
++		transferLeadershipOnRemoval: c.TransferLeadershipOnRemoval,
+ 		traceLogger:                 c.TraceLogger,
+ 	}
+ 
+@@ -870,8 +882,12 @@ func (r *raft) tickHeartbeat() {
+ 				r.logger.Debugf("error occurred during checking sending heartbeat: %v", err)
+ 			}
+ 		}
+-		// If current leader cannot transfer leadership in electionTimeout, it becomes leader again.
+-		if r.state == StateLeader && r.leadTransferee != None {
++		if r.state == StateLeader && r.handingOff() {
++			// A leader that is no longer a voter steps down if its handoff did not
++			// finish in electionTimeout.
++			r.becomeFollower(r.Term, None)
++		} else if r.state == StateLeader && r.leadTransferee != None {
++			// If current leader cannot transfer leadership in electionTimeout, it becomes leader again.
+ 			r.abortLeaderTransfer()
+ 		}
+ 	}
+@@ -1597,6 +1613,12 @@ func stepLeader(r *raft, m *pb.Message) error {
+ 			r.sendAppend(m.GetFrom())
+ 		}
+ 
++		// A handoff target may have ignored an earlier MsgTimeoutNow because it
++		// had not applied the configuration change yet, so ask again.
++		if r.handingOff() && m.GetFrom() == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
++			r.sendTimeoutNow(m.GetFrom())
++		}
++
+ 		if r.readOnly.option != ReadOnlySafe || len(m.GetContext()) == 0 {
+ 			return nil
+ 		}
+@@ -1991,15 +2013,14 @@ func (r *raft) switchToConfig(cfg tracker.Config, trk tracker.ProgressMap) *pb.C
+ 	r.isLearner = ok && pr.IsLearner
+ 
+ 	if (!ok || r.isLearner) && r.state == StateLeader {
+-		// This node is leader and was removed or demoted, step down if requested.
++		// This node is leader and was removed or demoted, hand off its leadership
++		// or step down if requested.
+ 		//
+ 		// We prevent demotions at the time writing but hypothetically we handle
+ 		// them the same way as removing the leader.
+-		//
+-		// TODO(tbg): ask follower with largest Match to TimeoutNow (to avoid
+-		// interruption). This might still drop some proposals but it's better than
+-		// nothing.
+-		if r.stepDownOnRemoval {
++		if r.transferLeadershipOnRemoval {
++			r.handOffLeadership()
++		} else if r.stepDownOnRemoval {
+ 			r.becomeFollower(r.Term, None)
+ 		}
+ 		return cs
+@@ -2054,6 +2075,32 @@ func (r *raft) resetRandomizedElectionTimeout() {
+ 	r.randomizedElectionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
+ }
+ 
++// handOffLeadership transfers the leadership of a leader that is no longer a
++// voter to the voter that has acknowledged the most of its log, the one with
++// the lowest ID on ties. The voter is caught up first if needed.
++func (r *raft) handOffLeadership() {
++	var to, match uint64
++	for _, id := range r.trk.VoterNodes() {
++		if pr := r.trk.Progress[id]; to == None || pr.Match > match {
++			to, match = id, pr.Match
++		}
++	}
++	r.logger.Infof("%x [term %d] hands off leadership to %x after leaving the voters", r.id, r.Term, to)
++	r.electionElapsed = 0
++	r.leadTransferee = to
++	if match == r.raftLog.lastIndex() {
++		r.sendTimeoutNow(to)
++	} else {
++		r.sendAppend(to)
++	}
++}
++
++// handingOff returns true if this node is no longer a voter and hands off its
++// leadership because of TransferLeadershipOnRemoval.
++func (r *raft) handingOff() bool {
++	return r.transferLeadershipOnRemoval && (r.trk.Progress[r.id] == nil || r.isLearner)
++}
++
+ func (r *raft) sendTimeoutNow(to uint64) {
+ 	r.send(&pb.Message{To: new(to), Type: pb.MsgTimeoutNow.Enum()})
+ }
+diff --git a/rafttest/interaction_env_handler_add_nodes.go b/rafttest/interaction_env_handler_add_nodes.go
+index 70fb2ed..0ed8507 100644
+--- a/rafttest/interaction_env_handler_add_nodes.go
++++ b/rafttest/interaction_env_handler_add_nodes.go
+@@ -71,6 +71,8 @@ func (env *InteractionEnv) handleAddNodes(t *testing.T, d datadriven.TestData) e
+ 				}
+ 			case "step-down-on-removal":
+ 				arg.Scan(t, i, &cfg.StepDownOnRemoval)
++			case "transfer-leadership-on-removal":
++				arg.Scan(t, i, &cfg.TransferLeadershipOnRemoval)
+ 			}
+ 		}
+ 	}

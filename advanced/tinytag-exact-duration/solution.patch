@@ -1,0 +1,495 @@
+diff --git a/README.md b/README.md
+index e60eba9..2f126ab 100644
+--- a/README.md
++++ b/README.md
+@@ -458,6 +458,17 @@ operations when many non-audio files exist in a folder, pass a
+ tag: TinyTag = TinyTag.get('invalid_file.jpg', check_magic_bytes=False)
+ ```
+ 
++### Exact Duration
++
++For MPEG audio and native FLAC files, the duration is normally estimated from
++file headers. To count the samples of every frame instead, and to leave out the
++encoder delay and padding recorded in a LAME header, pass an `exact_duration`
++argument with a value of `True`. The whole file is read in this case.
++
++```python
++tag: TinyTag = TinyTag.get('/some/music.mp3', exact_duration=True)
++```
++
+ ### Encoding
+ 
+ To open files using a specific encoding, you can use the `encoding` parameter.
+diff --git a/tinytag/tinytag.py b/tinytag/tinytag.py
+index 859dc0b..04238bc 100644
+--- a/tinytag/tinytag.py
++++ b/tinytag/tinytag.py
+@@ -32,6 +32,7 @@
+ 
+ from __future__ import annotations
+ from binascii import a2b_base64
++from bisect import bisect_left
+ from io import BytesIO
+ from os import PathLike, SEEK_CUR, SEEK_END, environ, fsdecode
+ from struct import unpack, unpack_from
+@@ -118,6 +119,7 @@ class TinyTag:
+         self._parse_duration = True
+         self._parse_tags = True
+         self._load_image = False
++        self._exact_duration = False
+         self._duration_parsed = False
+         self._tags_parsed = False
+         self.__dict__: dict[str, str | float | Images | OtherFields | None]
+@@ -131,7 +133,8 @@ class TinyTag:
+             image: bool = False,
+             encoding: str | None = None,
+             ignore_errors: bool | None = None,
+-            check_magic_bytes: bool = True) -> TinyTag:
++            check_magic_bytes: bool = True,
++            exact_duration: bool = False) -> TinyTag:
+         """Return a tag object for an audio file."""
+         should_close_file = file_obj is None
+         parser_class = None
+@@ -166,7 +169,8 @@ class TinyTag:
+             tag.filename = filename_str
+             tag.filesize = filesize
+             try:
+-                tag._load(tags=tags, duration=duration, image=image)
++                tag._load(tags=tags, duration=duration, image=image,
++                          exact_duration=exact_duration)
+             except Exception as exc:
+                 raise ParseError(exc) from exc
+             return tag
+@@ -287,10 +291,15 @@ class TinyTag:
+         raise UnsupportedFormatError(
+             'No tag reader found to support file type')
+ 
+-    def _load(self, tags: bool, duration: bool, image: bool = False) -> None:
++    def _load(self,
++              tags: bool,
++              duration: bool,
++              image: bool = False,
++              exact_duration: bool = False) -> None:
+         self._parse_tags = tags
+         self._parse_duration = duration
+         self._load_image = image
++        self._exact_duration = exact_duration
+         if self._filehandler is None:
+             raise ValueError("File handle is required")
+         if not self.filesize:
+@@ -355,6 +364,33 @@ class TinyTag:
+     def _unpad_bytes(s: bytes) -> bytes:
+         return s.rstrip(b'\x00')
+ 
++    def _set_exact_duration(self, samples: int) -> None:
++        if samples > 0 and self.samplerate:
++            self.duration = samples / self.samplerate
++        else:
++            self.duration = None
++
++    @staticmethod
++    def _audio_data_bounds(data: bytes) -> tuple[int, int]:
++        # skip ID3v2 tags at the start, ID3v1 and APEv2 tags at the end
++        start = 0
++        while data.startswith(b'ID3', start) and len(data) >= start + 10:
++            # the size field leaves out the 10-byte header, and the 10-byte
++            # footer when the footer flag is set (ID3v2.4 section 3.1)
++            # pylint: disable=protected-access
++            tag_size = _ID3._unsynchsafe(data, start + 6)
++            footer_size = 10 if data[start + 5] & 0x10 else 0
++            start += 10 + tag_size + footer_size
++        end = len(data)
++        if end - start >= 128 and data.startswith(b'TAG', end - 128):
++            end -= 128
++        if end - start >= 32 and data.startswith(b'APETAGEX', end - 32):
++            tag_size, _items, flags = unpack_from('<III', data, end - 20)
++            if flags & 0x80000000:  # header present
++                tag_size += 32
++            end = max(end - tag_size, start)
++        return start, end
++
+     def get_image(self) -> bytes | None:
+         """Deprecated, use 'images.any' instead."""
+         from warnings import warn  # pylint: disable=import-outside-toplevel
+@@ -1092,7 +1128,7 @@ class _ID3(TinyTag):
+             flac_tag._filehandler = fh  # pylint: disable=protected-access
+             flac_tag._load(  # pylint: disable=protected-access
+                 tags=self._parse_tags, duration=self._parse_duration,
+-                image=self._load_image)
++                image=self._load_image, exact_duration=self._exact_duration)
+             self._update(flac_tag)
+         else:
+             self.mime_type = 'audio/mpeg'
+@@ -1109,7 +1145,8 @@ class _ID3(TinyTag):
+             # pylint: disable=protected-access
+             mpeg_tag._filehandler = fh
+             mpeg_tag._end_padding = end_padding
+-            mpeg_tag._load(tags=False, duration=self._parse_duration)
++            mpeg_tag._load(tags=False, duration=self._parse_duration,
++                           exact_duration=self._exact_duration)
+             self._update(mpeg_tag)
+         self._tags_parsed = self._parse_tags
+         self._duration_parsed = self._parse_duration
+@@ -1519,12 +1556,25 @@ class _MPEG(TinyTag):
+         2,  # 10 Dual channel (2 mono channels)
+         1,  # 11 Single channel (Mono)
+     )
++    _SIDE_INFO_SIZES = (
++        (17, 9),   # MPEG Version 2 and 2.5 (stereo, mono)
++        (32, 17),  # MPEG Version 1 (stereo, mono)
++    )
++    _GAPLESS_ENCODERS = (b'LAME', b'Lavf', b'Lavc')
++    _DECODER_DELAY = 529
++    _SAME_RATE = 0x00180C00  # version and sample rate
+ 
+     def __init__(self) -> None:
+         super().__init__()
+         self._end_padding = 0
+ 
+     def _parse(self, fh: BinaryIO) -> None:
++        self._parse_audio_properties(fh)
++        if self._exact_duration and self._parse_duration:
++            fh.seek(0)
++            self._set_exact_duration(self._count_samples(fh.read()))
++
++    def _parse_audio_properties(self, fh: BinaryIO) -> None:
+         self.mime_type = 'audio/mpeg'
+         if not self._parse_duration:
+             return
+@@ -1657,6 +1707,134 @@ class _MPEG(TinyTag):
+         offset += 4
+         return frames, byte_count
+ 
++    def _parse_frame_header(
++            self, data: bytes, offset: int) -> tuple[int, int, int] | None:
++        # returns the frame length, the samples per frame and the header
++        header = data[offset:offset + 4]
++        if len(header) < 4 or header[0] != 0xFF or header[1] & 0xE0 != 0xE0:
++            return None
++        mpeg_id = (header[1] >> 3) & 0x03
++        layer_id = (header[1] >> 1) & 0x03
++        br_id = header[2] >> 4
++        sr_id = (header[2] >> 2) & 0x03
++        # free-format frames (bitrate index 0) are not counted, ffmpeg does
++        # not decode them either
++        if mpeg_id == 1 or layer_id == 0 or br_id in {0, 15} or sr_id == 3:
++            return None
++        samplerate = self._SAMPLE_RATES[mpeg_id][sr_id]
++        samples_pf = self._SAMPLES_PER_FRAME[mpeg_id][layer_id]
++        slot_size = self._SLOT_SIZES[layer_id]
++        frame_br = self._BITRATE_VERSION_LAYERS[mpeg_id][layer_id][br_id]
++        coefficient = (samples_pf // 8 // slot_size) * 1000
++        padding = (header[2] >> 1) & 0x01
++        frame_length = (
++            ((coefficient * frame_br) // samplerate + padding) * slot_size)
++        return frame_length, samples_pf, int.from_bytes(header, 'big')
++
++    def _parse_gapless_header(
++            self, data: bytes, offset: int) -> tuple[int, int, int] | None:
++        # returns the frame count of a Xing, Info or VBRI header in the frame
++        # at the offset, and the encoder delay and padding of a LAME header
++        if (data[offset + 1] >> 1) & 0x03 != 1:  # layer III only
++            return None
++        is_mpeg1 = (data[offset + 1] >> 3) & 0x03 == 3
++        is_mono = data[offset + 3] >> 6 == 3
++        xing_offset = 4 + self._SIDE_INFO_SIZES[is_mpeg1][is_mono]
++        content = data[offset:offset + xing_offset + 160].ljust(
++            xing_offset + 160, b'\x00')
++        frames = byte_count = 0
++        encoder_delay = padding = -1
++        if content.startswith((b'Xing', b'Info'), xing_offset):
++            frames, byte_count = self._parse_xing_header(content, xing_offset)
++            stream_size = len(data) - offset - 4
++            if (byte_count > 0 and stream_size - byte_count
++                    > min(stream_size, byte_count) >> 4):
++                # much more data than the header covers, probably several
++                # files joined together, so the frame count is not used
++                frames = 0
++            header_flags = unpack_from('>I', content, xing_offset + 4)[0]
++            lame_offset = xing_offset + 8
++            for flag, size in ((1, 4), (2, 4), (4, 100), (8, 4)):
++                if header_flags & flag:
++                    lame_offset += size
++            if content.startswith(self._GAPLESS_ENCODERS, lame_offset):
++                delays = int.from_bytes(
++                    content[lame_offset + 21:lame_offset + 24], 'big')
++                encoder_delay, padding = delays >> 12, delays & 0xFFF
++        elif (content.startswith(b'VBRI', 36)
++                and unpack_from('>H', content, 40)[0] == 1):
++            frames, byte_count = self._parse_vbri_header(content, 36)
++        if not frames and not byte_count:
++            return None
++        return max(frames, 0), encoder_delay, padding
++
++    def _find_first_frame(self, data: bytes, offset: int, end: int) -> int:
++        # the first frame header that is followed by a header for the same
++        # version and sample rate (zero bytes between them are skipped). A
++        # lone frame at the end of the file is not a stream ffmpeg can read,
++        # so no frame is found then.
++        while offset + 4 <= end:
++            frame = self._parse_frame_header(data, offset)
++            if frame is not None:
++                following = offset + frame[0]
++                while following < end and not data[following]:
++                    following += 1
++                if following + 4 > len(data):
++                    return end
++                next_frame = self._parse_frame_header(data, following)
++                if next_frame is not None and (
++                        next_frame[2] & self._SAME_RATE
++                        == frame[2] & self._SAME_RATE):
++                    return offset
++            offset += 1
++        return offset
++
++    def _count_samples(self, data: bytes) -> int:
++        # count the samples a decoder outputs: every frame except a Xing,
++        # Info or VBRI header frame, minus the encoder delay and padding
++        # recorded in a LAME header
++        offset, end = self._audio_data_bounds(data)
++        skip = discard_start = discard_end = 0
++        frame = self._parse_frame_header(data, offset)
++        if frame is None:  # other bytes before the first frame
++            offset = self._find_first_frame(data, offset, end)
++            frame = self._parse_frame_header(data, offset)
++        if frame is not None and offset + 4 <= end:
++            gapless = self._parse_gapless_header(data, offset)
++            if gapless is not None:
++                offset += frame[0]
++                declared_frames, encoder_delay, padding = gapless
++                if encoder_delay >= 0:
++                    skip = encoder_delay + self._DECODER_DELAY
++                    discard_end = declared_frames * frame[1]
++                    discard_start = (
++                        discard_end - padding + self._DECODER_DELAY)
++        offset = self._find_first_frame(data, offset, end)
++        samples = position = 0
++        stream = None
++        while offset + 4 <= end:
++            frame = self._parse_frame_header(data, offset)
++            if frame is None or (stream is not None
++                                 and frame[2] & self._SAME_RATE != stream):
++                offset += 1
++                continue
++            frame_length, samples_pf, header = frame
++            stream = header & self._SAME_RATE
++            offset += frame_length
++            frame_end = position + samples_pf
++            if position < discard_end and frame_end > discard_start:
++                # the decoder drops the end padding from this frame, and
++                # skips nothing more of the encoder delay
++                skip = 0
++                samples += samples_pf - min(frame_end - discard_start,
++                                            samples_pf)
++            else:
++                kept = max(samples_pf - skip, 0)
++                skip -= samples_pf - kept
++                samples += kept
++            position = frame_end
++        return samples
++
+ 
+ class _Ogg(TinyTag):
+     """OGG Parser."""
+@@ -2085,6 +2263,10 @@ class _Flac(TinyTag):
+     _STREAMINFO = 0
+     _VORBIS_COMMENT = 4
+     _PICTURE = 6
++    _BLOCK_SIZES = (0, 192, 576, 1152, 2304, 4608, 0, 0,
++                    256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
++    _SAMPLE_SIZES = (0, 8, 12, 0, 16, 20, 24, 32)
++    _CRC16_TABLE: tuple[int, ...] = ()
+ 
+     def _parse(self, fh: BinaryIO) -> None:
+         header = fh.read(4)
+@@ -2167,9 +2349,190 @@ class _Flac(TinyTag):
+             bitrate = (self.filesize - audio_offset) * 8 / self.duration / 1000
+             if bitrate > 0:
+                 self.bitrate = bitrate
++        if self._exact_duration and self._parse_duration:
++            fh.seek(0)
++            self._set_exact_duration(self._count_samples(fh.read()))
+         self._duration_parsed = self._parse_duration
+         self._tags_parsed = self._parse_tags
+ 
++    def _count_samples(self, data: bytes) -> int:
++        # count the samples of every complete frame. A frame usually ends
++        # where the CRC-16 of its data matches, so sync codes inside audio
++        # data are not mistaken for frames. Otherwise its subframes tell
++        # where it ends, for the last frame or one followed by other data.
++        offset, end = self._audio_data_bounds(data)
++        if not data.startswith(b'fLaC', offset):
++            return 0
++        offset += 4
++        while offset + 4 <= end:
++            is_last_block = data[offset] & 0x80
++            offset += 4 + int.from_bytes(data[offset + 1:offset + 4], 'big')
++            if is_last_block:
++                break
++        frames = list(self._find_frame_headers(data, offset, end))
++        samples = index = 0
++        while index < len(frames):
++            frame_offset, block_size = frames[index]
++            position = frame_offset
++            crc = 0
++            next_index = None
++            for candidate in range(index + 1, len(frames)):
++                next_position = frames[candidate][0]
++                crc = self._crc16(data[position:next_position], crc)
++                position = next_position
++                if crc == 0:
++                    next_index = candidate
++                    break
++            if next_index is None:
++                frame_size = self._frame_size(data[frame_offset:end])
++                if not frame_size:
++                    break
++                next_index = bisect_left(
++                    frames, (frame_offset + frame_size, 0), index + 1)
++            samples += block_size
++            index = next_index
++        return samples
++
++    def _find_frame_headers(self,
++                            data: bytes,
++                            offset: int,
++                            end: int) -> Iterator[tuple[int, int]]:
++        offset = data.find(b'\xFF', offset, end)
++        while offset != -1:
++            block_size, _header_size = self._parse_frame_header(
++                data[offset:min(offset + 16, end)])
++            if block_size:
++                yield offset, block_size
++            offset = data.find(b'\xFF', offset + 1, end)
++
++    def _parse_frame_header(self, header: bytes) -> tuple[int, int]:
++        # https://xiph.org/flac/format.html#frame_header
++        # returns the block size and the size of a valid frame header,
++        # otherwise zeros, also for a header that is cut off
++        if (len(header) < 6 or header[1] & 0xFE != 0xF8
++                or header[2] >> 4 == 0 or header[2] & 0x0F == 0x0F
++                or header[3] >> 4 > 10 or (header[3] >> 1) & 0x07 == 3
++                or header[3] & 0x01):
++            return 0, 0
++        # frame or sample number, coded like UTF-8
++        length = 0
++        while length < 8 and header[4] & (0x80 >> length):
++            length += 1
++        if length == 1 or length > 7:
++            return 0, 0
++        position = 4 + max(length, 1)
++        # an uncommon block size and sample rate follow in up to two bytes
++        # each, then the CRC-8
++        block_size_id = header[2] >> 4
++        block_size_length = {6: 1, 7: 2}.get(block_size_id, 0)
++        crc_position = (position + block_size_length
++                        + {12: 1, 13: 2, 14: 2}.get(header[2] & 0x0F, 0))
++        if len(header) <= crc_position:
++            return 0, 0
++        if any(byte & 0xC0 != 0x80 for byte in header[5:position]):
++            return 0, 0
++        if block_size_length:
++            block_size = int.from_bytes(
++                header[position:position + block_size_length], 'big') + 1
++        else:
++            block_size = self._BLOCK_SIZES[block_size_id]
++        crc = 0
++        for byte in header[:crc_position]:
++            crc ^= byte
++            for _ in range(8):
++                crc = ((crc << 1) ^ 0x07 if crc & 0x80 else crc << 1) & 0xFF
++        if crc != header[crc_position]:
++            return 0, 0
++        return block_size, crc_position + 1
++
++    def _frame_size(self, frame: bytes) -> int:
++        # https://xiph.org/flac/format.html#subframe
++        # follow the subframes to find where the frame ends; returns 0 when
++        # the data does not hold all of them and the frame footer
++        block_size, header_size = self._parse_frame_header(frame[:16])
++        channel_assignment = frame[3] >> 4
++        sample_size = (self._SAMPLE_SIZES[(frame[3] >> 1) & 0x07]
++                       or self.bitdepth or 0)
++        bits = format(int.from_bytes(frame, 'big'), f'0{len(frame) * 8}b')
++        position = header_size * 8
++
++        def read(count: int) -> int:
++            nonlocal position
++            if position + count > len(bits):
++                raise IndexError('frame is incomplete')
++            value = int(bits[position:position + count] or '0', 2)
++            position += count
++            return value
++
++        def read_unary() -> int:
++            nonlocal position
++            stop = bits.index('1', position)
++            count = stop - position
++            position = stop + 1
++            return count
++
++        side_channel = {8: 1, 9: 0, 10: 1}.get(channel_assignment)
++        channels = 2 if side_channel is not None else channel_assignment + 1
++        try:
++            for channel in range(channels):
++                size = sample_size + (channel == side_channel)
++                read(1)
++                subframe_type = read(6)
++                if read(1):  # wasted bits per sample
++                    size -= read_unary() + 1
++                if subframe_type == 0:  # constant
++                    read(size)
++                    continue
++                if subframe_type == 1:  # verbatim
++                    read(size * block_size)
++                    continue
++                if 8 <= subframe_type <= 12:  # fixed predictor
++                    order = subframe_type - 8
++                    read(order * size)
++                elif subframe_type >= 32:  # linear predictor
++                    order = subframe_type - 31
++                    read(order * size)
++                    precision = read(4) + 1
++                    read(5)
++                    read(order * precision)
++                else:
++                    return 0
++                coding_method = read(2)
++                if coding_method > 1:
++                    return 0
++                parameter_size = 4 + coding_method
++                partition_order = read(4)
++                for partition in range(1 << partition_order):
++                    count = block_size >> partition_order
++                    if partition == 0:
++                        count -= order
++                    parameter = read(parameter_size)
++                    if parameter == (1 << parameter_size) - 1:  # escape
++                        read(read(5) * count)
++                        continue
++                    for _ in range(count):
++                        read_unary()
++                        read(parameter)
++        except (IndexError, ValueError):
++            return 0
++        size = (position + 7) // 8 + 2
++        return size if size <= len(frame) else 0
++
++    @classmethod
++    def _crc16(cls, data: bytes, crc: int = 0) -> int:
++        if not cls._CRC16_TABLE:
++            table: list[int] = []
++            for byte in range(256):
++                value = byte << 8
++                for _ in range(8):
++                    value = ((value << 1) ^ 0x8005 if value & 0x8000
++                             else value << 1) & 0xFFFF
++                table.append(value)
++            cls._CRC16_TABLE = tuple(table)
++        for byte in data:
++            crc = ((crc << 8) & 0xFFFF) ^ cls._CRC16_TABLE[(crc >> 8) ^ byte]
++        return crc
++
+     @classmethod
+     def _parse_image(cls,
+                      fh: BinaryIO,

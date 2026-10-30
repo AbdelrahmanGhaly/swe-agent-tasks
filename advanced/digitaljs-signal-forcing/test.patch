@@ -1,0 +1,1074 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..98e64b1
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,80 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() { echo "usage: $0 [--output_path <path>] base|new" >&2; exit 2; }
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new) MODE="$1"; MODE_COUNT=$((MODE_COUNT + 1)); shift ;;
++    --output_path) shift; [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }; OUTPUT_PATH="$1"; shift ;;
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    *) echo "unknown argument: $1" >&2; usage ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")"
++ROOT="$(pwd)"
++[ -n "$OUTPUT_PATH" ] || OUTPUT_PATH="$ROOT/junit-$MODE.xml"
++case "$OUTPUT_PATH" in /*) ;; *) OUTPUT_PATH="$ROOT/$OUTPUT_PATH" ;; esac
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++rm -f "$OUTPUT_PATH"
++
++NEW_TESTS="tests/pinned_ports_11f5af.test.mjs"
++JEST_JUNIT_REPORTER="$(npm root -g)/jest-junit"
++export JEST_JUNIT_OUTPUT_FILE="$OUTPUT_PATH"
++export JEST_JUNIT_REPORT_TEST_SUITE_ERRORS=true
++
++write_failure() {
++  cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites name="jest tests" tests="1" failures="1" errors="0" time="0">
++<testsuite name="$MODE" tests="1" failures="1" errors="0" time="0">
++<testcase classname="$MODE" name="$1" time="0">
++<failure message="$1">$2</failure>
++</testcase>
++</testsuite>
++</testsuites>
++XMLEOF
++}
++
++rm -rf lib
++if ! BUILD_LOG="$(./node_modules/.bin/babel src -d lib 2>&1)"; then
++  printf '%s\n' "$BUILD_LOG" >&2
++  write_failure "library build" "$(printf '%s' "$BUILD_LOG" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++  exit 1
++fi
++
++JEST_LOG="$(mktemp)"
++if [ "$MODE" = "base" ]; then
++  # The whole existing suite runs. It reuses identical test names within a describe block; the
++  # environment numbers repeated names so every result is reported under its own name.
++  # Math.random is seeded, so the randomized logic table checks and the randomly drawn constants
++  # are the same on every run.
++  timeout 1500 ./node_modules/.bin/jest tests/index.test.mjs --ci --forceExit \
++    --testEnvironment "$ROOT/tests/unique_names_f2a2e1.js" \
++    --setupFiles "$ROOT/tests/seeded_random_f890fd.js" \
++    --reporters=default --reporters="$JEST_JUNIT_REPORTER" 2>&1 | tee "$JEST_LOG"
++  STATUS=${PIPESTATUS[0]}
++  # The two constant-operand families repeat each comparison, arithmetic and shift check for many
++  # constants and widths (10,344 of the 11,880 cases). The report lists them as one case per
++  # engine, operation and family; that case fails, naming its failing tests, if any of them fails.
++  if [ -f "$OUTPUT_PATH" ]; then
++    node "$ROOT/tests/grouped_report_d98768.js" "$OUTPUT_PATH" || STATUS=1
++  fi
++else
++  timeout 1500 ./node_modules/.bin/jest "$NEW_TESTS" --ci --forceExit \
++    --reporters=default --reporters="$JEST_JUNIT_REPORTER" 2>&1 | tee "$JEST_LOG"
++  STATUS=${PIPESTATUS[0]}
++fi
++
++if ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  write_failure "jest run" "jest exited with status $STATUS without reporting any test. Last lines of its output:
++$(tail -n 60 "$JEST_LOG" | tr -d '\000-\010\013\014\016-\037' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++  [ "$STATUS" -ne 0 ] || STATUS=1
++fi
++rm -f "$JEST_LOG"
++exit "$STATUS"
+diff --git a/tests/grouped_report_d98768.js b/tests/grouped_report_d98768.js
+new file mode 100644
+index 0000000..865b38c
+--- /dev/null
++++ b/tests/grouped_report_d98768.js
+@@ -0,0 +1,42 @@
++const fs = require('fs');
++
++const file = process.argv[2];
++const testcasePattern = /\n\s*<testcase [^>]*?(?:\/>|>[\s\S]*?<\/testcase>)/g;
++const familyPattern = /^(\S+) (\S+) with (constant|\d+ bits constant) /;
++const failed = testcase => /<(failure|error)\b/.test(testcase);
++let totalTests = 0;
++let totalFailures = 0;
++
++const xml = fs.readFileSync(file, 'utf8').replace(/<testsuite ([^>]*)>([\s\S]*?)<\/testsuite>/g, (suite, attrs, body) => {
++    const groups = new Map();
++    let kept = body.replace(testcasePattern, testcase => {
++        const name = / name="([^"]*)"/.exec(testcase)[1];
++        const match = familyPattern.exec(name);
++        if (!match) return testcase;
++        const key = match[1] + ' ' + match[2] + ' with ' + (match[3] == 'constant' ? 'constant' : 'bits constant');
++        const group = groups.get(key) || { cases: 0, time: 0, failures: [] };
++        group.cases++;
++        group.time += Number((/ time="([^"]*)"/.exec(testcase) || [])[1]) || 0;
++        if (failed(testcase)) {
++            const detail = /<(?:failure|error)\b[^>]*>([\s\S]*?)<\/(?:failure|error)>/.exec(testcase);
++            group.failures.push(detail ? name + '\n' + detail[1] : name);
++        }
++        groups.set(key, group);
++        return '';
++    }).replace(/\s*$/, '');
++    for (const [key, group] of groups) {
++        kept += `\n    <testcase classname="${key}" name="${key} (all ${group.cases} cases)" time="${group.time.toFixed(3)}">`;
++        if (group.failures.length)
++            kept += `\n      <failure message="${group.failures.length} of ${group.cases} failed">${group.failures.join('\n\n')}</failure>`;
++        kept += '\n    </testcase>';
++    }
++    const testcases = kept.match(testcasePattern) || [];
++    const failures = testcases.filter(failed).length;
++    totalTests += testcases.length;
++    totalFailures += failures;
++    attrs = attrs.replace(/ tests="\d+"/, ` tests="${testcases.length}"`).replace(/ failures="\d+"/, ` failures="${failures}"`);
++    return `<testsuite ${attrs}>${kept}\n  </testsuite>`;
++});
++
++fs.writeFileSync(file, xml.replace(/<testsuites ([^>]*)>/, (tag, attrs) =>
++    `<testsuites ${attrs.replace(/ tests="\d+"/, ` tests="${totalTests}"`).replace(/ failures="\d+"/, ` failures="${totalFailures}"`)}>`));
+diff --git a/tests/pinned_ports_11f5af.test.mjs b/tests/pinned_ports_11f5af.test.mjs
+new file mode 100644
+index 0000000..5af058e
+--- /dev/null
++++ b/tests/pinned_ports_11f5af.test.mjs
+@@ -0,0 +1,892 @@
++"use strict";
++
++import { HeadlessCircuit } from '../lib/circuit.mjs';
++import { Circuit } from '../lib/index.mjs';
++import { Vector3vl } from '3vl';
++import { SynchEngine } from '../lib/engines/synch.mjs';
++import { WorkerEngine } from '../lib/engines/worker.mjs';
++
++jest.mock('jquery', () => { const $ = () => $; return $; });
++jest.mock('jquery-ui/ui/widgets/dialog.js', () => ({}));
++jest.mock('jquery-ui/themes/base/all.css', () => ({}));
++jest.mock('../lib/style.css.js', () => ({}), { virtual: true });
++
++console.assert = (stmt, msg) => { if (!stmt) throw new Error(msg); };
++
++jest.setTimeout(60000);
++
++const workerURL = new URL('../lib/engines/worker-worker.js', require('url').pathToFileURL(__filename).toString());
++const engineOptions = { workerURL };
++const engines = [["synch", SynchEngine], ["worker", WorkerEngine]];
++
++const clone = x => JSON.parse(JSON.stringify(x));
++const sig = bin => Vector3vl.fromBin(bin, bin.length);
++
++const live = [];
++afterEach(() => {
++    while (live.length) live.pop().shutdown();
++});
++
++function build(data, engine, Class = HeadlessCircuit) {
++    const circuit = new Class(clone(data), { engine, engineOptions });
++    live.push(circuit);
++    circuit.observeGraph();
++    return circuit;
++}
++
++function observeAll(circuit, where = []) {
++    if (where.length) circuit.observeGraph(where);
++    for (const label of Object.keys(circuit.getLabelIndex(where).subcircuits))
++        observeAll(circuit, where.concat([label]));
++}
++
++function outputs(circuit) {
++    return circuit.getOutputCells().map(cell => cell.id + '=' + cell.getOutput().toBin()).sort().join(' ');
++}
++
++async function run(circuit, script, from, to, log = []) {
++    await circuit.synchronize();
++    for (let step = from; step < to; step++) {
++        for (const [at, id, bin] of script)
++            if (at == step) circuit.setInput(id, sig(bin));
++        await circuit.updateGates({ synchronous: true });
++        log.push(circuit.tick + ' ' + outputs(circuit));
++    }
++    return log;
++}
++
++function device(circuit, label, where = []) {
++    return circuit.findDeviceByLabel(label, where);
++}
++
++function record(circuit, label, port, calls, where = [], options = {}) {
++    return circuit.monitor(device(circuit, label, where), port, (tick, value) => {
++        calls.push(tick + ':' + value.toBin());
++    }, options);
++}
++
++async function both(c, twin, from, to, opsC, opsT, log, twinLog) {
++    for (let step = from; step < to; step++) {
++        if (opsC[step]) opsC[step]();
++        if (opsT[step]) opsT[step]();
++        await run(c, [], step, step + 1, log);
++        await run(twin, [], step, step + 1, twinLog);
++    }
++}
++
++function clocked(circuit, ops, steps) {
++    for (const [step, bin] of steps) {
++        const before = ops[step];
++        ops[step] = () => { if (before) before(); circuit.setInput('clk', sig(bin)); };
++    }
++    return ops;
++}
++
++const GATES = {
++    devices: {
++        a: { type: 'Input', label: 'a', net: 'a', bits: 1 },
++        b: { type: 'Input', label: 'b', net: 'b', bits: 1 },
++        n: { type: 'Not', label: 'n', bits: 1, propagation: 3 },
++        g: { type: 'And', label: 'g', bits: 1, propagation: 2 },
++        m: { type: 'Output', label: 'm', net: 'm', bits: 1 },
++        o: { type: 'Output', label: 'o', net: 'o', bits: 1 }
++    },
++    connectors: [
++        { from: { id: 'a', port: 'out' }, to: { id: 'n', port: 'in' } },
++        { from: { id: 'n', port: 'out' }, to: { id: 'g', port: 'in1' } },
++        { from: { id: 'b', port: 'out' }, to: { id: 'g', port: 'in2' } },
++        { from: { id: 'n', port: 'out' }, to: { id: 'm', port: 'in' } },
++        { from: { id: 'g', port: 'out' }, to: { id: 'o', port: 'in' } }
++    ]
++};
++
++const HOLD = {
++    devices: {
++        clk: { type: 'Input', label: 'clk', net: 'clk', bits: 1 },
++        en: { type: 'Input', label: 'en', net: 'en', bits: 1 },
++        d: { type: 'Input', label: 'd', net: 'd', bits: 4 },
++        ff: { type: 'Dff', label: 'ff', bits: 4, polarity: { clock: true, enable: true }, initial: '0000' },
++        q: { type: 'Output', label: 'q', net: 'q', bits: 4 }
++    },
++    connectors: [
++        { from: { id: 'clk', port: 'out' }, to: { id: 'ff', port: 'clk' } },
++        { from: { id: 'en', port: 'out' }, to: { id: 'ff', port: 'en' } },
++        { from: { id: 'd', port: 'out' }, to: { id: 'ff', port: 'in' } },
++        { from: { id: 'ff', port: 'out' }, to: { id: 'q', port: 'in' } }
++    ]
++};
++
++const COUNT = {
++    devices: {
++        clk: { type: 'Clock', label: 'clk', propagation: 2 },
++        ff: { type: 'Dff', label: 'ff', bits: 4, polarity: { clock: true }, initial: '0000' },
++        one: { type: 'Constant', label: 'one', constant: '0001' },
++        add: { type: 'Addition', label: 'add', bits: { in1: 4, in2: 4, out: 4 }, propagation: 1 },
++        rep: { type: 'Repeater', label: 'rep', bits: 4, propagation: 1 },
++        k: { type: 'Output', label: 'k', net: 'k', bits: 1 },
++        q: { type: 'Output', label: 'q', net: 'q', bits: 4 },
++        r: { type: 'Output', label: 'r', net: 'r', bits: 4 }
++    },
++    connectors: [
++        { from: { id: 'clk', port: 'out' }, to: { id: 'ff', port: 'clk' } },
++        { from: { id: 'clk', port: 'out' }, to: { id: 'k', port: 'in' } },
++        { from: { id: 'ff', port: 'out' }, to: { id: 'add', port: 'in1' } },
++        { from: { id: 'one', port: 'out' }, to: { id: 'add', port: 'in2' } },
++        { from: { id: 'add', port: 'out' }, to: { id: 'ff', port: 'in' } },
++        { from: { id: 'ff', port: 'out' }, to: { id: 'q', port: 'in' } },
++        { from: { id: 'ff', port: 'out' }, to: { id: 'rep', port: 'in' } },
++        { from: { id: 'rep', port: 'out' }, to: { id: 'r', port: 'in' } }
++    ]
++};
++
++const MEM = {
++    devices: {
++        clk: { type: 'Input', label: 'clk', net: 'clk', bits: 1 },
++        ra: { type: 'Input', label: 'ra', net: 'ra', bits: 2 },
++        sa: { type: 'Input', label: 'sa', net: 'sa', bits: 2 },
++        wa: { type: 'Input', label: 'wa', net: 'wa', bits: 2 },
++        wd: { type: 'Input', label: 'wd', net: 'wd', bits: 4 },
++        mem: { type: 'Memory', label: 'mem', bits: 4, abits: 2, words: 4, propagation: 2, rdports: [{}, { clock_polarity: true, transparent: true }], wrports: [{ clock_polarity: true }], memdata: ['0001', '0010', '0011', '0100'] },
++        c: { type: 'Output', label: 'c', net: 'c', bits: 4 },
++        s: { type: 'Output', label: 's', net: 's', bits: 4 }
++    },
++    connectors: [
++        { from: { id: 'ra', port: 'out' }, to: { id: 'mem', port: 'rd0addr' } },
++        { from: { id: 'sa', port: 'out' }, to: { id: 'mem', port: 'rd1addr' } },
++        { from: { id: 'clk', port: 'out' }, to: { id: 'mem', port: 'rd1clk' } },
++        { from: { id: 'clk', port: 'out' }, to: { id: 'mem', port: 'wr0clk' } },
++        { from: { id: 'wa', port: 'out' }, to: { id: 'mem', port: 'wr0addr' } },
++        { from: { id: 'wd', port: 'out' }, to: { id: 'mem', port: 'wr0data' } },
++        { from: { id: 'mem', port: 'rd0data' }, to: { id: 'c', port: 'in' } },
++        { from: { id: 'mem', port: 'rd1data' }, to: { id: 's', port: 'in' } }
++    ]
++};
++
++const TWINS = {
++    devices: {
++        clk: { type: 'Input', label: 'clk', net: 'clk', bits: 1 },
++        d1: { type: 'Input', label: 'd1', net: 'd1', bits: 4 },
++        d2: { type: 'Input', label: 'd2', net: 'd2', bits: 4 },
++        r1: { type: 'Subcircuit', label: 'r1', celltype: 'reg' },
++        r2: { type: 'Subcircuit', label: 'r2', celltype: 'reg' },
++        q1: { type: 'Output', label: 'q1', net: 'q1', bits: 4 },
++        q2: { type: 'Output', label: 'q2', net: 'q2', bits: 4 }
++    },
++    connectors: [
++        { from: { id: 'clk', port: 'out' }, to: { id: 'r1', port: 'clk' } },
++        { from: { id: 'clk', port: 'out' }, to: { id: 'r2', port: 'clk' } },
++        { from: { id: 'd1', port: 'out' }, to: { id: 'r1', port: 'd' } },
++        { from: { id: 'd2', port: 'out' }, to: { id: 'r2', port: 'd' } },
++        { from: { id: 'r1', port: 'q' }, to: { id: 'q1', port: 'in' } },
++        { from: { id: 'r2', port: 'q' }, to: { id: 'q2', port: 'in' } }
++    ],
++    subcircuits: {
++        reg: {
++            devices: {
++                clk: { type: 'Input', label: 'clk', net: 'clk', bits: 1 },
++                d: { type: 'Input', label: 'd', net: 'd', bits: 4 },
++                ff: { type: 'Dff', label: 'ff', bits: 4, polarity: { clock: true } },
++                inv: { type: 'Subcircuit', label: 'inv', celltype: 'invert' },
++                q: { type: 'Output', label: 'q', net: 'q', bits: 4 }
++            },
++            connectors: [
++                { from: { id: 'clk', port: 'out' }, to: { id: 'ff', port: 'clk' } },
++                { from: { id: 'd', port: 'out' }, to: { id: 'inv', port: 'i' } },
++                { from: { id: 'inv', port: 'o' }, to: { id: 'ff', port: 'in' } },
++                { from: { id: 'ff', port: 'out' }, to: { id: 'q', port: 'in' } }
++            ]
++        },
++        invert: {
++            devices: {
++                i: { type: 'Input', label: 'i', net: 'i', bits: 4 },
++                n: { type: 'Not', label: 'n', bits: 4, propagation: 2 },
++                o: { type: 'Output', label: 'o', net: 'o', bits: 4 }
++            },
++            connectors: [
++                { from: { id: 'i', port: 'out' }, to: { id: 'n', port: 'in' } },
++                { from: { id: 'n', port: 'out' }, to: { id: 'o', port: 'in' } }
++            ]
++        }
++    }
++};
++
++const WIDE = {
++    devices: {
++        d: { type: 'Input', label: 'd', net: 'd', bits: 40 },
++        rep: { type: 'Repeater', label: 'rep', bits: 40, propagation: 1 },
++        inv: { type: 'Not', label: 'inv', bits: 40, propagation: 1 },
++        q: { type: 'Output', label: 'q', net: 'q', bits: 40 }
++    },
++    connectors: [
++        { from: { id: 'd', port: 'out' }, to: { id: 'rep', port: 'in' } },
++        { from: { id: 'rep', port: 'out' }, to: { id: 'inv', port: 'in' } },
++        { from: { id: 'inv', port: 'out' }, to: { id: 'q', port: 'in' } }
++    ]
++};
++
++const BUS = {
++    devices: {
++        w: { type: 'Input', label: 'w', net: 'w', bits: 4 },
++        s: { type: 'Input', label: 's', net: 's', bits: 1 },
++        split: { type: 'BusUngroup', label: 'split', groups: [2, 2] },
++        join: { type: 'BusGroup', label: 'join', groups: [2, 2] },
++        mux: { type: 'Mux', label: 'mux', bits: { in: 4, sel: 1 } },
++        y: { type: 'Output', label: 'y', net: 'y', bits: 4 },
++        z: { type: 'Output', label: 'z', net: 'z', bits: 4 }
++    },
++    connectors: [
++        { from: { id: 'w', port: 'out' }, to: { id: 'split', port: 'in' } },
++        { from: { id: 'split', port: 'out0' }, to: { id: 'join', port: 'in1' } },
++        { from: { id: 'split', port: 'out1' }, to: { id: 'join', port: 'in0' } },
++        { from: { id: 'join', port: 'out' }, to: { id: 'y', port: 'in' } },
++        { from: { id: 'w', port: 'out' }, to: { id: 'mux', port: 'in0' } },
++        { from: { id: 'join', port: 'out' }, to: { id: 'mux', port: 'in1' } },
++        { from: { id: 's', port: 'out' }, to: { id: 'mux', port: 'sel' } },
++        { from: { id: 'mux', port: 'out' }, to: { id: 'z', port: 'in' } }
++    ]
++};
++
++const merged = (value, mask, own) => value.and(mask).or(own.and(mask.not()));
++
++const GATES_START = ["1 m=x o=x", "2 m=x o=x", "3 m=x o=x", "4 m=0 o=x", "5 m=0 o=x", "6 m=0 o=0"];
++const HOLD_SCRIPT = [[0, 'clk', '0'], [0, 'en', '1'], [0, 'd', '0011'], [2, 'clk', '1'], [4, 'clk', '0'], [5, 'en', '0']];
++const HOLD_START = ["1 q=0000", "2 q=0000", "3 q=0000", "4 q=0011", "5 q=0011", "6 q=0011", "7 q=0011", "8 q=0011"];
++const MEM_SCRIPT = [[0, 'clk', '0'], [0, 'ra', '01'], [0, 'sa', '10'], [0, 'wa', '01'], [0, 'wd', '1111']];
++const TWINS_SCRIPT = [[0, 'clk', '0'], [0, 'd1', '0011'], [0, 'd2', '1100'], [3, 'clk', '1'], [6, 'clk', '0'], [9, 'clk', '1'], [12, 'clk', '0'], [15, 'clk', '1'], [18, 'clk', '0'], [21, 'clk', '1']];
++
++describe.each(engines)('forcing on %s', (_n, engine) => {
++    describe('output ports', () => {
++        test('everything connected to a forced output sees the value at once and reacts after its own delay', async () => {
++            const c = build(GATES, engine);
++            const log = await run(c, [[0, 'a', '1'], [0, 'b', '1']], 0, 6);
++            c.force(device(c, 'n'), 'out', sig('1'));
++            await run(c, [], 6, 10, log);
++            expect(log).toEqual(GATES_START.concat(["7 m=1 o=0", "8 m=1 o=0", "9 m=1 o=1", "10 m=1 o=1"]));
++        });
++
++        test('releasing an output shows what the device produces by then, at once', async () => {
++            const c = build(GATES, engine);
++            const log = await run(c, [[0, 'a', '1'], [0, 'b', '1']], 0, 6);
++            c.force(device(c, 'n'), 'out', sig('0'));
++            await run(c, [[6, 'a', '0'], [10, 'a', '1']], 6, 12, log);
++            c.release(device(c, 'n'), 'out');
++            await run(c, [], 12, 16, log);
++            expect(log).toEqual(GATES_START.concat([
++                "7 m=0 o=0", "8 m=0 o=0", "9 m=0 o=0", "10 m=0 o=0", "11 m=0 o=0", "12 m=0 o=0",
++                "13 m=1 o=0", "14 m=0 o=0", "15 m=0 o=1", "16 m=0 o=0"
++            ]));
++        });
++
++        test('a register keeps what it holds while its output is forced', async () => {
++            const c = build(HOLD, engine);
++            const log = await run(c, HOLD_SCRIPT, 0, 8);
++            c.force(device(c, 'ff'), 'out', sig('1100'));
++            await run(c, [[8, 'clk', '1'], [10, 'clk', '0'], [12, 'clk', '1']], 8, 14, log);
++            c.release(device(c, 'ff'), 'out');
++            await run(c, [], 14, 16, log);
++            expect(log).toEqual(HOLD_START.concat(["9 q=1100", "10 q=1100", "11 q=1100", "12 q=1100", "13 q=1100", "14 q=1100", "15 q=0011", "16 q=0011"]));
++        });
++
++        test('a register keeps capturing its inputs while its output is forced', async () => {
++            const c = build(HOLD, engine);
++            const log = await run(c, HOLD_SCRIPT, 0, 8);
++            c.force(device(c, 'ff'), 'out', sig('1111'));
++            await run(c, [[8, 'en', '1'], [8, 'd', '0101'], [9, 'clk', '1']], 8, 12, log);
++            c.release(device(c, 'ff'), 'out');
++            await run(c, [], 12, 14, log);
++            expect(log).toEqual(HOLD_START.concat(["9 q=1111", "10 q=1111", "11 q=1111", "12 q=1111", "13 q=0101", "14 q=0101"]));
++        });
++
++        test('a clock keeps its own pace while its output is forced', async () => {
++            const c = build(COUNT, engine);
++            const twin = build(COUNT, engine);
++            const clock = [], twinClock = [];
++            const sample = async (circuit, into) => {
++                await circuit.updateGates({ synchronous: true });
++                await circuit.synchronize();
++                into.push(circuit.tick + ':' + circuit.getOutput('k').toBin());
++            };
++            for (let step = 0; step < 5; step++) {
++                await sample(c, clock);
++                await sample(twin, twinClock);
++            }
++            c.force(device(c, 'clk'), 'out', sig('0'));
++            for (let step = 5; step < 15; step++) {
++                await sample(c, clock);
++                await sample(twin, twinClock);
++            }
++            c.release(device(c, 'clk'), 'out');
++            for (let step = 15; step < 24; step++) {
++                await sample(c, clock);
++                await sample(twin, twinClock);
++            }
++            expect(clock.slice(0, 5)).toEqual(twinClock.slice(0, 5));
++            expect(clock.slice(5, 15)).toEqual(twinClock.slice(5, 15).map(entry => entry.replace(/:.$/, ':0')));
++            expect(clock.slice(15)).toEqual(twinClock.slice(15));
++        });
++
++        test('bits outside the mask keep following the device', async () => {
++            const c = build(COUNT, engine);
++            const twin = build(COUNT, engine);
++            await run(c, [], 0, 10);
++            await run(twin, [], 0, 10);
++            const value = sig('1000'), mask = sig('1100');
++            c.force(device(c, 'rep'), 'out', value, mask);
++            const shown = [], expected = [];
++            for (let step = 10; step < 40; step++) {
++                await run(c, [], step, step + 1);
++                await run(twin, [], step, step + 1);
++                shown.push(c.getOutput('r').toBin() + ' ' + c.getOutput('q').toBin());
++                expected.push(merged(value, mask, twin.getOutput('r')).toBin() + ' ' + twin.getOutput('q').toBin());
++            }
++            expect(shown).toEqual(expected);
++            expect(new Set(shown.map(entry => entry.slice(2, 4))).size).toBe(4);
++        });
++
++        test('forcing more bits adds to the bits already forced and releasing some keeps the rest', async () => {
++            const c = build(COUNT, engine);
++            const twin = build(COUNT, engine);
++            await run(c, [], 0, 10);
++            await run(twin, [], 0, 10);
++            const rep = device(c, 'rep');
++            const plan = {
++                10: () => c.force(rep, 'out', sig('1000'), sig('1000')),
++                14: () => c.force(rep, 'out', sig('0001'), sig('0001')),
++                18: () => c.force(rep, 'out', sig('0100'), sig('1100')),
++                22: () => c.release(rep, 'out', sig('1001')),
++                26: () => c.release(rep, 'out')
++            };
++            const records = {
++                10: ['1xxx', '1000'], 14: ['1xx1', '1001'], 18: ['01x1', '1101'], 22: ['x1xx', '0100'], 26: null
++            };
++            let record = null;
++            const shown = [], expected = [];
++            for (let step = 10; step < 30; step++) {
++                if (plan[step]) {
++                    plan[step]();
++                    record = records[step];
++                }
++                await run(c, [], step, step + 1);
++                await run(twin, [], step, step + 1);
++                shown.push(c.getOutput('r').toBin());
++                const own = twin.getOutput('r');
++                expected.push(record ? merged(sig(record[0].replace(/x/g, '0')), sig(record[1]), own).toBin() : own.toBin());
++            }
++            expect(shown).toEqual(expected);
++        });
++
++        test('the other outputs of a device keep working while one is forced', async () => {
++            const c = build(MEM, engine);
++            const twin = build(MEM, engine);
++            const script = MEM_SCRIPT.concat([[7, 'clk', '1'], [9, 'clk', '0'], [9, 'sa', '01'], [11, 'clk', '1']]);
++            const log = await run(c, script, 0, 4);
++            const twinLog = await run(twin, script, 0, 4);
++            c.force(device(c, 'mem'), 'rd0data', sig('1001'));
++            await run(c, script, 4, 15, log);
++            await run(twin, script, 4, 15, twinLog);
++            expect(log.map(entry => entry.split(' ')[2])).toEqual(twinLog.map(entry => entry.split(' ')[2]));
++            expect(log.slice(4).map(entry => entry.split(' ')[1])).toEqual(Array(11).fill('c=1001'));
++        });
++
++        test('releasing a register output shows what it captured while forced, even when that is the forced value', async () => {
++            const c = build(HOLD, engine);
++            const log = await run(c, HOLD_SCRIPT, 0, 8);
++            c.force(device(c, 'ff'), 'out', sig('0000'));
++            await run(c, [[8, 'en', '1'], [8, 'd', '0000'], [9, 'clk', '1']], 8, 12, log);
++            c.release(device(c, 'ff'), 'out');
++            await run(c, [], 12, 14, log);
++            await c.synchronize();
++            expect(log).toEqual(HOLD_START.concat(["9 q=0000", "10 q=0000", "11 q=0000", "12 q=0000", "13 q=0000", "14 q=0000"]));
++            expect(c.getOutput('q').toBin()).toBe('0000');
++        });
++
++        test('releasing a gate output shows what the gate produces by then, even when that is the forced value', async () => {
++            const c = build(GATES, engine);
++            const log = await run(c, [[0, 'a', '1'], [0, 'b', '1']], 0, 6);
++            c.force(device(c, 'n'), 'out', sig('1'));
++            await run(c, [[8, 'a', '0']], 6, 12, log);
++            c.release(device(c, 'n'), 'out');
++            await run(c, [], 12, 14, log);
++            expect(log).toEqual(GATES_START.concat(["7 m=1 o=0", "8 m=1 o=0", "9 m=1 o=1", "10 m=1 o=1", "11 m=1 o=1", "12 m=1 o=1", "13 m=1 o=1", "14 m=1 o=1"]));
++        });
++
++        test('releasing a masked force shows the device value on every bit, even where it matches the forced bits', async () => {
++            const c = build(HOLD, engine);
++            const log = await run(c, HOLD_SCRIPT, 0, 8);
++            c.force(device(c, 'ff'), 'out', sig('1000'), sig('1100'));
++            await run(c, [[8, 'en', '1'], [8, 'd', '1001'], [9, 'clk', '1']], 8, 12, log);
++            c.release(device(c, 'ff'), 'out');
++            await run(c, [], 12, 14, log);
++            expect(log).toEqual(HOLD_START.concat(["9 q=1011", "10 q=1011", "11 q=1001", "12 q=1001", "13 q=1001", "14 q=1001"]));
++        });
++    });
++
++    describe('input ports', () => {
++        test('a device reacts to a forced input after its own delay and sees what is connected at release', async () => {
++            const c = build(GATES, engine);
++            const log = await run(c, [[0, 'a', '0'], [0, 'b', '1']], 0, 6);
++            c.force(device(c, 'g'), 'in2', sig('0'));
++            await run(c, [[9, 'b', '0'], [10, 'b', '1'], [11, 'b', '0']], 6, 12, log);
++            c.release(device(c, 'g'), 'in2');
++            await run(c, [[13, 'b', '1']], 12, 17, log);
++            expect(log).toEqual([
++                "1 m=x o=x", "2 m=x o=x", "3 m=x o=x", "4 m=1 o=x", "5 m=1 o=x", "6 m=1 o=1",
++                "7 m=1 o=1", "8 m=1 o=1", "9 m=1 o=0", "10 m=1 o=0", "11 m=1 o=0", "12 m=1 o=0",
++                "13 m=1 o=0", "14 m=1 o=0", "15 m=1 o=0", "16 m=1 o=1", "17 m=1 o=1"
++            ]);
++        });
++
++        test('a forced input of an output device is what it shows', async () => {
++            const c = build(GATES, engine);
++            const log = await run(c, [[0, 'a', '1'], [0, 'b', '1']], 0, 6);
++            c.force(device(c, 'm'), 'in', sig('1'));
++            await run(c, [], 6, 8, log);
++            c.release(device(c, 'm'), 'in');
++            await run(c, [], 8, 10, log);
++            expect(log).toEqual(GATES_START.concat(["7 m=1 o=0", "8 m=1 o=0", "9 m=0 o=0", "10 m=0 o=0"]));
++        });
++
++        test('bits of an input outside the mask keep following what is connected', async () => {
++            const c = build(HOLD, engine);
++            const twin = build(HOLD, engine);
++            const log = await run(c, HOLD_SCRIPT, 0, 8);
++            const twinLog = await run(twin, HOLD_SCRIPT, 0, 8);
++            const value = sig('1000'), mask = sig('1100');
++            c.force(device(c, 'ff'), 'in', value, mask);
++            const feed = [[8, '0001'], [10, '0110'], [12, '1011'], [14, '1101']];
++            const script = [[8, 'en', '1'], [9, 'clk', '1'], [11, 'clk', '0'], [13, 'clk', '1'], [15, 'clk', '0'], [17, 'clk', '1'], [19, 'clk', '0'], [21, 'clk', '1']];
++            await run(c, script.concat(feed.map(([at, bin]) => [at, 'd', bin])), 8, 24, log);
++            await run(twin, script.concat(feed.map(([at, bin]) => [at, 'd', merged(value, mask, sig(bin)).toBin()])), 8, 24, twinLog);
++            expect(log).toEqual(twinLog);
++        });
++
++        test('a device keeps following its other inputs while one input is forced and sees what is connected again at release', async () => {
++            const c = build(GATES, engine);
++            const twin = build(GATES, engine);
++            const log = await run(c, [[0, 'a', '0'], [0, 'b', '0']], 0, 6);
++            const twinLog = await run(twin, [[0, 'a', '0'], [0, 'b', '0']], 0, 6);
++            const script = [[7, 'a', '1'], [13, 'a', '0'], [19, 'a', '1'], [27, 'a', '0']];
++            c.force(device(c, 'g'), 'in2', sig('1'));
++            twin.setInput('b', sig('1'));
++            await run(c, script, 6, 24, log);
++            await run(twin, script, 6, 24, twinLog);
++            c.release(device(c, 'g'), 'in2');
++            twin.setInput('b', sig('0'));
++            await run(c, script, 24, 36, log);
++            await run(twin, script, 24, 36, twinLog);
++            expect(log).toEqual(twinLog);
++            expect(log.slice(6, 24).filter(entry => entry.endsWith('o=1')).length).toBeGreaterThan(3);
++            expect(log.slice(6, 24).filter(entry => entry.endsWith('o=0')).length).toBeGreaterThan(3);
++            expect(log.slice(27).every(entry => entry.endsWith('o=0'))).toBe(true);
++        });
++
++        test('a forced clock input clocks the register like a connected one', async () => {
++            const c = build(HOLD, engine);
++            const twin = build(HOLD, engine);
++            const start = [[0, 'clk', '0'], [0, 'en', '1'], [0, 'd', '0011']];
++            const log = await run(c, start, 0, 8);
++            const twinLog = await run(twin, start, 0, 8);
++            const ff = device(c, 'ff');
++            await both(c, twin, 8, 20, {
++                8: () => c.setInput('d', sig('0101')),
++                9: () => c.force(ff, 'clk', sig('1')),
++                10: () => c.setInput('d', sig('1001')),
++                12: () => c.setInput('clk', sig('1')),
++                13: () => c.setInput('clk', sig('0')),
++                14: () => c.release(ff, 'clk'),
++                16: () => c.setInput('clk', sig('1'))
++            }, {
++                8: () => twin.setInput('d', sig('0101')),
++                9: () => twin.setInput('clk', sig('1')),
++                10: () => twin.setInput('d', sig('1001')),
++                14: () => twin.setInput('clk', sig('0')),
++                16: () => twin.setInput('clk', sig('1'))
++            }, log, twinLog);
++            expect(log).toEqual(twinLog);
++            expect(log[12]).toContain('q=0101');
++            expect(log[19]).toContain('q=1001');
++        });
++
++        test('forced memory inputs are used like connected ones', async () => {
++            const c = build(MEM, engine);
++            const twin = build(MEM, engine);
++            const log = await run(c, MEM_SCRIPT, 0, 4);
++            const twinLog = await run(twin, MEM_SCRIPT, 0, 4);
++            const mem = device(c, 'mem');
++            await both(c, twin, 4, 20, {
++                4: () => c.force(mem, 'rd0addr', sig('11')),
++                6: () => { c.force(mem, 'wr0data', sig('0101')); c.force(mem, 'wr0addr', sig('00')); },
++                7: () => c.setInput('clk', sig('1')),
++                9: () => c.setInput('clk', sig('0')),
++                10: () => { c.release(mem, 'wr0data'); c.release(mem, 'wr0addr'); c.force(mem, 'rd0addr', sig('00')); },
++                13: () => c.release(mem, 'rd0addr'),
++                15: () => c.setInput('ra', sig('00'))
++            }, {
++                4: () => twin.setInput('ra', sig('11')),
++                6: () => { twin.setInput('wd', sig('0101')); twin.setInput('wa', sig('00')); },
++                7: () => twin.setInput('clk', sig('1')),
++                9: () => twin.setInput('clk', sig('0')),
++                10: () => { twin.setInput('wd', sig('1111')); twin.setInput('wa', sig('01')); twin.setInput('ra', sig('00')); },
++                13: () => twin.setInput('ra', sig('01')),
++                15: () => twin.setInput('ra', sig('00'))
++            }, log, twinLog);
++            expect(log).toEqual(twinLog);
++            expect(log[19]).toContain('c=0101');
++        });
++
++        test('a hidden setInput that ends at the forced value shows at release', async () => {
++            const c = build(GATES, engine);
++            const twin = build(GATES, engine);
++            const log = await run(c, [[0, 'a', '1'], [0, 'b', '1']], 0, 6);
++            const twinLog = await run(twin, [[0, 'a', '1'], [0, 'b', '1']], 0, 6);
++            await both(c, twin, 6, 24, {
++                6: () => c.force(device(c, 'a'), 'out', sig('0')),
++                8: () => c.setInput('a', sig('1')),
++                9: () => c.setInput('a', sig('0')),
++                12: () => c.release(device(c, 'a'), 'out'),
++                18: () => c.setInput('a', sig('1'))
++            }, {
++                6: () => twin.setInput('a', sig('0')),
++                18: () => twin.setInput('a', sig('1'))
++            }, log, twinLog);
++            expect(log).toEqual(twinLog);
++            expect(log[16]).toContain('m=1');
++        });
++
++        test('forces on an input device add up and release in parts under hidden setInputs', async () => {
++            const c = build(HOLD, engine);
++            const twin = build(HOLD, engine);
++            const start = [[0, 'clk', '0'], [0, 'en', '1'], [0, 'd', '0011']];
++            const log = await run(c, start, 0, 8);
++            const twinLog = await run(twin, start, 0, 8);
++            const d = device(c, 'd');
++            let own = sig('0011'), value = sig('0000'), mask = sig('0000');
++            const show = () => twin.setInput('d', merged(value, mask, own));
++            const add = (v, m) => { value = merged(sig(v), sig(m), value); mask = mask.or(sig(m)); };
++            const edges = [[9, '1'], [11, '0'], [13, '1'], [15, '0'], [17, '1'], [19, '0'], [21, '1'], [23, '0'], [25, '1']];
++            await both(c, twin, 8, 28, clocked(c, {
++                8: () => c.force(d, 'out', sig('1000'), sig('1100')),
++                10: () => c.setInput('d', sig('0110')),
++                12: () => c.force(d, 'out', sig('0001'), sig('0001')),
++                14: () => c.setInput('d', sig('0100')),
++                16: () => c.release(d, 'out', sig('1100')),
++                18: () => c.setInput('d', sig('0101')),
++                20: () => c.release(d, 'out'),
++                22: () => c.setInput('d', sig('1111'))
++            }, edges), clocked(twin, {
++                8: () => { add('1000', '1100'); show(); },
++                10: () => { own = sig('0110'); show(); },
++                12: () => { add('0001', '0001'); show(); },
++                14: () => { own = sig('0100'); show(); },
++                16: () => { mask = mask.and(sig('1100').not()); show(); },
++                18: () => { own = sig('0101'); show(); },
++                20: () => { mask = sig('0000'); show(); },
++                22: () => { own = sig('1111'); show(); }
++            }, edges), log, twinLog);
++            expect(log).toEqual(twinLog);
++            expect(new Set(log.slice(8)).size).toBeGreaterThan(4);
++            expect(log[27]).toContain('q=1111');
++        });
++
++        test('setInput on a forced input device takes effect when it is released', async () => {
++            const c = build(GATES, engine);
++            const twin = build(GATES, engine);
++            const calls = [], twinCalls = [];
++            record(c, 'a', 'out', calls);
++            record(c, 'n', 'out', calls);
++            record(twin, 'a', 'out', twinCalls);
++            record(twin, 'n', 'out', twinCalls);
++            const log = await run(c, [[0, 'a', '1'], [0, 'b', '1']], 0, 6);
++            const twinLog = await run(twin, [[0, 'a', '1'], [0, 'b', '1']], 0, 6);
++            c.force(device(c, 'a'), 'out', sig('0'));
++            twin.setInput('a', sig('0'));
++            await run(c, [[8, 'a', '1'], [9, 'a', '0'], [10, 'a', '1']], 6, 12, log);
++            await run(twin, [], 6, 12, twinLog);
++            c.release(device(c, 'a'), 'out');
++            twin.setInput('a', sig('1'));
++            await run(c, [], 12, 18, log);
++            await run(twin, [], 12, 18, twinLog);
++            await c.synchronize();
++            await twin.synchronize();
++            expect(log).toEqual(twinLog);
++            expect(calls).toEqual(twinCalls);
++        });
++    });
++});
++
++describe.each(engines)('monitors on %s', (_n, engine) => {
++    test('changes hidden by forcing are not reported, and masked forcing reports changes of the other bits', async () => {
++        const full = build(COUNT, engine);
++        const masked = build(COUNT, engine);
++        const fullCalls = [], maskedCalls = [];
++        record(full, 'rep', 'out', fullCalls);
++        record(masked, 'rep', 'out', maskedCalls);
++        await run(full, [], 0, 10);
++        await run(masked, [], 0, 10);
++        full.force(device(full, 'rep'), 'out', sig('0110'));
++        masked.force(device(masked, 'rep'), 'out', sig('1000'), sig('1100'));
++        await run(full, [], 10, 20);
++        await run(masked, [], 10, 20);
++        full.release(device(full, 'rep'), 'out');
++        masked.release(device(masked, 'rep'), 'out');
++        await run(full, [], 20, 26);
++        await run(masked, [], 20, 26);
++        await full.synchronize();
++        await masked.synchronize();
++        expect(fullCalls).toEqual(['0:xxxx', '2:0000', '5:0001', '9:0010', '11:0110', '21:0101', '25:0110']);
++        expect(maskedCalls).toEqual(['0:xxxx', '2:0000', '5:0001', '9:0010', '11:1010', '13:1011', '17:1000', '21:0101', '25:0110']);
++    });
++
++    test('a monitor added to a forced port reports the forced bits first', async () => {
++        const c = build(COUNT, engine);
++        await run(c, [], 0, 10);
++        c.force(device(c, 'rep'), 'out', sig('0110'), sig('0110'));
++        const calls = [];
++        record(c, 'rep', 'out', calls);
++        await run(c, [], 10, 14);
++        await c.synchronize();
++        expect(calls).toEqual(['10:0110', '13:0111']);
++    });
++
++    test('waits and trigger values see forced values', async () => {
++        const c = build(GATES, engine);
++        await run(c, [[0, 'a', '1'], [0, 'b', '1']], 0, 6);
++        const raised = c.waitFor(device(c, 'n'), 'out', sig('1'));
++        const lowered = [];
++        record(c, 'n', 'out', lowered, [], { triggerValues: [sig('0')], oneShot: true });
++        c.force(device(c, 'n'), 'out', sig('1'));
++        await run(c, [], 6, 8);
++        expect(await raised).toBe(7);
++        c.release(device(c, 'n'), 'out');
++        await run(c, [], 8, 10);
++        c.force(device(c, 'n'), 'out', sig('1'));
++        c.release(device(c, 'n'), 'out');
++        c.force(device(c, 'n'), 'out', sig('1'));
++        await run(c, [], 10, 12);
++        c.release(device(c, 'n'), 'out');
++        await run(c, [], 12, 14);
++        await c.synchronize();
++        expect(lowered).toEqual(['9:0']);
++    });
++});
++
++describe.each(engines)('subcircuits on %s', (_n, engine) => {
++    test('forcing a subcircuit output shows outside and leaves the inside alone', async () => {
++        const c = build(TWINS, engine);
++        const twin = build(TWINS, engine);
++        const log = await run(c, TWINS_SCRIPT, 0, 7);
++        const twinLog = await run(twin, TWINS_SCRIPT, 0, 7);
++        c.force(device(c, 'r1'), 'q', sig('1010'));
++        await run(c, TWINS_SCRIPT, 7, 20, log);
++        await run(twin, TWINS_SCRIPT, 7, 20, twinLog);
++        c.release(device(c, 'r1'), 'q');
++        await run(c, TWINS_SCRIPT, 20, 24, log);
++        await run(twin, TWINS_SCRIPT, 20, 24, twinLog);
++        expect(log).toEqual(twinLog.map((entry, i) => i >= 7 && i < 20 ? entry.replace(/q1=\S+/, 'q1=1010') : entry));
++    });
++
++    test('forcing a subcircuit input reaches the devices inside', async () => {
++        const c = build(TWINS, engine);
++        const twin = build(TWINS, engine);
++        const log = await run(c, TWINS_SCRIPT, 0, 7);
++        const twinLog = await run(twin, TWINS_SCRIPT, 0, 7);
++        c.force(device(c, 'r1'), 'd', sig('0000'));
++        twin.setInput('d1', sig('0000'));
++        await run(c, TWINS_SCRIPT, 7, 16, log);
++        await run(twin, TWINS_SCRIPT, 7, 16, twinLog);
++        c.release(device(c, 'r1'), 'd');
++        twin.setInput('d1', sig('0011'));
++        await run(c, TWINS_SCRIPT, 16, 24, log);
++        await run(twin, TWINS_SCRIPT, 16, 24, twinLog);
++        expect(log).toEqual(twinLog);
++        expect(log[12]).toContain('q1=1111');
++    });
++
++    test('devices inside subcircuits, output devices included, can be forced like top-level ones', async () => {
++        const c = build(TWINS, engine);
++        observeAll(c);
++        const log = await run(c, TWINS_SCRIPT, 0, 7);
++        c.force(device(c, 'n', ['r1', 'inv']), 'out', sig('0110'));
++        c.force(device(c, 'q', ['r2']), 'in', sig('1001'));
++        await run(c, TWINS_SCRIPT, 7, 13, log);
++        c.release(device(c, 'n', ['r1', 'inv']), 'out');
++        c.release(device(c, 'q', ['r2']), 'in');
++        await run(c, TWINS_SCRIPT, 13, 18, log);
++        expect(log).toEqual([
++            "1 q1=xxxx q2=xxxx", "2 q1=xxxx q2=xxxx", "3 q1=xxxx q2=xxxx", "4 q1=xxxx q2=xxxx", "5 q1=1100 q2=0011", "6 q1=1100 q2=0011", "7 q1=1100 q2=0011",
++            "8 q1=1100 q2=1001", "9 q1=1100 q2=1001", "10 q1=1100 q2=1001", "11 q1=0110 q2=1001", "12 q1=0110 q2=1001", "13 q1=0110 q2=1001",
++            "14 q1=0110 q2=0011", "15 q1=0110 q2=0011", "16 q1=0110 q2=0011", "17 q1=1100 q2=0011", "18 q1=1100 q2=0011"
++        ]);
++    });
++
++    test('releasing a subcircuit output shows what the inside holds by then, even when that is the forced value', async () => {
++        const c = build(TWINS, engine);
++        const twin = build(TWINS, engine);
++        const script = TWINS_SCRIPT.concat([[7, 'd1', '1001']]);
++        const log = await run(c, script, 0, 7);
++        const twinLog = await run(twin, script, 0, 7);
++        c.force(device(c, 'r1'), 'q', sig('0110'));
++        await run(c, script, 7, 13, log);
++        await run(twin, script, 7, 13, twinLog);
++        c.release(device(c, 'r1'), 'q');
++        await run(c, script, 13, 15, log);
++        await run(twin, script, 13, 15, twinLog);
++        expect(twinLog[12]).toContain('q1=0110');
++        expect(log).toEqual(twinLog.map((entry, i) => i >= 7 && i < 13 ? entry.replace(/q1=\S+/, 'q1=0110') : entry));
++    });
++});
++
++describe('before any update', () => {
++    const seenAfter = async (c, find, settle) => {
++        await run(c, [[0, 'a', '1'], [0, 'b', '1']], 0, 6);
++        const seen = [];
++        const look = async () => { await settle(); seen.push(c.getOutput('m').toBin()); };
++        c.force(find('n'), 'out', sig('1'));
++        await look();
++        c.release(find('n'), 'out');
++        await look();
++        c.force(find('m'), 'in', sig('1'));
++        await look();
++        c.release(find('m'), 'in');
++        await look();
++        return seen;
++    };
++
++    test('a connected output device shows a force and a release at once on the synchronous engine', async () => {
++        const c = build(GATES, SynchEngine);
++        expect(await seenAfter(c, label => device(c, label), async () => {})).toEqual(['1', '0', '1', '0']);
++    });
++
++    test('a connected output device shows a force and a release at once on Circuit', async () => {
++        const c = new Circuit(clone(GATES));
++        live.push(c);
++        expect(await seenAfter(c, label => c.findDeviceByLabel(label), async () => {})).toEqual(['1', '0', '1', '0']);
++    });
++
++    test('a connected output device shows a force and a release after synchronize on a worker circuit', async () => {
++        const c = build(GATES, WorkerEngine);
++        expect(await seenAfter(c, label => device(c, label), () => c.synchronize())).toEqual(['1', '0', '1', '0']);
++    });
++});
++
++describe('Circuit on its default engine', () => {
++    test('forces and releases like the synchronous engine', async () => {
++        const c = new Circuit(clone(HOLD));
++        live.push(c);
++        const log = await run(c, HOLD_SCRIPT, 0, 8);
++        c.force(c.findDeviceByLabel('ff'), 'out', sig('1100'));
++        await run(c, [[8, 'clk', '1'], [10, 'clk', '0'], [12, 'clk', '1']], 8, 14, log);
++        c.release(c.findDeviceByLabel('ff'), 'out');
++        await run(c, [], 14, 16, log);
++        expect(log).toEqual(HOLD_START.concat(["9 q=1100", "10 q=1100", "11 q=1100", "12 q=1100", "13 q=1100", "14 q=1100", "15 q=0011", "16 q=0011"]));
++    });
++});
++
++describe('the main thread of a worker circuit', () => {
++    test('shows forced values after a synchronize while the worker keeps the device values', async () => {
++        const c = build(COUNT, WorkerEngine);
++        const twin = build(COUNT, WorkerEngine);
++        await run(c, [], 0, 9);
++        await run(twin, [], 0, 9);
++        c.force(device(c, 'ff'), 'out', sig('1000'));
++        await c.synchronize();
++        const shown = [c.getOutput('q').toBin(), c.getOutput('r').toBin()];
++        await run(c, [], 9, 13);
++        await c.synchronize();
++        shown.push(c.getOutput('q').toBin(), c.getOutput('r').toBin());
++        c.release(device(c, 'ff'), 'out');
++        await c.synchronize();
++        shown.push(c.getOutput('q').toBin());
++        expect(shown).toEqual(['1000', '0010', '1000', '1000', '1001']);
++    });
++});
++
++describe.each(engines)('more on %s', (_n, engine) => {
++    test('monitors on a subcircuit output report what it shows', async () => {
++        const c = build(TWINS, engine);
++        const shows = [];
++        record(c, 'r1', 'q', shows);
++        const script = [[0, 'clk', '0'], [0, 'd1', '0011'], [3, 'clk', '1'], [6, 'clk', '0'], [8, 'd1', '0101'], [9, 'clk', '1'], [12, 'clk', '0'], [15, 'clk', '1']];
++        await run(c, script, 0, 7);
++        c.force(device(c, 'r1'), 'q', sig('0000'));
++        c.force(device(c, 'r1'), 'd', sig('0110'));
++        await run(c, script, 7, 12);
++        c.release(device(c, 'r1'), 'q');
++        c.release(device(c, 'r1'), 'd');
++        await run(c, script, 12, 18);
++        await c.synchronize();
++        expect(shows).toEqual(['0:xxxx', '5:1100', '8:0000', '13:1001', '17:1010']);
++    });
++
++    test('a force that selects no bits forces nothing', async () => {
++        const c = build(MEM, engine);
++        const twin = build(MEM, engine);
++        const log = await run(c, MEM_SCRIPT, 0, 4);
++        const twinLog = await run(twin, MEM_SCRIPT, 0, 4);
++        c.force(device(c, 'mem'), 'rd1data', sig('1010'), sig('0000'));
++        c.force(device(c, 'c'), 'in', sig('1111'), sig('0000'));
++        await run(c, [[5, 'sa', '01'], [7, 'clk', '1']], 4, 10, log);
++        await run(twin, [[5, 'sa', '01'], [7, 'clk', '1']], 4, 10, twinLog);
++        expect(log).toEqual(twinLog);
++    });
++
++    test('values and masks as wide as the port work on a port wider than 32 bits', async () => {
++        const c = build(WIDE, engine);
++        const own = sig('1100'.repeat(10)), next = sig('01'.repeat(20));
++        const value = sig('0110100101'.repeat(4));
++        const mask = sig('1000001111' + '0'.repeat(20) + '0000000110');
++        const rest = sig('0000001111' + '0'.repeat(20) + '0000000110');
++        const shown = [];
++        const step = async (from, to) => {
++            await run(c, [], from, to);
++            shown.push(c.getOutput('q').toBin());
++        };
++        c.setInput('d', own);
++        await step(0, 4);
++        c.force(device(c, 'rep'), 'out', value, mask);
++        await step(4, 8);
++        c.setInput('d', next);
++        await step(8, 12);
++        c.release(device(c, 'rep'), 'out', sig('1' + '0'.repeat(39)));
++        await step(12, 16);
++        c.release(device(c, 'rep'), 'out');
++        await step(16, 20);
++        expect(shown).toEqual([
++            own.not().toBin(),
++            merged(value, mask, own).not().toBin(),
++            merged(value, mask, next).not().toBin(),
++            merged(value, rest, next).not().toBin(),
++            next.not().toBin()
++        ]);
++    });
++
++    test('bus and selector devices can be forced on any one of their ports', async () => {
++        const c = build(BUS, engine);
++        const shown = [];
++        const step = async (from, action) => {
++            action();
++            await run(c, [], from, from + 4);
++            shown.push(c.getOutput('y').toBin() + ' ' + c.getOutput('z').toBin());
++        };
++        await step(0, () => { c.setInput('w', sig('0110')); c.setInput('s', sig('0')); });
++        await step(4, () => c.force(device(c, 'split'), 'out0', sig('11')));
++        await step(8, () => c.force(device(c, 'join'), 'in0', sig('00')));
++        await step(12, () => c.force(device(c, 'mux'), 'sel', sig('1')));
++        await step(16, () => c.setInput('w', sig('1001')));
++        await step(20, () => c.release(device(c, 'split'), 'out0'));
++        await step(24, () => c.release(device(c, 'join'), 'in0'));
++        await step(28, () => c.release(device(c, 'mux'), 'sel'));
++        expect(shown).toEqual([
++            '1001 0110', '1101 0110', '1100 0110', '1100 1100',
++            '1100 1100', '0100 0100', '0110 0110', '0110 1001'
++        ]);
++    });
++
++    test('a value with unknown bits is forced as it is', async () => {
++        const c = build(GATES, engine);
++        const log = await run(c, [[0, 'a', '1'], [0, 'b', '1']], 0, 6);
++        c.force(device(c, 'n'), 'out', sig('x'));
++        await run(c, [], 6, 10, log);
++        expect(log).toEqual(GATES_START.concat(["7 m=x o=0", "8 m=x o=0", "9 m=x o=x", "10 m=x o=x"]));
++    });
++});
+diff --git a/tests/seeded_random_f890fd.js b/tests/seeded_random_f890fd.js
+new file mode 100644
+index 0000000..c62bcbe
+--- /dev/null
++++ b/tests/seeded_random_f890fd.js
+@@ -0,0 +1,8 @@
++let seed = 0x6b8b4567;
++
++Math.random = () => {
++    seed = (seed + 0x6d2b79f5) | 0;
++    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
++    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
++    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
++};
+diff --git a/tests/unique_names_f2a2e1.js b/tests/unique_names_f2a2e1.js
+new file mode 100644
+index 0000000..158aecf
+--- /dev/null
++++ b/tests/unique_names_f2a2e1.js
+@@ -0,0 +1,22 @@
++const { TestEnvironment } = require('jest-environment-node');
++
++class UniqueNamesEnvironment extends TestEnvironment {
++    constructor(config, context) {
++        super(config, context);
++        this.seenNames = new Map();
++    }
++
++    handleTestEvent(event, state) {
++        if (event.name !== 'add_test') return;
++        const block = state.currentDescribeBlock;
++        const test = block.children[block.children.length - 1];
++        const names = [test.name];
++        for (let b = block; b && b.parent; b = b.parent) names.unshift(b.name);
++        const fullName = names.join(' ');
++        const count = (this.seenNames.get(fullName) || 0) + 1;
++        this.seenNames.set(fullName, count);
++        if (count > 1) test.name = `${test.name} (${count})`;
++    }
++}
++
++module.exports = UniqueNamesEnvironment;

@@ -1,0 +1,2708 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..53d3e1f
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,228 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++    echo "usage: $0 [--output_path <path>] base|new" >&2
++    exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++
++while [ $# -gt 0 ]; do
++    case "$1" in
++        base|new)
++            MODE="$1"
++            MODE_COUNT=$((MODE_COUNT + 1))
++            shift
++            ;;
++        --output_path)
++            shift
++            if [ $# -lt 1 ] || [ -z "$1" ]; then
++                echo "missing value for --output_path" >&2
++                usage
++            fi
++            OUTPUT_PATH="$1"
++            shift
++            ;;
++        --output_path=*)
++            OUTPUT_PATH="${1#--output_path=}"
++            if [ -z "$OUTPUT_PATH" ]; then
++                echo "missing value for --output_path" >&2
++                usage
++            fi
++            shift
++            ;;
++        *)
++            echo "unknown argument: $1" >&2
++            usage
++            ;;
++    esac
++done
++
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++case "$OUTPUT_PATH" in
++    ""|/*) ;;
++    *) OUTPUT_PATH="$(pwd)/$OUTPUT_PATH" ;;
++esac
++
++REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/linuxdeploy-tests.XXXXXX" 2>/dev/null || mktemp -d /tmp/linuxdeploy-tests.XXXXXX)" || exit 1
++trap 'rm -rf "$WORK_DIR"' EXIT
++
++if [ -z "$OUTPUT_PATH" ]; then
++    OUTPUT_PATH="$WORK_DIR/results.xml"
++else
++    mkdir -p "$(dirname "$OUTPUT_PATH")"
++fi
++
++mkdir -p "$WORK_DIR/tmp"
++export TMPDIR="$WORK_DIR/tmp"
++export LC_ALL=C
++export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
++unset LD_LIBRARY_PATH LD_PRELOAD
++
++JOBS="$(nproc 2>/dev/null || echo 2)"
++[ "$JOBS" -gt 8 ] && JOBS=8
++
++CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DUSE_CCACHE=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5)
++
++if [ "$MODE" = base ]; then
++    SOURCE_DIR="$REPO_DIR"
++    CMAKE_ARGS+=(-DBUILD_TESTING=ON)
++    TARGETS=(test_appdir test_linuxdeploy test_elf_file)
++    SOURCES=(tests/core/test_appdir.cpp tests/core/test_linuxdeploy.cpp tests/core/test_elf_file.cpp)
++else
++    SOURCE_DIR="$REPO_DIR/tests/native_rpath_80306a"
++    TARGETS=(test_native_rpath_80306a)
++    SOURCES=(tests/native_rpath_80306a/test_native_rpath_80306a.cpp)
++fi
++
++SOURCE_PATHS=()
++for source in "${SOURCES[@]}"; do
++    SOURCE_PATHS+=("$REPO_DIR/$source")
++done
++
++cat > "$WORK_DIR/junit.py" <<'PYEOF'
++import os
++import re
++import sys
++import xml.etree.ElementTree as ET
++
++
++def tests_in(source):
++    try:
++        with open(source, errors="replace") as f:
++            text = f.read()
++    except OSError:
++        return []
++    return re.findall(r"^\s*TEST(?:_F)?\(\s*(\w+)\s*,\s*(\w+)\s*\)", text, re.M)
++
++
++def tail(path, lines=120):
++    try:
++        with open(path, errors="replace") as f:
++            return "".join(f.readlines()[-lines:])
++    except OSError:
++        return ""
++
++
++def failing_cases(tests, message, detail):
++    suites = {}
++    for suite_name, test_name in tests:
++        suite = suites.get(suite_name)
++        if suite is None:
++            suite = suites[suite_name] = ET.Element("testsuite", {"name": suite_name})
++        case = ET.SubElement(suite, "testcase", {"name": test_name, "classname": suite_name, "status": "run", "time": "0"})
++        failure = ET.SubElement(case, "failure", {"message": message})
++        failure.text = detail
++    return list(suites.values())
++
++
++def write(path, suites):
++    root = ET.Element("testsuites", {"name": "AllTests"})
++    total = failed = 0
++    for suite in suites:
++        cases = suite.findall("testcase")
++        failures = sum(1 for case in cases if case.find("failure") is not None or case.find("error") is not None)
++        suite.set("tests", str(len(cases)))
++        suite.set("failures", str(failures))
++        suite.set("errors", "0")
++        total += len(cases)
++        failed += failures
++        root.append(suite)
++    root.set("tests", str(total))
++    root.set("failures", str(failed))
++    root.set("errors", "0")
++    ET.ElementTree(root).write(path, encoding="UTF-8", xml_declaration=True)
++
++
++def main():
++    output, action = sys.argv[1], sys.argv[2]
++
++    if action == "build-failed":
++        log, sources = sys.argv[3], sys.argv[4:]
++        tests = [test for source in sources for test in tests_in(source)]
++        write(output, failing_cases(tests, "the tests did not build", "The test binaries did not build.\n\n" + tail(log)))
++        return 1
++
++    suites = []
++    synthesized = False
++    entries = sys.argv[3:]
++    for i in range(0, len(entries), 4):
++        report, log, status, source = entries[i:i + 4]
++        expected = tests_in(source)
++        try:
++            found = ET.parse(report).getroot().iter("testsuite")
++            found = [suite for suite in found if suite.findall("testcase")]
++        except Exception:
++            found = None
++
++        if found is None:
++            detail = "The test binary exited with status %s without writing a report.\n\n%s" % (status, tail(log))
++            suites.extend(failing_cases(expected, "the test binary did not report", detail))
++            synthesized = True
++            continue
++
++        reported = {(case.get("classname"), case.get("name")) for suite in found for case in suite.findall("testcase")}
++        suites.extend(found)
++        missing = [test for test in expected if test not in reported]
++        if missing:
++            detail = "The test binary exited with status %s before reporting this test.\n\n%s" % (status, tail(log))
++            suites.extend(failing_cases(missing, "the test did not report", detail))
++            synthesized = True
++            continue
++
++        failed = any(case.find("failure") is not None or case.find("error") is not None
++                     for suite in found for case in suite.findall("testcase"))
++        if status != "0" and not failed:
++            binary = os.path.splitext(os.path.basename(report))[0]
++            detail = "The test binary exited with status %s after reporting every test as passed.\n\n%s" % (status, tail(log))
++            suites.extend(failing_cases([(binary, "exitStatus")], "the test binary exited with status " + status, detail))
++            synthesized = True
++
++    write(output, suites)
++    return 1 if synthesized else 0
++
++
++sys.exit(main())
++PYEOF
++
++echo "configuring and building ${TARGETS[*]}"
++cmake -S "$SOURCE_DIR" -B "$WORK_DIR/build" "${CMAKE_ARGS[@]}" > "$WORK_DIR/build.log" 2>&1 &&
++    cmake --build "$WORK_DIR/build" -j"$JOBS" --target "${TARGETS[@]}" >> "$WORK_DIR/build.log" 2>&1
++BUILD_STATUS=$?
++
++if [ "$BUILD_STATUS" -ne 0 ]; then
++    tail -n 80 "$WORK_DIR/build.log"
++    python3 "$WORK_DIR/junit.py" "$OUTPUT_PATH" build-failed "$WORK_DIR/build.log" "${SOURCE_PATHS[@]}"
++    exit 1
++fi
++
++STATUS=0
++MERGE_ARGS=()
++
++for i in "${!TARGETS[@]}"; do
++    target="${TARGETS[$i]}"
++    binary="$(find "$WORK_DIR/build" -type f -name "$target" -perm -u+x | head -n 1)"
++    report="$WORK_DIR/$target.xml"
++    log="$WORK_DIR/$target.log"
++    status=127
++
++    if [ -n "$binary" ]; then
++        (cd "$(dirname "$binary")" && timeout -k 10 1800 "$binary" --gtest_output="xml:$report") 2>&1 | tee "$log"
++        status=${PIPESTATUS[0]}
++    else
++        echo "$target was not built" | tee "$log"
++    fi
++
++    [ "$status" -ne 0 ] && STATUS=1
++    MERGE_ARGS+=("$report" "$log" "$status" "${SOURCE_PATHS[$i]}")
++done
++
++python3 "$WORK_DIR/junit.py" "$OUTPUT_PATH" merge "${MERGE_ARGS[@]}" || STATUS=1
++
++exit "$STATUS"
+diff --git a/tests/native_rpath_80306a/CMakeLists.txt b/tests/native_rpath_80306a/CMakeLists.txt
+new file mode 100644
+index 0000000..880f00c
+--- /dev/null
++++ b/tests/native_rpath_80306a/CMakeLists.txt
+@@ -0,0 +1,16 @@
++cmake_minimum_required(VERSION 3.13)
++
++project(linuxdeploy_native_rpath_test C CXX)
++
++set(CMAKE_CXX_STANDARD 17)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++
++set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
++set(USE_CCACHE OFF CACHE BOOL "" FORCE)
++add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../.. linuxdeploy)
++
++find_package(GTest REQUIRED)
++
++add_executable(test_native_rpath_80306a test_native_rpath_80306a.cpp)
++target_link_libraries(test_native_rpath_80306a PRIVATE linuxdeploy_core GTest::gtest GTest::gtest_main)
++target_include_directories(test_native_rpath_80306a PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+diff --git a/tests/native_rpath_80306a/test_native_rpath_80306a.cpp b/tests/native_rpath_80306a/test_native_rpath_80306a.cpp
+new file mode 100644
+index 0000000..8308274
+--- /dev/null
++++ b/tests/native_rpath_80306a/test_native_rpath_80306a.cpp
+@@ -0,0 +1,2446 @@
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <elf.h>
++#include <filesystem>
++#include <fstream>
++#include <functional>
++#include <iostream>
++#include <iterator>
++#include <linux/audit.h>
++#include <linux/filter.h>
++#include <linux/seccomp.h>
++#include <map>
++#include <optional>
++#include <poll.h>
++#include <random>
++#include <regex>
++#include <signal.h>
++#include <sstream>
++#include <string>
++#include <sys/prctl.h>
++#include <sys/resource.h>
++#include <sys/syscall.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#include <utility>
++#include <vector>
++
++#include "gtest/gtest.h"
++
++#include "linuxdeploy/core/elf_file.h"
++
++namespace fs = std::filesystem;
++
++using namespace linuxdeploy::core::elf_file;
++
++namespace {
++    using Environment = std::map<std::string, std::string>;
++
++    struct ProcessResult {
++        int status = -1;
++        bool timedOut = false;
++        std::string output;
++
++        bool succeeded() const {
++            return !timedOut && WIFEXITED(status) && WEXITSTATUS(status) == 0;
++        }
++    };
++
++    std::string readAll(int fd) {
++        std::string data;
++        char buffer[4096];
++
++        while (true) {
++            const auto count = read(fd, buffer, sizeof(buffer));
++
++            if (count < 0 && errno == EINTR)
++                continue;
++
++            if (count <= 0)
++                break;
++
++            data.append(buffer, static_cast<size_t>(count));
++        }
++
++        return data;
++    }
++
++    void writeAll(int fd, const std::string& data) {
++        size_t written = 0;
++
++        while (written < data.size()) {
++            const auto count = write(fd, data.data() + written, data.size() - written);
++
++            if (count < 0 && errno == EINTR)
++                continue;
++
++            if (count <= 0)
++                return;
++
++            written += static_cast<size_t>(count);
++        }
++    }
++
++    void flushOutput() {
++        std::cout.flush();
++        std::cerr.flush();
++        fflush(nullptr);
++    }
++
++    const Environment& plainEnvironment() {
++        static const Environment environment{{"PATH", "/usr/bin:/bin"}, {"LC_ALL", "C"}};
++        return environment;
++    }
++
++    ProcessResult runProcess(const std::vector<std::string>& arguments, const fs::path& workingDirectory,
++                             const Environment& environment = plainEnvironment()) {
++        std::vector<std::string> environmentStrings;
++        for (const auto& variable : environment)
++            environmentStrings.push_back(variable.first + "=" + variable.second);
++
++        std::vector<char*> argv;
++        for (const auto& argument : arguments)
++            argv.push_back(const_cast<char*>(argument.c_str()));
++        argv.push_back(nullptr);
++
++        std::vector<char*> envp;
++        for (const auto& variable : environmentStrings)
++            envp.push_back(const_cast<char*>(variable.c_str()));
++        envp.push_back(nullptr);
++
++        int fds[2];
++        if (pipe(fds) != 0)
++            throw std::runtime_error("pipe() failed");
++
++        flushOutput();
++        const auto pid = fork();
++
++        if (pid < 0)
++            throw std::runtime_error("fork() failed");
++
++        if (pid == 0) {
++            setpgid(0, 0);
++            dup2(fds[1], STDOUT_FILENO);
++            dup2(fds[1], STDERR_FILENO);
++            close(fds[0]);
++            close(fds[1]);
++
++            if (chdir(workingDirectory.c_str()) != 0)
++                _exit(126);
++
++            execve(argv[0], argv.data(), envp.data());
++            _exit(127);
++        }
++
++        setpgid(pid, pid);
++        close(fds[1]);
++
++        ProcessResult result;
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
++
++        while (true) {
++            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
++
++            if (remaining <= 0) {
++                result.timedOut = true;
++                break;
++            }
++
++            pollfd descriptor{fds[0], POLLIN, 0};
++            const auto ready = poll(&descriptor, 1, static_cast<int>(remaining));
++
++            if (ready < 0 && errno == EINTR)
++                continue;
++
++            if (ready == 0) {
++                result.timedOut = true;
++                break;
++            }
++
++            char buffer[4096];
++            const auto count = read(fds[0], buffer, sizeof(buffer));
++
++            if (count < 0 && errno == EINTR)
++                continue;
++
++            if (count <= 0)
++                break;
++
++            result.output.append(buffer, static_cast<size_t>(count));
++        }
++
++        if (result.timedOut) {
++            kill(-pid, SIGKILL);
++            result.output += "\n[did not finish within 30 seconds]";
++        }
++
++        close(fds[0]);
++
++        while (waitpid(pid, &result.status, 0) < 0 && errno == EINTR) {}
++
++        return result;
++    }
++
++    std::string describe(const std::vector<std::string>& arguments) {
++        std::string command;
++
++        for (const auto& argument : arguments)
++            command += argument + " ";
++
++        return command;
++    }
++
++    std::string runOrThrow(const std::vector<std::string>& arguments, const fs::path& workingDirectory = fs::current_path()) {
++        const auto result = runProcess(arguments, workingDirectory);
++
++        if (!result.succeeded())
++            throw std::runtime_error("command failed: " + describe(arguments) + "\n" + result.output);
++
++        return result.output;
++    }
++
++    void writeFile(const fs::path& path, const std::string& contents) {
++        fs::create_directories(path.parent_path());
++        std::ofstream ofs(path, std::ios::binary);
++        ofs << contents;
++    }
++
++    std::vector<char> readBytes(const fs::path& path) {
++        std::ifstream ifs(path, std::ios::binary);
++        return {std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>()};
++    }
++
++    void writeBytes(const fs::path& path, const std::vector<char>& data) {
++        std::fstream stream(path, std::ios::binary | std::ios::in | std::ios::out);
++        stream.write(data.data(), static_cast<std::streamsize>(data.size()));
++    }
++
++    fs::path makeTemporaryDirectory(const std::string& prefix) {
++        auto pattern = (fs::temp_directory_path() / (prefix + "-XXXXXX")).string();
++
++        if (mkdtemp(pattern.data()) == nullptr)
++            throw std::runtime_error("mkdtemp() failed");
++
++        return fs::canonical(pattern);
++    }
++
++    class TemporaryDirectory {
++        public:
++            const fs::path path;
++
++            explicit TemporaryDirectory(const std::string& prefix) : path(makeTemporaryDirectory(prefix)) {}
++
++            ~TemporaryDirectory() {
++                std::error_code error;
++                fs::remove_all(path, error);
++            }
++    };
++
++    int programAttemptFd = -1;
++
++    void reportProgramAttempt(int) {
++        const char marker = 'x';
++        if (write(programAttemptFd, &marker, 1) < 0) {}
++        _exit(87);
++    }
++
++    bool forbidRunningPrograms() {
++        const uint32_t trap = SECCOMP_RET_TRAP;
++        const uint32_t allow = SECCOMP_RET_ALLOW;
++
++        struct sock_filter filter[] = {
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 3, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 7, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_I386, 10, 0),
++            BPF_STMT(BPF_RET | BPF_K, trap),
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
++            BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x40000000, 11, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 59, 10, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 322, 9, 0),
++            BPF_STMT(BPF_RET | BPF_K, allow),
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 221, 6, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 281, 5, 0),
++            BPF_STMT(BPF_RET | BPF_K, allow),
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 11, 2, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 358, 1, 0),
++            BPF_STMT(BPF_RET | BPF_K, allow),
++            BPF_STMT(BPF_RET | BPF_K, trap),
++        };
++
++        struct sock_fprog program{};
++        program.len = static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0]));
++        program.filter = filter;
++
++        struct sigaction action{};
++        action.sa_handler = reportProgramAttempt;
++        sigemptyset(&action.sa_mask);
++
++        return sigaction(SIGSYS, &action, nullptr) == 0 &&
++               prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 &&
++               syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program) == 0;
++    }
++
++    struct CallResult {
++        std::string failure;
++        std::string value;
++    };
++
++    // runs the call in a child that cannot start programs; a fake patchelf is also the first one on PATH and in
++    // $PATCHELF, so an attempt to use one is noticed even where the filter cannot be installed
++    CallResult callInChild(const std::function<std::string()>& call) {
++        static const fs::path fakeTools = []() {
++            const auto directory = makeTemporaryDirectory("native-rpath-fake-tools");
++            const auto marker = directory / "patchelf-was-run";
++            writeFile(directory / "patchelf", "#!/bin/sh\ntouch '" + marker.string() + "'\nexit 1\n");
++            fs::permissions(directory / "patchelf", fs::perms::owner_all);
++            return directory;
++        }();
++
++        const auto marker = fakeTools / "patchelf-was-run";
++        std::error_code error;
++        fs::remove(marker, error);
++
++        CallResult result;
++        int resultFds[2];
++        int attemptFds[2];
++
++        if (pipe(resultFds) != 0 || pipe(attemptFds) != 0) {
++            result.failure = "could not be run: pipe() failed";
++            return result;
++        }
++
++        flushOutput();
++        const auto pid = fork();
++
++        if (pid == 0) {
++            close(resultFds[0]);
++            close(attemptFds[0]);
++            programAttemptFd = attemptFds[1];
++
++            setenv("PATCHELF", (fakeTools / "patchelf").c_str(), 1);
++            setenv("PATH", (fakeTools.string() + ":/usr/bin:/bin").c_str(), 1);
++
++            const bool filtered = forbidRunningPrograms();
++
++            std::string payload;
++            try {
++                payload = "R" + call();
++            } catch (const std::exception& e) {
++                payload = std::string("Xthrew an exception: ") + e.what();
++            } catch (...) {
++                payload = "Xthrew an unknown exception";
++            }
++
++            struct rusage children{};
++            if (!filtered && getrusage(RUSAGE_CHILDREN, &children) == 0 && children.ru_maxrss > 0)
++                reportProgramAttempt(0);
++
++            writeAll(resultFds[1], payload);
++            _exit(0);
++        }
++
++        close(resultFds[1]);
++        close(attemptFds[1]);
++
++        std::string data;
++        bool timedOut = false;
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
++
++        while (true) {
++            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
++
++            if (remaining <= 0) {
++                timedOut = true;
++                break;
++            }
++
++            pollfd descriptor{resultFds[0], POLLIN, 0};
++            const auto ready = poll(&descriptor, 1, static_cast<int>(remaining));
++
++            if (ready < 0 && errno == EINTR)
++                continue;
++
++            if (ready == 0) {
++                timedOut = true;
++                break;
++            }
++
++            char buffer[4096];
++            const auto count = read(resultFds[0], buffer, sizeof(buffer));
++
++            if (count < 0 && errno == EINTR)
++                continue;
++
++            if (count <= 0)
++                break;
++
++            data.append(buffer, static_cast<size_t>(count));
++        }
++
++        close(resultFds[0]);
++
++        if (timedOut)
++            kill(pid, SIGKILL);
++
++        int status = 0;
++        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
++
++        pollfd attempt{attemptFds[0], POLLIN, 0};
++        const bool programAttempted = poll(&attempt, 1, 0) > 0 && (attempt.revents & POLLIN) != 0;
++        close(attemptFds[0]);
++
++        if (programAttempted || fs::exists(marker))
++            result.failure = "tried to run a program, which is not allowed";
++        else if (timedOut)
++            result.failure = "did not return within 120 seconds";
++        else if (WIFSIGNALED(status))
++            result.failure = "crashed with signal " + std::to_string(WTERMSIG(status));
++        else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
++            result.failure = "ended with exit status " + std::to_string(WEXITSTATUS(status));
++        else if (data.empty())
++            result.failure = "returned no result";
++        else if (data.front() == 'X')
++            result.failure = data.substr(1);
++        else
++            result.value = data.substr(1);
++
++        return result;
++    }
++
++    CallResult getRPath(const fs::path& file) {
++        return callInChild([&file]() {
++            return ElfFile(file).getRPath();
++        });
++    }
++
++    CallResult setRPath(const fs::path& file, const std::string& value) {
++        return callInChild([&file, &value]() {
++            return std::string(ElfFile(file).setRPath(value) ? "true" : "false");
++        });
++    }
++
++    ::testing::AssertionResult rpathIs(const fs::path& file, const std::string& expected) {
++        const auto result = getRPath(file);
++
++        if (!result.failure.empty())
++            return ::testing::AssertionFailure() << "getRPath(" << file << ") " << result.failure;
++
++        if (result.value != expected)
++            return ::testing::AssertionFailure() << "getRPath(" << file << ") returned \"" << result.value << "\" instead of \"" << expected << "\"";
++
++        return ::testing::AssertionSuccess();
++    }
++
++    ::testing::AssertionResult setsRPath(const fs::path& file, const std::string& value) {
++        const auto result = setRPath(file, value);
++
++        if (!result.failure.empty())
++            return ::testing::AssertionFailure() << "setRPath(" << file << ", \"" << value << "\") " << result.failure;
++
++        if (result.value != "true")
++            return ::testing::AssertionFailure() << "setRPath(" << file << ", \"" << value << "\") returned false";
++
++        return ::testing::AssertionSuccess();
++    }
++
++    struct Section {
++        std::string name;
++        Elf64_Shdr header{};
++    };
++
++    // an ELF reader of its own, so that the checks do not depend on the code under test
++    class ElfImage {
++        public:
++            fs::path path;
++            std::vector<char> bytes;
++            Elf64_Ehdr ehdr{};
++            std::vector<Elf64_Phdr> phdrs;
++            std::vector<Section> sections;
++            std::vector<Elf64_Dyn> dynamic;
++
++        private:
++            template<typename T>
++            T load(uint64_t offset) const {
++                if (offset > bytes.size() || bytes.size() - offset < sizeof(T))
++                    throw std::runtime_error("truncated ELF file " + path.string());
++
++                T value;
++                memcpy(&value, bytes.data() + offset, sizeof(T));
++                return value;
++            }
++
++        public:
++            explicit ElfImage(const fs::path& file) : path(file), bytes(readBytes(file)) {
++                if (bytes.size() < sizeof(Elf64_Ehdr) || memcmp(bytes.data(), ELFMAG, SELFMAG) != 0 || bytes[EI_CLASS] != ELFCLASS64)
++                    throw std::runtime_error("not a 64-bit ELF file: " + file.string());
++
++                ehdr = load<Elf64_Ehdr>(0);
++
++                for (uint64_t i = 0; i < ehdr.e_phnum; ++i)
++                    phdrs.push_back(load<Elf64_Phdr>(ehdr.e_phoff + i * sizeof(Elf64_Phdr)));
++
++                if (ehdr.e_shoff != 0 && ehdr.e_shnum != 0) {
++                    std::vector<Elf64_Shdr> headers;
++                    for (uint64_t i = 0; i < ehdr.e_shnum; ++i)
++                        headers.push_back(load<Elf64_Shdr>(ehdr.e_shoff + i * sizeof(Elf64_Shdr)));
++
++                    const auto& names = headers.at(ehdr.e_shstrndx);
++
++                    for (const auto& header : headers) {
++                        Section section;
++                        section.header = header;
++                        if (header.sh_name < names.sh_size)
++                            section.name = std::string(bytes.data() + names.sh_offset + header.sh_name);
++                        sections.push_back(section);
++                    }
++                }
++
++                for (const auto& phdr : phdrs) {
++                    if (phdr.p_type != PT_DYNAMIC)
++                        continue;
++
++                    for (uint64_t position = 0; position + sizeof(Elf64_Dyn) <= phdr.p_filesz; position += sizeof(Elf64_Dyn)) {
++                        const auto entry = load<Elf64_Dyn>(phdr.p_offset + position);
++
++                        if (entry.d_tag == DT_NULL)
++                            break;
++
++                        dynamic.push_back(entry);
++                    }
++                }
++            }
++
++            std::vector<char> at(uint64_t address, uint64_t size) const {
++                for (const auto& phdr : phdrs) {
++                    if (phdr.p_type == PT_LOAD && address >= phdr.p_vaddr && address + size <= phdr.p_vaddr + phdr.p_filesz) {
++                        const auto offset = phdr.p_offset + (address - phdr.p_vaddr);
++
++                        if (offset + size > bytes.size())
++                            break;
++
++                        return {bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.begin() + static_cast<std::ptrdiff_t>(offset + size)};
++                    }
++                }
++
++                throw std::runtime_error("address not backed by " + path.string());
++            }
++
++            std::optional<uint64_t> value(int64_t tag) const {
++                for (const auto& entry : dynamic) {
++                    if (entry.d_tag == tag)
++                        return entry.d_un.d_val;
++                }
++
++                return std::nullopt;
++            }
++
++            std::string string(uint64_t offset) const {
++                const auto table = at(value(DT_STRTAB).value(), value(DT_STRSZ).value());
++
++                if (offset >= table.size())
++                    throw std::runtime_error("string offset out of range in " + path.string());
++
++                return std::string(table.data() + offset, strnlen(table.data() + offset, table.size() - offset));
++            }
++
++            std::vector<std::string> strings(int64_t tag) const {
++                std::vector<std::string> result;
++
++                for (const auto& entry : dynamic) {
++                    if (entry.d_tag == tag)
++                        result.push_back(string(entry.d_un.d_val));
++                }
++
++                return result;
++            }
++
++            const Section* section(const std::string& name) const {
++                for (const auto& section : sections) {
++                    if (section.name == name)
++                        return &section;
++                }
++
++                return nullptr;
++            }
++
++            std::vector<char> contents(const Section& section) const {
++                if (section.header.sh_type == SHT_NOBITS)
++                    return {};
++
++                const auto begin = section.header.sh_offset;
++                const auto end = begin + section.header.sh_size;
++
++                if (end > bytes.size())
++                    throw std::runtime_error("section " + section.name + " outside of " + path.string());
++
++                return {bytes.begin() + static_cast<std::ptrdiff_t>(begin), bytes.begin() + static_cast<std::ptrdiff_t>(end)};
++            }
++
++            std::vector<Elf64_Phdr> segments(uint32_t type) const {
++                std::vector<Elf64_Phdr> result;
++
++                for (const auto& phdr : phdrs) {
++                    if (phdr.p_type == type)
++                        result.push_back(phdr);
++                }
++
++                return result;
++            }
++
++            std::vector<char> segmentContents(const Elf64_Phdr& phdr) const {
++                if (phdr.p_offset > bytes.size() || bytes.size() - phdr.p_offset < phdr.p_filesz)
++                    throw std::runtime_error("program header outside of " + path.string());
++
++                return {bytes.begin() + static_cast<std::ptrdiff_t>(phdr.p_offset), bytes.begin() + static_cast<std::ptrdiff_t>(phdr.p_offset + phdr.p_filesz)};
++            }
++
++            std::string interpreter() const {
++                for (const auto& phdr : phdrs) {
++                    if (phdr.p_type == PT_INTERP)
++                        return std::string(bytes.data() + phdr.p_offset, strnlen(bytes.data() + phdr.p_offset, phdr.p_filesz));
++                }
++
++                return {};
++            }
++
++            bool hasSectionHeaders() const {
++                return !sections.empty();
++            }
++    };
++
++    struct RPathEntries {
++        std::vector<std::string> rpath;
++        std::vector<std::string> runpath;
++    };
++
++    RPathEntries rpathEntriesOf(const fs::path& file) {
++        const ElfImage image(file);
++        return {image.strings(DT_RPATH), image.strings(DT_RUNPATH)};
++    }
++
++    ::testing::AssertionResult hasEntries(const fs::path& file, const std::vector<std::string>& rpath, const std::vector<std::string>& runpath) {
++        const auto entries = rpathEntriesOf(file);
++
++        if (entries.rpath == rpath && entries.runpath == runpath)
++            return ::testing::AssertionSuccess();
++
++        auto failure = ::testing::AssertionFailure() << file << " has DT_RPATH [";
++        for (const auto& value : entries.rpath)
++            failure << "\"" << value << "\" ";
++        failure << "] and DT_RUNPATH [";
++        for (const auto& value : entries.runpath)
++            failure << "\"" << value << "\" ";
++        failure << "]";
++
++        return failure;
++    }
++
++    // the tables the dynamic loader finds through these tags may live elsewhere afterwards, but must read the same
++    bool isTableTag(int64_t tag) {
++        switch (tag) {
++            case DT_HASH:
++            case DT_GNU_HASH:
++            case DT_SYMTAB:
++            case DT_RELA:
++            case DT_REL:
++            case DT_JMPREL:
++            case DT_VERSYM:
++            case DT_VERDEF:
++            case DT_VERNEED:
++                return true;
++            default:
++                return false;
++        }
++    }
++
++    bool isStringTag(int64_t tag) {
++        return tag == DT_NEEDED || tag == DT_SONAME || tag == DT_AUXILIARY || tag == DT_FILTER || tag == DT_AUDIT || tag == DT_DEPAUDIT ||
++               tag == DT_CONFIG;
++    }
++
++    std::optional<uint64_t> tableSize(const ElfImage& image, int64_t tag, uint64_t address) {
++        switch (tag) {
++            case DT_RELA:
++                return image.value(DT_RELASZ);
++            case DT_REL:
++                return image.value(DT_RELSZ);
++            case DT_JMPREL:
++                return image.value(DT_PLTRELSZ);
++            default:
++                break;
++        }
++
++        for (const auto& section : image.sections) {
++            if (section.header.sh_addr == address && (section.header.sh_flags & SHF_ALLOC) != 0 && section.header.sh_type != SHT_NOBITS)
++                return section.header.sh_size;
++        }
++
++        return std::nullopt;
++    }
++
++    std::string normalized(std::string text, const fs::path& file) {
++        static const std::regex lengths(R"(at file offset 0x[0-9a-fA-F]+ with length 0x[0-9a-fA-F]+)");
++        static const std::regex numbers(R"((Addr|Offset|offset|address):? ?0x[0-9a-fA-F]+)");
++
++        size_t position;
++        while ((position = text.find(file.string())) != std::string::npos)
++            text.replace(position, file.string().size(), "FILE");
++
++        text = std::regex_replace(text, lengths, "at file offset X");
++        text = std::regex_replace(text, numbers, "$1 X");
++        return text;
++    }
++
++    std::string readelf(const std::vector<std::string>& options, const fs::path& file) {
++        std::vector<std::string> arguments{"/usr/bin/readelf", "-W"};
++        arguments.insert(arguments.end(), options.begin(), options.end());
++        arguments.push_back(file.string());
++
++        const auto result = runProcess(arguments, file.parent_path());
++        return normalized(result.output, file);
++    }
++
++    // the notes readelf reads, whether it finds them through section headers or through program headers
++    std::vector<std::string> readelfNotes(const std::vector<std::string>& options, const fs::path& file) {
++        std::istringstream text(readelf(options, file));
++        std::vector<std::string> notes;
++
++        for (std::string line; std::getline(text, line);) {
++            if (!line.empty() && line.rfind("Displaying notes found", 0) != 0 && line.rfind("  Owner", 0) != 0)
++                notes.push_back(line);
++        }
++
++        std::sort(notes.begin(), notes.end());
++        return notes;
++    }
++
++    // a copy of a file as it was, to compare the changed file with
++    class Snapshot {
++        public:
++            fs::path copy;
++            std::optional<ElfImage> image;
++
++            Snapshot(const fs::path& file, const fs::path& directory) {
++                static int counter = 0;
++
++                fs::create_directories(directory);
++                copy = directory / (std::to_string(counter++) + "-" + file.filename().string());
++                fs::copy_file(file, copy);
++                image.emplace(copy);
++            }
++    };
++
++    // everything but the search path reads the same as before
++    void expectOnlyRPathChanged(const Snapshot& snapshot, const fs::path& file) {
++        const auto& before = snapshot.image.value();
++        const ElfImage after(file);
++
++        EXPECT_EQ(before.interpreter(), after.interpreter()) << file << ": interpreter changed";
++
++        const auto byTag = [](const ElfImage& image) {
++            std::map<int64_t, std::vector<Elf64_Dyn>> entries;
++
++            for (const auto& entry : image.dynamic) {
++                if (entry.d_tag != DT_STRTAB && entry.d_tag != DT_STRSZ && entry.d_tag != DT_RPATH && entry.d_tag != DT_RUNPATH)
++                    entries[entry.d_tag].push_back(entry);
++            }
++
++            return entries;
++        };
++
++        const auto beforeEntries = byTag(before);
++        const auto afterEntries = byTag(after);
++
++        for (const auto& tagEntries : beforeEntries) {
++            const auto tag = tagEntries.first;
++            const auto now = afterEntries.find(tag);
++
++            if (now == afterEntries.end() || now->second.size() != tagEntries.second.size()) {
++                ADD_FAILURE() << file << ": the dynamic entries with tag " << tag << " changed in number";
++                continue;
++            }
++
++            for (size_t i = 0; i < tagEntries.second.size(); ++i) {
++                const auto& old = tagEntries.second[i];
++                const auto& changed = now->second[i];
++
++                if (isStringTag(tag)) {
++                    EXPECT_EQ(before.string(old.d_un.d_val), after.string(changed.d_un.d_val)) << file << ": dynamic entry " << i << " with tag " << tag << " reads differently";
++                } else if (isTableTag(tag)) {
++                    const auto size = tableSize(before, tag, old.d_un.d_ptr);
++
++                    if (size.has_value()) {
++                        EXPECT_EQ(before.at(old.d_un.d_ptr, size.value()), after.at(changed.d_un.d_ptr, size.value())) << file << ": the table of the dynamic entry with tag " << tag << " reads differently";
++                    }
++                } else if (tag != DT_DEBUG) {
++                    EXPECT_EQ(old.d_un.d_val, changed.d_un.d_val) << file << ": the value of the dynamic entry with tag " << tag << " changed";
++                }
++            }
++        }
++
++        for (const auto& tagEntries : afterEntries) {
++            if (beforeEntries.find(tagEntries.first) == beforeEntries.end()) {
++                ADD_FAILURE() << file << ": a dynamic entry with tag " << tagEntries.first << " was added";
++            }
++        }
++
++        if (before.hasSectionHeaders()) {
++            for (const auto& section : before.sections) {
++                if (section.name.empty() || section.name == ".dynamic" || section.name == ".dynstr" || section.name == ".shstrtab")
++                    continue;
++
++                const auto* now = after.section(section.name);
++
++                if (now == nullptr) {
++                    ADD_FAILURE() << file << ": section " << section.name << " is gone";
++                    continue;
++                }
++
++                EXPECT_EQ(section.header.sh_type, now->header.sh_type) << file << ": section " << section.name << " changed its type";
++                EXPECT_EQ(section.header.sh_size, now->header.sh_size) << file << ": section " << section.name << " changed its size";
++                EXPECT_TRUE(before.contents(section) == after.contents(*now)) << file << ": section " << section.name << " changed its contents";
++
++                if (section.header.sh_type == SHT_NOBITS || (section.header.sh_flags & SHF_EXECINSTR) != 0 || (section.header.sh_flags & SHF_WRITE) != 0) {
++                    EXPECT_EQ(section.header.sh_addr, now->header.sh_addr) << file << ": section " << section.name << " moved in memory";
++                }
++            }
++        }
++
++        for (const auto type : {static_cast<uint32_t>(PT_GNU_STACK), static_cast<uint32_t>(PT_GNU_RELRO), static_cast<uint32_t>(PT_TLS), static_cast<uint32_t>(PT_GNU_EH_FRAME)}) {
++            const auto old = before.segments(type);
++            const auto now = after.segments(type);
++
++            ASSERT_EQ(old.size(), now.size()) << file << ": the number of program headers of type " << std::hex << type << " changed";
++
++            for (size_t i = 0; i < old.size(); ++i) {
++                EXPECT_EQ(old[i].p_flags, now[i].p_flags) << file << ": program header of type " << std::hex << type << " changed its flags";
++                EXPECT_EQ(old[i].p_vaddr, now[i].p_vaddr) << file << ": program header of type " << std::hex << type << " moved";
++                EXPECT_EQ(old[i].p_memsz, now[i].p_memsz) << file << ": program header of type " << std::hex << type << " changed its size";
++            }
++        }
++
++        for (const auto type : {static_cast<uint32_t>(PT_INTERP), static_cast<uint32_t>(PT_NOTE), static_cast<uint32_t>(PT_GNU_PROPERTY)}) {
++            const auto old = before.segments(type);
++            const auto now = after.segments(type);
++
++            ASSERT_EQ(old.size(), now.size()) << file << ": the number of program headers of type " << std::hex << type << " changed";
++
++            for (size_t i = 0; i < old.size(); ++i) {
++                EXPECT_EQ(old[i].p_filesz, now[i].p_filesz) << file << ": program header of type " << std::hex << type << " changed its size";
++                EXPECT_TRUE(before.segmentContents(old[i]) == after.segmentContents(now[i])) << file << ": program header of type " << std::hex << type << " describes other contents";
++            }
++        }
++
++        const std::vector<std::string> dynamicOption = before.hasSectionHeaders() ? std::vector<std::string>{} : std::vector<std::string>{"-D"};
++
++        for (const auto& option : {"--dyn-syms", "-V", "-r"}) {
++            auto options = dynamicOption;
++            options.emplace_back(option);
++            EXPECT_EQ(readelf(options, snapshot.copy), readelf(options, file)) << file << ": readelf " << option << " reads differently";
++        }
++
++        auto noteOptions = dynamicOption;
++        noteOptions.emplace_back("-n");
++        EXPECT_EQ(readelfNotes(noteOptions, snapshot.copy), readelfNotes(noteOptions, file)) << file << ": readelf -n finds other notes";
++    }
++
++    const char* libraryDependencySource = "int dep_value(void) { return VALUE; }\n";
++
++    const char* librarySource =
++        "int dep_value(void);\n"
++        "static int calls;\n"
++        "int scale = 2;\n"
++        "__thread int bias = 3;\n"
++        "int run(void) { calls++; return dep_value() + scale + bias + calls - 1; }\n";
++
++    const char* executableSource =
++        "#include <stdio.h>\n"
++        "int run(void);\n"
++        "static char zeros[BSS_SIZE];\n"
++        "static int data_value = 7;\n"
++        "int main(void) {\n"
++        "    long sum = 0;\n"
++        "    for (unsigned long i = 0; i < sizeof(zeros); i += 4096) sum += zeros[i] + zeros[sizeof(zeros) - 1 - i];\n"
++        "    printf(\"run=%d zeros=%ld data=%d\\n\", run(), sum, data_value);\n"
++        "    return 0;\n"
++        "}\n";
++
++    const std::string outputWithA = "run=45 zeros=0 data=7\n";
++    const std::string outputWithB = "run=55 zeros=0 data=7\n";
++
++    enum class Tag {
++        None,
++        RPath,
++        RunPath,
++    };
++
++    std::vector<std::string> tagOptions(Tag tag, const std::string& value) {
++        switch (tag) {
++            case Tag::RPath:
++                return {"-Wl,--disable-new-dtags", "-Wl,-rpath," + value};
++            case Tag::RunPath:
++                return {"-Wl,--enable-new-dtags", "-Wl,-rpath," + value};
++            default:
++                return {};
++        }
++    }
++
++    struct FixtureOptions {
++        Tag libraryTag = Tag::RunPath;
++        std::string libraryValue = "$ORIGIN/../deps-a";
++        Tag executableTag = Tag::RunPath;
++        std::string executableValue = "$ORIGIN/../lib";
++        std::vector<std::string> flags;
++        std::string bssSize = "65536";
++        std::vector<std::string> extraDependencies;
++        size_t librarySymbols = 0;
++        size_t executableSymbols = 0;
++        std::string libraryBssSize;
++    };
++
++    // functions the file exports only to make its dynamic symbol and string tables large
++    std::string exportedFunctions(const std::string& prefix, size_t count) {
++        std::string source;
++
++        for (size_t i = 0; i < count; ++i) {
++            const auto name = prefix + "_exported_function_with_a_rather_long_name_" + std::to_string(i);
++            source += "int " + name + "(void) { return " + std::to_string(i) + "; }\n";
++        }
++
++        return source;
++    }
++
++    // deps-a/libdep.so and deps-b/libdep.so (dep_value 40 and 50), lib/librun.so (run = dep_value + 5, through .data, .bss
++    // and TLS), bin/prog (PIE) and bin/prog-nopie printing run(), a zero check over .bss and a .data value
++    class Fixture {
++        public:
++            fs::path root;
++
++            fs::path library() const {
++                return root / "lib" / "librun.so";
++            }
++
++            fs::path executable() const {
++                return root / "bin" / "prog";
++            }
++
++            fs::path nonPieExecutable() const {
++                return root / "bin" / "prog-nopie";
++            }
++
++            ProcessResult run(const fs::path& executable) const {
++                return runProcess({executable.string()}, root);
++            }
++    };
++
++    void compile(const std::vector<std::string>& arguments, const fs::path& directory) {
++        runOrThrow(arguments, directory);
++    }
++
++    Fixture buildFixture(const fs::path& root, const FixtureOptions& options = {}) {
++        Fixture fixture{root};
++
++        std::string librarySourceText = librarySource;
++        if (!options.libraryBssSize.empty())
++            librarySourceText += "static char reserved[" + options.libraryBssSize + "];\nint reserved_last(void) { return reserved[sizeof(reserved) - 1]; }\n";
++
++        writeFile(root / "src" / "dep.c", libraryDependencySource);
++        writeFile(root / "src" / "lib.c", librarySourceText + exportedFunctions("library", options.librarySymbols));
++        writeFile(root / "src" / "main.c", executableSource + exportedFunctions("program", options.executableSymbols));
++
++        for (const auto& variant : {std::make_pair("deps-a", "40"), std::make_pair("deps-b", "50")}) {
++            fs::create_directories(root / variant.first);
++            std::vector<std::string> arguments{"/usr/bin/gcc", "-shared", "-fPIC", std::string("-DVALUE=") + variant.second,
++                                               "-o", (root / variant.first / "libdep.so").string(), (root / "src" / "dep.c").string(),
++                                               "-Wl,-soname,libdep.so"};
++            arguments.insert(arguments.end(), options.flags.begin(), options.flags.end());
++            compile(arguments, root);
++        }
++
++        for (const auto& name : options.extraDependencies) {
++            writeFile(root / "src" / (name + ".c"), "int " + name + "_marker;\n");
++            compile({"/usr/bin/gcc", "-shared", "-fPIC", "-o", (root / "deps-a" / ("lib" + name + ".so")).string(),
++                     (root / "src" / (name + ".c")).string(), "-Wl,-soname,lib" + name + ".so"}, root);
++            fs::copy_file(root / "deps-a" / ("lib" + name + ".so"), root / "deps-b" / ("lib" + name + ".so"));
++        }
++
++        fs::create_directories(root / "lib");
++        std::vector<std::string> library{"/usr/bin/gcc", "-shared", "-fPIC", "-o", fixture.library().string(),
++                                         (root / "src" / "lib.c").string(), "-Wl,-soname,librun.so", "-L" + (root / "deps-a").string(),
++                                         "-Wl,--no-as-needed", "-ldep"};
++        for (const auto& name : options.extraDependencies)
++            library.push_back("-l" + name);
++        const auto libraryTags = tagOptions(options.libraryTag, options.libraryValue);
++        library.insert(library.end(), libraryTags.begin(), libraryTags.end());
++        library.insert(library.end(), options.flags.begin(), options.flags.end());
++        compile(library, root);
++
++        fs::create_directories(root / "bin");
++        for (const bool pie : {true, false}) {
++            const auto output = pie ? fixture.executable() : fixture.nonPieExecutable();
++            std::vector<std::string> executable{"/usr/bin/gcc", "-DBSS_SIZE=" + options.bssSize, "-o", output.string(),
++                                                (root / "src" / "main.c").string(), "-L" + (root / "lib").string(), "-lrun",
++                                                "-Wl,-rpath-link," + (root / "deps-a").string()};
++            if (!pie) {
++                executable.emplace_back("-fno-pie");
++                executable.emplace_back("-no-pie");
++            }
++            if (options.executableSymbols > 0)
++                executable.emplace_back("-rdynamic");
++            const auto executableTags = tagOptions(options.executableTag, options.executableValue);
++            executable.insert(executable.end(), executableTags.begin(), executableTags.end());
++            executable.insert(executable.end(), options.flags.begin(), options.flags.end());
++            compile(executable, root);
++        }
++
++        return fixture;
++    }
++
++    // a copy of the fixture tree in which the given files are stripped with binutils' strip
++    fs::path strippedCopy(const Fixture& fixture, const std::vector<fs::path>& files) {
++        const auto copy = fixture.root.parent_path() / (fixture.root.filename().string() + "-stripped");
++        fs::remove_all(copy);
++        fs::copy(fixture.root, copy, fs::copy_options::recursive);
++
++        for (const auto& file : files) {
++            const auto target = copy / fs::relative(file, fixture.root);
++            const auto result = runProcess({"/usr/bin/strip", target.string()}, copy);
++
++            if (!result.succeeded())
++                throw std::runtime_error("strip " + target.string() + " failed: " + result.output);
++        }
++
++        return copy;
++    }
++
++    ::testing::AssertionResult runsWith(const fs::path& root, const fs::path& executable, const std::string& expected) {
++        const auto result = runProcess({executable.string()}, root);
++
++        if (result.succeeded() && result.output == expected)
++            return ::testing::AssertionSuccess();
++
++        return ::testing::AssertionFailure() << executable << " printed \"" << result.output << "\" (status " << result.status
++                                             << ") instead of \"" << expected << "\"";
++    }
++
++    ::testing::AssertionResult failsToFind(const fs::path& root, const fs::path& executable, const std::string& library) {
++        const auto result = runProcess({executable.string()}, root);
++
++        if (!result.succeeded() && result.output.find(library) != std::string::npos && result.output.find("cannot open shared object file") != std::string::npos)
++            return ::testing::AssertionSuccess();
++
++        return ::testing::AssertionFailure() << executable << " printed \"" << result.output << "\" (status " << result.status
++                                             << ") instead of failing to find " << library;
++    }
++
++    // runs the strip check: the stripped copies still run like the originals and keep their search paths
++    void expectStrippedCopyWorks(const Fixture& fixture, const std::vector<fs::path>& files, const std::vector<std::pair<fs::path, std::string>>& runs) {
++        fs::path copy;
++
++        try {
++            copy = strippedCopy(fixture, files);
++        } catch (const std::exception& e) {
++            FAIL() << e.what();
++        }
++
++        for (const auto& file : files) {
++            const auto original = rpathEntriesOf(file);
++            const auto stripped = copy / fs::relative(file, fixture.root);
++            EXPECT_TRUE(hasEntries(stripped, original.rpath, original.runpath)) << "after strip";
++        }
++
++        for (const auto& run : runs)
++            EXPECT_TRUE(runsWith(copy, copy / fs::relative(run.first, fixture.root), run.second)) << "after strip";
++    }
++
++    void removeSectionHeaders(const fs::path& file) {
++        auto data = readBytes(file);
++        Elf64_Ehdr ehdr;
++        memcpy(&ehdr, data.data(), sizeof(ehdr));
++        ehdr.e_shoff = 0;
++        ehdr.e_shnum = 0;
++        ehdr.e_shstrndx = 0;
++        memcpy(data.data(), &ehdr, sizeof(ehdr));
++        writeBytes(file, data);
++    }
++
++    class NativeRPathTest : public ::testing::Test {
++        protected:
++            std::optional<TemporaryDirectory> directory;
++
++            void SetUp() override {
++                directory.emplace("native-rpath");
++            }
++
++            fs::path path(const std::string& name) const {
++                return directory->path / name;
++            }
++
++            Fixture fixture(const FixtureOptions& options = {}, const std::string& name = "fixture") const {
++                return buildFixture(path(name), options);
++            }
++
++            Snapshot snapshot(const fs::path& file) const {
++                return Snapshot(file, path("snapshots"));
++            }
++    };
++}
++
++namespace {
++    // gives the fixture's library a DT_RPATH for deps-a and a DT_RUNPATH for deps-b (older linkers wrote both)
++    void giveLibraryBothEntries(const Fixture& fixture) {
++        const auto both = fixture.root / "both" / "librun.so";
++        fs::create_directories(both.parent_path());
++
++        compile({"/usr/bin/gcc", "-shared", "-fPIC", "-o", both.string(), (fixture.root / "src" / "lib.c").string(),
++                 "-L" + (fixture.root / "deps-a").string(), "-ldep", "-Wl,--disable-new-dtags", "-Wl,-rpath,$ORIGIN/../deps-a",
++                 "-Wl,-soname,$ORIGIN/../deps-b"}, fixture.root);
++
++        auto data = readBytes(both);
++        ElfImage image(both);
++
++        for (const auto& phdr : image.phdrs) {
++            if (phdr.p_type != PT_DYNAMIC)
++                continue;
++
++            for (uint64_t position = 0; position + sizeof(Elf64_Dyn) <= phdr.p_filesz; position += sizeof(Elf64_Dyn)) {
++                Elf64_Dyn entry;
++                memcpy(&entry, data.data() + phdr.p_offset + position, sizeof(entry));
++
++                if (entry.d_tag == DT_SONAME) {
++                    entry.d_tag = DT_RUNPATH;
++                    memcpy(data.data() + phdr.p_offset + position, &entry, sizeof(entry));
++                }
++            }
++        }
++
++        writeBytes(both, data);
++        fs::copy_file(both, fixture.library(), fs::copy_options::overwrite_existing);
++    }
++
++    // the offset of a name the linker stored inside another string
++    ::testing::AssertionResult storedInside(const fs::path& file, const std::string& name, int64_t tag) {
++        const ElfImage image(file);
++        const auto value = image.value(tag);
++
++        if (!value.has_value())
++            return ::testing::AssertionFailure() << file << " has no entry with tag " << tag;
++
++        const auto container = image.string(value.value());
++        const auto table = image.at(image.value(DT_STRTAB).value(), image.value(DT_STRSZ).value());
++        const auto end = value.value() + container.size();
++
++        for (uint64_t offset = value.value() + 1; offset < end; ++offset) {
++            if (std::string(table.data() + offset) == name) {
++                const auto symbols = runProcess({"/usr/bin/readelf", "-W", "--dyn-syms", file.string()}, file.parent_path()).output;
++                const auto needed = image.strings(DT_NEEDED);
++
++                if (symbols.find(" " + name + "\n") != std::string::npos || std::find(needed.begin(), needed.end(), name) != needed.end())
++                    return ::testing::AssertionSuccess();
++            }
++        }
++
++        return ::testing::AssertionFailure() << "the linker did not store " << name << " inside \"" << container << "\" in " << file;
++    }
++
++    bool isElfFile(const fs::path& file) {
++        std::ifstream ifs(file, std::ios::binary);
++        char magic[SELFMAG] = {};
++        ifs.read(magic, SELFMAG);
++        return ifs && memcmp(magic, ELFMAG, SELFMAG) == 0;
++    }
++
++    // copies a program of the system, changes its search path and checks it behaves as before, also after strip
++    void expectSystemProgramStillRuns(const fs::path& directory, const std::vector<fs::path>& candidates, const std::vector<std::string>& arguments) {
++        // the first candidate that is a real ELF file, as a system may replace a program with a wrapper script
++        std::optional<fs::path> found;
++        for (const auto& candidate : candidates) {
++            std::error_code error;
++            const auto resolved = fs::canonical(candidate, error);
++
++            if (!error && isElfFile(resolved)) {
++                found = resolved;
++                break;
++            }
++        }
++
++        ASSERT_TRUE(found.has_value()) << "none of the candidates is an ELF file: " << candidates.front();
++        const auto original = found.value();
++
++        const auto copy = directory / "bin" / original.filename();
++        fs::create_directories(copy.parent_path());
++        fs::create_directories(directory / "lib");
++        fs::copy_file(original, copy);
++        const auto snapshot = Snapshot(copy, directory / "snapshots");
++
++        auto command = arguments;
++        command.insert(command.begin(), copy.string());
++        const auto expected = runProcess(command, directory);
++
++        ASSERT_TRUE(setsRPath(copy, "$ORIGIN/../lib:$ORIGIN/../lib/private"));
++        EXPECT_TRUE(rpathIs(copy, "$ORIGIN/../lib:$ORIGIN/../lib/private"));
++
++        const auto changed = runProcess(command, directory);
++        EXPECT_EQ(expected.status, changed.status) << copy;
++        EXPECT_EQ(expected.output, changed.output) << copy;
++
++        expectOnlyRPathChanged(snapshot, copy);
++
++        const auto strippedDirectory = directory / "stripped";
++        const auto stripped = strippedDirectory / "bin" / original.filename();
++        fs::create_directories(stripped.parent_path());
++        fs::create_directories(strippedDirectory / "lib");
++        fs::copy_file(copy, stripped);
++        const auto strip = runProcess({"/usr/bin/strip", stripped.string()}, directory);
++        ASSERT_TRUE(strip.succeeded()) << strip.output;
++
++        command[0] = stripped.string();
++        const auto afterStrip = runProcess(command, strippedDirectory);
++        EXPECT_EQ(expected.status, afterStrip.status) << stripped;
++        EXPECT_EQ(normalized(expected.output, directory), normalized(afterStrip.output, strippedDirectory)) << stripped;
++    }
++
++    fs::path systemLibrary(const std::string& name) {
++        for (const auto& directory : {"/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/lib/x86_64-linux-gnu", "/lib/aarch64-linux-gnu"}) {
++            const auto candidate = fs::path(directory) / name;
++
++            if (fs::exists(candidate))
++                return fs::canonical(candidate);
++        }
++
++        throw std::runtime_error("system library not found: " + name);
++    }
++
++    // runs every check on a fixture built with the given options: both executables get a new search path, and so
++    // does the library, then the files run, read the same otherwise and survive strip
++    void expectLayoutWorks(const fs::path& root, const FixtureOptions& options) {
++        auto adjusted = options;
++        adjusted.executableTag = Tag::None;
++        const auto fixture = buildFixture(root, adjusted);
++
++        EXPECT_TRUE(failsToFind(fixture.root, fixture.executable(), "librun.so"));
++
++        const auto library = Snapshot(fixture.library(), root / "snapshots");
++        const auto executable = Snapshot(fixture.executable(), root / "snapshots");
++        const auto nonPie = Snapshot(fixture.nonPieExecutable(), root / "snapshots");
++
++        const std::string libraryValue = "/nonexistent/first/directory/of/the/library:$ORIGIN/../deps-b";
++        ASSERT_TRUE(setsRPath(fixture.library(), libraryValue));
++        ASSERT_TRUE(setsRPath(fixture.executable(), "$ORIGIN/../lib"));
++        ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), "$ORIGIN/../lib"));
++
++        EXPECT_TRUE(hasEntries(fixture.library(), {}, {libraryValue}));
++        EXPECT_TRUE(hasEntries(fixture.executable(), {}, {"$ORIGIN/../lib"}));
++        EXPECT_TRUE(hasEntries(fixture.nonPieExecutable(), {}, {"$ORIGIN/../lib"}));
++
++        EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++        EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithB));
++
++        expectOnlyRPathChanged(library, fixture.library());
++        expectOnlyRPathChanged(executable, fixture.executable());
++        expectOnlyRPathChanged(nonPie, fixture.nonPieExecutable());
++
++        expectStrippedCopyWorks(fixture, {fixture.library(), fixture.executable(), fixture.nonPieExecutable()},
++                                {{fixture.executable(), outputWithB}, {fixture.nonPieExecutable(), outputWithB}});
++    }
++
++    // files whose string tables are too large for the padding between segments
++    FixtureOptions largeStringTables(std::vector<std::string> flags) {
++        FixtureOptions options;
++        options.flags = std::move(flags);
++        options.librarySymbols = 600;
++        options.executableSymbols = 600;
++        return options;
++    }
++
++    // gcc links with LLVM's lld when a directory on its program path has an ld.lld; distributions keep lld in the
++    // directory of their LLVM version
++    std::vector<std::string> lldFlags() {
++        static const fs::path directory = []() {
++            const auto result = makeTemporaryDirectory("native-rpath-lld");
++            std::vector<fs::path> candidates{"/usr/bin/ld.lld"};
++
++            for (const auto& entry : fs::directory_iterator("/usr/lib")) {
++                if (entry.path().filename().string().rfind("llvm-", 0) == 0)
++                    candidates.push_back(entry.path() / "bin" / "lld");
++            }
++
++            for (const auto& candidate : candidates) {
++                if (fs::exists(candidate)) {
++                    fs::create_symlink(candidate, result / "ld.lld");
++                    break;
++                }
++            }
++
++            return result;
++        }();
++
++        return {"-B" + directory.string(), "-fuse-ld=lld"};
++    }
++
++    // values that grow well past the gaps between segments, with the files stripped after every other call
++    void expectLongerValuesWithStripInBetweenWork(const fs::path& root, FixtureOptions options) {
++        options.executableTag = Tag::None;
++        const auto fixture = buildFixture(root, options);
++        const std::vector<fs::path> files{fixture.library(), fixture.executable(), fixture.nonPieExecutable()};
++        int call = 0;
++
++        for (const size_t length : {60, 900, 3000, 5000, 9000, 20}) {
++            const auto padding = "/nonexistent/" + std::string(length, static_cast<char>('a' + call));
++            const auto output = call % 2 == 0 ? outputWithB : outputWithA;
++
++            ASSERT_TRUE(setsRPath(fixture.library(), padding + (call % 2 == 0 ? ":$ORIGIN/../deps-b" : ":$ORIGIN/../deps-a")));
++            ASSERT_TRUE(setsRPath(fixture.executable(), padding + ":$ORIGIN/../lib"));
++            ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), padding + ":$ORIGIN/../lib"));
++            EXPECT_TRUE(runsWith(root, fixture.executable(), output)) << "after call " << call;
++            EXPECT_TRUE(runsWith(root, fixture.nonPieExecutable(), output)) << "after call " << call;
++
++            if (call % 2 == 1) {
++                for (const auto& file : files)
++                    ASSERT_TRUE(runProcess({"/usr/bin/strip", file.string()}, root).succeeded()) << "strip " << file;
++
++                EXPECT_TRUE(runsWith(root, fixture.executable(), output)) << "after strip " << call;
++                EXPECT_TRUE(runsWith(root, fixture.nonPieExecutable(), output)) << "after strip " << call;
++            }
++
++            ++call;
++        }
++    }
++
++    // an executable whose DT_AUDIT or DT_DEPAUDIT name the linker stored inside its DT_RUNPATH string; the audit
++    // library announces itself when the dynamic loader loads it
++    void expectAuditNameInsideTheOldRunpathWorks(const fs::path& root, int64_t tag) {
++        FixtureOptions options;
++        options.executableTag = Tag::None;
++        const auto fixture = buildFixture(root, options);
++        const auto audit = root / "audit" / "libaudit.so";
++        const auto program = root / "bin" / "audited";
++
++        writeFile(root / "src" / "audit.c", "#include <unistd.h>\nunsigned int la_version(unsigned int version) { if (write(1, \"audited\\n\", 8) < 0) {} return version; }\n");
++        fs::create_directories(audit.parent_path());
++        compile({"/usr/bin/gcc", "-shared", "-fPIC", "-o", audit.string(), (root / "src" / "audit.c").string()}, root);
++        compile({"/usr/bin/gcc", "-DBSS_SIZE=65536", "-o", program.string(), (root / "src" / "main.c").string(), "-L" + (root / "lib").string(), "-lrun",
++                 "-Wl,-rpath-link," + (root / "deps-a").string(), "-Wl,--enable-new-dtags", "-Wl,-rpath,$ORIGIN/../lib:" + audit.string(),
++                 std::string(tag == DT_AUDIT ? "-Wl,--audit=" : "-Wl,--depaudit=") + audit.string()}, root);
++
++        const ElfImage image(program);
++        const auto runpath = image.value(DT_RUNPATH).value();
++        const auto name = image.value(tag).value();
++        ASSERT_TRUE(name > runpath && name < runpath + image.string(runpath).size()) << "the linker did not store the audit name inside the DT_RUNPATH string";
++
++        const auto expected = runProcess({program.string()}, root);
++        ASSERT_TRUE(expected.succeeded() && expected.output == "audited\n" + outputWithA) << expected.output;
++        const auto before = Snapshot(program, root / "snapshots");
++        const auto value = "$ORIGIN/../lib:/" + std::string(audit.string().size() - 1, 'x');
++
++        ASSERT_TRUE(setsRPath(program, value));
++
++        EXPECT_TRUE(hasEntries(program, {}, {value}));
++        EXPECT_TRUE(runsWith(root, program, expected.output));
++        expectOnlyRPathChanged(before, program);
++    }
++}
++
++TEST_F(NativeRPathTest, getRPathReturnsTheRunpathOfALibrary) {
++    const auto fixture = this->fixture();
++    EXPECT_TRUE(rpathIs(fixture.library(), "$ORIGIN/../deps-a"));
++}
++
++TEST_F(NativeRPathTest, getRPathReturnsTheRunpathOfAnExecutable) {
++    const auto fixture = this->fixture();
++    EXPECT_TRUE(rpathIs(fixture.executable(), "$ORIGIN/../lib"));
++    EXPECT_TRUE(rpathIs(fixture.nonPieExecutable(), "$ORIGIN/../lib"));
++}
++
++TEST_F(NativeRPathTest, getRPathReturnsTheRpathWithoutARunpath) {
++    FixtureOptions options;
++    options.libraryTag = Tag::RPath;
++    options.executableTag = Tag::RPath;
++    options.executableValue = "$ORIGIN/../lib:/opt/unused";
++    const auto fixture = this->fixture(options);
++
++    EXPECT_TRUE(rpathIs(fixture.library(), "$ORIGIN/../deps-a"));
++    EXPECT_TRUE(rpathIs(fixture.executable(), "$ORIGIN/../lib:/opt/unused"));
++}
++
++TEST_F(NativeRPathTest, getRPathPrefersTheRunpathOverTheRpath) {
++    const auto fixture = this->fixture();
++    giveLibraryBothEntries(fixture);
++
++    ASSERT_TRUE(hasEntries(fixture.library(), {"$ORIGIN/../deps-a"}, {"$ORIGIN/../deps-b"}));
++    ASSERT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    EXPECT_TRUE(rpathIs(fixture.library(), "$ORIGIN/../deps-b"));
++}
++
++TEST_F(NativeRPathTest, getRPathIsEmptyWithoutEither) {
++    FixtureOptions options;
++    options.libraryTag = Tag::None;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++
++    EXPECT_TRUE(rpathIs(fixture.library(), ""));
++    EXPECT_TRUE(rpathIs(fixture.executable(), ""));
++    EXPECT_TRUE(rpathIs(fixture.nonPieExecutable(), ""));
++}
++
++TEST_F(NativeRPathTest, getRPathOfAStaticExecutableIsEmpty) {
++    writeFile(path("static.c"), "int main(void) { return 0; }\n");
++    compile({"/usr/bin/gcc", "-static", "-o", path("static").string(), path("static.c").string()}, path(""));
++
++    EXPECT_TRUE(rpathIs(path("static"), ""));
++}
++
++TEST_F(NativeRPathTest, getRPathWorksWithoutSectionHeaders) {
++    FixtureOptions options;
++    options.libraryTag = Tag::RPath;
++    options.libraryValue = "$ORIGIN/../deps-a:/opt/without/sections";
++    const auto fixture = this->fixture(options);
++    removeSectionHeaders(fixture.library());
++    removeSectionHeaders(fixture.executable());
++
++    EXPECT_TRUE(rpathIs(fixture.library(), "$ORIGIN/../deps-a:/opt/without/sections"));
++    EXPECT_TRUE(rpathIs(fixture.executable(), "$ORIGIN/../lib"));
++}
++
++TEST_F(NativeRPathTest, setRPathReplacesTheRunpathOfALibrary) {
++    const auto fixture = this->fixture();
++    const auto before = snapshot(fixture.library());
++    ASSERT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "$ORIGIN/../deps-b"));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {"$ORIGIN/../deps-b"}));
++    EXPECT_TRUE(rpathIs(fixture.library(), "$ORIGIN/../deps-b"));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithB));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, setRPathReplacesTheRunpathOfAnExecutable) {
++    const auto fixture = this->fixture();
++    const auto executable = snapshot(fixture.executable());
++    const auto nonPie = snapshot(fixture.nonPieExecutable());
++    fs::rename(fixture.root / "lib", fixture.root / "moved-lib");
++    ASSERT_TRUE(failsToFind(fixture.root, fixture.executable(), "librun.so"));
++    ASSERT_TRUE(failsToFind(fixture.root, fixture.nonPieExecutable(), "librun.so"));
++
++    ASSERT_TRUE(setsRPath(fixture.executable(), "$ORIGIN/../moved-lib"));
++    ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), "$ORIGIN/../moved-lib"));
++
++    EXPECT_TRUE(hasEntries(fixture.executable(), {}, {"$ORIGIN/../moved-lib"}));
++    EXPECT_TRUE(hasEntries(fixture.nonPieExecutable(), {}, {"$ORIGIN/../moved-lib"}));
++    EXPECT_TRUE(rpathIs(fixture.executable(), "$ORIGIN/../moved-lib"));
++    EXPECT_TRUE(rpathIs(fixture.nonPieExecutable(), "$ORIGIN/../moved-lib"));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithA));
++    expectOnlyRPathChanged(executable, fixture.executable());
++    expectOnlyRPathChanged(nonPie, fixture.nonPieExecutable());
++}
++
++TEST_F(NativeRPathTest, setRPathWithALongerValue) {
++    const auto fixture = this->fixture();
++    const auto before = snapshot(fixture.library());
++    const std::string value = "/nonexistent/directory/searched/first/by/the/loader:$ORIGIN/../deps-b:$ORIGIN/../deps-a";
++
++    ASSERT_TRUE(setsRPath(fixture.library(), value));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {value}));
++    EXPECT_TRUE(rpathIs(fixture.library(), value));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, setRPathWithAShorterValue) {
++    FixtureOptions options;
++    options.libraryValue = "$ORIGIN/../deps-a:/a/long/directory/that/is/never/used/by/the/loader";
++    const auto fixture = this->fixture(options);
++    const auto before = snapshot(fixture.library());
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "$ORIGIN/../deps-b"));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {"$ORIGIN/../deps-b"}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, setRPathKeepsTheRpathTagOfALibrary) {
++    FixtureOptions options;
++    options.libraryTag = Tag::RPath;
++    const auto fixture = this->fixture(options);
++    const auto before = snapshot(fixture.library());
++    const std::string value = "/nonexistent:$ORIGIN/../deps-b";
++
++    ASSERT_TRUE(setsRPath(fixture.library(), value));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {value}, {}));
++    EXPECT_TRUE(rpathIs(fixture.library(), value));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, setRPathKeepsTheRpathTagOfAnExecutable) {
++    FixtureOptions options;
++    options.executableTag = Tag::RPath;
++    options.executableValue = "/nonexistent";
++    const auto fixture = this->fixture(options);
++    const auto executable = snapshot(fixture.executable());
++    const auto nonPie = snapshot(fixture.nonPieExecutable());
++
++    ASSERT_TRUE(failsToFind(fixture.root, fixture.executable(), "librun.so"));
++    ASSERT_TRUE(setsRPath(fixture.executable(), "$ORIGIN/../lib:/nonexistent/too"));
++    ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), "$ORIGIN/../lib:/nonexistent/too"));
++
++    EXPECT_TRUE(hasEntries(fixture.executable(), {"$ORIGIN/../lib:/nonexistent/too"}, {}));
++    EXPECT_TRUE(hasEntries(fixture.nonPieExecutable(), {"$ORIGIN/../lib:/nonexistent/too"}, {}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithA));
++    expectOnlyRPathChanged(executable, fixture.executable());
++    expectOnlyRPathChanged(nonPie, fixture.nonPieExecutable());
++}
++
++TEST_F(NativeRPathTest, setRPathOnAFileWithBothEntriesKeepsBothTags) {
++    const auto fixture = this->fixture();
++    giveLibraryBothEntries(fixture);
++    const auto before = snapshot(fixture.library());
++    const std::string value = "$ORIGIN/../deps-a:/nonexistent";
++
++    ASSERT_TRUE(setsRPath(fixture.library(), value));
++
++    const auto entries = rpathEntriesOf(fixture.library());
++    EXPECT_EQ(std::vector<std::string>{value}, entries.runpath);
++    ASSERT_EQ(1u, entries.rpath.size());
++    EXPECT_TRUE(entries.rpath.front() == value || entries.rpath.front() == "$ORIGIN/../deps-a") << entries.rpath.front();
++    EXPECT_TRUE(rpathIs(fixture.library(), value));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, setRPathAddsARunpathToALibraryWithoutOne) {
++    FixtureOptions options;
++    options.libraryTag = Tag::None;
++    const auto fixture = this->fixture(options);
++    const auto before = snapshot(fixture.library());
++    ASSERT_TRUE(failsToFind(fixture.root, fixture.executable(), "libdep.so"));
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "$ORIGIN/../deps-b"));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {"$ORIGIN/../deps-b"}));
++    EXPECT_TRUE(rpathIs(fixture.library(), "$ORIGIN/../deps-b"));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithB));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, setRPathAddsARunpathToAPieExecutableWithoutOne) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++    const auto before = snapshot(fixture.executable());
++    ASSERT_TRUE(failsToFind(fixture.root, fixture.executable(), "librun.so"));
++
++    ASSERT_TRUE(setsRPath(fixture.executable(), "$ORIGIN/../lib"));
++
++    EXPECT_TRUE(hasEntries(fixture.executable(), {}, {"$ORIGIN/../lib"}));
++    EXPECT_TRUE(rpathIs(fixture.executable(), "$ORIGIN/../lib"));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    expectOnlyRPathChanged(before, fixture.executable());
++}
++
++TEST_F(NativeRPathTest, setRPathAddsARunpathToANonPieExecutableWithoutOne) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++    const auto before = snapshot(fixture.nonPieExecutable());
++    ASSERT_TRUE(failsToFind(fixture.root, fixture.nonPieExecutable(), "librun.so"));
++
++    ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), "$ORIGIN/../lib"));
++
++    EXPECT_TRUE(hasEntries(fixture.nonPieExecutable(), {}, {"$ORIGIN/../lib"}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithA));
++    expectOnlyRPathChanged(before, fixture.nonPieExecutable());
++}
++
++TEST_F(NativeRPathTest, setRPathAcceptsAnEmptyValue) {
++    const auto fixture = this->fixture();
++    const auto before = snapshot(fixture.library());
++    ASSERT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++
++    ASSERT_TRUE(setsRPath(fixture.library(), ""));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {""}));
++    EXPECT_TRUE(rpathIs(fixture.library(), ""));
++    EXPECT_TRUE(failsToFind(fixture.root, fixture.executable(), "libdep.so"));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, setRPathAcceptsAVeryLongValue) {
++    const auto fixture = this->fixture();
++    const auto before = snapshot(fixture.library());
++    const auto value = "/nonexistent/" + std::string(9000, 'x') + ":$ORIGIN/../deps-b";
++
++    ASSERT_TRUE(setsRPath(fixture.library(), value));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {value}));
++    EXPECT_TRUE(rpathIs(fixture.library(), value));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, setRPathWithTheCurrentValueKeepsTheFileWorking) {
++    const auto fixture = this->fixture();
++    const auto before = snapshot(fixture.library());
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "$ORIGIN/../deps-a"));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {"$ORIGIN/../deps-a"}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, setRPathThroughASymlinkChangesTheFileItPointsTo) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++    const auto library = snapshot(fixture.library());
++    const auto executable = snapshot(fixture.executable());
++    const auto links = fixture.root / "links";
++    fs::create_directories(links);
++    fs::create_symlink("../lib/librun.so", links / "librun.so");
++    fs::create_symlink("../bin/prog", links / "prog");
++    ASSERT_TRUE(failsToFind(fixture.root, fixture.executable(), "librun.so"));
++
++    ASSERT_TRUE(setsRPath(links / "librun.so", "$ORIGIN/../deps-b"));
++    ASSERT_TRUE(setsRPath(links / "prog", "$ORIGIN/../lib"));
++
++    EXPECT_TRUE(fs::is_symlink(links / "librun.so"));
++    EXPECT_TRUE(fs::is_symlink(links / "prog"));
++    EXPECT_EQ(fs::path("../lib/librun.so"), fs::read_symlink(links / "librun.so"));
++    EXPECT_EQ(fs::path("../bin/prog"), fs::read_symlink(links / "prog"));
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {"$ORIGIN/../deps-b"}));
++    EXPECT_TRUE(hasEntries(fixture.executable(), {}, {"$ORIGIN/../lib"}));
++    EXPECT_TRUE(rpathIs(links / "prog", "$ORIGIN/../lib"));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    expectOnlyRPathChanged(library, fixture.library());
++    expectOnlyRPathChanged(executable, fixture.executable());
++}
++
++TEST_F(NativeRPathTest, setRPathUsesOriginInBracesToo) {
++    const auto fixture = this->fixture();
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "${ORIGIN}/../deps-b"));
++
++    EXPECT_TRUE(rpathIs(fixture.library(), "${ORIGIN}/../deps-b"));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++}
++
++TEST_F(NativeRPathTest, otherDynamicEntriesAndNamesReadTheSame) {
++    FixtureOptions options;
++    for (int i = 0; i < 24; ++i)
++        options.extraDependencies.push_back("extra" + std::to_string(i));
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++    const auto library = snapshot(fixture.library());
++    const auto executable = snapshot(fixture.executable());
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "/first/unused/directory:$ORIGIN/../deps-b:/last/unused/directory"));
++    ASSERT_TRUE(setsRPath(fixture.executable(), "/first/unused/directory:$ORIGIN/../lib"));
++
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    expectOnlyRPathChanged(library, fixture.library());
++    expectOnlyRPathChanged(executable, fixture.executable());
++}
++
++TEST_F(NativeRPathTest, aSymbolNameStoredInsideTheOldRunpathStillReadsTheSame) {
++    FixtureOptions options;
++    options.libraryValue = "$ORIGIN/../deps-a:/opt/fixture/run";
++    const auto fixture = this->fixture(options);
++    ASSERT_TRUE(storedInside(fixture.library(), "run", DT_RUNPATH));
++    const auto before = snapshot(fixture.library());
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "$ORIGIN/../deps-b"));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {"$ORIGIN/../deps-b"}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, aSymbolNameStoredInsideTheOldRunpathSurvivesALongerValue) {
++    FixtureOptions options;
++    options.libraryValue = "$ORIGIN/../deps-a:/opt/fixture/run";
++    const auto fixture = this->fixture(options);
++    ASSERT_TRUE(storedInside(fixture.library(), "run", DT_RUNPATH));
++    const auto before = snapshot(fixture.library());
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "$ORIGIN/../deps-b:/a/much/longer/value/than/the/one/the/linker/wrote/there"));
++
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, aNeededNameStoredInsideTheOldRpathStillReadsTheSame) {
++    FixtureOptions options;
++    options.libraryTag = Tag::RPath;
++    options.libraryValue = "$ORIGIN/../deps-a:/opt/fixture/libdep.so";
++    const auto fixture = this->fixture(options);
++    ASSERT_TRUE(storedInside(fixture.library(), "libdep.so", DT_RPATH));
++    const auto before = snapshot(fixture.library());
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "$ORIGIN/../deps-b"));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {"$ORIGIN/../deps-b"}, {}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, anAuditNameStoredInsideTheOldRunpathStillReadsTheSame) {
++    expectAuditNameInsideTheOldRunpathWorks(path("fixture"), DT_AUDIT);
++}
++
++TEST_F(NativeRPathTest, aDependencyAuditNameStoredInsideTheOldRunpathStillReadsTheSame) {
++    expectAuditNameInsideTheOldRunpathWorks(path("fixture"), DT_DEPAUDIT);
++}
++
++TEST_F(NativeRPathTest, exceptionsAndThreadLocalsStillWork) {
++    writeFile(path("cxx/src/lib.cpp"),
++              "#include <stdexcept>\n"
++              "extern \"C\" int dep_value(void);\n"
++              "thread_local int calls = 0;\n"
++              "int checked(int value) { ++calls; if (value > 100) throw std::runtime_error(\"too big\"); return value + dep_value() + calls; }\n");
++    writeFile(path("cxx/src/main.cpp"),
++              "#include <iostream>\n#include <stdexcept>\n#include <thread>\n"
++              "int checked(int value);\n"
++              "int main() {\n"
++              "    int result = 0;\n"
++              "    std::thread worker([&result]() { try { checked(1000); } catch (const std::exception& e) { result = checked(2); } });\n"
++              "    worker.join();\n"
++              "    std::cout << \"result=\" << result << std::endl;\n"
++              "}\n");
++    writeFile(path("cxx/src/dep.c"), "int dep_value(void) { return 40; }\n");
++
++    const auto root = path("cxx");
++    fs::create_directories(root / "deps");
++    fs::create_directories(root / "lib");
++    fs::create_directories(root / "bin");
++    compile({"/usr/bin/gcc", "-shared", "-fPIC", "-o", (root / "deps/libdep.so").string(), (root / "src/dep.c").string()}, root);
++    compile({"/usr/bin/g++", "-shared", "-fPIC", "-o", (root / "lib/libchecked.so").string(), (root / "src/lib.cpp").string(),
++             "-L" + (root / "deps").string(), "-ldep"}, root);
++    compile({"/usr/bin/g++", "-o", (root / "bin/checked").string(), (root / "src/main.cpp").string(), "-pthread",
++             "-L" + (root / "lib").string(), "-lchecked", "-Wl,-rpath-link," + (root / "deps").string()}, root);
++
++    Fixture fixture{root};
++    ASSERT_TRUE(setsRPath(root / "lib/libchecked.so", "$ORIGIN/../deps"));
++    ASSERT_TRUE(setsRPath(root / "bin/checked", "$ORIGIN/../lib"));
++
++    EXPECT_TRUE(runsWith(root, root / "bin/checked", "result=44\n"));
++    expectStrippedCopyWorks(fixture, {root / "lib/libchecked.so", root / "bin/checked"}, {{root / "bin/checked", "result=44\n"}});
++}
++
++TEST_F(NativeRPathTest, strippedLibraryStillLoads) {
++    const auto fixture = this->fixture();
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "/nonexistent/directory/before/the/right/one:$ORIGIN/../deps-b"));
++    ASSERT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++
++    expectStrippedCopyWorks(fixture, {fixture.library()}, {{fixture.executable(), outputWithB}, {fixture.nonPieExecutable(), outputWithB}});
++}
++
++TEST_F(NativeRPathTest, strippedPieExecutableStillRuns) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++
++    ASSERT_TRUE(setsRPath(fixture.executable(), "/nonexistent/directory/before/the/right/one:$ORIGIN/../lib"));
++    ASSERT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++
++    expectStrippedCopyWorks(fixture, {fixture.executable()}, {{fixture.executable(), outputWithA}});
++}
++
++TEST_F(NativeRPathTest, strippedNonPieExecutableStillRuns) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++
++    ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), "/nonexistent/directory/before/the/right/one:$ORIGIN/../lib"));
++    ASSERT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithA));
++
++    expectStrippedCopyWorks(fixture, {fixture.nonPieExecutable()}, {{fixture.nonPieExecutable(), outputWithA}});
++}
++
++TEST_F(NativeRPathTest, strippedFilesWithReplacedEntriesStillRun) {
++    FixtureOptions options;
++    options.libraryTag = Tag::RPath;
++    const auto fixture = this->fixture(options);
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "$ORIGIN/../deps-b:/a/longer/value/than/before"));
++    ASSERT_TRUE(setsRPath(fixture.executable(), "$ORIGIN/../lib:/a/longer/value/than/before"));
++    ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), "$ORIGIN/../lib:/a/longer/value/than/before"));
++
++    expectStrippedCopyWorks(fixture, {fixture.library(), fixture.executable(), fixture.nonPieExecutable()},
++                            {{fixture.executable(), outputWithB}, {fixture.nonPieExecutable(), outputWithB}});
++}
++
++TEST_F(NativeRPathTest, setRPathOnAFileThatWasChangedAndStrippedBefore) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++
++    for (const auto& file : {fixture.library(), fixture.executable()}) {
++        ASSERT_TRUE(setsRPath(file, file == fixture.library() ? "$ORIGIN/../deps-b" : "$ORIGIN/../lib"));
++        ASSERT_TRUE(runProcess({"/usr/bin/strip", file.string()}, fixture.root).succeeded());
++    }
++
++    ASSERT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "/nonexistent/one:/nonexistent/two:$ORIGIN/../deps-a"));
++    ASSERT_TRUE(setsRPath(fixture.executable(), "/nonexistent/one:$ORIGIN/../lib"));
++
++    EXPECT_TRUE(rpathIs(fixture.library(), "/nonexistent/one:/nonexistent/two:$ORIGIN/../deps-a"));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    expectStrippedCopyWorks(fixture, {fixture.library(), fixture.executable()}, {{fixture.executable(), outputWithA}});
++}
++
++TEST_F(NativeRPathTest, setRPathOnExecutablesPatchelfChangedBefore) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    options.bssSize = "16384";
++    const auto fixture = this->fixture(options);
++    const std::vector<fs::path> executables{fixture.executable(), fixture.nonPieExecutable()};
++
++    for (const auto& file : executables)
++        runOrThrow({"/usr/bin/patchelf", "--set-rpath", "$ORIGIN/../lib", file.string()}, fixture.root);
++
++    ASSERT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    ASSERT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithA));
++    const auto executable = snapshot(fixture.executable());
++    const auto nonPie = snapshot(fixture.nonPieExecutable());
++    const auto value = "/nonexistent/" + std::string(5000, 'p') + ":$ORIGIN/../lib";
++
++    ASSERT_TRUE(setsRPath(fixture.executable(), value));
++    ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), value));
++
++    EXPECT_TRUE(hasEntries(fixture.executable(), {}, {value}));
++    EXPECT_TRUE(hasEntries(fixture.nonPieExecutable(), {}, {value}));
++    EXPECT_TRUE(rpathIs(fixture.nonPieExecutable(), value));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithA));
++    expectOnlyRPathChanged(executable, fixture.executable());
++    expectOnlyRPathChanged(nonPie, fixture.nonPieExecutable());
++    expectStrippedCopyWorks(fixture, executables, {{fixture.executable(), outputWithA}, {fixture.nonPieExecutable(), outputWithA}});
++}
++
++TEST_F(NativeRPathTest, setRPathOnExecutablesWhoseInterpreterPatchelfSet) {
++    const auto fixture = this->fixture();
++    const std::vector<fs::path> executables{fixture.executable(), fixture.nonPieExecutable()};
++
++    for (const auto& file : executables)
++        runOrThrow({"/usr/bin/patchelf", "--set-interpreter", ElfImage(file).interpreter(), file.string()}, fixture.root);
++
++    ASSERT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    ASSERT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithA));
++    const auto executable = snapshot(fixture.executable());
++    const auto nonPie = snapshot(fixture.nonPieExecutable());
++    const auto value = "/nonexistent/" + std::string(300, 'i') + ":$ORIGIN/../lib";
++
++    ASSERT_TRUE(setsRPath(fixture.executable(), value));
++    ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), value));
++
++    EXPECT_TRUE(hasEntries(fixture.executable(), {}, {value}));
++    EXPECT_TRUE(hasEntries(fixture.nonPieExecutable(), {}, {value}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithA));
++    expectOnlyRPathChanged(executable, fixture.executable());
++    expectOnlyRPathChanged(nonPie, fixture.nonPieExecutable());
++    expectStrippedCopyWorks(fixture, executables, {{fixture.executable(), outputWithA}, {fixture.nonPieExecutable(), outputWithA}});
++}
++
++TEST_F(NativeRPathTest, bashStillRuns) {
++    expectSystemProgramStillRuns(path("bash"), {"/usr/bin/bash", "/bin/bash", "/usr/bin/bash.real"}, {"-c", "echo $((6 * 7)); x=(a b c); echo ${#x[@]} ${x[1]}"});
++}
++
++TEST_F(NativeRPathTest, pythonStillRuns) {
++    expectSystemProgramStillRuns(path("python"), {"/usr/bin/python3", "/usr/bin/python3.11", "/usr/bin/python3.real"},
++                                 {"-c", "import json, hashlib, zlib; print(json.dumps({'a': [1, 2]}), hashlib.sha256(b'x').hexdigest()[:12], zlib.crc32(b'abc'))"});
++}
++
++TEST_F(NativeRPathTest, perlStillRuns) {
++    expectSystemProgramStillRuns(path("perl"), {"/usr/bin/perl", "/usr/bin/perl5.36.0", "/usr/bin/perl.real"}, {"-e", "my %h = (a => 1, b => 2); print join(',', map { \"$_=$h{$_}\" } sort keys %h), \"\\n\""});
++}
++
++TEST_F(NativeRPathTest, makeStillRuns) {
++    writeFile(path("make/Makefile"), "all:\n\t@echo built $(words a b c)\n");
++    expectSystemProgramStillRuns(path("make"), {"/usr/bin/make", "/usr/bin/make.real"}, {"-s", "-f", path("make/Makefile").string()});
++}
++
++TEST_F(NativeRPathTest, tarStillRuns) {
++    expectSystemProgramStillRuns(path("tar"), {"/usr/bin/tar", "/bin/tar", "/usr/bin/tar.real"}, {"--version"});
++}
++
++TEST_F(NativeRPathTest, readelfStillRuns) {
++    expectSystemProgramStillRuns(path("readelf"), {"/usr/bin/readelf", "/usr/bin/readelf.real"}, {"-h", "/usr/bin/true"});
++}
++
++TEST_F(NativeRPathTest, linkerStillRuns) {
++    expectSystemProgramStillRuns(path("ld"), {"/usr/bin/ld.bfd", "/usr/bin/ld"}, {"--version"});
++}
++
++TEST_F(NativeRPathTest, gdbStillRuns) {
++    expectSystemProgramStillRuns(path("gdb"), {"/usr/bin/gdb", "/usr/bin/gdb.real"}, {"-nx", "-batch", "-ex", "print 6 * 7"});
++}
++
++TEST_F(NativeRPathTest, lsStillRuns) {
++    expectSystemProgramStillRuns(path("ls"), {"/usr/bin/ls", "/bin/ls", "/usr/bin/ls.real"}, {"-1", "/usr/share"});
++}
++
++TEST_F(NativeRPathTest, systemZlibStillLoads) {
++    const auto root = path("zlib");
++    fs::create_directories(root / "lib");
++    fs::create_directories(root / "bin");
++    fs::copy_file(systemLibrary("libz.so.1"), root / "lib" / "libz.so.1");
++
++    writeFile(root / "host.c",
++              "#include <stdio.h>\n"
++              "const char* zlibVersion(void);\n"
++              "unsigned long crc32(unsigned long crc, const unsigned char* data, unsigned int length);\n"
++              "int main(void) { printf(\"%s %lu\\n\", zlibVersion(), crc32(0, (const unsigned char*) \"abc\", 3)); return 0; }\n");
++    compile({"/usr/bin/gcc", "-o", (root / "bin/host").string(), (root / "host.c").string(), (root / "lib/libz.so.1").string(),
++             "-Wl,--enable-new-dtags", "-Wl,-rpath,$ORIGIN/../lib"}, root);
++
++    const auto expected = runProcess({(root / "bin/host").string()}, root);
++    ASSERT_TRUE(expected.succeeded()) << expected.output;
++    const auto before = snapshot(root / "lib" / "libz.so.1");
++
++    ASSERT_TRUE(setsRPath(root / "lib" / "libz.so.1", "$ORIGIN/private:$ORIGIN"));
++
++    EXPECT_TRUE(rpathIs(root / "lib" / "libz.so.1", "$ORIGIN/private:$ORIGIN"));
++    EXPECT_TRUE(runsWith(root, root / "bin/host", expected.output));
++    expectOnlyRPathChanged(before, root / "lib" / "libz.so.1");
++    expectStrippedCopyWorks(Fixture{root}, {root / "lib" / "libz.so.1"}, {{root / "bin/host", expected.output}});
++}
++
++TEST_F(NativeRPathTest, systemCxxLibraryStillLoads) {
++    const auto root = path("libstdcxx");
++    fs::create_directories(root / "lib");
++    fs::create_directories(root / "bin");
++    fs::copy_file(systemLibrary("libstdc++.so.6"), root / "lib" / "libstdc++.so.6");
++
++    writeFile(root / "host.cpp",
++              "#include <iostream>\n#include <map>\n#include <stdexcept>\n#include <string>\n"
++              "int main() {\n"
++              "    std::map<std::string, int> counts{{\"a\", 1}, {\"b\", 2}};\n"
++              "    try { counts.at(\"c\"); } catch (const std::out_of_range&) { counts[\"c\"] = 3; }\n"
++              "    for (const auto& entry : counts) std::cout << entry.first << entry.second;\n"
++              "    std::cout << std::endl;\n"
++              "}\n");
++    compile({"/usr/bin/g++", "-o", (root / "bin/host").string(), (root / "host.cpp").string(), "-Wl,--enable-new-dtags",
++             "-Wl,-rpath,$ORIGIN/../lib"}, root);
++
++    const auto expected = runProcess({(root / "bin/host").string()}, root);
++    ASSERT_TRUE(expected.succeeded()) << expected.output;
++    const auto before = snapshot(root / "lib" / "libstdc++.so.6");
++
++    ASSERT_TRUE(setsRPath(root / "lib" / "libstdc++.so.6", "$ORIGIN"));
++
++    EXPECT_TRUE(runsWith(root, root / "bin/host", expected.output));
++    expectOnlyRPathChanged(before, root / "lib" / "libstdc++.so.6");
++    expectStrippedCopyWorks(Fixture{root}, {root / "lib" / "libstdc++.so.6"}, {{root / "bin/host", expected.output}});
++}
++
++TEST_F(NativeRPathTest, twoMebibyteAlignedFiles) {
++    FixtureOptions options;
++    options.flags = {"-Wl,-z,max-page-size=0x200000"};
++    expectLayoutWorks(path("fixture"), options);
++}
++
++TEST_F(NativeRPathTest, twoMebibyteAlignedFilesWithSeparateCode) {
++    FixtureOptions options;
++    options.flags = {"-Wl,-z,max-page-size=0x200000", "-Wl,-z,separate-code"};
++    expectLayoutWorks(path("fixture"), options);
++}
++
++TEST_F(NativeRPathTest, smallPagesWithoutSeparateCode) {
++    FixtureOptions options;
++    options.flags = {"-Wl,-z,max-page-size=0x1000", "-Wl,-z,noseparate-code"};
++    expectLayoutWorks(path("fixture"), options);
++}
++
++TEST_F(NativeRPathTest, filesWithoutRelro) {
++    FixtureOptions options;
++    options.flags = {"-Wl,-z,norelro"};
++    expectLayoutWorks(path("fixture"), options);
++}
++
++TEST_F(NativeRPathTest, filesBoundNow) {
++    FixtureOptions options;
++    options.flags = {"-Wl,-z,now"};
++    expectLayoutWorks(path("fixture"), options);
++}
++
++TEST_F(NativeRPathTest, filesWithSysvHashTables) {
++    FixtureOptions options;
++    options.flags = {"-Wl,--hash-style=sysv"};
++    expectLayoutWorks(path("fixture"), options);
++}
++
++TEST_F(NativeRPathTest, filesWithBothHashTables) {
++    FixtureOptions options;
++    options.flags = {"-Wl,--hash-style=both"};
++    expectLayoutWorks(path("fixture"), options);
++}
++
++TEST_F(NativeRPathTest, filesWithManyDependencies) {
++    FixtureOptions options;
++    for (int i = 0; i < 40; ++i)
++        options.extraDependencies.push_back("many" + std::to_string(i));
++    expectLayoutWorks(path("fixture"), options);
++}
++
++TEST_F(NativeRPathTest, filesWithALargeBss) {
++    FixtureOptions options;
++    options.bssSize = std::to_string(64 << 20);
++    expectLayoutWorks(path("fixture"), options);
++}
++
++TEST_F(NativeRPathTest, filesWithoutSeparateCodeAndLargeStringTables) {
++    expectLayoutWorks(path("fixture"), largeStringTables({"-Wl,-z,noseparate-code"}));
++}
++
++TEST_F(NativeRPathTest, filesWithoutSeparateCodeOrBuildIdAndLargeStringTables) {
++    expectLayoutWorks(path("fixture"), largeStringTables({"-Wl,-z,noseparate-code", "-Wl,--build-id=none"}));
++}
++
++TEST_F(NativeRPathTest, goldLinkedFilesWithLargeStringTables) {
++    expectLayoutWorks(path("fixture"), largeStringTables({"-fuse-ld=gold"}));
++}
++
++TEST_F(NativeRPathTest, goldLinkedFilesWithReadOnlyDataInItsOwnSegment) {
++    FixtureOptions options;
++    options.flags = {"-fuse-ld=gold", "-Wl,--rosegment"};
++    expectLayoutWorks(path("fixture"), options);
++}
++
++TEST_F(NativeRPathTest, lldLinkedFilesWithLargeStringTables) {
++    expectLayoutWorks(path("fixture"), largeStringTables(lldFlags()));
++}
++
++namespace {
++    // the library and both executables export so many symbols that their string tables fit into no gap between
++    // segments
++    FixtureOptions largeMemoryOptions() {
++        FixtureOptions options;
++        options.executableTag = Tag::None;
++        options.librarySymbols = 3000;
++        options.executableSymbols = 3000;
++        return options;
++    }
++
++    // the fixture is built three times, with 8 MiB, 64 MiB and 256 MiB of zero-initialized memory reserved in the library
++    // and in both executables, and gets the same changes each time; no file may grow by as much as the memory it
++    // reserves, and reserving more memory may not make a file grow by as much more
++    void expectLargeMemoryDoesNotBloat(const fs::path& root, FixtureOptions options, bool withoutSectionHeaders, int calls) {
++        const std::vector<intmax_t> reserved{intmax_t{8} << 20, intmax_t{64} << 20, intmax_t{256} << 20};
++        std::vector<std::vector<intmax_t>> growth;
++
++        for (const auto memory : reserved) {
++            options.bssSize = std::to_string(memory);
++            options.libraryBssSize = std::to_string(memory);
++
++            const auto fixture = buildFixture(root / ("reserved-" + std::to_string(memory >> 20)), options);
++            const std::vector<fs::path> files{fixture.library(), fixture.executable(), fixture.nonPieExecutable()};
++            std::vector<intmax_t> sizes;
++            std::vector<Snapshot> snapshots;
++
++            for (const auto& file : files) {
++                if (withoutSectionHeaders)
++                    removeSectionHeaders(file);
++
++                sizes.push_back(static_cast<intmax_t>(fs::file_size(file)));
++                snapshots.emplace_back(file, fixture.root.parent_path() / (fixture.root.filename().string() + "-snapshots"));
++            }
++
++            for (int call = 0; call < calls; ++call) {
++                const auto padding = "/nonexistent/" + std::string(static_cast<size_t>(call + 1) * 40, 'x');
++
++                ASSERT_TRUE(setsRPath(fixture.library(), padding + ":$ORIGIN/../deps-b"));
++                ASSERT_TRUE(setsRPath(fixture.executable(), padding + ":$ORIGIN/../lib"));
++                ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), padding + ":$ORIGIN/../lib"));
++
++                EXPECT_TRUE(rpathIs(fixture.library(), padding + ":$ORIGIN/../deps-b"));
++                EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++                EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithB));
++            }
++
++            growth.emplace_back();
++
++            for (size_t i = 0; i < files.size(); ++i) {
++                growth.back().push_back(static_cast<intmax_t>(fs::file_size(files[i])) - sizes[i]);
++                EXPECT_LT(growth.back().back(), memory) << files[i] << " grew by at least as much as the zero-initialized memory it reserves";
++                expectOnlyRPathChanged(snapshots[i], files[i]);
++            }
++
++            if (!withoutSectionHeaders) {
++                expectStrippedCopyWorks(fixture, files, {{fixture.executable(), outputWithB}, {fixture.nonPieExecutable(), outputWithB}});
++            }
++        }
++
++        for (size_t i = 0; i < growth.front().size(); ++i) {
++            EXPECT_LT(growth.back()[i] - growth.front()[i], reserved.back() - reserved.front())
++                << "reserving " << ((reserved.back() - reserved.front()) >> 20) << " MiB more zero-initialized memory made file " << i
++                << " grow by " << growth.back()[i] << " instead of " << growth.front()[i] << " bytes";
++        }
++    }
++}
++
++TEST_F(NativeRPathTest, largeZeroInitializedMemoryDoesNotBloatTheFiles) {
++    expectLargeMemoryDoesNotBloat(path("fixture"), largeMemoryOptions(), false, 1);
++}
++
++TEST_F(NativeRPathTest, largeZeroInitializedMemoryOverRepeatedCalls) {
++    expectLargeMemoryDoesNotBloat(path("fixture"), largeMemoryOptions(), false, 3);
++}
++
++TEST_F(NativeRPathTest, largeZeroInitializedMemoryWithoutSectionHeaders) {
++    expectLargeMemoryDoesNotBloat(path("fixture"), largeMemoryOptions(), true, 2);
++}
++
++TEST_F(NativeRPathTest, largeZeroInitializedMemoryInTwoMebibyteAlignedFiles) {
++    auto options = largeMemoryOptions();
++    options.flags = {"-Wl,-z,max-page-size=0x200000"};
++    expectLargeMemoryDoesNotBloat(path("fixture"), options, false, 1);
++}
++
++TEST_F(NativeRPathTest, largeZeroInitializedMemoryWithRpathEntries) {
++    auto options = largeMemoryOptions();
++    options.libraryTag = Tag::RPath;
++    options.executableTag = Tag::RPath;
++    options.executableValue = "/nonexistent";
++    expectLargeMemoryDoesNotBloat(path("fixture"), options, false, 1);
++}
++
++TEST_F(NativeRPathTest, libraryWithoutSectionHeaders) {
++    const auto fixture = this->fixture();
++    removeSectionHeaders(fixture.library());
++    const auto before = snapshot(fixture.library());
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "/nonexistent/directory/before/the/right/one:$ORIGIN/../deps-b"));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {"/nonexistent/directory/before/the/right/one:$ORIGIN/../deps-b"}));
++    EXPECT_TRUE(rpathIs(fixture.library(), "/nonexistent/directory/before/the/right/one:$ORIGIN/../deps-b"));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithB));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, libraryWithoutSectionHeadersOrRunpath) {
++    FixtureOptions options;
++    options.libraryTag = Tag::None;
++    const auto fixture = this->fixture(options);
++    removeSectionHeaders(fixture.library());
++    const auto before = snapshot(fixture.library());
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "$ORIGIN/../deps-b"));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {"$ORIGIN/../deps-b"}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, pieExecutableWithoutSectionHeaders) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++    removeSectionHeaders(fixture.executable());
++    const auto before = snapshot(fixture.executable());
++
++    ASSERT_TRUE(setsRPath(fixture.executable(), "$ORIGIN/../lib"));
++
++    EXPECT_TRUE(hasEntries(fixture.executable(), {}, {"$ORIGIN/../lib"}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    expectOnlyRPathChanged(before, fixture.executable());
++}
++
++TEST_F(NativeRPathTest, nonPieExecutableWithoutSectionHeaders) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++    removeSectionHeaders(fixture.nonPieExecutable());
++    const auto before = snapshot(fixture.nonPieExecutable());
++
++    ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), "$ORIGIN/../lib"));
++
++    EXPECT_TRUE(hasEntries(fixture.nonPieExecutable(), {}, {"$ORIGIN/../lib"}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithA));
++    expectOnlyRPathChanged(before, fixture.nonPieExecutable());
++}
++
++TEST_F(NativeRPathTest, twoMebibyteAlignedFilesWithoutSectionHeaders) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    options.flags = {"-Wl,-z,max-page-size=0x200000"};
++    const auto fixture = this->fixture(options);
++
++    for (const auto& file : {fixture.library(), fixture.executable(), fixture.nonPieExecutable()})
++        removeSectionHeaders(file);
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "/nonexistent:$ORIGIN/../deps-b"));
++    ASSERT_TRUE(setsRPath(fixture.executable(), "$ORIGIN/../lib"));
++    ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), "$ORIGIN/../lib"));
++
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), outputWithB));
++}
++
++TEST_F(NativeRPathTest, repeatedCallsWithoutSectionHeaders) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++    removeSectionHeaders(fixture.library());
++    removeSectionHeaders(fixture.executable());
++
++    const std::vector<std::pair<std::string, std::string>> steps{
++        {"$ORIGIN/../deps-b", outputWithB},
++        {"/nonexistent/" + std::string(300, 'y') + ":$ORIGIN/../deps-a", outputWithA},
++        {"$ORIGIN/../deps-b", outputWithB},
++    };
++
++    for (const auto& step : steps) {
++        ASSERT_TRUE(setsRPath(fixture.library(), step.first));
++        ASSERT_TRUE(setsRPath(fixture.executable(), "/nonexistent/" + std::to_string(step.first.size()) + ":$ORIGIN/../lib"));
++        EXPECT_TRUE(rpathIs(fixture.library(), step.first));
++        EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), step.second));
++    }
++}
++
++TEST_F(NativeRPathTest, secondCallWithALongerValue) {
++    const auto fixture = this->fixture();
++    const auto before = snapshot(fixture.library());
++
++    ASSERT_TRUE(setsRPath(fixture.library(), "/nonexistent:$ORIGIN/../deps-b"));
++    ASSERT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithB));
++    ASSERT_TRUE(setsRPath(fixture.library(), "/nonexistent/and/a/much/longer/value/than/the/first/call/wrote:$ORIGIN/../deps-a"));
++
++    EXPECT_TRUE(hasEntries(fixture.library(), {}, {"/nonexistent/and/a/much/longer/value/than/the/first/call/wrote:$ORIGIN/../deps-a"}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    expectOnlyRPathChanged(before, fixture.library());
++}
++
++TEST_F(NativeRPathTest, secondCallWithAShorterValue) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++    const auto before = snapshot(fixture.executable());
++
++    ASSERT_TRUE(setsRPath(fixture.executable(), "/nonexistent/a/rather/long/first/value:$ORIGIN/../lib"));
++    ASSERT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    ASSERT_TRUE(setsRPath(fixture.executable(), "$ORIGIN/../lib"));
++
++    EXPECT_TRUE(hasEntries(fixture.executable(), {}, {"$ORIGIN/../lib"}));
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++    expectOnlyRPathChanged(before, fixture.executable());
++}
++
++TEST_F(NativeRPathTest, manyCallsInARow) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++    const auto library = snapshot(fixture.library());
++    const auto executable = snapshot(fixture.executable());
++    const auto nonPie = snapshot(fixture.nonPieExecutable());
++
++    for (int i = 0; i < 8; ++i) {
++        const auto useB = i % 2 == 0;
++        const auto padding = "/nonexistent/" + std::string(static_cast<size_t>((i * 97) % 400), 'p');
++        const auto value = padding + (useB ? ":$ORIGIN/../deps-b" : ":$ORIGIN/../deps-a");
++
++        ASSERT_TRUE(setsRPath(fixture.library(), value));
++        ASSERT_TRUE(setsRPath(fixture.executable(), padding + ":$ORIGIN/../lib"));
++        ASSERT_TRUE(setsRPath(fixture.nonPieExecutable(), padding + ":$ORIGIN/../lib"));
++
++        EXPECT_TRUE(rpathIs(fixture.library(), value));
++        EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), useB ? outputWithB : outputWithA));
++        EXPECT_TRUE(runsWith(fixture.root, fixture.nonPieExecutable(), useB ? outputWithB : outputWithA));
++    }
++
++    expectOnlyRPathChanged(library, fixture.library());
++    expectOnlyRPathChanged(executable, fixture.executable());
++    expectOnlyRPathChanged(nonPie, fixture.nonPieExecutable());
++    expectStrippedCopyWorks(fixture, {fixture.library(), fixture.executable(), fixture.nonPieExecutable()},
++                            {{fixture.executable(), outputWithA}, {fixture.nonPieExecutable(), outputWithA}});
++}
++
++TEST_F(NativeRPathTest, longerValuesWithStripInBetween) {
++    expectLongerValuesWithStripInBetweenWork(path("fixture"), largeStringTables({}));
++}
++
++TEST_F(NativeRPathTest, longerValuesWithStripInBetweenInLldLinkedFiles) {
++    expectLongerValuesWithStripInBetweenWork(path("fixture"), largeStringTables(lldFlags()));
++}
++
++namespace {
++    std::string expectedOutput(const std::string& libraryValue) {
++        std::stringstream elements(libraryValue);
++        std::string element;
++
++        while (std::getline(elements, element, ':')) {
++            if (element == "$ORIGIN/../deps-a" || element == "${ORIGIN}/../deps-a")
++                return outputWithA;
++
++            if (element == "$ORIGIN/../deps-b" || element == "${ORIGIN}/../deps-b")
++                return outputWithB;
++        }
++
++        return {};
++    }
++
++    std::string randomValue(std::mt19937& random, const std::vector<std::string>& useful) {
++        std::vector<std::string> elements;
++        const auto count = std::uniform_int_distribution<int>(1, 3)(random);
++
++        for (int i = 0; i < count; ++i) {
++            if (std::uniform_int_distribution<int>(0, 2)(random) == 0) {
++                const auto length = std::uniform_int_distribution<int>(1, 1200)(random);
++                elements.push_back("/nonexistent/" + std::string(static_cast<size_t>(length), static_cast<char>('a' + i)));
++            } else {
++                elements.push_back(useful[std::uniform_int_distribution<size_t>(0, useful.size() - 1)(random)]);
++            }
++        }
++
++        std::string value;
++        for (const auto& element : elements)
++            value += (value.empty() ? "" : ":") + element;
++
++        return value;
++    }
++
++    // random sequences of changes, on random kinds of files, sometimes stripped in between
++    void runRandomScenarios(const fs::path& directory, unsigned seed, int count) {
++        std::mt19937 random(seed);
++
++        std::vector<std::pair<std::string, FixtureOptions>> variants;
++        variants.emplace_back("plain", FixtureOptions{});
++        {
++            FixtureOptions options;
++            options.libraryTag = Tag::RPath;
++            options.executableTag = Tag::None;
++            variants.emplace_back("rpath", options);
++        }
++        {
++            FixtureOptions options;
++            options.libraryTag = Tag::None;
++            options.flags = {"-Wl,-z,max-page-size=0x200000"};
++            variants.emplace_back("aligned", options);
++        }
++        {
++            FixtureOptions options;
++            options.flags = {"-Wl,--hash-style=sysv", "-Wl,-z,now"};
++            variants.emplace_back("sysv", options);
++        }
++
++        std::vector<Fixture> templates;
++        for (const auto& variant : variants)
++            templates.push_back(buildFixture(directory / ("template-" + variant.first), variant.second));
++
++        const std::vector<std::string> libraryValues{"$ORIGIN/../deps-a", "${ORIGIN}/../deps-b", "$ORIGIN/../deps-b", "${ORIGIN}/../deps-a"};
++        const std::vector<std::string> executableValues{"$ORIGIN/../lib", "${ORIGIN}/../lib"};
++
++        for (int scenario = 0; scenario < count; ++scenario) {
++            const auto& base = templates[std::uniform_int_distribution<size_t>(0, templates.size() - 1)(random)];
++            const auto root = directory / ("scenario-" + std::to_string(scenario));
++            fs::copy(base.root, root, fs::copy_options::recursive);
++            const Fixture fixture{root};
++
++            const std::vector<fs::path> files{fixture.library(), fixture.executable(), fixture.nonPieExecutable()};
++            std::map<fs::path, bool> withoutSections;
++
++            for (const auto& file : files) {
++                withoutSections[file] = std::uniform_int_distribution<int>(0, 4)(random) == 0;
++
++                if (withoutSections[file])
++                    removeSectionHeaders(file);
++            }
++
++            auto libraryValue = ElfImage(fixture.library()).strings(DT_RUNPATH);
++            const auto libraryRPath = ElfImage(fixture.library()).strings(DT_RPATH);
++            std::string currentLibrary = !libraryValue.empty() ? libraryValue.front() : (!libraryRPath.empty() ? libraryRPath.front() : "");
++            std::map<fs::path, std::string> currentExecutable;
++            for (const auto& file : {fixture.executable(), fixture.nonPieExecutable()}) {
++                const auto values = ElfImage(file).strings(DT_RUNPATH);
++                currentExecutable[file] = values.empty() ? "" : values.front();
++            }
++
++            const auto steps = std::uniform_int_distribution<int>(1, 4)(random);
++
++            for (int step = 0; step < steps; ++step) {
++                const auto& file = files[std::uniform_int_distribution<size_t>(0, files.size() - 1)(random)];
++                std::string value;
++
++                if (file == fixture.library()) {
++                    value = randomValue(random, libraryValues);
++                    currentLibrary = value;
++                } else {
++                    value = randomValue(random, executableValues);
++                    if (std::uniform_int_distribution<int>(0, 3)(random) != 0 && value.find("/../lib") == std::string::npos)
++                        value += ":$ORIGIN/../lib";
++                    currentExecutable[file] = value;
++                }
++
++                ASSERT_TRUE(setsRPath(file, value)) << "scenario " << scenario << " step " << step;
++                EXPECT_TRUE(rpathIs(file, value)) << "scenario " << scenario << " step " << step;
++
++                if (!withoutSections[file] && std::uniform_int_distribution<int>(0, 5)(random) == 0) {
++                    ASSERT_TRUE(runProcess({"/usr/bin/strip", file.string()}, root).succeeded()) << "strip in scenario " << scenario;
++                }
++
++                for (const auto& executable : {fixture.executable(), fixture.nonPieExecutable()}) {
++                    const auto& executableValue = currentExecutable[executable];
++                    const auto findsLibrary = executableValue.find("$ORIGIN/../lib") != std::string::npos ||
++                                              executableValue.find("${ORIGIN}/../lib") != std::string::npos;
++                    const auto output = expectedOutput(currentLibrary);
++
++                    if (!findsLibrary) {
++                        EXPECT_TRUE(failsToFind(root, executable, "librun.so")) << "scenario " << scenario << " step " << step;
++                    } else if (output.empty()) {
++                        EXPECT_TRUE(failsToFind(root, executable, "libdep.so")) << "scenario " << scenario << " step " << step;
++                    } else {
++                        EXPECT_TRUE(runsWith(root, executable, output)) << "scenario " << scenario << " step " << step;
++                    }
++                }
++            }
++
++            std::error_code error;
++            fs::remove_all(root, error);
++        }
++    }
++}
++
++TEST_F(NativeRPathTest, randomSequencesOfChangesSeed1) {
++    runRandomScenarios(path("random"), 1, 24);
++}
++
++TEST_F(NativeRPathTest, randomSequencesOfChangesSeed2) {
++    runRandomScenarios(path("random"), 2, 24);
++}
++
++TEST_F(NativeRPathTest, randomSequencesOfChangesSeed3) {
++    runRandomScenarios(path("random"), 3, 24);
++}
++
++TEST_F(NativeRPathTest, getRPathAndSetRPathRunNoProgram) {
++    FixtureOptions options;
++    options.executableTag = Tag::None;
++    const auto fixture = this->fixture(options);
++
++    const auto read = getRPath(fixture.library());
++    EXPECT_EQ("", read.failure);
++    const auto write = setRPath(fixture.executable(), "$ORIGIN/../lib");
++    EXPECT_EQ("", write.failure);
++    EXPECT_EQ("true", write.value);
++    EXPECT_TRUE(runsWith(fixture.root, fixture.executable(), outputWithA));
++}

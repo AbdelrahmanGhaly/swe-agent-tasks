@@ -1,0 +1,674 @@
+diff --git a/doc/index.md b/doc/index.md
+index d2872c97..f95e957f 100644
+--- a/doc/index.md
++++ b/doc/index.md
+@@ -1598,7 +1598,10 @@ This option suppresses the `#line` directives in the generated scanner code.
+ This option specifies `NAME` as a prefix for the generated `yyFlexLexer` class
+ to replace the default `yy` prefix.  Also renames the prefix of `yylex()`.
+ Generates <i>`lex.NAME.cpp`</i> file instead of <i>`lex.yy.cpp`</i>, and
+-generates <i>`lex.NAME.h`</i> with option `−−header-file`.
++generates <i>`lex.NAME.h`</i> with option `−−header-file`.  With option `−−yy`
++the prefix renames the global variables and functions of the scanner and the
++global `yywrap()` function it calls, like Flex `-P` does, while the specification
++may still use the `yy` names.
+ 
+ #### `−−nostdinit`
+ 
+@@ -1673,7 +1676,13 @@ and also \ref reflex-bison.
+ This option enables `−−flex` and `−−bison` to generate a scanner that accepts
+ Flex lexer specifications and works with Bison parsers, by defining global
+ (i.e. non-thread-safe and non-reentrant) "yy" variables and functions, such as
+-`yyin`, `yyout`, `yytext`, `yyleng`, `yylineno`, and `yylex()`.
++`yyin`, `yyout`, `yytext`, `yyleng`, `yylineno`, and `yylex()`.  Also defines
++the Flex functions `yyrestart()`, `yylex_destroy()`, `yyget_in()`,
++`yyset_in()`, `yyget_out()`, `yyset_out()`, `yyget_text()`, `yyget_leng()`,
++`yyget_lineno()`, `yyset_lineno()`, `yyget_debug()` and `yyset_debug()`.
++`ECHO` writes to `yyout`.  These functions are declared before the code of the
++definitions section, so that code can call them, and they have C linkage when
++the specification defines `YY_EXTERN_C` as `extern "C"`.
+ 
+ #### `−−yywrap` and `−−noyywrap`
+ 
+@@ -4024,7 +4033,10 @@ In addition, use option `−−prefix=NAME` to output the generated code in file
+ clashes.  This option also affect the `−−flex` option by generating
+ `xxFlexLexer` with a `xxlex()` method when option `−−prefix=xx` is specified.
+ The generated `#define` names (some of which are added to support option
+-`−−flex`) are prefixed to avoid macro name clashes.
++`−−flex`) are prefixed to avoid macro name clashes.  Scanners generated with
++option `−−yy` and different prefixes can be linked into one application, each
++with its own global `xxin`, `xxout`, `xxtext`, `xxleng`, `xxlineno` and
++`xxlex()` and other Flex functions with prefix `xx`.
+ 
+ Alternatively to `−−lexer=NAME` and `−−prefix=NAME`, you can use
+ `−−namespace=NAME` to place the generated lexer class in a C++ namespace to
+@@ -8829,6 +8841,10 @@ global `FILE*` type variables:
+ ~~~
+ </div>
+ 
++Like Flex, `yyin` and `yyout` are NULL until the first `yylex()` call sets them
++to `stdin` and `stdout` when they are still NULL, and `yylex_destroy()` resets
++them to NULL.
++
+ Note that without option `−−yy`, when options `−−flex` and `−−bison` are used,
+ `yyin` is a pointer to a `reflex::Input` object.  This means that `yyin` is not
+ restricted to `FILE*` types and accepts files, steams and strings:
+diff --git a/include/reflex/flexlexer.h b/include/reflex/flexlexer.h
+index ee43846c..96515b33 100644
+--- a/include/reflex/flexlexer.h
++++ b/include/reflex/flexlexer.h
+@@ -74,7 +74,7 @@
+ #define YY_SCANNER_DOT_         YY_SCANNER.
+ #endif
+ 
+-#if (defined(REFLEX_OPTION_yywrap) || defined(REFLEX_OPTION_bison)) && !defined(REFLEX_OPTION_noyywrap)
++#if (defined(REFLEX_OPTION_yywrap) || defined(REFLEX_OPTION_bison)) && !defined(REFLEX_OPTION_noyywrap) && (defined(REFLEX_OPTION_reentrant) || !defined(REFLEX_OPTION_yy))
+ #if defined(REFLEX_OPTION_reentrant)
+ 
+ /// Flex-compatible global yywrap() is enabled with `%%option yywrap` or `%%option bison`.
+@@ -517,11 +517,11 @@ class FlexLexer : public AbstractLexer<M> {
+     if (os)
+       this->out(*os);
+   }
+-  /// Default yywrap operation at EOF: do not wrap input.
++  /// Default yywrap operation at EOF: do not wrap input, a reflex --yy generated yyFlexLexer overrides this method to call its own global yywrap().
+   virtual int yywrap()
+     /// @returns 1 (0 indicates that new input was set and wrap after EOF is OK).
+   {
+-#if (defined(REFLEX_OPTION_yywrap) || defined(REFLEX_OPTION_bison)) && !defined(REFLEX_OPTION_noyywrap)
++#if (defined(REFLEX_OPTION_yywrap) || defined(REFLEX_OPTION_bison)) && !defined(REFLEX_OPTION_noyywrap) && (defined(REFLEX_OPTION_reentrant) || !defined(REFLEX_OPTION_yy))
+ #if defined(REFLEX_OPTION_reentrant)
+     return ::yywrap(static_cast<yyscan_t>(this));
+ #else
+diff --git a/src/reflex.cpp b/src/reflex.cpp
+index 92296545..53c2e43c 100644
+--- a/src/reflex.cpp
++++ b/src/reflex.cpp
+@@ -1857,6 +1857,7 @@ void Reflex::write()
+   {
+     write_class();
+   }
++  write_flex_names();
+   write_section_1();
+   write_lexer();
+   write_main();
+@@ -1990,12 +1991,24 @@ void Reflex::write_class()
+       if (!options["yy"].empty())
+         *out <<
+           "#undef yyin\n"
+-          "#undef yyout\n";
++          "#undef yyout\n"
++          "#undef yyrestart\n";
+       *out <<
+         "#undef yytext\n"
+         "#undef yyleng\n"
+         "#undef yylineno\n";
++      if (options["prefix"] != "yy")
++        *out << "#define YY_SCANNER " << options["prefix"] << "scanner\n";
+     }
++    if ((!options["yywrap"].empty() || !options["bison"].empty()) && options["noyywrap"].empty() && options["reentrant"].empty() &&
++        !options["yy"].empty() && (!options["bison_cc"].empty() || !options["bison_bridge"].empty()))
++      *out <<
++        "\n"
++        "#if defined(YY_EXTERN_C)\n"
++        "YY_EXTERN_C int " << options["prefix"] << "wrap(void);\n"
++        "#else\n"
++        "int " << options["prefix"] << "wrap(void);\n"
++        "#endif\n";
+   }
+   else
+   {
+@@ -2031,6 +2044,24 @@ void Reflex::write_class()
+       *out << ",\n      " << options["ctorinit"];
+     *out << '\n';
+     write_section_init();
++    if ((!options["yywrap"].empty() || !options["bison"].empty()) && options["noyywrap"].empty() && options["reentrant"].empty() && !options["yy"].empty())
++    {
++      if (options["bison_cc"].empty() && options["bison_bridge"].empty())
++        *out <<
++          "  // the global " << options["prefix"] << "wrap() function is called at EOF\n"
++          "  virtual int yywrap(void);\n";
++      else
++        *out <<
++          "  // the global " << options["prefix"] << "wrap() function is called at EOF\n"
++          "  virtual int yywrap(void)\n"
++          "  {\n"
++          "    return ::" << options["prefix"] << "wrap();\n"
++          "  }\n";
++    }
++    if (!options["yy"].empty() && options["bison_cc"].empty() && options["reentrant"].empty() && options["bison_bridge"].empty())
++      *out <<
++        "  // ECHO and output() write to the global " << options["prefix"] << "out FILE*\n"
++        "  virtual void LexerOutput(const char *s, size_t n);\n";
+     if (!options["bison_complete"].empty())
+     {
+       if (!options["bison_locations"].empty())
+@@ -2306,6 +2337,115 @@ void Reflex::write_class()
+   }
+ }
+ 
++/// Write Flex-compatible macros to lex.yy.cpp that map the yy names to the prefixed global names, and with option --yy declare the global variables for section 1 like Flex does
++void Reflex::write_flex_names()
++{
++  if (!out->good())
++    return;
++  if (options["flex"].empty() || !options["bison_cc"].empty() || (options["bison"].empty() && options["bison_locations"].empty()) || !options["reentrant"].empty() || !options["bison_bridge"].empty())
++    return;
++  std::string prefix = options["prefix"];
++  if (prefix == "yy" && options["yy"].empty())
++    return;
++  write_banner("FLEX-COMPATIBLE NAMES");
++  if (prefix != "yy")
++  {
++    if (!options["yy"].empty())
++      *out <<
++        "#define yyin " << prefix << "in\n"
++        "#define yyout " << prefix << "out\n";
++    *out <<
++      "#define yytext " << prefix << "text\n"
++      "#define yyleng " << prefix << "leng\n"
++      "#define yylineno " << prefix << "lineno\n"
++      "#define yylex " << prefix << "lex\n";
++    if (!options["yy"].empty())
++      *out <<
++        "#define yywrap " << prefix << "wrap\n"
++        "#define yyrestart " << prefix << "restart\n"
++        "#define yylex_destroy " << prefix << "lex_destroy\n"
++        "#define yyget_in " << prefix << "get_in\n"
++        "#define yyset_in " << prefix << "set_in\n"
++        "#define yyget_out " << prefix << "get_out\n"
++        "#define yyset_out " << prefix << "set_out\n"
++        "#define yyget_text " << prefix << "get_text\n"
++        "#define yyget_leng " << prefix << "get_leng\n"
++        "#define yyget_lineno " << prefix << "get_lineno\n"
++        "#define yyset_lineno " << prefix << "set_lineno\n"
++        "#define yyget_debug " << prefix << "get_debug\n"
++        "#define yyset_debug " << prefix << "set_debug\n";
++  }
++  if (!options["yy"].empty())
++  {
++    if (prefix != "yy")
++      *out << "\n";
++    *out <<
++      "extern FILE *" << prefix << "in;\n"
++      "extern FILE *" << prefix << "out;\n";
++    if (!options["array"].empty() && options["pointer"].empty())
++      *out <<
++        "extern char " << prefix << "text[];\n";
++    else
++      *out <<
++        "extern char *" << prefix << "text;\n";
++    *out <<
++      "extern yy_size_t " << prefix << "leng;\n"
++      "extern int " << prefix << "lineno;\n"
++      "\n"
++      "#ifdef YY_EXTERN_C\n";
++    write_flex_prototypes("YY_EXTERN_C ");
++    *out <<
++      "#else\n"
++      "#define YY_FLEX_CXX_LINKAGE\n";
++    write_flex_prototypes("");
++    *out <<
++      "#endif\n";
++  }
++}
++
++/// Write the Flex-compatible function prototypes of a --yy scanner with prefix NAME and the given LINKAGE
++void Reflex::write_flex_prototypes(const char *linkage)
++{
++  const std::string& prefix = options["prefix"];
++  *out <<
++    linkage << "void " << prefix << "restart(FILE*);\n" <<
++    linkage << "int " << prefix << "lex_destroy(void);\n" <<
++    linkage << "FILE *" << prefix << "get_in(void);\n" <<
++    linkage << "void " << prefix << "set_in(FILE*);\n" <<
++    linkage << "FILE *" << prefix << "get_out(void);\n" <<
++    linkage << "void " << prefix << "set_out(FILE*);\n" <<
++    linkage << "char *" << prefix << "get_text(void);\n" <<
++    linkage << "int " << prefix << "get_leng(void);\n" <<
++    linkage << "int " << prefix << "get_lineno(void);\n" <<
++    linkage << "void " << prefix << "set_lineno(int);\n" <<
++    linkage << "int " << prefix << "get_debug(void);\n" <<
++    linkage << "void " << prefix << "set_debug(int);\n";
++}
++
++/// Write the C-linkage forwarders of the Flex-compatible functions of a --yy scanner, for when section 1 defines YY_EXTERN_C after the functions were declared with C++ linkage
++void Reflex::write_flex_forwarders()
++{
++  const std::string& prefix = options["prefix"];
++  *out <<
++    "#if defined(YY_FLEX_CXX_LINKAGE) && defined(YY_EXTERN_C)\n"
++    "namespace " << prefix << "_extern_c {\n"
++    "YY_EXTERN_C void " << prefix << "restart(FILE *input_file) { ::" << prefix << "restart(input_file); }\n"
++    "YY_EXTERN_C int " << prefix << "lex_destroy(void) { return ::" << prefix << "lex_destroy(); }\n"
++    "YY_EXTERN_C FILE *" << prefix << "get_in(void) { return ::" << prefix << "get_in(); }\n"
++    "YY_EXTERN_C void " << prefix << "set_in(FILE *in_str) { ::" << prefix << "set_in(in_str); }\n"
++    "YY_EXTERN_C FILE *" << prefix << "get_out(void) { return ::" << prefix << "get_out(); }\n"
++    "YY_EXTERN_C void " << prefix << "set_out(FILE *out_str) { ::" << prefix << "set_out(out_str); }\n"
++    "YY_EXTERN_C char *" << prefix << "get_text(void) { return ::" << prefix << "get_text(); }\n"
++    "YY_EXTERN_C int " << prefix << "get_leng(void) { return ::" << prefix << "get_leng(); }\n"
++    "YY_EXTERN_C int " << prefix << "get_lineno(void) { return ::" << prefix << "get_lineno(); }\n"
++    "YY_EXTERN_C void " << prefix << "set_lineno(int line_number) { ::" << prefix << "set_lineno(line_number); }\n"
++    "YY_EXTERN_C int " << prefix << "get_debug(void) { return ::" << prefix << "get_debug(); }\n"
++    "YY_EXTERN_C void " << prefix << "set_debug(int debug_flag) { ::" << prefix << "set_debug(debug_flag); }\n"
++    "}\n"
++    "#endif\n"
++    "\n";
++}
++
+ /// Write %%top code to lex.yy.cpp
+ void Reflex::write_section_top()
+ {
+@@ -2647,7 +2787,10 @@ void Reflex::write_lexer()
+       *out << options["lexer"];
+     *out <<
+       " YY_SCANNER;\n"
+-      "\n"
++      "\n";
++    if (!options["flex"].empty() && !options["yy"].empty())
++      write_flex_forwarders();
++    *out <<
+       "#ifndef YY_EXTERN_C\n"
+       "#define YY_EXTERN_C\n"
+       "#endif\n"
+@@ -2656,8 +2799,13 @@ void Reflex::write_lexer()
+     {
+       if (!options["yy"].empty())
+         *out <<
+-          "FILE *" << prefix << "in = stdin;\n"
+-          "FILE *yyout = stdout;\n"
++          "FILE *" << prefix << "in = NULL;\n"
++          "FILE *" << prefix << "out = NULL;\n"
++          "\n"
++          "static int " << prefix << "_lineno_synced = 1;\n"
++          "static bool " << prefix << "_lineno_set = false;\n"
++          "static void " << prefix << "_sync_lineno(void);\n"
++          "static void " << prefix << "_sync_globals(int c);\n"
+           "\n";
+       if (!options["array"].empty() && options["pointer"].empty())
+       {
+@@ -2668,7 +2816,7 @@ void Reflex::write_lexer()
+           "\n"
+           "char " << prefix << "text[YYLMAX];\n"
+           "yy_size_t " << prefix << "leng;\n"
+-          "int " << prefix << "lineno;\n"
++          "int " << prefix << "lineno = 1;\n"
+           "\n";
+         if (!options["bison_locations"].empty())
+           *out <<
+@@ -2680,7 +2828,14 @@ void Reflex::write_lexer()
+             "{\n";
+         if (!options["yy"].empty())
+           *out <<
+-            "  if (" << prefix << "in != YY_SCANNER.in()->file())\n"
++            "  if (!YY_SCANNER.has_matcher())\n"
++            "  {\n"
++            "    if (" << prefix << "in == NULL)\n"
++            "      " << prefix << "in = stdin;\n"
++            "    if (" << prefix << "out == NULL)\n"
++            "      " << prefix << "out = stdout;\n"
++            "  }\n"
++            "  if (" << prefix << "in != YY_SCANNER.in().file())\n"
+             "    YY_SCANNER.in(" << prefix << "in);\n";
+         if (!options["bison_locations"].empty())
+           *out <<
+@@ -2688,12 +2843,17 @@ void Reflex::write_lexer()
+         else
+           *out <<
+             "  " << token_type << " " << lex << "_token = YY_SCANNER." << lex << "(" << args << ");\n";
++        if (!options["yy"].empty())
++          *out <<
++            "  " << prefix << "_sync_lineno();\n";
++        else
++          *out <<
++            "  " << prefix << "leng = static_cast<yy_size_t>(YY_SCANNER.YYLeng());\n"
++            "  if (" << prefix << "leng >= YYLMAX)\n"
++            "    YY_SCANNER.LexerError(\"token too large, exceeds YYLMAX\");\n"
++            "  memcpy(" << prefix << "text, YY_SCANNER.YYText(), " << prefix << "leng + 1);\n"
++            "  " << prefix << "lineno = static_cast<int>(YY_SCANNER.lineno());\n";
+         *out <<
+-          "  " << prefix << "leng = static_cast<yy_size_t>(YY_SCANNER.YYLeng());\n"
+-          "  if (" << prefix << "leng >= YYLMAX)\n"
+-          "    YY_SCANNER.LexerError(\"token too large, exceeds YYLMAX\");\n"
+-          "  memcpy(" << prefix << "text, YY_SCANNER.YYText(), " << prefix << "leng + 1);\n"
+-          "  " << prefix << "lineno = static_cast<int>(YY_SCANNER.lineno());\n"
+           "  return " << lex << "_token;\n"
+           "}\n";
+       }
+@@ -2702,7 +2862,7 @@ void Reflex::write_lexer()
+         *out <<
+           "char *" << prefix << "text;\n"
+           "yy_size_t " << prefix << "leng;\n"
+-          "int " << prefix << "lineno;\n"
++          "int " << prefix << "lineno = 1;\n"
+           "\n";
+         if (!options["bison_locations"].empty())
+           *out <<
+@@ -2714,26 +2874,213 @@ void Reflex::write_lexer()
+             "{\n";
+         if (!options["yy"].empty())
+           *out <<
++            "  if (!YY_SCANNER.has_matcher())\n"
++            "  {\n"
++            "    if (" << prefix << "in == NULL)\n"
++            "      " << prefix << "in = stdin;\n"
++            "    if (" << prefix << "out == NULL)\n"
++            "      " << prefix << "out = stdout;\n"
++            "  }\n"
+             "  if (" << prefix << "in != YY_SCANNER.in())\n"
+-            "    YY_SCANNER.in(" << prefix << "in);";
++            "    YY_SCANNER.in(" << prefix << "in);\n";
+         if (!options["bison_locations"].empty())
+           *out <<
+             "  " << token_type << " " << lex << "_token = YY_SCANNER." << lex << "(*lvalp, *llocp" << comma_args << ");\n";
+         else
+           *out <<
+             "  " << token_type << " " << lex << "_token = YY_SCANNER." << lex << "(" << args << ");\n";
++        if (!options["yy"].empty())
++          *out <<
++            "  " << prefix << "_sync_lineno();\n";
++        else
++          *out <<
++            "  " << prefix << "text = const_cast<char*>(YY_SCANNER.YYText());\n"
++            "  " << prefix << "leng = static_cast<yy_size_t>(YY_SCANNER.YYLeng());\n"
++            "  " << prefix << "lineno = static_cast<int>(YY_SCANNER.lineno());\n";
+         *out <<
+-          "  " << prefix << "text = const_cast<char*>(YY_SCANNER.YYText());\n"
+-          "  " << prefix << "leng = static_cast<yy_size_t>(YY_SCANNER.YYLeng());\n"
+-          "  " << prefix << "lineno = static_cast<int>(YY_SCANNER.lineno());\n"
+           "  return " << lex << "_token;\n"
+           "}\n";
+       }
++      if (!options["yy"].empty())
++      {
++        *out <<
++          "\n"
++          "void " << prefix << "restart(FILE *input_file)\n"
++          "{\n"
++          "  " << prefix << "in = input_file;\n"
++          "  YY_SCANNER.in(input_file);\n"
++          "}\n"
++          "\n"
++          "int " << prefix << "lex_destroy(void)\n"
++          "{\n"
++          "  while (YY_SCANNER.pop_matcher())\n"
++          "    continue;\n"
++          "  while (!YY_SCANNER.states_empty())\n"
++          "    YY_SCANNER.pop_state();\n"
++          "  YY_SCANNER.start(0);\n"
++          "  YY_SCANNER.in(reflex::Input());\n"
++          "  " << prefix << "in = NULL;\n"
++          "  " << prefix << "out = NULL;\n"
++          "  " << prefix << "lineno = 1;\n"
++          "  return 0;\n"
++          "}\n"
++          "\n"
++          "FILE *" << prefix << "get_in(void)\n"
++          "{\n"
++          "  return " << prefix << "in;\n"
++          "}\n"
++          "\n"
++          "void " << prefix << "set_in(FILE *in_str)\n"
++          "{\n"
++          "  " << prefix << "in = in_str;\n"
++          "}\n"
++          "\n"
++          "FILE *" << prefix << "get_out(void)\n"
++          "{\n"
++          "  return " << prefix << "out;\n"
++          "}\n"
++          "\n"
++          "void " << prefix << "set_out(FILE *out_str)\n"
++          "{\n"
++          "  " << prefix << "out = out_str;\n"
++          "}\n"
++          "\n"
++          "char *" << prefix << "get_text(void)\n"
++          "{\n"
++          "  return " << prefix << "text;\n"
++          "}\n"
++          "\n"
++          "int " << prefix << "get_leng(void)\n"
++          "{\n"
++          "  return static_cast<int>(" << prefix << "leng);\n"
++          "}\n"
++          "\n"
++          "int " << prefix << "get_lineno(void)\n"
++          "{\n"
++          "  return " << prefix << "lineno;\n"
++          "}\n"
++          "\n"
++          "void " << prefix << "set_lineno(int line_number)\n"
++          "{\n"
++          "  " << prefix << "lineno = line_number;\n"
++          "  " << prefix << "_lineno_set = true;\n"
++          "}\n"
++          "\n"
++          "int " << prefix << "get_debug(void)\n"
++          "{\n"
++          "  return YY_SCANNER.debug();\n"
++          "}\n"
++          "\n"
++          "void " << prefix << "set_debug(int debug_flag)\n"
++          "{\n"
++          "  YY_SCANNER.set_debug(debug_flag);\n"
++          "}\n"
++          "\n"
++          "void ";
++        if (!options["namespace"].empty())
++          write_namespace_scope();
++        *out <<
++          options["lexer"] << "::LexerOutput(const char *s, size_t n)\n"
++          "{\n"
++          "  fwrite(s, 1, n, " << prefix << "out);\n"
++          "}\n"
++          "\n";
++        bool array = !options["array"].empty() && options["pointer"].empty();
++        if (!array)
++          *out <<
++            "static char " << prefix << "_char_text[2];\n"
++            "\n";
++        *out <<
++          "static void " << prefix << "_sync_lineno(void)\n"
++          "{\n"
++          "  // a yyset_lineno() call or yylineno change since the last sync is the line on which the current match starts\n"
++          "  if (" << prefix << "_lineno_set || " << prefix << "lineno != " << prefix << "_lineno_synced)\n"
++          "    YY_SCANNER.lineno(" << prefix << "lineno);\n"
++          "  " << prefix << "_lineno_set = false;\n"
++          "  " << prefix << "lineno = " << prefix << "_lineno_synced = static_cast<int>(YY_SCANNER.lineno());\n"
++          "}\n"
++          "\n"
++          "static void " << prefix << "_sync_eof(void)\n"
++          "{\n";
++        if (array)
++          *out <<
++            "  " << prefix << "text[0] = '\\0';\n";
++        else
++          *out <<
++            "  " << prefix << "_char_text[0] = '\\0';\n"
++            "  " << prefix << "text = " << prefix << "_char_text;\n";
++        *out <<
++          "  " << prefix << "leng = 0;\n"
++          "  " << prefix << "_sync_lineno();\n"
++          "}\n"
++          "\n"
++          "static void " << prefix << "_sync_globals(int c)\n"
++          "{\n"
++          "  if (c != EOF)\n"
++          "  {\n";
++        if (array)
++          *out <<
++            "    " << prefix << "text[0] = static_cast<char>(c);\n"
++            "    " << prefix << "text[1] = '\\0';\n";
++        else
++          *out <<
++            "    " << prefix << "_char_text[0] = static_cast<char>(c);\n"
++            "    " << prefix << "_char_text[1] = '\\0';\n"
++            "    " << prefix << "text = " << prefix << "_char_text;\n";
++        *out <<
++          "    " << prefix << "leng = 1;\n"
++          "  }\n"
++          "  else\n"
++          "  {\n";
++        if (array)
++          *out <<
++            "    " << prefix << "leng = static_cast<yy_size_t>(YY_SCANNER.YYLeng());\n"
++            "    if (" << prefix << "leng >= YYLMAX)\n"
++            "      YY_SCANNER.LexerError(\"token too large, exceeds YYLMAX\");\n"
++            "    memcpy(" << prefix << "text, YY_SCANNER.YYText(), " << prefix << "leng + 1);\n";
++        else
++          *out <<
++            "    " << prefix << "text = const_cast<char*>(YY_SCANNER.YYText());\n"
++            "    " << prefix << "leng = static_cast<yy_size_t>(YY_SCANNER.YYLeng());\n";
++        *out <<
++          "  }\n"
++          "  " << prefix << "_sync_lineno();\n"
++          "}\n";
++        if ((!options["yywrap"].empty() || !options["bison"].empty()) && options["noyywrap"].empty())
++        {
++          *out <<
++            "\n"
++            "YY_EXTERN_C int " << prefix << "wrap(void);\n"
++            "\n";
++          if (prefix != "yy")
++            *out << "#undef yywrap\n";
++          *out << "int ";
++          if (!options["namespace"].empty())
++            write_namespace_scope();
++          *out <<
++            options["lexer"] << "::yywrap(void)\n"
++            "{\n"
++            "  if (this == &YY_SCANNER)\n"
++            "    " << prefix << "_sync_eof();\n"
++            "  return ::" << prefix << "wrap();\n"
++            "}\n";
++          if (prefix != "yy")
++            *out << "#define yywrap " << prefix << "wrap\n";
++        }
++      }
++      *out << "\n";
++      if (options["yy"].empty() || options["array"].empty() || !options["pointer"].empty())
++        *out <<
++          "#define " << prefix << "text const_cast<char*>(YY_SCANNER.YYText())\n";
+       *out <<
+-        "\n"
+-        "#define " << prefix << "text const_cast<char*>(YY_SCANNER.YYText())\n"
+-        "#define " << prefix << "leng static_cast<yy_size_t>(YY_SCANNER.YYLeng())\n"
+-        "#define " << prefix << "lineno static_cast<int>(YY_SCANNER.lineno())\n";
++        "#define " << prefix << "leng static_cast<yy_size_t>(YY_SCANNER.YYLeng())\n";
++      if (options["yy"].empty())
++        *out <<
++          "#define " << prefix << "lineno static_cast<int>(YY_SCANNER.lineno())\n";
++      else
++        *out <<
++          "#undef yyless\n"
++          "#define yyless(n) (YY_SCANNER.matcher().less(n), " << prefix << "_sync_globals(EOF))\n";
+     }
+     else
+     {
+@@ -2821,15 +3168,22 @@ void Reflex::write_lexer()
+       *out << "  static const " << library->pattern << " PATTERN_" << conditions[start] << "(REGEX_" << conditions[start] << ");\n";
+     }
+   }
++  bool yy_globals = !options["yy"].empty() && options["bison_cc"].empty() && options["reentrant"].empty() && options["bison_bridge"].empty();
+   *out <<
+     "  if (!has_matcher())\n"
+     "  {\n";
++  if (yy_globals)
++    *out <<
++      "    int yy_lineno_start = this == &YY_SCANNER ? " << prefix << "get_lineno() : 1;\n";
+   if (!options["tabs"].empty())
+     *out <<
+       "    matcher(new Matcher(PATTERN_" << conditions[0] << ", " << (options["nostdinit"].empty() ? "stdinit()" : "nostdinit()") << ", this, \"T=" << options["tabs"] << "\"));\n";
+   else
+     *out <<
+       "    matcher(new Matcher(PATTERN_" << conditions[0] << ", " << (options["nostdinit"].empty() ? "stdinit()" : "nostdinit()") << ", this));\n";
++  if (yy_globals)
++    *out <<
++      "    matcher().lineno(yy_lineno_start);\n";
+ #ifdef WITH_BOOST_PARTIAL_MATCH_BUG
+   if (options["matcher"] == "boost" || options["matcher"] == "boost-perl")
+     *out <<
+@@ -2894,6 +3248,10 @@ void Reflex::write_lexer()
+       *out <<
+         "        {\n"
+         "          case 0:\n";
++      if (yy_globals)
++        *out <<
++          "            if (this == &YY_SCANNER)\n"
++          "              " << prefix << "_sync_eof();\n";
+       bool has_eof = false;
+       for (Rules::const_iterator rule = rules[start].begin(); rule != rules[start].end(); ++rule)
+       {
+@@ -2940,6 +3298,10 @@ void Reflex::write_lexer()
+         "          case 0:\n"
+         "            if (matcher().at_end())\n"
+         "            {\n";
++      if (yy_globals)
++        *out <<
++          "              if (this == &YY_SCANNER)\n"
++          "                " << prefix << "_sync_eof();\n";
+       bool has_eof = false;
+       for (Rules::const_iterator rule = rules[start].begin(); rule != rules[start].end(); ++rule)
+       {
+@@ -3012,6 +3374,12 @@ void Reflex::write_lexer()
+         if (!options["exception"].empty())
+           *out <<
+             "              throw " << options["exception"] << ";\n";
++        else if (yy_globals)
++          *out <<
++            "              int c = matcher().input();\n"
++            "              if (this == &YY_SCANNER)\n"
++            "                " << prefix << "_sync_globals(c);\n"
++            "              output(c);\n";
+         else if (!options["flex"].empty())
+           *out <<
+             "              output(matcher().input());\n";
+@@ -3059,6 +3427,10 @@ void Reflex::write_lexer()
+               SGR("\\033[1;35m") << "rule " << escape_bs(rule->code.file) << ":" << rule->code.lineno << SGR("\\033[0m") <<
+               " start(\" << start() << \") \" << matcher().lineno() << \",\" << matcher().columno() << \":"
+               "\\\"" << SGR("\\033[1m") << "\" << matcher().text() << \"" << SGR("\\033[0m") << "\\\"\\n\";\n";
++          if (yy_globals)
++            *out <<
++              "            if (this == &YY_SCANNER)\n"
++              "              " << prefix << "_sync_globals(EOF);\n";
+           if (!options["flex"].empty())
+             *out <<
+               "            YY_USER_ACTION\n";
+@@ -3490,8 +3862,13 @@ void Reflex::write_header_file()
+           *out <<
+             "extern FILE *" << prefix << "in;\n"
+             "extern FILE *" << prefix << "out;\n";
++        if (!options["array"].empty() && options["pointer"].empty())
++          *out <<
++            "extern char " << prefix << "text[];\n";
++        else
++          *out <<
++            "extern char *" << prefix << "text;\n";
+         *out <<
+-          "extern char *" << prefix << "text;\n"
+           "extern yy_size_t " << prefix << "leng;\n"
+           "extern int " << prefix << "lineno;\n"
+           "\n";
+@@ -3499,6 +3876,8 @@ void Reflex::write_header_file()
+           *out << "YY_EXTERN_C " << token_type << " " << prefix << "lex(" << yystype << "*, " << yyltype << "*" << comma_params << ");\n";
+         else
+           *out << "YY_EXTERN_C " << token_type << " " << prefix << "lex(" << params << ");\n";
++        if (!options["yy"].empty())
++          write_flex_prototypes("YY_EXTERN_C ");
+       }
+       else
+       {
+diff --git a/src/reflex.h b/src/reflex.h
+index 0b044f7a..3e3b50b4 100644
+--- a/src/reflex.h
++++ b/src/reflex.h
+@@ -158,6 +158,9 @@ class Reflex
+   void        write_prelude();
+   void        write_defines();
+   void        write_class();
++  void        write_flex_names();
++  void        write_flex_prototypes(const char *linkage);
++  void        write_flex_forwarders();
+   void        write_section_top();
+   void        write_section_class();
+   void        write_section_init();

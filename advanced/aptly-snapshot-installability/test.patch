@@ -1,0 +1,2026 @@
+diff --git a/cmd/snapshot_verify_installable_88d50e_test.go b/cmd/snapshot_verify_installable_88d50e_test.go
+new file mode 100644
+index 00000000..ff2aae76
+--- /dev/null
++++ b/cmd/snapshot_verify_installable_88d50e_test.go
+@@ -0,0 +1,1825 @@
++package cmd_test
++
++import (
++	"archive/tar"
++	"bytes"
++	"compress/gzip"
++	"crypto/md5"
++	"crypto/sha256"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++)
++
++var (
++	aptlyBinary     string
++	aptlyBuildError error
++)
++
++func TestMain(m *testing.M) {
++	dir, err := os.MkdirTemp("", "aptly-verify-installable")
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++	aptlyBinary = filepath.Join(dir, "aptly")
++	if out, err := exec.Command("go", "build", "-o", aptlyBinary, "..").CombinedOutput(); err != nil {
++		aptlyBuildError = fmt.Errorf("%v\n%s", err, out)
++	}
++	code := m.Run()
++	_ = os.RemoveAll(dir)
++	os.Exit(code)
++}
++
++type aptlyEnv struct {
++	t      *testing.T
++	dir    string
++	config string
++}
++
++func newAptlyEnv(t *testing.T) *aptlyEnv {
++	t.Helper()
++	if aptlyBuildError != nil {
++		t.Fatalf("unable to build aptly: %s", aptlyBuildError)
++	}
++	dir := t.TempDir()
++	config := filepath.Join(dir, "aptly.conf")
++	content := fmt.Sprintf("{\"rootDir\": %q, \"architectures\": []}\n", filepath.Join(dir, "root"))
++	if err := os.WriteFile(config, []byte(content), 0644); err != nil {
++		t.Fatal(err)
++	}
++	return &aptlyEnv{t: t, dir: dir, config: config}
++}
++
++func (e *aptlyEnv) exec(args ...string) (string, string, error) {
++	cmd := exec.Command(aptlyBinary, append([]string{"-config=" + e.config}, args...)...)
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout = &stdout
++	cmd.Stderr = &stderr
++	err := cmd.Run()
++	return stdout.String(), stderr.String(), err
++}
++
++func (e *aptlyEnv) run(args ...string) string {
++	e.t.Helper()
++	stdout, stderr, err := e.exec(args...)
++	if err != nil {
++		e.t.Fatalf("aptly %s: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout, stderr)
++	}
++	return stdout
++}
++
++func splitStanzas(text string) []string {
++	var stanzas []string
++	for _, block := range strings.Split(strings.TrimSpace(text), "\n\n") {
++		if block = strings.TrimSpace(block); block != "" {
++			stanzas = append(stanzas, block+"\n")
++		}
++	}
++	return stanzas
++}
++
++func stanzaField(stanza, field string) string {
++	for _, line := range strings.Split(stanza, "\n") {
++		if strings.HasPrefix(line, field+": ") {
++			return strings.TrimPrefix(line, field+": ")
++		}
++	}
++	return ""
++}
++
++func tarGz(t *testing.T, files map[string]string) []byte {
++	t.Helper()
++	var buf bytes.Buffer
++	gz := gzip.NewWriter(&buf)
++	tw := tar.NewWriter(gz)
++	names := make([]string, 0, len(files))
++	for name := range files {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	for _, name := range names {
++		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(files[name]))}); err != nil {
++			t.Fatal(err)
++		}
++		if _, err := tw.Write([]byte(files[name])); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := tw.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := gz.Close(); err != nil {
++		t.Fatal(err)
++	}
++	return buf.Bytes()
++}
++
++func writeDeb(t *testing.T, path, control string) {
++	t.Helper()
++	var buf bytes.Buffer
++	buf.WriteString("!<arch>\n")
++	members := []struct {
++		name    string
++		content []byte
++	}{
++		{"debian-binary", []byte("2.0\n")},
++		{"control.tar.gz", tarGz(t, map[string]string{"./control": control})},
++		{"data.tar.gz", tarGz(t, nil)},
++	}
++	for _, member := range members {
++		fmt.Fprintf(&buf, "%-16s%-12d%-6d%-6d%-8s%-10d`\n", member.name, 0, 0, 0, "100644", len(member.content))
++		buf.Write(member.content)
++		if len(member.content)%2 == 1 {
++			buf.WriteByte('\n')
++		}
++	}
++	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func writeDsc(t *testing.T, dir, name, version string) {
++	t.Helper()
++	tarball := name + "_" + version + ".tar.gz"
++	content := tarGz(t, map[string]string{name + "/README": "source\n"})
++	if err := os.WriteFile(filepath.Join(dir, tarball), content, 0644); err != nil {
++		t.Fatal(err)
++	}
++	dsc := fmt.Sprintf("Format: 3.0 (native)\nSource: %s\nBinary: %s\nArchitecture: any\nVersion: %s\n"+
++		"Maintainer: Test <test@example.com>\nChecksums-Sha256:\n %x %d %s\nFiles:\n %x %d %s\n",
++		name, name, version, sha256.Sum256(content), len(content), tarball, md5.Sum(content), len(content), tarball)
++	if err := os.WriteFile(filepath.Join(dir, name+"_"+version+".dsc"), []byte(dsc), 0644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func (e *aptlyEnv) packages(name, stanzas string) string {
++	e.t.Helper()
++	dir := filepath.Join(e.dir, "packages-"+name)
++	if err := os.MkdirAll(dir, 0755); err != nil {
++		e.t.Fatal(err)
++	}
++	for _, stanza := range splitStanzas(stanzas) {
++		file := fmt.Sprintf("%s_%s_%s.deb", stanzaField(stanza, "Package"), stanzaField(stanza, "Version"), stanzaField(stanza, "Architecture"))
++		writeDeb(e.t, filepath.Join(dir, file), stanza)
++	}
++	return dir
++}
++
++func (e *aptlyEnv) snapshotFrom(name, dir string) {
++	e.t.Helper()
++	e.run("repo", "create", name)
++	e.run("repo", "add", name, dir)
++	e.run("snapshot", "create", name, "from", "repo", name)
++}
++
++func (e *aptlyEnv) snapshot(name, stanzas string) {
++	e.t.Helper()
++	e.snapshotFrom(name, e.packages(name, stanzas))
++}
++
++func (e *aptlyEnv) verify(architectures string, args ...string) (string, string) {
++	e.t.Helper()
++	var all []string
++	if architectures != "" {
++		all = append(all, "-architectures="+architectures)
++	}
++	all = append(all, "snapshot", "verify")
++	all = append(all, args...)
++	stdout, stderr, err := e.exec(all...)
++	if err != nil {
++		e.t.Fatalf("aptly %s: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(all, " "), err, stdout, stderr)
++	}
++	return stdout, stderr
++}
++
++func (e *aptlyEnv) assertUninstallable(architectures string, snapshots []string, expected ...string) {
++	e.t.Helper()
++	stdout, stderr := e.verify(architectures, append([]string{"-installable"}, snapshots...)...)
++	lines := strings.Split(stdout, "\n")
++	for i, line := range lines {
++		var count int
++		if _, err := fmt.Sscanf(line, "Uninstallable packages (%d):", &count); err == nil && strings.HasSuffix(line, "):") {
++			got := []string{}
++			for _, item := range lines[i+1:] {
++				if !strings.HasPrefix(item, "  ") {
++					break
++				}
++				got = append(got, strings.TrimPrefix(item, "  "))
++			}
++			if count != len(got) {
++				e.t.Fatalf("report announces %d packages but lists %d:\n%s", count, len(got), stdout)
++			}
++			sort.Strings(got)
++			want := append([]string{}, expected...)
++			sort.Strings(want)
++			if !reflect.DeepEqual(got, want) {
++				e.t.Fatalf("uninstallable packages:\n got %q\nwant %q", got, want)
++			}
++			return
++		}
++	}
++	e.t.Fatalf("no installability report in output\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
++}
++
++type archiveRand struct{ state uint64 }
++
++func (r *archiveRand) next() uint64 {
++	r.state += 0x9E3779B97F4A7C15
++	z := r.state
++	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
++	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
++	return z ^ (z >> 31)
++}
++
++func (r *archiveRand) intn(n int) int { return int(r.next() % uint64(n)) }
++
++func (r *archiveRand) chance(percent int) bool { return r.intn(100) < percent }
++
++func (r *archiveRand) pick(weights ...int) int {
++	total := 0
++	for _, w := range weights {
++		total += w
++	}
++	n := r.intn(total)
++	for i, w := range weights {
++		if n < w {
++			return i
++		}
++		n -= w
++	}
++	return len(weights) - 1
++}
++
++func (r *archiveRand) perm(n int) []int {
++	p := make([]int, n)
++	for i := range p {
++		p[i] = i
++	}
++	for i := n - 1; i > 0; i-- {
++		j := r.intn(i + 1)
++		p[i], p[j] = p[j], p[i]
++	}
++	return p
++}
++
++type randomPackage struct {
++	name, version, arch string
++	fields              map[string]string
++	extra               bool
++}
++
++type randomArchive struct {
++	architectures []string
++	packages      []randomPackage
++}
++
++var (
++	randomVersions  = []string{"0.9", "1.0", "1.0-1", "1.2~rc1", "1.2", "1.2a", "1.2+b1", "1.2-rc1-1", "2.0", "2.0+b1", "1:0.5", "3"}
++	randomMultiArch = []string{"no", "same", "foreign", "allowed"}
++	randomOperators = []string{"<<", "<=", "=", ">=", ">>"}
++	randomFields    = []string{"Multi-Arch", "Essential", "Pre-Depends", "Depends", "Recommends", "Suggests", "Conflicts", "Breaks", "Provides"}
++)
++
++type randomName struct {
++	name      string
++	multiArch string
++	versions  []string
++	essential bool
++}
++
++func generateArchive(seed uint64) randomArchive {
++	r := &archiveRand{state: seed}
++	var archive randomArchive
++	switch r.pick(20, 55, 25) {
++	case 0:
++		archive.architectures = []string{"amd64"}
++	case 1:
++		archive.architectures = []string{"amd64", "i386"}
++	default:
++		archive.architectures = []string{"amd64", "i386", "arm64"}
++	}
++	archs := append([]string{}, archive.architectures...)
++	if r.chance(30) {
++		archs = append(archs, "armhf")
++	}
++	withExtra := r.chance(40)
++
++	names := make([]*randomName, 5+r.intn(14))
++	virtuals := make([]string, r.intn(5))
++	for i := range names {
++		n := &randomName{name: fmt.Sprintf("p%d", i), multiArch: randomMultiArch[r.pick(50, 15, 20, 15)]}
++		for _, idx := range r.perm(len(randomVersions))[:1+r.intn(3)] {
++			n.versions = append(n.versions, randomVersions[idx])
++		}
++		n.essential = r.chance(8)
++		names[i] = n
++	}
++	for i := range virtuals {
++		virtuals[i] = fmt.Sprintf("v%d", i)
++	}
++	byName := map[string]*randomName{}
++	for _, n := range names {
++		byName[n.name] = n
++	}
++
++	type planned struct {
++		name          *randomName
++		version, arch string
++	}
++	var plan []planned
++	for _, n := range names {
++		for _, v := range n.versions {
++			if n.multiArch != "same" && r.chance(25) {
++				plan = append(plan, planned{n, v, "all"})
++				continue
++			}
++			var chosen []string
++			for _, a := range archs {
++				if r.chance(60) {
++					chosen = append(chosen, a)
++				}
++			}
++			if len(chosen) == 0 {
++				chosen = []string{archs[r.intn(len(archs))]}
++			}
++			for _, a := range chosen {
++				plan = append(plan, planned{n, v, a})
++			}
++		}
++	}
++
++	provided := map[string]bool{}
++	provides := make([][]string, len(plan))
++	for i := range plan {
++		if !r.chance(25) {
++			continue
++		}
++		for j := 1 + r.intn(2); j > 0; j-- {
++			target := names[r.intn(len(names))].name
++			if len(virtuals) > 0 && r.chance(90) {
++				target = virtuals[r.intn(len(virtuals))]
++			}
++			entry := target
++			if r.chance(35) {
++				entry = fmt.Sprintf("%s (= %s)", target, randomVersions[r.intn(len(randomVersions))])
++			}
++			provides[i] = append(provides[i], entry)
++			provided[target] = true
++		}
++	}
++
++	foreign := map[string]bool{}
++	for i, p := range plan {
++		if p.name.multiArch != "foreign" {
++			continue
++		}
++		foreign[p.name.name] = true
++		for _, entry := range provides[i] {
++			foreign[strings.Fields(entry)[0]] = true
++		}
++	}
++
++	versionFor := func(target string) string {
++		if n, ok := byName[target]; ok && r.chance(75) {
++			return n.versions[r.intn(len(n.versions))]
++		}
++		return randomVersions[r.intn(len(randomVersions))]
++	}
++	relation := func() string {
++		var target string
++		switch r.pick(70, 20, 10) {
++		case 0:
++			target = names[r.intn(len(names))].name
++		case 1:
++			if len(virtuals) == 0 {
++				target = names[r.intn(len(names))].name
++			} else {
++				target = virtuals[r.intn(len(virtuals))]
++			}
++		default:
++			target = fmt.Sprintf("ghost%d", r.intn(3))
++		}
++		if n, ok := byName[target]; ok && n.multiArch == "allowed" && !provided[target] && r.chance(30) {
++			return target + ":any"
++		}
++		s := target
++		if r.chance(5) {
++			if qualifier := archs[r.intn(len(archs))]; !foreign[target] {
++				s += ":" + qualifier
++			}
++		}
++		if r.chance(35) {
++			s += fmt.Sprintf(" (%s %s)", randomOperators[r.intn(len(randomOperators))], versionFor(target))
++		}
++		return s
++	}
++	relations := func(groups int) string {
++		var parts []string
++		for g := 0; g < groups; g++ {
++			n := 1
++			if r.chance(30) {
++				n += 1 + r.intn(2)
++			}
++			var alternatives []string
++			for i := 0; i < n; i++ {
++				alternatives = append(alternatives, relation())
++			}
++			parts = append(parts, strings.Join(alternatives, " | "))
++		}
++		return strings.Join(parts, ", ")
++	}
++	conflict := func(p planned, own []string) string {
++		var target string
++		if p.name.multiArch == "same" {
++			var options []string
++			for _, n := range names {
++				if n.name != p.name.name && !provided[n.name] {
++					options = append(options, n.name)
++				}
++			}
++			if len(options) == 0 {
++				return ""
++			}
++			target = options[r.intn(len(options))]
++		} else {
++			switch r.pick(60, 10, 20, 10) {
++			case 0:
++				target = names[r.intn(len(names))].name
++			case 1:
++				target = p.name.name
++			case 2:
++				if len(virtuals) == 0 {
++					target = names[r.intn(len(names))].name
++				} else {
++					target = virtuals[r.intn(len(virtuals))]
++				}
++			default:
++				if len(own) > 0 {
++					target = strings.Fields(own[r.intn(len(own))])[0]
++				} else {
++					target = names[r.intn(len(names))].name
++				}
++			}
++		}
++		if r.chance(40) {
++			return fmt.Sprintf("%s (%s %s)", target, randomOperators[r.intn(len(randomOperators))], versionFor(target))
++		}
++		return target
++	}
++
++	for i, p := range plan {
++		fields := map[string]string{}
++		if p.name.multiArch != "no" || r.chance(10) {
++			fields["Multi-Arch"] = p.name.multiArch
++		}
++		if p.name.essential {
++			fields["Essential"] = "yes"
++		}
++		if groups := r.pick(30, 35, 25, 10); groups > 0 {
++			fields["Depends"] = relations(groups)
++		}
++		if r.chance(15) {
++			fields["Pre-Depends"] = relations(1)
++		}
++		if r.chance(15) {
++			fields["Recommends"] = relations(1 + r.intn(2))
++		}
++		if r.chance(10) {
++			fields["Suggests"] = relations(1)
++		}
++		if r.chance(30) {
++			var conflicts []string
++			for j := 1 + r.intn(2); j > 0; j-- {
++				if c := conflict(p, provides[i]); c != "" {
++					conflicts = append(conflicts, c)
++				}
++			}
++			if len(conflicts) > 0 {
++				fields["Conflicts"] = strings.Join(conflicts, ", ")
++			}
++		}
++		if r.chance(20) {
++			if c := conflict(p, provides[i]); c != "" {
++				fields["Breaks"] = c
++			}
++		}
++		if len(provides[i]) > 0 {
++			fields["Provides"] = strings.Join(provides[i], ", ")
++		}
++		archive.packages = append(archive.packages, randomPackage{
++			name:    p.name.name,
++			version: p.version,
++			arch:    p.arch,
++			fields:  fields,
++			extra:   withExtra && r.chance(25),
++		})
++	}
++	return archive
++}
++
++func (a randomArchive) stanzas(extra bool) string {
++	var b strings.Builder
++	for _, p := range a.packages {
++		if p.extra != extra {
++			continue
++		}
++		fmt.Fprintf(&b, "Package: %s\nVersion: %s\nArchitecture: %s\n", p.name, p.version, p.arch)
++		for _, field := range randomFields {
++			if value, ok := p.fields[field]; ok {
++				fmt.Fprintf(&b, "%s: %s\n", field, value)
++			}
++		}
++		b.WriteString("\n")
++	}
++	return b.String()
++}
++
++func checkRandomArchive(t *testing.T, seed uint64, expected ...string) {
++	t.Helper()
++	archive := generateArchive(seed)
++	e := newAptlyEnv(t)
++	e.snapshot("main", archive.stanzas(false))
++	snapshots := []string{"main"}
++	if extra := archive.stanzas(true); extra != "" {
++		e.snapshot("extra", extra)
++		snapshots = append(snapshots, "extra")
++	}
++	e.assertUninstallable(strings.Join(archive.architectures, ","), snapshots, expected...)
++}
++
++func TestSnapshotVerifyInstallableKeepsPlainVerify(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: app
++Version: 1.0
++Architecture: amd64
++Depends: helper
++
++Package: helper
++Version: 1.0
++Architecture: amd64
++Conflicts: app
++
++Package: tool
++Version: 1.0
++Architecture: amd64
++Depends: libmissing (>= 2)
++
++Package: libfoo
++Version: 4.3.5-rc1-1
++Architecture: amd64
++
++Package: needs-old-foo
++Version: 1.0
++Architecture: amd64
++Depends: libfoo (<< 4.3.5a)
++`)
++	stdout, stderr := e.verify("amd64", "main")
++	want := "Loading packages...\nVerifying...\nMissing dependencies (1):\n  libmissing (>= 2) [amd64]\n"
++	if stdout != want {
++		t.Fatalf("plain verify output changed:\n got %q\nwant %q\nstderr:\n%s", stdout, want, stderr)
++	}
++	e.assertUninstallable("amd64", []string{"main"}, "app_1.0_amd64 [amd64]", "needs-old-foo_1.0_amd64 [amd64]", "tool_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableConflictWithDependency(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: webapp
++Version: 1.0
++Architecture: amd64
++Depends: libjson1
++
++Package: webapp
++Version: 2.0
++Architecture: amd64
++Depends: libjson1
++
++Package: libjson1
++Version: 2.1
++Architecture: amd64
++Conflicts: webapp (<< 2.0)
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "webapp_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableBreaksActsLikeConflicts(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: plugin
++Version: 1.0
++Architecture: amd64
++Depends: host
++
++Package: plugin
++Version: 2.5
++Architecture: amd64
++Depends: host (>= 3)
++
++Package: host
++Version: 3.0
++Architecture: amd64
++Breaks: plugin (<< 2)
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "plugin_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableAlternativeNeedsBacktracking(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: mailer
++Version: 1.0
++Architecture: amd64
++Depends: postfix | ssmtp, logrotate
++
++Package: strict-mailer
++Version: 1.0
++Architecture: amd64
++Depends: postfix, logrotate
++
++Package: postfix
++Version: 3.7
++Architecture: amd64
++Conflicts: logrotate
++
++Package: ssmtp
++Version: 2.64
++Architecture: amd64
++
++Package: logrotate
++Version: 3.21
++Architecture: amd64
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "strict-mailer_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableChoiceDeepInDependencyChain(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: app
++Version: 1.0
++Architecture: amd64
++Depends: frontend, database
++
++Package: app-gl
++Version: 1.0
++Architecture: amd64
++Depends: renderer-gl, database
++
++Package: frontend
++Version: 1.0
++Architecture: amd64
++Depends: renderer-gl | renderer-soft
++
++Package: renderer-gl
++Version: 1.0
++Architecture: amd64
++Depends: libgl1
++
++Package: renderer-soft
++Version: 1.0
++Architecture: amd64
++
++Package: libgl1
++Version: 1.0
++Architecture: amd64
++Conflicts: libdb5
++
++Package: database
++Version: 1.0
++Architecture: amd64
++Depends: libdb5
++
++Package: libdb5
++Version: 5.3
++Architecture: amd64
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "app-gl_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableVirtualPackageProviderConflictingWithItself(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: postfix
++Version: 3.7
++Architecture: amd64
++Provides: mail-transport-agent
++Conflicts: mail-transport-agent
++
++Package: exim4
++Version: 4.96
++Architecture: amd64
++Provides: mail-transport-agent
++Conflicts: mail-transport-agent
++
++Package: mailutils
++Version: 1.0
++Architecture: amd64
++Depends: mail-transport-agent
++
++Package: mta-bundle
++Version: 1.0
++Architecture: amd64
++Depends: postfix, exim4
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "mta-bundle_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableVersionedDependencyNeedsVersionedProvides(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: mesa
++Version: 23.0
++Architecture: amd64
++Provides: libgl-api (= 4.6)
++
++Package: legacy-gl
++Version: 1.0
++Architecture: amd64
++Provides: libgl-api
++
++Package: gl-shim
++Version: 6.0
++Architecture: amd64
++Provides: libgl-api
++
++Package: game
++Version: 1.0
++Architecture: amd64
++Depends: libgl-api (>= 4.5)
++
++Package: newgame
++Version: 1.0
++Architecture: amd64
++Depends: libgl-api (>= 5.0)
++
++Package: oldgame
++Version: 1.0
++Architecture: amd64
++Depends: libgl-api
++Conflicts: mesa
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "newgame_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableVersionedConflictsOnlyHitVersionedProvides(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: mesa
++Version: 23.0
++Architecture: amd64
++Provides: libgl-api (= 4.6)
++
++Package: legacy-gl
++Version: 1.0
++Architecture: amd64
++Provides: libgl-api
++
++Package: viewer
++Version: 1.0
++Architecture: amd64
++Depends: mesa
++Conflicts: libgl-api (<< 5)
++
++Package: viewer-legacy
++Version: 1.0
++Architecture: amd64
++Depends: legacy-gl
++Conflicts: libgl-api (<< 5)
++
++Package: viewer-strict
++Version: 1.0
++Architecture: amd64
++Depends: legacy-gl
++Conflicts: libgl-api
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "viewer-strict_1.0_amd64 [amd64]", "viewer_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableTwoVersionsOfOnePackageCannotCoexist(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: libssl
++Version: 1.1.1
++Architecture: amd64
++
++Package: libssl
++Version: 3.0.11
++Architecture: amd64
++
++Package: curl
++Version: 7.88
++Architecture: amd64
++Depends: libssl (<< 2)
++
++Package: wget
++Version: 1.21
++Architecture: amd64
++Depends: libssl (>= 3)
++
++Package: downloader
++Version: 1.0
++Architecture: amd64
++Depends: curl, wget
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "downloader_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableVersionRelations(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: libcore
++Version: 1:2.0~rc1-1
++Architecture: amd64
++
++Package: needs-older
++Version: 1.0
++Architecture: amd64
++Depends: libcore (<< 1:2.0)
++
++Package: needs-at-most
++Version: 1.0
++Architecture: amd64
++Depends: libcore (<= 1:2.0~rc1)
++
++Package: needs-exact
++Version: 1.0
++Architecture: amd64
++Depends: libcore (= 1:2.0~rc1-1)
++
++Package: needs-at-least
++Version: 1.0
++Architecture: amd64
++Depends: libcore (>= 2.0)
++
++Package: needs-newer
++Version: 1.0
++Architecture: amd64
++Depends: libcore (>> 1:2.0~rc1-1)
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "needs-at-most_1.0_amd64 [amd64]", "needs-newer_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableVersionsFollowDpkgOrder(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: libqt6webenginecore6
++Version: 6.4.2-final+dfsg-1
++Architecture: amd64
++
++Package: qt6-webview-plugins
++Version: 6.4.2-1
++Architecture: amd64
++Depends: libqt6webenginecore6 (>= 6.4.2+dfsg~)
++
++Package: libfoo
++Version: 4.3.5-rc1-1
++Architecture: amd64
++
++Package: needs-old-foo
++Version: 1.0
++Architecture: amd64
++Depends: libfoo (<< 4.3.5a)
++
++Package: needs-new-foo
++Version: 1.0
++Architecture: amd64
++Depends: libfoo (>> 4.3.5+b1)
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "needs-old-foo_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableVersionNumbersOfAnyLengthCompareByValue(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: libsnapshot
++Version: 2.18446744073709551617
++Architecture: amd64
++
++Package: wants-later-snapshot
++Version: 1.0
++Architecture: amd64
++Depends: libsnapshot (>> 2.18446744073709551616)
++
++Package: wants-future-snapshot
++Version: 1.0
++Architecture: amd64
++Depends: libsnapshot (>= 2.18446744073709551618)
++
++Package: wants-padded-snapshot
++Version: 1.0
++Architecture: amd64
++Depends: libsnapshot (= 2.0018446744073709551617)
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "wants-future-snapshot_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableDependencyCycles(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: ruby
++Version: 3.1
++Architecture: amd64
++Depends: ruby-stdlib
++
++Package: ruby-stdlib
++Version: 3.1
++Architecture: amd64
++Depends: ruby (= 3.1)
++
++Package: gem-tool
++Version: 1.0
++Architecture: amd64
++Depends: ruby
++Conflicts: ruby-stdlib
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "gem-tool_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableMultiArchForeignSatisfiesOtherArchitectures(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: make
++Version: 4.3
++Architecture: i386
++Multi-Arch: foreign
++
++Package: builder
++Version: 1.0
++Architecture: amd64
++Depends: make
++
++Package: patch
++Version: 2.7
++Architecture: i386
++
++Package: patcher
++Version: 1.0
++Architecture: amd64
++Depends: patch
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "patcher_1.0_amd64 [amd64]")
++	e.assertUninstallable("amd64", []string{"main"}, "builder_1.0_amd64 [amd64]", "patcher_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableMultiArchSameVersionsMustMatch(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: libpng16
++Version: 1.6.39
++Architecture: amd64
++Multi-Arch: same
++
++Package: libpng16
++Version: 1.6.39
++Architecture: i386
++Multi-Arch: same
++
++Package: libpng16
++Version: 1.6.40
++Architecture: i386
++Multi-Arch: same
++
++Package: thumbnailer
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: libpng16 (>= 1.6.40)
++
++Package: thumbnailer-old
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: libpng16
++
++Package: gallery
++Version: 1.0
++Architecture: amd64
++Depends: libpng16, thumbnailer
++
++Package: gallery-old
++Version: 1.0
++Architecture: amd64
++Depends: libpng16, thumbnailer-old
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "gallery_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableMultiArchSameLockFollowsChosenVersions(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: libfoo1
++Version: 1.0
++Architecture: amd64
++Multi-Arch: same
++
++Package: libfoo1
++Version: 1.0
++Architecture: i386
++Multi-Arch: same
++
++Package: libfoo1
++Version: 2.0
++Architecture: amd64
++Multi-Arch: same
++
++Package: libfoo1
++Version: 2.0
++Architecture: i386
++Multi-Arch: same
++
++Package: plugin-loader
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: libfoo1 (>= 2.0)
++
++Package: legacy-app
++Version: 1.0
++Architecture: amd64
++Depends: libfoo1 (<< 2.0), plugin-loader
++
++Package: modern-app
++Version: 1.0
++Architecture: amd64
++Depends: libfoo1, plugin-loader
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "legacy-app_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableMultiArchSameVersionsMatchByValue(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: viewer
++Version: 1.0
++Architecture: amd64
++Depends: libjpeg, jpeg-convert
++
++Package: jpeg-convert
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: libjpeg
++
++Package: libjpeg
++Version: 2.1-1
++Architecture: amd64
++Multi-Arch: same
++
++Package: libjpeg
++Version: 0:2.1-1
++Architecture: i386
++Multi-Arch: same
++
++Package: editor
++Version: 1.0
++Architecture: amd64
++Depends: libpng, png-convert
++
++Package: png-convert
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: libpng
++
++Package: libpng
++Version: 1.6
++Architecture: amd64
++Multi-Arch: same
++
++Package: libpng
++Version: 1.6-0
++Architecture: i386
++Multi-Arch: same
++
++Package: scanner
++Version: 1.0
++Architecture: amd64
++Depends: libtiff, tiff-convert
++
++Package: tiff-convert
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: libtiff
++
++Package: libtiff
++Version: 4.5
++Architecture: amd64
++Multi-Arch: same
++
++Package: libtiff
++Version: 4.5.0
++Architecture: i386
++Multi-Arch: same
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "scanner_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableMultiArchSamePackagesIgnoreTheirOwnConflicts(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: libpam-modules
++Version: 1.5.2-6
++Architecture: amd64
++Multi-Arch: same
++Provides: libpam-mkhomedir, libpam-motd
++Conflicts: libpam-mkhomedir, libpam-motd
++
++Package: libpam-modules
++Version: 1.5.2-6
++Architecture: i386
++Multi-Arch: same
++Provides: libpam-mkhomedir, libpam-motd
++Conflicts: libpam-mkhomedir, libpam-motd
++
++Package: login
++Version: 1:4.13+dfsg1-1
++Architecture: amd64
++Depends: libpam-modules, pam-auth-helper
++
++Package: pam-auth-helper
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: libpam-modules
++
++Package: libelogind0
++Version: 252.9-1
++Architecture: amd64
++Multi-Arch: same
++Provides: libsystemd0 (= 252.9)
++Conflicts: libsystemd0
++
++Package: libelogind0
++Version: 252.9-1
++Architecture: i386
++Multi-Arch: same
++Provides: libsystemd0 (= 252.9)
++Conflicts: libsystemd0
++
++Package: session-tool
++Version: 1.0
++Architecture: amd64
++Depends: libelogind0, elogind-helper
++
++Package: elogind-helper
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: libelogind0
++
++Package: libsystemd0
++Version: 252.17-1
++Architecture: amd64
++Multi-Arch: same
++
++Package: journal-tool
++Version: 1.0
++Architecture: amd64
++Depends: libsystemd0 (>= 252.17), libelogind0
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "journal-tool_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableSameNameOnTwoArchitecturesNeedsMultiArchSame(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: zlib-tools
++Version: 1.2
++Architecture: amd64
++
++Package: zlib-tools
++Version: 1.2
++Architecture: i386
++
++Package: compressor
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: zlib-tools
++
++Package: archiver
++Version: 1.0
++Architecture: amd64
++Depends: zlib-tools, compressor
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "archiver_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableArchitectureAllPackagesAreNative(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: fonts-data
++Version: 2.0
++Architecture: all
++
++Package: fonts-common
++Version: 2.0
++Architecture: all
++Multi-Arch: foreign
++
++Package: renderer
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: fonts-data
++
++Package: renderer-common
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: fonts-common
++
++Package: editor
++Version: 1.0
++Architecture: amd64
++Depends: renderer
++
++Package: editor-common
++Version: 1.0
++Architecture: amd64
++Depends: renderer-common
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "editor_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableProvidesBelongToTheProviderArchitecture(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: openjdk-jre
++Version: 17
++Architecture: i386
++Provides: java-runtime
++
++Package: busybox-static
++Version: 1.36
++Architecture: i386
++Multi-Arch: foreign
++Provides: awk-impl
++
++Package: java-app
++Version: 1.0
++Architecture: amd64
++Depends: java-runtime
++
++Package: script
++Version: 1.0
++Architecture: amd64
++Depends: awk-impl
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "java-app_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableConflictsReachEveryArchitecture(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: printer-driver
++Version: 1.0
++Architecture: i386
++Multi-Arch: foreign
++Depends: libcups
++
++Package: libcups
++Version: 2.4
++Architecture: i386
++
++Package: libcups
++Version: 2.4
++Architecture: amd64
++
++Package: print-ui
++Version: 1.0
++Architecture: amd64
++Depends: printer-driver
++Conflicts: libcups
++
++Package: print-ui-native
++Version: 1.0
++Architecture: amd64
++Depends: printer-driver
++Conflicts: libcups:amd64
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "print-ui_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableAnyQualifiedConflictsReachEveryArchitecture(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: tool
++Version: 1.0
++Architecture: amd64
++Depends: helper
++Conflicts: oldlib:any
++
++Package: helper
++Version: 1.0
++Architecture: amd64
++Depends: oldlib:i386
++
++Package: oldlib
++Version: 1.0
++Architecture: i386
++
++Package: viewer
++Version: 1.0
++Architecture: amd64
++Depends: codec
++Breaks: libold:any
++
++Package: codec
++Version: 1.0
++Architecture: amd64
++Depends: libold:i386 | libnew
++
++Package: libold
++Version: 1.0
++Architecture: i386
++Multi-Arch: same
++
++Package: libnew
++Version: 1.0
++Architecture: amd64
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "tool_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableAnyQualifierAcceptsAllowedPackagesOfEveryArchitecture(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: python3
++Version: 3.11.2
++Architecture: i386
++Multi-Arch: allowed
++
++Package: py-script
++Version: 1.0
++Architecture: amd64
++Depends: python3:any
++
++Package: py-native
++Version: 1.0
++Architecture: amd64
++Depends: python3
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "py-native_1.0_amd64 [amd64]")
++	e.assertUninstallable("amd64", []string{"main"}, "py-native_1.0_amd64 [amd64]", "py-script_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableArchitectureQualifiedDependencies(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: wine32
++Version: 8.0
++Architecture: i386
++
++Package: wine64
++Version: 8.0
++Architecture: amd64
++
++Package: wine
++Version: 8.0
++Architecture: amd64
++Depends: wine64, wine32:i386
++
++Package: wine-native-only
++Version: 8.0
++Architecture: amd64
++Depends: wine32:amd64
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "wine-native-only_8.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableEssentialPackagesJoinEveryInstallation(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: base-files
++Version: 12.4
++Architecture: amd64
++Essential: yes
++
++Package: dash
++Version: 0.5.12
++Architecture: amd64
++Essential: yes
++Depends: libc6
++
++Package: libc6
++Version: 2.36
++Architecture: amd64
++
++Package: hello
++Version: 2.10
++Architecture: amd64
++
++Package: fake-base
++Version: 1.0
++Architecture: amd64
++Conflicts: base-files
++
++Package: static-only
++Version: 1.0
++Architecture: amd64
++Conflicts: libc6
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "fake-base_1.0_amd64 [amd64]", "static-only_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableBrokenEssentialPackageBreaksEverything(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: coreutils
++Version: 9.1
++Architecture: amd64
++Essential: yes
++Depends: libacl1
++
++Package: hello
++Version: 2.10
++Architecture: amd64
++
++Package: tool
++Version: 1.0
++Architecture: all
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "coreutils_9.1_amd64 [amd64]", "hello_2.10_amd64 [amd64]", "tool_1.0_all [amd64]")
++}
++
++func TestSnapshotVerifyInstallableEssentialNameNeedsOneInstallableVersion(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: base-passwd
++Version: 3.6.1
++Architecture: amd64
++Essential: yes
++Depends: libdebconfclient0
++
++Package: base-passwd
++Version: 3.6.3
++Architecture: amd64
++Essential: yes
++
++Package: hello
++Version: 2.10
++Architecture: amd64
++
++Package: pinned
++Version: 1.0
++Architecture: amd64
++Depends: base-passwd (<< 3.6.2)
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "base-passwd_3.6.1_amd64 [amd64]", "pinned_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableOlderEssentialVersionStillCounts(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: base-files
++Version: 13.0
++Architecture: amd64
++Essential: yes
++Depends: libsystemd-shared (>= 255)
++
++Package: base-files
++Version: 12.4
++Architecture: amd64
++Essential: yes
++
++Package: hello
++Version: 2.10
++Architecture: amd64
++
++Package: needs-new-base
++Version: 1.0
++Architecture: amd64
++Depends: base-files (>= 13)
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "base-files_13.0_amd64 [amd64]", "needs-new-base_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableOnlyEssentialVersionsSatisfyTheEssentialRule(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: sysvinit-utils
++Version: 3.06
++Architecture: amd64
++Essential: yes
++Depends: libselinux1
++
++Package: sysvinit-utils
++Version: 3.07
++Architecture: amd64
++
++Package: hello
++Version: 2.10
++Architecture: amd64
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "hello_2.10_amd64 [amd64]", "sysvinit-utils_3.06_amd64 [amd64]", "sysvinit-utils_3.07_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableEssentialChoicesDependOnThePackage(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: init-system
++Version: 1.0
++Architecture: amd64
++Essential: yes
++Depends: systemd-sysv | sysvinit-core
++
++Package: systemd-sysv
++Version: 252
++Architecture: amd64
++Conflicts: sysv-rc
++
++Package: sysvinit-core
++Version: 3.06
++Architecture: amd64
++
++Package: sysv-rc
++Version: 3.06
++Architecture: amd64
++
++Package: systemd-timer
++Version: 1.0
++Architecture: amd64
++Conflicts: sysvinit-core
++
++Package: torn
++Version: 1.0
++Architecture: amd64
++Depends: sysv-rc
++Conflicts: sysvinit-core
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "torn_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableForeignEssentialPackagesCount(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: lib32-base
++Version: 1.0
++Architecture: i386
++Essential: yes
++Depends: lib32-missing
++
++Package: hello
++Version: 2.10
++Architecture: amd64
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "hello_2.10_amd64 [amd64]", "lib32-base_1.0_i386 [i386]")
++	e.assertUninstallable("amd64", []string{"main"})
++}
++
++func TestSnapshotVerifyInstallableEssentialPackagesFromSourceSnapshots(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: hello
++Version: 2.10
++Architecture: amd64
++Depends: libc6
++
++Package: fake-base
++Version: 1.0
++Architecture: amd64
++Conflicts: base-files
++`)
++	e.snapshot("extra1", `
++Package: base-files
++Version: 12.4
++Architecture: amd64
++Essential: yes
++
++Package: libc6
++Version: 2.36
++Architecture: amd64
++`)
++	e.assertUninstallable("amd64", []string{"main", "extra1"}, "fake-base_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallablePreDependsCountRecommendsDoNot(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: installer
++Version: 1.0
++Architecture: amd64
++Pre-Depends: dpkg-helper
++
++Package: viewer
++Version: 1.0
++Architecture: amd64
++Recommends: codec-pack
++Suggests: viewer-doc
++`)
++	e.assertUninstallable("amd64", []string{"main"}, "installer_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableSourceSnapshotsHelpButAreNotChecked(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: app
++Version: 1.0
++Architecture: amd64
++Depends: libfoo
++
++Package: lonely
++Version: 1.0
++Architecture: amd64
++Depends: nothing-provides-this
++`)
++	e.snapshot("extra1", `
++Package: libfoo
++Version: 1.0
++Architecture: amd64
++
++Package: broken-lib
++Version: 1.0
++Architecture: amd64
++Depends: missing-dependency
++`)
++	e.snapshot("extra2", `
++Package: libbar
++Version: 1.0
++Architecture: amd64
++Conflicts: libfoo
++`)
++	e.assertUninstallable("amd64", []string{"main", "extra1", "extra2"}, "lonely_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableArchitectureAllPackagesCheckedOnEachArchitecture(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: docs-viewer
++Version: 1.0
++Architecture: all
++Depends: libviewer
++
++Package: libviewer
++Version: 1.0
++Architecture: amd64
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "docs-viewer_1.0_all [i386]")
++}
++
++func TestSnapshotVerifyInstallableUnlistedArchitecturesAreLeftOut(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: firmware-tool
++Version: 1.0
++Architecture: armhf
++Multi-Arch: foreign
++Depends: nothing-here
++
++Package: flasher
++Version: 1.0
++Architecture: amd64
++Depends: firmware-tool
++
++Package: probe
++Version: 1.0
++Architecture: i386
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"}, "flasher_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableDefaultArchitecturesComeFromBinaryPackages(t *testing.T) {
++	e := newAptlyEnv(t)
++	dir := e.packages("main", `
++Package: hello
++Version: 2.10
++Architecture: amd64
++Depends: libhello
++
++Package: libhello
++Version: 2.10
++Architecture: i386
++
++Package: hello-doc
++Version: 2.10
++Architecture: all
++Depends: hello
++`)
++	writeDsc(t, dir, "hello", "2.10")
++	e.snapshotFrom("main", dir)
++	e.assertUninstallable("", []string{"main"}, "hello-doc_2.10_all [amd64]", "hello-doc_2.10_all [i386]", "hello_2.10_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableDefaultArchitecturesFromAnArm64Snapshot(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: rover
++Version: 1.0
++Architecture: arm64
++Depends: libgps
++
++Package: rover-doc
++Version: 1.0
++Architecture: all
++Depends: rover
++
++Package: libgps
++Version: 2.1
++Architecture: arm64
++Depends: libusb (>= 2)
++
++Package: libusb
++Version: 1.0
++Architecture: arm64
++
++Package: compass
++Version: 1.0
++Architecture: arm64
++`)
++	e.assertUninstallable("", []string{"main"}, "libgps_2.1_arm64 [arm64]", "rover-doc_1.0_all [arm64]", "rover_1.0_arm64 [arm64]")
++}
++
++func TestSnapshotVerifyInstallableAllPackagesInstallable(t *testing.T) {
++	e := newAptlyEnv(t)
++	e.snapshot("main", `
++Package: hello
++Version: 2.10
++Architecture: amd64
++Depends: libc6 (>= 2.34)
++
++Package: libc6
++Version: 2.36
++Architecture: amd64
++Multi-Arch: same
++
++Package: libc6
++Version: 2.36
++Architecture: i386
++Multi-Arch: same
++
++Package: hello-doc
++Version: 2.10
++Architecture: all
++`)
++	e.assertUninstallable("amd64,i386", []string{"main"})
++}
++
++func TestSnapshotVerifyInstallableRandomArchive01(t *testing.T) {
++	checkRandomArchive(t, 12, "p0_1.2a_i386 [i386]", "p10_2.0_amd64 [amd64]", "p12_1.0_amd64 [amd64]", "p1_1.0_i386 [i386]", "p2_1.0-1_i386 [i386]", "p5_2.0_amd64 [amd64]", "p6_1.2~rc1_all [i386]", "p6_3_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive02(t *testing.T) {
++	checkRandomArchive(t, 13, "p10_1:0.5_amd64 [amd64]", "p1_1.2_amd64 [amd64]", "p1_1.2_arm64 [arm64]", "p1_1.2a_i386 [i386]", "p2_1.0-1_arm64 [arm64]", "p2_3_all [amd64]", "p2_3_all [arm64]", "p4_1:0.5_amd64 [amd64]", "p4_2.0_arm64 [arm64]", "p8_3_arm64 [arm64]", "p9_1.0-1_arm64 [arm64]", "p9_1.2-rc1-1_i386 [i386]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive03(t *testing.T) {
++	checkRandomArchive(t, 15, "p0_1.0_i386 [i386]", "p10_1.2-rc1-1_i386 [i386]", "p10_1.2_amd64 [amd64]", "p10_1.2_i386 [i386]", "p2_1.2-rc1-1_all [amd64]", "p3_1.2~rc1_i386 [i386]", "p5_1.0_all [amd64]", "p5_1.0_all [i386]", "p5_1.2_amd64 [amd64]", "p7_0.9_i386 [i386]", "p7_1.2-rc1-1_i386 [i386]", "p7_1.2~rc1_amd64 [amd64]", "p7_1.2~rc1_i386 [i386]", "p8_1:0.5_all [amd64]", "p8_1:0.5_all [i386]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive04(t *testing.T) {
++	checkRandomArchive(t, 16, "p0_1.2~rc1_amd64 [amd64]", "p0_2.0_i386 [i386]", "p1_2.0+b1_i386 [i386]", "p2_1.2-rc1-1_all [amd64]", "p2_1.2-rc1-1_all [arm64]", "p2_1.2-rc1-1_all [i386]", "p3_1.2+b1_i386 [i386]", "p5_1.2-rc1-1_i386 [i386]", "p6_1.2-rc1-1_amd64 [amd64]", "p6_1.2-rc1-1_arm64 [arm64]", "p6_2.0+b1_amd64 [amd64]", "p7_1.0-1_all [amd64]", "p7_1.0-1_all [arm64]", "p7_1.0-1_all [i386]", "p8_1.2a_arm64 [arm64]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive05(t *testing.T) {
++	checkRandomArchive(t, 20, "p0_1.2a_i386 [i386]", "p0_1:0.5_i386 [i386]", "p10_1.2~rc1_i386 [i386]", "p3_1.2~rc1_i386 [i386]", "p4_3_amd64 [amd64]", "p8_3_amd64 [amd64]", "p9_1.2_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive06(t *testing.T) {
++	checkRandomArchive(t, 21, "p0_1.2-rc1-1_i386 [i386]", "p1_1.0_i386 [i386]", "p3_1.2+b1_all [amd64]", "p3_1.2+b1_all [i386]", "p3_1.2a_amd64 [amd64]", "p3_1.2~rc1_i386 [i386]", "p5_1.2+b1_amd64 [amd64]", "p5_2.0_i386 [i386]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive07(t *testing.T) {
++	checkRandomArchive(t, 23, "p0_1.2a_i386 [i386]", "p13_3_i386 [i386]", "p14_1.2_amd64 [amd64]", "p14_1.2_i386 [i386]", "p15_1.2_i386 [i386]", "p1_1.2_amd64 [amd64]", "p1_1.2_i386 [i386]", "p2_1.2+b1_i386 [i386]", "p5_2.0+b1_amd64 [amd64]", "p6_2.0+b1_amd64 [amd64]", "p6_3_i386 [i386]", "p7_1.2_amd64 [amd64]", "p9_1.0-1_i386 [i386]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive08(t *testing.T) {
++	checkRandomArchive(t, 31, "p0_1.2-rc1-1_amd64 [amd64]", "p10_1.2_i386 [i386]", "p10_1.2a_amd64 [amd64]", "p11_1.2a_all [i386]", "p12_3_amd64 [amd64]", "p13_1.0_i386 [i386]", "p1_1.2-rc1-1_amd64 [amd64]", "p1_3_all [amd64]", "p1_3_all [i386]", "p5_2.0+b1_amd64 [amd64]", "p6_1.2-rc1-1_i386 [i386]", "p7_1.0_amd64 [amd64]", "p7_1.2~rc1_amd64 [amd64]", "p8_3_amd64 [amd64]", "p9_1.2+b1_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive09(t *testing.T) {
++	checkRandomArchive(t, 35, "p1_2.0+b1_amd64 [amd64]", "p2_0.9_all [amd64]", "p2_0.9_all [i386]", "p4_1.2a_amd64 [amd64]", "p5_1.2-rc1-1_amd64 [amd64]", "p5_2.0_arm64 [arm64]", "p8_1.2a_arm64 [arm64]", "p8_2.0+b1_all [amd64]", "p8_2.0+b1_all [arm64]", "p8_2.0+b1_all [i386]", "p9_1.2+b1_amd64 [amd64]", "p9_1.2+b1_arm64 [arm64]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive10(t *testing.T) {
++	checkRandomArchive(t, 36, "p0_0.9_amd64 [amd64]", "p10_1.2+b1_i386 [i386]", "p10_1.2-rc1-1_amd64 [amd64]", "p10_1.2-rc1-1_i386 [i386]", "p3_1.2a_amd64 [amd64]", "p4_1.2+b1_all [i386]", "p4_1.2~rc1_i386 [i386]", "p5_1.0-1_i386 [i386]", "p7_1.2a_i386 [i386]", "p7_1:0.5_amd64 [amd64]", "p8_0.9_all [amd64]", "p8_0.9_all [i386]", "p8_2.0+b1_i386 [i386]", "p9_1.0_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive11(t *testing.T) {
++	checkRandomArchive(t, 40, "p0_1.2-rc1-1_amd64 [amd64]", "p0_1.2-rc1-1_arm64 [arm64]", "p1_0.9_arm64 [arm64]", "p1_1.0-1_amd64 [amd64]", "p1_3_amd64 [amd64]", "p1_3_arm64 [arm64]", "p2_0.9_all [amd64]", "p2_0.9_all [arm64]", "p2_0.9_all [i386]", "p3_3_i386 [i386]", "p4_1.0-1_all [amd64]", "p4_1.0-1_all [arm64]", "p4_1.0-1_all [i386]", "p4_3_all [amd64]", "p4_3_all [arm64]", "p4_3_all [i386]", "p5_1.2_all [amd64]", "p5_1.2_all [arm64]", "p5_3_amd64 [amd64]", "p6_1.0_arm64 [arm64]", "p6_1.0_i386 [i386]", "p6_2.0+b1_arm64 [arm64]", "p7_1.2-rc1-1_i386 [i386]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive12(t *testing.T) {
++	checkRandomArchive(t, 51, "p0_1.2-rc1-1_amd64 [amd64]", "p0_1.2_all [amd64]", "p0_1.2_all [i386]", "p2_1.2_amd64 [amd64]", "p2_1.2a_amd64 [amd64]", "p3_1:0.5_amd64 [amd64]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive13(t *testing.T) {
++	checkRandomArchive(t, 57, "p0_1.0-1_amd64 [amd64]", "p0_1.2-rc1-1_i386 [i386]", "p0_1.2a_i386 [i386]", "p10_1.2_all [amd64]", "p10_1.2_all [i386]", "p10_1:0.5_i386 [i386]", "p11_0.9_i386 [i386]", "p12_1.0-1_amd64 [amd64]", "p12_1.2_i386 [i386]", "p1_1.2-rc1-1_amd64 [amd64]", "p1_1.2-rc1-1_i386 [i386]", "p2_1.2a_all [i386]", "p3_1.2~rc1_amd64 [amd64]", "p3_1.2~rc1_i386 [i386]", "p3_1:0.5_all [amd64]", "p3_1:0.5_all [i386]", "p4_3_i386 [i386]", "p6_2.0_i386 [i386]", "p8_1.2+b1_i386 [i386]", "p9_2.0_i386 [i386]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive14(t *testing.T) {
++	checkRandomArchive(t, 59, "p11_1.0_amd64 [amd64]", "p11_1.0_arm64 [arm64]", "p11_1.2+b1_amd64 [amd64]", "p11_1.2+b1_i386 [i386]", "p12_1:0.5_i386 [i386]", "p13_2.0+b1_all [amd64]", "p13_2.0+b1_all [arm64]", "p13_2.0+b1_all [i386]", "p1_1.2~rc1_i386 [i386]", "p1_1:0.5_all [amd64]", "p2_1.2_amd64 [amd64]", "p2_1:0.5_i386 [i386]", "p4_1.0_all [amd64]", "p4_1.0_all [arm64]", "p4_1.0_all [i386]", "p6_0.9_i386 [i386]", "p7_2.0+b1_amd64 [amd64]", "p7_2.0+b1_i386 [i386]", "p8_1.2+b1_amd64 [amd64]", "p8_1.2+b1_i386 [i386]", "p9_1.2~rc1_arm64 [arm64]")
++}
++
++func TestSnapshotVerifyInstallableRandomArchive15(t *testing.T) {
++	checkRandomArchive(t, 318, "p11_2.0+b1_i386 [i386]", "p12_0.9_amd64 [amd64]", "p12_0.9_arm64 [arm64]", "p1_1:0.5_amd64 [amd64]", "p1_1:0.5_arm64 [arm64]", "p1_3_i386 [i386]", "p2_1.2+b1_all [amd64]", "p2_1.2+b1_all [arm64]", "p2_1.2+b1_all [i386]", "p2_1.2~rc1_arm64 [arm64]", "p3_1.0_amd64 [amd64]", "p4_1.0-1_amd64 [amd64]", "p4_1.2_amd64 [amd64]", "p5_1.2+b1_amd64 [amd64]", "p6_3_amd64 [amd64]", "p7_1.2_all [amd64]", "p7_1.2_all [arm64]", "p9_1.2a_i386 [i386]")
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..b289d108
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,189 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || { echo "missing value for --output_path" >&2; usage; }
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 2
++
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++export GOPROXY=off
++for dir in /usr/local/go/bin /opt/go/bin /usr/local/bin; do
++  case ":$PATH:" in
++    *":$dir:"*) ;;
++    *) [ -d "$dir" ] && PATH="$dir:$PATH" ;;
++  esac
++done
++export PATH
++if ! go list -m all >/dev/null 2>&1 && [ -d /opt/go/pkg/mod ]; then
++  export GOPATH=/opt/go
++  export GOMODCACHE=/opt/go/pkg/mod
++fi
++GO_BUILD_CACHE="$(go env GOCACHE 2>/dev/null)"
++if [ -z "$GO_BUILD_CACHE" ] || ! mkdir -p "$GO_BUILD_CACHE" 2>/dev/null || [ ! -w "$GO_BUILD_CACHE" ]; then
++  GO_BUILD_CACHE="/tmp/go-build-$(id -u)"
++fi
++export GOCACHE="$GO_BUILD_CACHE"
++GOPATH="$(go env GOPATH)"
++GOMODCACHE="$(go env GOMODCACHE)"
++export GOPATH GOMODCACHE
++# the api and context suites keep their default aptly root (~/.aptly) under HOME, so every run gets a fresh one
++export HOME="$(mktemp -d)"
++
++NEW_PKG="github.com/aptly-dev/aptly/cmd"
++NEW_FILE="cmd/snapshot_verify_installable_88d50e_test.go"
++NEW_RUN='^TestSnapshotVerifyInstallable'
++LOG="$(mktemp)"
++LIST_ERR="$(mktemp)"
++trap 'rm -f "$LOG" "$LIST_ERR"' EXIT
++LIST_STATUS=0
++
++if [ "$MODE" = "base" ]; then
++  PKGS="$(go list ./... 2>"$LIST_ERR")"
++  LIST_STATUS=$?
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    PKGS="$(go list -e ./... 2>/dev/null)"
++  fi
++  cat "$LIST_ERR" >>"$LOG"
++  # database/etcddb: every test connects to an etcd server on 127.0.0.1:2379, which the image does not run
++  # files: DiskFullSuite needs a tiny filesystem, either loop-mounted (root with mount privileges) or already mounted at /smallfs
++  # http: the *ConnectError tests expect a DNS "no such host" error, while the offline sandbox reports "network is unreachable"
++  # pgp: Gnupg2VerifierSuite.TestVerifyClearsigned expects three good signing keys, the gpgv in the image reports two
++  # swift: each test binds its fake Swift server to a random port in 20000-29999 with no retry (swift/public_test.go:28), so a port already taken on the host fails it
++  PKGS="$(printf '%s\n' "$PKGS" | grep -v -e '^$' -e "^$NEW_PKG\$" \
++    -e '/database/etcddb$' -e '/files$' -e '/http$' -e '/pgp$' -e '/swift$' -e '/api$')"
++  if [ -n "$PKGS" ]; then
++    go test -v -count=1 -timeout 20m $PKGS >>"$LOG" 2>&1
++    STATUS=$?
++  else
++    STATUS=1
++  fi
++  # api: FilesUploadDiskFullSuite provokes permission errors, which never happen when the tests run as root
++  go test -v -count=1 -timeout 20m ./api/ \
++    -check.f '^(APISuite|GPGSuite|MiddlewareSuite|MirrorSuite|PackagesSuite|PublishedFileMissingSuite|ReposSuite|SnapshotsSuite)\.' >>"$LOG" 2>&1
++  API_STATUS=$?
++  [ "$API_STATUS" -ne 0 ] && STATUS="$API_STATUS"
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    echo "[setup failed] go list ./... exited with status $LIST_STATUS" >>"$LOG"
++    [ "$STATUS" -eq 0 ] && STATUS="$LIST_STATUS"
++  fi
++else
++  go test -v -count=1 -timeout 20m -run "$NEW_RUN" ./cmd/ >>"$LOG" 2>&1
++  STATUS=$?
++fi
++
++if ! grep -qE '^ *--- (PASS|FAIL|SKIP):' "$LOG"; then
++  echo "no tests were collected in mode $MODE" >>"$LOG"
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++cat "$LOG"
++
++expected_tests() {
++  grep -ho '^func TestSnapshotVerifyInstallable[A-Za-z0-9_]*' "$NEW_FILE" 2>/dev/null | sed 's/^func //'
++}
++
++xml_escape() {
++  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' | tr -d '\000-\010\013\014\016-\037'
++}
++
++add_failures() {
++  suite="$1"
++  message="$2"
++  detail="$3"
++  shift 3
++  grep -q '</testsuites>' "$OUTPUT_PATH" 2>/dev/null || printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++  EXTRA="$(mktemp)"
++  MERGED="$(mktemp)"
++  {
++    echo "<testsuite name=\"$suite\" tests=\"$#\" failures=\"$#\" errors=\"0\">"
++    for name in "$@"; do
++      echo "<testcase name=\"$name\" classname=\"$suite\"><failure message=\"$message\">$detail</failure></testcase>"
++    done
++    echo '</testsuite>'
++  } >"$EXTRA"
++  awk -v extra="$EXTRA" '/<\/testsuites>/ { while ((getline line < extra) > 0) print line } { print }' "$OUTPUT_PATH" >"$MERGED"
++  TESTS="$(grep -c '<testcase ' "$MERGED")"
++  FAILURES="$(grep -c '<failure' "$MERGED")"
++  ERRORS="$(grep -c '<error' "$MERGED")"
++  sed -E "1,/<testsuites/ s#<testsuites[^>]*>#<testsuites tests=\"$TESTS\" failures=\"$FAILURES\" errors=\"$ERRORS\">#" "$MERGED" >"$OUTPUT_PATH"
++  rm -f "$EXTRA" "$MERGED"
++}
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOG" | tr -d '\000-\010\013\014\016-\037' | go-junit-report >"$OUTPUT_PATH" 2>/dev/null || true
++  PANICKED="$(awk '/^--- FAIL: /{name=$3} /^panic: /{print name; exit}' "$LOG")"
++  RAN=0
++  NAMES=""
++  if [ "$MODE" = "new" ]; then
++    SUITE="$NEW_PKG"
++    for name in $(expected_tests); do
++      if grep -q "<testcase name=\"$name\"" "$OUTPUT_PATH" 2>/dev/null; then
++        RAN=1
++      else
++        NAMES="$NAMES $name"
++      fi
++    done
++  else
++    SUITE="github.com/aptly-dev/aptly"
++    if grep -q '<testcase ' "$OUTPUT_PATH" 2>/dev/null; then
++      RAN=1
++    else
++      NAMES="build"
++    fi
++  fi
++  if [ -n "$NAMES" ]; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    DETAIL="$(grep -E '^# |\.go:[0-9]+:[0-9]+: |\[(build|setup) failed\]|^panic|timed out' "$LOG" | head -n 40)"
++    [ -n "$DETAIL" ] || DETAIL="$(tail -n 40 "$LOG")"
++    DETAIL="$(printf '%s\n' "$DETAIL" | xml_escape)"
++    if [ "$RAN" -eq 1 ] && [ -n "$PANICKED" ]; then
++      MESSAGE="not run: the test binary exited after $PANICKED panicked"
++    elif [ "$RAN" -eq 1 ]; then
++      MESSAGE="not run: the test binary exited before reaching this test"
++    else
++      MESSAGE="the test package failed to build or run"
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++    fi
++    add_failures "$SUITE" "$MESSAGE" "$DETAIL" $NAMES
++  fi
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    DETAIL="$(head -n 40 "$LIST_ERR" | xml_escape)"
++    add_failures "$SUITE" "package discovery failed: go list ./... exited with status $LIST_STATUS" "$DETAIL" package_discovery
++  fi
++fi
++
++exit "$STATUS"

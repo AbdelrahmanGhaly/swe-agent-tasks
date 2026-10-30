@@ -1,0 +1,2195 @@
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 3f32205..e8cd711 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -28,16 +28,19 @@ use std::{
+ use crate::{
+     error, error_loc,
+     eval::{Evaluator, FrameType},
+-    expr::{Evaluable, Value},
++    expr::{Evaluable, ParseExprOpt, Value, parse_expr},
+     flags::FLAGS,
+     loc::Loc,
+     log,
+     rule::Rule,
+     stmt::AssignOp,
+-    strutil::{Pattern, get_ext, strip_ext, trim_leading_curdir, word_scanner},
++    strutil::{
++        Pattern, WordWriter, basename, dirname, get_ext, is_space_byte, strip_ext,
++        trim_leading_curdir, word_scanner,
++    },
+     symtab::{Symbol, intern},
+     timeutil::ScopedTimeReporter,
+-    var::{ScopedVar, Var, Variable, Vars},
++    var::{ScopedVar, Var, VarOrigin, Variable, Vars},
+     warn_loc,
+ };
+ 
+@@ -114,7 +117,7 @@ fn apply_output_pattern(r: &Rule, output: Symbol, inputs: &[Symbol]) -> Vec<Symb
+         }
+         return ret;
+     }
+-    if r.output_patterns.is_empty() {
++    if r.output_patterns.is_empty() || r.is_secondary_expanded {
+         ret.extend(inputs);
+         return ret;
+     }
+@@ -127,6 +130,164 @@ fn apply_output_pattern(r: &Rule, output: Symbol, inputs: &[Symbol]) -> Vec<Symb
+     ret
+ }
+ 
++// What a prerequisite list gets its second expansion with: the automatic
++// variables, and the location messages are reported at.
++#[derive(Clone)]
++struct SecondaryContext {
++    output: Symbol,
++    stem: Bytes,
++    first_input: Bytes,
++    inputs: Vec<Symbol>,
++    order_only_inputs: Vec<Symbol>,
++    loc: Option<Loc>,
++}
++
++// The value a target-specific or pattern-specific variable has for its own
++// target, without anything inherited from the targets that need it. `scope`
++// holds what the target sees so far; outside of it is the global value. A
++// pattern's `?=` gives way to a global value, as make decides it when the
++// target's variables are set up; a target's own `?=` was decided when its
++// line was read.
++fn own_rule_var(name: Symbol, var: &Var, from_pattern: bool, scope: &Vars) -> Option<Var> {
++    let global = name.get_global_var();
++    let op = var.read().assign_op;
++    match op {
++        Some(AssignOp::PlusEq) => match scope.peek(name).or(global) {
++            Some(outer) => Some(Variable::new_appended(outer, var.clone())),
++            None => Some(var.clone()),
++        },
++        Some(AssignOp::QuestionEq) if from_pattern && global.is_some() => None,
++        _ => Some(var.clone()),
++    }
++}
++
++// The names make gives as $@ and $% for a target: an archive member
++// `lib(member)` is `lib` and `member`, anything else is the target and "".
++fn split_archive_member(name: &Bytes) -> (Bytes, Bytes) {
++    if let Some(paren) = memchr(b'(', name)
++        && paren > 0
++        && name.len() > paren + 2
++        && name.ends_with(b")")
++        && !(name[paren + 1] == b'(' && name[name.len() - 2] == b')')
++    {
++        return (name.slice(..paren), name.slice(paren + 1..name.len() - 1));
++    }
++    (name.clone(), Bytes::new())
++}
++
++// The suffixes make 4.2.1 knows until a makefile changes .SUFFIXES.
++const DEFAULT_SUFFIXES: &[u8] = b".out .a .ln .o .c .cc .C .cpp .p .f .F .m .r .y .l .ym .yl \
++    .s .S .mod .sym .def .h .info .dvi .tex .texinfo .texi .txinfo .w .ch .web .sh .elc .el";
++
++// The name make uses for a file in $^, $+ and $|, and to find the $* of a
++// target without a pattern: an archive member by its member name.
++fn listed_name(name: Bytes) -> Bytes {
++    let (_, member) = split_archive_member(&name);
++    if member.is_empty() { name } else { member }
++}
++
++// Where make reports messages from the second expansion of a target whose
++// recipe is `r`: the first line of the recipe, which is the rule's own line
++// for a recipe after `;`. Without a recipe there is no location.
++fn recipe_loc(r: Option<&Rule>) -> Option<Loc> {
++    let r = r?;
++    if r.cmds.is_empty() {
++        return None;
++    }
++    r.cmd_loc.clone().or_else(|| Some(r.loc.clone()))
++}
++
++fn add_secondary_var(scope: &Vars, name: &str, value: Bytes) {
++    let mut dirs = BytesMut::new();
++    let mut bases = BytesMut::new();
++    {
++        let mut dw = WordWriter::new(&mut dirs);
++        let mut bw = WordWriter::new(&mut bases);
++        for tok in word_scanner(&value) {
++            dw.write(&dirname(&value.slice_ref(tok)));
++            bw.write(basename(tok));
++        }
++    }
++    let mut vars = scope.0.lock();
++    for (name, value) in [
++        (name.to_string(), value),
++        (format!("{name}D"), dirs.freeze()),
++        (format!("{name}F"), bases.freeze()),
++    ] {
++        vars.insert(
++            intern(name),
++            Variable::with_simple_string(value, VarOrigin::Automatic, None, None),
++        );
++    }
++}
++
++// Replaces `%' with `$*' the way make does before the second expansion:
++// every `%' of a static pattern rule, but only the first `%' of each word
++// of a pattern rule. A variable reference stays inside its word.
++fn subst_secondary_stem(r: &Rule, text: &Bytes) -> Bytes {
++    if r.output_patterns.is_empty() {
++        return text.clone();
++    }
++    let mut out = BytesMut::with_capacity(text.len() + 2);
++    if !r.outputs.is_empty() {
++        for &c in text.iter() {
++            if c == b'%' {
++                out.put_slice(b"$*");
++            } else {
++                out.put_u8(c);
++            }
++        }
++        return out.freeze();
++    }
++    let mut i = 0;
++    while i < text.len() {
++        if is_space_byte(&text[i]) {
++            out.put_u8(text[i]);
++            i += 1;
++            continue;
++        }
++        let beg = i;
++        while i < text.len() && !is_space_byte(&text[i]) {
++            let c = text[i];
++            i += 1;
++            if c == b'|' {
++                break;
++            }
++            if c != b'$' || i == text.len() {
++                continue;
++            }
++            let open = text[i];
++            i += 1;
++            if open != b'(' && open != b'{' {
++                continue;
++            }
++            let close = if open == b'(' { b')' } else { b'}' };
++            let mut depth = 0;
++            while i < text.len() {
++                if text[i] == open {
++                    depth += 1;
++                } else if text[i] == close {
++                    depth -= 1;
++                    if depth < 0 {
++                        i += 1;
++                        break;
++                    }
++                }
++                i += 1;
++            }
++        }
++        let word = &text[beg..i];
++        if let Some(pct) = memchr(b'%', word) {
++            out.put_slice(&word[..pct]);
++            out.put_slice(b"$*");
++            out.put_slice(&word[pct + 1..]);
++        } else {
++            out.put_slice(word);
++        }
++    }
++    out.freeze()
++}
++
+ struct RuleTrieEntry {
+     rule: Arc<Rule>,
+     suffix: Vec<u8>,
+@@ -201,7 +362,7 @@ fn is_suffix_rule(output: &Symbol) -> bool {
+     true
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ struct RuleMerger {
+     rules: Vec<Arc<Rule>>,
+     implicit_outputs: Vec<(Symbol, Arc<Mutex<RuleMerger>>)>,
+@@ -391,6 +552,9 @@ type SuffixRuleMap = HashMap<Bytes, Vec<Arc<Rule>>>;
+ struct DepBuilder<'a> {
+     ev: &'a mut Evaluator,
+     rules: HashMap<Symbol, Arc<Mutex<RuleMerger>>>,
++    has_secondary_inputs: bool,
++    expanded_rule_mergers: HashMap<Symbol, Arc<Mutex<RuleMerger>>>,
++    suffixes: Vec<Bytes>,
+     rule_vars: HashMap<Symbol, Arc<Vars>>,
+     cur_rule_vars: Option<Arc<Vars>>,
+ 
+@@ -421,6 +585,9 @@ impl<'a> DepBuilder<'a> {
+         let mut ret = Self {
+             ev,
+             rules: HashMap::new(),
++            has_secondary_inputs: false,
++            expanded_rule_mergers: HashMap::new(),
++            suffixes: Vec::new(),
+             rule_vars,
+             cur_rule_vars: None,
+ 
+@@ -445,23 +612,36 @@ impl<'a> DepBuilder<'a> {
+             eprintln!("*kati*: {} suffix rules", ret.suffix_rules.len());
+         }
+ 
+-        ret.handle_special_targets();
++        // Like make, expand the prerequisites of every target once all makefiles
++        // are read, whether or not the target is built. That includes suffix rule
++        // declarations such as `.c.o`: make 4.2.1 expands them too, and only the
++        // suffix rules made from them leave the result unused.
++        if ret.has_secondary_inputs {
++            ret.init_suffixes()?;
++            let mut outputs = ret.rules.keys().cloned().collect::<Vec<_>>();
++            outputs.sort_by_cached_key(|o| o.as_bytes());
++            for output in outputs {
++                ret.lookup_rule_merger(output)?;
++            }
++        }
++
++        ret.handle_special_targets()?;
+ 
+         Ok(ret)
+     }
+ 
+-    fn handle_special_targets(&mut self) {
+-        if let Some((targets, _)) = self.get_rule_inputs(intern(".PHONY")) {
++    fn handle_special_targets(&mut self) -> Result<()> {
++        if let Some((targets, _)) = self.get_rule_inputs(intern(".PHONY"))? {
+             for t in targets {
+                 self.phony.insert(t);
+             }
+         }
+-        if let Some((targets, _)) = self.get_rule_inputs(intern(".KATI_RESTAT")) {
++        if let Some((targets, _)) = self.get_rule_inputs(intern(".KATI_RESTAT"))? {
+             for t in targets {
+                 self.restat.insert(t);
+             }
+         }
+-        if let Some((targets, loc)) = self.get_rule_inputs(intern(".SUFFIXES")) {
++        if let Some((targets, loc)) = self.get_rule_inputs(intern(".SUFFIXES"))? {
+             if targets.is_empty() {
+                 self.suffix_rules.clear();
+             } else {
+@@ -477,7 +657,6 @@ impl<'a> DepBuilder<'a> {
+             ".PRECIOUS",
+             ".INTERMEDIATE",
+             ".SECONDARY",
+-            ".SECONDEXPANSION",
+             ".IGNORE",
+             ".LOW_RESOLUTION_TIME",
+             ".SILENT",
+@@ -486,10 +665,11 @@ impl<'a> DepBuilder<'a> {
+             ".ONESHELL",
+         ];
+         for p in unsupported_builtin_targets {
+-            if let Some((_, loc)) = self.get_rule_inputs(intern(p)) {
++            if let Some((_, loc)) = self.get_rule_inputs(intern(p))? {
+                 warn_loc!(Some(&loc), "kati doesn't support {p}");
+             }
+         }
++        Ok(())
+     }
+ 
+     fn build(&mut self, mut targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
+@@ -502,10 +682,13 @@ impl<'a> DepBuilder<'a> {
+         }
+         if FLAGS.gen_all_targets {
+             let mut non_root_targets = HashSet::new();
+-            for (sym, merger) in &self.rules {
+-                if is_special_target(sym) {
++            for sym in self.rules.keys().cloned().collect::<Vec<_>>() {
++                if is_special_target(&sym) {
+                     continue;
+                 }
++                let Some(merger) = self.lookup_rule_merger(sym)? else {
++                    continue;
++                };
+                 for r in merger.lock().rules.iter() {
+                     for t in &r.inputs {
+                         non_root_targets.insert(*t);
+@@ -546,8 +729,10 @@ impl<'a> DepBuilder<'a> {
+             || std::fs::exists(OsStr::from_bytes(&target.as_bytes())).is_ok_and(|v| v)
+     }
+ 
+-    fn get_rule_inputs(&self, s: Symbol) -> Option<(Vec<Symbol>, Loc)> {
+-        let merger = self.rules.get(&s)?;
++    fn get_rule_inputs(&mut self, s: Symbol) -> Result<Option<(Vec<Symbol>, Loc)>> {
++        let Some(merger) = self.lookup_rule_merger(s)? else {
++            return Ok(None);
++        };
+         let merger = merger.lock();
+         let mut ret = Vec::new();
+         assert!(!merger.rules.is_empty());
+@@ -557,7 +742,279 @@ impl<'a> DepBuilder<'a> {
+             }
+         }
+ 
+-        Some((ret, merger.rules[0].loc.clone()))
++        Ok(Some((ret, merger.rules[0].loc.clone())))
++    }
++
++    // Expands the prerequisites `r` left for the second expansion.
++    fn expand_secondary_inputs(
++        &mut self,
++        r: &Rule,
++        ctx: &SecondaryContext,
++        pattern_vars: Option<Arc<Vars>>,
++        target_vars: Option<Arc<Vars>>,
++    ) -> Result<(Vec<Symbol>, Vec<Symbol>)> {
++        let scope = Vars::new();
++        for (vars, from_pattern) in [(pattern_vars, true), (target_vars, false)] {
++            let Some(vars) = vars else {
++                continue;
++            };
++            let vars = vars.0.lock().clone();
++            for (name, var) in vars {
++                if let Some(var) = own_rule_var(name, &var, from_pattern, &scope) {
++                    scope.0.lock().insert(name, var);
++                }
++            }
++        }
++
++        let mut all = BytesMut::new();
++        let mut uniq = BytesMut::new();
++        let mut order_only = BytesMut::new();
++        {
++            let mut all_writer = WordWriter::new(&mut all);
++            let mut uniq_writer = WordWriter::new(&mut uniq);
++            let mut order_only_writer = WordWriter::new(&mut order_only);
++            let mut seen = HashSet::new();
++            for input in &ctx.inputs {
++                let s = listed_name(input.as_bytes());
++                all_writer.write(&s);
++                if seen.insert(*input) {
++                    uniq_writer.write(&s);
++                }
++            }
++            for input in &ctx.order_only_inputs {
++                if seen.insert(*input) {
++                    order_only_writer.write(&listed_name(input.as_bytes()));
++                }
++            }
++        }
++        let (archive, member) = split_archive_member(&ctx.output.as_bytes());
++        add_secondary_var(&scope, "@", archive);
++        add_secondary_var(&scope, "%", member);
++        add_secondary_var(&scope, "*", ctx.stem.clone());
++        add_secondary_var(&scope, "<", ctx.first_input.clone());
++        add_secondary_var(&scope, "^", uniq.freeze());
++        add_secondary_var(&scope, "+", all.freeze());
++        add_secondary_var(&scope, "|", order_only.freeze());
++
++        let text = subst_secondary_stem(r, r.secondary_inputs.as_ref().unwrap());
++        let mut loc = r.loc.clone();
++        // The line's comments are gone already, so a `#` the first expansion
++        // produced stays in the list.
++        let value = parse_expr(&mut loc, text, ParseExprOpt::Define)?;
++        let orig_scope = self.ev.current_scope.replace(Arc::new(scope));
++        // Like make, report messages at the target's recipe, if it has one.
++        let orig_loc = std::mem::replace(&mut self.ev.loc, ctx.loc.clone());
++        let expanded = value.eval_to_buf(self.ev);
++        self.ev.loc = orig_loc;
++        self.ev.current_scope = orig_scope;
++        let expanded = expanded?;
++
++        let mut inputs = Vec::new();
++        let mut order_only_inputs = Vec::new();
++        let mut is_order_only = false;
++        for input in word_scanner(&expanded) {
++            if input == b"|" {
++                is_order_only = true;
++                continue;
++            }
++            let sym = intern(expanded.slice_ref(trim_leading_curdir(input)));
++            if is_order_only {
++                order_only_inputs.push(sym);
++            } else {
++                inputs.push(sym);
++            }
++        }
++        Ok((inputs, order_only_inputs))
++    }
++
++    // The suffix list as make keeps it: the built-in suffixes, emptied by each
++    // `.SUFFIXES:` rule without prerequisites and extended by the others. Like
++    // make, .SUFFIXES gets its second expansion before the targets whose $* the
++    // list decides.
++    fn init_suffixes(&mut self) -> Result<()> {
++        self.suffixes = word_scanner(DEFAULT_SUFFIXES)
++            .map(Bytes::copy_from_slice)
++            .collect();
++        let Some(merger) = self.lookup_rule_merger(intern(".SUFFIXES"))? else {
++            return Ok(());
++        };
++        for r in &merger.lock().rules {
++            if r.inputs.is_empty() && !r.is_secondary_expanded {
++                self.suffixes.clear();
++            }
++            self.suffixes.extend(r.inputs.iter().map(|s| s.as_bytes()));
++        }
++        Ok(())
++    }
++
++    // $* for a prerequisite list of `merger` that is not from a pattern: like
++    // make, the stem of the target's static pattern rule, or else the target
++    // name less the first known suffix it ends with.
++    fn plain_stem(&self, output: Symbol, merger: &RuleMerger) -> Bytes {
++        let output_str = output.as_bytes();
++        if let Some(r) = merger
++            .rules
++            .iter()
++            .rev()
++            .find(|r| !r.output_patterns.is_empty())
++        {
++            let pat = Pattern::new(r.output_patterns[0].as_bytes());
++            return Bytes::copy_from_slice(pat.stem(&output_str));
++        }
++        let name = listed_name(output_str);
++        for suffix in &self.suffixes {
++            if name.len() > suffix.len() && name.ends_with(suffix) {
++                return name.slice(..name.len() - suffix.len());
++            }
++        }
++        Bytes::new()
++    }
++
++    // Returns `merger` with the second expansion done for `output`. The
++    // prerequisites of the rule with the recipe come first, as in make, and the
++    // lists are expanded in that order; $< and $^ see what is known by then. A
++    // double-colon rule stands alone, with only its own prerequisites and recipe.
++    fn expand_secondary_rules(
++        &mut self,
++        output: Symbol,
++        merger: Arc<Mutex<RuleMerger>>,
++    ) -> Result<Arc<Mutex<RuleMerger>>> {
++        if !self.has_secondary_inputs {
++            return Ok(merger);
++        }
++        if let Some(expanded) = self.expanded_rule_mergers.get(&output) {
++            return Ok(expanded.clone());
++        }
++
++        let (mut needs_expansion, implicit_outputs) = {
++            let merger = merger.lock();
++            (
++                merger.rules.iter().any(|r| r.secondary_inputs.is_some()),
++                merger.implicit_outputs.clone(),
++            )
++        };
++        let mut implicit_output_mergers = Vec::new();
++        for (sym, m) in implicit_outputs {
++            let found = self.lookup_rule_merger(sym)?.unwrap_or_else(|| m.clone());
++            if !Arc::ptr_eq(&found, &m) {
++                needs_expansion = true;
++            }
++            implicit_output_mergers.push(found);
++        }
++        if !needs_expansion {
++            return Ok(merger);
++        }
++
++        let mut expanded = merger.lock().clone();
++        for (p, found) in expanded
++            .implicit_outputs
++            .iter_mut()
++            .zip(implicit_output_mergers)
++        {
++            p.1 = found;
++        }
++
++        let alone = expanded.is_double_colon;
++        let first = if alone {
++            None
++        } else {
++            expanded.primary_rule.clone()
++        };
++        let mut order = Vec::new();
++        if let Some(first) = &first {
++            order.push(first.clone());
++        }
++        for r in &expanded.rules {
++            if let Some(first) = &first
++                && Arc::ptr_eq(r, first)
++            {
++                continue;
++            }
++            order.push(r.clone());
++        }
++
++        let mut known: Vec<Option<(Vec<Symbol>, Vec<Symbol>)>> = order
++            .iter()
++            .map(|r| {
++                if r.secondary_inputs.is_some() {
++                    None
++                } else {
++                    Some((
++                        apply_output_pattern(r, output, &r.inputs),
++                        apply_output_pattern(r, output, &r.order_only_inputs),
++                    ))
++                }
++            })
++            .collect();
++
++        let output_str = output.as_bytes();
++        let primary_loc = recipe_loc(expanded.primary_rule.as_deref());
++        for i in 0..order.len() {
++            if known[i].is_some() {
++                continue;
++            }
++            let r = order[i].clone();
++            let (stem, pattern_vars) = if r.output_patterns.is_empty() {
++                (self.plain_stem(output, &expanded), None)
++            } else {
++                let pat = Pattern::new(r.output_patterns[0].as_bytes());
++                (
++                    Bytes::copy_from_slice(pat.stem(&output_str)),
++                    self.lookup_rule_vars(r.output_patterns[0]),
++                )
++            };
++            let mut ctx = SecondaryContext {
++                output,
++                stem,
++                first_input: Bytes::new(),
++                inputs: Vec::new(),
++                order_only_inputs: Vec::new(),
++                loc: if alone {
++                    recipe_loc(Some(&*r))
++                } else {
++                    primary_loc.clone()
++                },
++            };
++            if !alone {
++                for k in &known {
++                    let Some((inputs, _)) = k else {
++                        break;
++                    };
++                    if let Some(first) = inputs.first() {
++                        ctx.first_input = first.as_bytes();
++                        break;
++                    }
++                }
++                ctx.inputs = known.iter().flatten().flat_map(|k| &k.0).cloned().collect();
++                ctx.order_only_inputs =
++                    known.iter().flatten().flat_map(|k| &k.1).cloned().collect();
++            }
++
++            let target_vars = self.lookup_rule_vars(output);
++            let (inputs, order_only_inputs) =
++                self.expand_secondary_inputs(&r, &ctx, pattern_vars, target_vars)?;
++            let mut e = (*r).clone();
++            e.secondary_inputs = None;
++            e.inputs = inputs;
++            e.order_only_inputs = order_only_inputs;
++            e.is_secondary_expanded = true;
++            let e = Arc::new(e);
++            known[i] = Some((e.inputs.clone(), e.order_only_inputs.clone()));
++            for rule in expanded.rules.iter_mut() {
++                if Arc::ptr_eq(rule, &r) {
++                    *rule = e.clone();
++                }
++            }
++            if let Some(primary_rule) = &expanded.primary_rule
++                && Arc::ptr_eq(primary_rule, &r)
++            {
++                expanded.primary_rule = Some(e);
++            }
++        }
++
++        let expanded = Arc::new(Mutex::new(expanded));
++        self.expanded_rule_mergers.insert(output, expanded.clone());
++        Ok(expanded)
+     }
+ 
+     fn populate_rules(&mut self) -> Result<()> {
+@@ -629,6 +1086,10 @@ impl<'a> DepBuilder<'a> {
+         let mut r = rule.clone();
+         r.inputs.clear();
+         r.inputs.push(intern(input_suffix));
++        // The suffix rule takes none of the declaration's prerequisites, also not
++        // the ones left for the second expansion; the declaration itself is still
++        // expanded with every other target.
++        r.secondary_inputs = None;
+         r.is_suffix_rule = true;
+         self.suffix_rules
+             .entry(output_suffix)
+@@ -649,6 +1110,9 @@ impl<'a> DepBuilder<'a> {
+                 .add_rule(*output, rule.clone())?;
+             self.populate_suffix_rule(&rule, *output)?;
+         }
++        if rule.secondary_inputs.is_some() {
++            self.has_secondary_inputs = true;
++        }
+         Ok(())
+     }
+ 
+@@ -691,8 +1155,11 @@ impl<'a> DepBuilder<'a> {
+         Ok(())
+     }
+ 
+-    fn lookup_rule_merger(&self, o: Symbol) -> Option<Arc<Mutex<RuleMerger>>> {
+-        self.rules.get(&o).cloned()
++    fn lookup_rule_merger(&mut self, o: Symbol) -> Result<Option<Arc<Mutex<RuleMerger>>>> {
++        let Some(merger) = self.rules.get(&o).cloned() else {
++            return Ok(None);
++        };
++        Ok(Some(self.expand_secondary_rules(o, merger)?))
+     }
+ 
+     fn lookup_rule_vars(&self, o: Symbol) -> Option<Arc<Vars>> {
+@@ -703,31 +1170,57 @@ impl<'a> DepBuilder<'a> {
+         &mut self,
+         rule: &Rule,
+         output: Symbol,
++        explicit_ctx: &SecondaryContext,
+         n: Arc<Mutex<DepNode>>,
+-    ) -> Option<Arc<Rule>> {
++    ) -> Result<Option<Arc<Rule>>> {
+         let output_str = output.as_bytes();
+         let mut matched = None;
++        let mut expanded = None;
+         for output_pattern in &rule.output_patterns {
+             let pat = Pattern::new(output_pattern.as_bytes());
+             if pat.matches(&output_str) {
+-                let mut ok = true;
+-                for input in &rule.inputs {
+-                    let buf = pat.append_subst(&output_str, &input.as_bytes());
+-                    if !self.exists(intern(buf)) {
+-                        ok = false;
+-                        break;
+-                    }
++                if rule.secondary_inputs.is_some() {
++                    let ctx = SecondaryContext {
++                        stem: Bytes::copy_from_slice(pat.stem(&output_str)),
++                        ..explicit_ctx.clone()
++                    };
++                    let pattern_vars = self.lookup_rule_vars(*output_pattern);
++                    let target_vars = self.lookup_rule_vars(output);
++                    let (inputs, order_only_inputs) =
++                        self.expand_secondary_inputs(rule, &ctx, pattern_vars, target_vars)?;
++                    let mut e = rule.clone();
++                    e.secondary_inputs = None;
++                    e.inputs = inputs;
++                    e.order_only_inputs = order_only_inputs;
++                    e.is_secondary_expanded = true;
++                    expanded = Some(e);
+                 }
+ 
+-                if ok {
++                let names: Vec<Symbol> = if let Some(e) = &expanded {
++                    // make rejects the rule when any expanded prerequisite, order-only
++                    // ones included, cannot be made.
++                    e.inputs
++                        .iter()
++                        .chain(&e.order_only_inputs)
++                        .cloned()
++                        .collect()
++                } else {
++                    rule.inputs
++                        .iter()
++                        .map(|input| intern(pat.append_subst(&output_str, &input.as_bytes())))
++                        .collect()
++                };
++                if names.iter().all(|name| self.exists(*name)) {
+                     matched = Some(*output_pattern);
+                     break;
+                 }
+             }
+         }
+-        let matched = matched?;
++        let Some(matched) = matched else {
++            return Ok(None);
++        };
+ 
+-        let mut rule = rule.clone();
++        let mut rule = expanded.unwrap_or_else(|| rule.clone());
+         if rule.output_patterns.len() > 1 {
+             // We should mark all other output patterns as used.
+             let pat = Pattern::new(matched.as_bytes());
+@@ -741,7 +1234,7 @@ impl<'a> DepBuilder<'a> {
+             rule.output_patterns.clear();
+             rule.output_patterns.push(matched);
+         }
+-        Some(Arc::new(rule))
++        Ok(Some(Arc::new(rule)))
+     }
+ 
+     fn merge_implicit_rule_vars(
+@@ -760,8 +1253,12 @@ impl<'a> DepBuilder<'a> {
+         Some(found)
+     }
+ 
+-    fn pick_rule(&mut self, output: Symbol, n: &Arc<Mutex<DepNode>>) -> Option<PickedRuleInfo> {
+-        let rule_merger = self.lookup_rule_merger(output);
++    fn pick_rule(
++        &mut self,
++        output: Symbol,
++        n: &Arc<Mutex<DepNode>>,
++    ) -> Result<Option<PickedRuleInfo>> {
++        let rule_merger = self.lookup_rule_merger(output)?;
+         let vars = self.lookup_rule_vars(output);
+         if let Some(rule_merger) = &rule_merger
+             && rule_merger.lock().primary_rule.is_some()
+@@ -770,68 +1267,96 @@ impl<'a> DepBuilder<'a> {
+             for (sym, _) in &rule_merger.lock().implicit_outputs {
+                 vars = self.merge_implicit_rule_vars(*sym, vars);
+             }
+-            return Some(PickedRuleInfo {
++            return Ok(Some(PickedRuleInfo {
+                 merger: Some(rule_merger.clone()),
+                 pattern_rule: None,
+                 vars,
+-            });
++            }));
+         }
+ 
++        // A pattern rule's second expansion gets $<, $^ and $| from the target's
++        // other rules. make tries the rule before the target has a recipe, so its
++        // messages have no location.
++        let mut explicit_ctx = SecondaryContext {
++            output,
++            stem: Bytes::new(),
++            first_input: Bytes::new(),
++            inputs: Vec::new(),
++            order_only_inputs: Vec::new(),
++            loc: None,
++        };
++        if let Some(rule_merger) = &rule_merger {
++            for r in &rule_merger.lock().rules {
++                explicit_ctx
++                    .inputs
++                    .extend(apply_output_pattern(r, output, &r.inputs));
++                explicit_ctx.order_only_inputs.extend(apply_output_pattern(
++                    r,
++                    output,
++                    &r.order_only_inputs,
++                ));
++            }
++            if let Some(first) = explicit_ctx.inputs.first() {
++                explicit_ctx.first_input = first.as_bytes();
++            }
++        }
+         let irules = self.implicit_rules.get(&output.as_bytes());
+         for rule in irules.into_iter().rev() {
+-            let Some(pattern_rule) = self.can_pick_implicit_rule(&rule, output, n.clone()) else {
++            let Some(pattern_rule) =
++                self.can_pick_implicit_rule(&rule, output, &explicit_ctx, n.clone())?
++            else {
+                 continue;
+             };
+             if rule_merger.is_some() {
+-                return Some(PickedRuleInfo {
++                return Ok(Some(PickedRuleInfo {
+                     merger: rule_merger,
+                     pattern_rule: Some(pattern_rule),
+                     vars,
+-                });
++                }));
+             }
+             assert!(pattern_rule.output_patterns.len() == 1);
+             let vars = self.merge_implicit_rule_vars(pattern_rule.output_patterns[0], vars);
+-            return Some(PickedRuleInfo {
++            return Ok(Some(PickedRuleInfo {
+                 merger: None,
+                 pattern_rule: Some(pattern_rule),
+                 vars,
+-            });
++            }));
+         }
+ 
+         let output_str = output.as_bytes();
+         let Some(output_suffix) = get_ext(&output_str) else {
+             if rule_merger.is_some() {
+-                return Some(PickedRuleInfo {
++                return Ok(Some(PickedRuleInfo {
+                     merger: rule_merger,
+                     pattern_rule: None,
+                     vars,
+-                });
++                }));
+             } else {
+-                return None;
++                return Ok(None);
+             }
+         };
+         if !output_suffix.starts_with(b".") {
+             if rule_merger.is_some() {
+-                return Some(PickedRuleInfo {
++                return Ok(Some(PickedRuleInfo {
+                     merger: rule_merger,
+                     pattern_rule: None,
+                     vars,
+-                });
++                }));
+             } else {
+-                return None;
++                return Ok(None);
+             }
+         }
+         let output_suffix = &output_suffix[1..];
+ 
+         let Some(found) = self.suffix_rules.get(output_suffix) else {
+             if rule_merger.is_some() {
+-                return Some(PickedRuleInfo {
++                return Ok(Some(PickedRuleInfo {
+                     merger: rule_merger,
+                     pattern_rule: None,
+                     vars,
+-                });
++                }));
+             } else {
+-                return None;
++                return Ok(None);
+             }
+         };
+ 
+@@ -843,32 +1368,32 @@ impl<'a> DepBuilder<'a> {
+             }
+ 
+             if rule_merger.is_some() {
+-                return Some(PickedRuleInfo {
++                return Ok(Some(PickedRuleInfo {
+                     merger: rule_merger,
+                     pattern_rule: Some(irule.clone()),
+                     vars,
+-                });
++                }));
+             }
+             let mut vars = vars;
+             if vars.is_some() {
+                 assert!(irule.outputs.len() == 1);
+                 vars = self.merge_implicit_rule_vars(irule.outputs[0], vars);
+             }
+-            return Some(PickedRuleInfo {
++            return Ok(Some(PickedRuleInfo {
+                 merger: rule_merger,
+                 pattern_rule: Some(irule.clone()),
+                 vars,
+-            });
++            }));
+         }
+ 
+         if rule_merger.is_some() {
+-            Some(PickedRuleInfo {
++            Ok(Some(PickedRuleInfo {
+                 merger: rule_merger,
+                 pattern_rule: None,
+                 vars,
+-            })
++            }))
+         } else {
+-            None
++            Ok(None)
+         }
+     }
+ 
+@@ -890,7 +1415,7 @@ impl<'a> DepBuilder<'a> {
+         );
+         self.done.insert(output, n.clone());
+ 
+-        let Some(mut picked_rule_info) = self.pick_rule(output, &n) else {
++        let Some(mut picked_rule_info) = self.pick_rule(output, &n)? else {
+             return Ok(n);
+         };
+         if let Some(merger) = &picked_rule_info.merger
+@@ -899,7 +1424,7 @@ impl<'a> DepBuilder<'a> {
+             output = merger.lock().parent_sym.unwrap();
+             self.done.insert(output, n.clone());
+             n.lock().output = output;
+-            let Some(new_picked_rule_info) = self.pick_rule(output, &n) else {
++            let Some(new_picked_rule_info) = self.pick_rule(output, &n)? else {
+                 return Ok(n);
+             };
+             // Update the picked_rule_info with the new values
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 6bb5651..b2f033d 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -36,7 +36,9 @@ use crate::stmt::{
+     AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt, IncludeStmt, RuleSep, RuleStmt,
+     Statement,
+ };
+-use crate::strutil::{is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
++use crate::strutil::{
++    find_outside_paren, is_space_byte, trim_leading_curdir, trim_right_space, word_scanner,
++};
+ use crate::symtab::{ALLOW_RULES_SYM, KATI_READONLY_SYM, MAKEFILE_LIST, SHELL_SYM, Symbol, intern};
+ use crate::var::{Var, VarOrigin, Variable, Vars};
+ use crate::{collect_stats_with_slow_report, error_loc, file_cache, log, warn_loc};
+@@ -268,6 +270,8 @@ pub struct Evaluator {
+ 
+     posix_sym: Symbol,
+     is_posix: bool,
++    second_expansion_sym: Symbol,
++    second_expansion: bool,
+ 
+     /// Whether `export`/`unexport` directives are allowed.
+     pub export_allowed: ExportAllowed,
+@@ -315,6 +319,8 @@ impl Evaluator {
+ 
+             posix_sym: crate::symtab::intern(".POSIX"),
+             is_posix: false,
++            second_expansion_sym: crate::symtab::intern(".SECONDEXPANSION"),
++            second_expansion: false,
+ 
+             export_allowed: ExportAllowed::Allowed,
+ 
+@@ -588,27 +594,38 @@ impl Evaluator {
+                 .or_insert_with(|| Arc::new(Vars::new()))
+                 .clone();
+ 
+-            let rhs = if assign.rhs.is_empty() {
+-                stmt.rhs.clone()
++            // Like make, a target's `?=` does nothing when the variable already has a
++            // global value as the line is read. A pattern's waits until it is used.
++            if assign.op == AssignOp::QuestionEq
++                && !is_pattern_rule(&target.as_bytes())
++                && var_sym.get_global_var().is_some()
++            {
++                continue;
++            }
++
++            // The text $(value) gives.
++            let (rhs, orig_rhs) = if assign.rhs.is_empty() {
++                (stmt.rhs.clone(), stmt.orig_rhs.clone())
+             } else if let Some(stmt_rhs) = stmt.rhs.clone() {
+                 let sep = if stmt.sep == RuleSep::Semicolon {
+                     b" ; "
+                 } else {
+                     b" = "
+                 };
+-                Some(Arc::new(Value::List(
+-                    self.loc.clone(),
+-                    vec![
+-                        Arc::new(Value::Literal(None, after_targets.slice_ref(assign.rhs))),
+-                        Arc::new(Value::Literal(None, Bytes::from_static(sep))),
+-                        stmt_rhs,
+-                    ],
+-                )))
++                (
++                    Some(Arc::new(Value::List(
++                        self.loc.clone(),
++                        vec![
++                            Arc::new(Value::Literal(None, after_targets.slice_ref(assign.rhs))),
++                            Arc::new(Value::Literal(None, Bytes::from_static(sep))),
++                            stmt_rhs,
++                        ],
++                    ))),
++                    Bytes::from([assign.rhs, &sep[..], &stmt.orig_rhs[..]].concat()),
++                )
+             } else {
+-                Some(Arc::new(Value::Literal(
+-                    None,
+-                    after_targets.slice_ref(assign.rhs),
+-                )))
++                let text = after_targets.slice_ref(assign.rhs);
++                (Some(Arc::new(Value::Literal(None, text.clone()))), text)
+             };
+ 
+             self.current_scope = Some(scope);
+@@ -617,13 +634,8 @@ impl Evaluator {
+                     self.mark_vars_readonly(&rhs)?;
+                 }
+             } else {
+-                let (rhs_var, needs_assign) = self.eval_rhs(
+-                    var_sym,
+-                    rhs.unwrap(),
+-                    Bytes::from_static(b"*TODO*"),
+-                    assign.op,
+-                    false,
+-                )?;
++                let (rhs_var, needs_assign) =
++                    self.eval_rhs(var_sym, rhs.unwrap(), orig_rhs, assign.op, false)?;
+                 if needs_assign {
+                     let mut readonly = false;
+                     rhs_var.write().assign_op = Some(assign.op);
+@@ -672,7 +684,13 @@ impl Evaluator {
+         // It is an assignment when either after_targets contains an assignment token
+         // or separator is an assignment token, but only if there is no ';' before the
+         // first assignment token.
+-        let mut separator_pos = memchr2(b'=', b';', &after_targets);
++        // After .SECONDEXPANSION, an `=` or `;` inside a reference left for the
++        // second expansion, like `$$(SRCS:.c=.o)`, belongs to the prerequisites.
++        let mut separator_pos = if self.second_expansion {
++            find_outside_paren(&after_targets, b"=;")
++        } else {
++            memchr2(b'=', b';', &after_targets)
++        };
+         let separator = if let Some(separator_pos) = separator_pos {
+             Some(after_targets[separator_pos])
+         } else if stmt.sep == RuleSep::Eq || stmt.sep == RuleSep::FinalEq {
+@@ -703,7 +721,7 @@ impl Evaluator {
+         } else {
+             rule.outputs = targets;
+         }
+-        rule.parse_prerequisites(&after_targets, separator_pos, stmt)?;
++        rule.parse_prerequisites(&after_targets, separator_pos, stmt, self.second_expansion)?;
+ 
+         if stmt.sep == RuleSep::Semicolon {
+             rule.cmds.push(stmt.rhs.clone().unwrap());
+@@ -713,6 +731,10 @@ impl Evaluator {
+             if o == &self.posix_sym {
+                 self.is_posix = true;
+             }
++            // Only the rules read after .SECONDEXPANSION get the second expansion.
++            if o == &self.second_expansion_sym {
++                self.second_expansion = true;
++            }
+         }
+ 
+         log!("Rule: {:?}", rule);
+diff --git a/src-rs/parser.rs b/src-rs/parser.rs
+index 6c3e20d..510a3a5 100644
+--- a/src-rs/parser.rs
++++ b/src-rs/parser.rs
+@@ -213,6 +213,7 @@ impl Parser {
+         let rule_lhs: Arc<Value>;
+         let mut rule_sep = RuleSep::Null;
+         let rule_rhs: Option<Arc<Value>>;
++        let mut rule_orig_rhs = Bytes::new();
+ 
+         let sep_plus_one = sep.map(|sep| sep + 1).unwrap_or(0);
+ 
+@@ -237,19 +238,20 @@ impl Parser {
+                 RuleSep::Semicolon => ParseExprOpt::Command,
+                 _ => ParseExprOpt::Normal,
+             };
+-            rule_rhs = Some(parse_expr(
+-                &mut mutable_loc,
+-                line.slice_ref(trim_left_space(&line[found + 1..])),
+-                opt,
+-            )?);
++            rule_orig_rhs = line.slice_ref(trim_left_space(&line[found + 1..]));
++            rule_rhs = Some(parse_expr(&mut mutable_loc, rule_orig_rhs.clone(), opt)?);
+         } else {
+             rule_lhs = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
+             rule_rhs = None;
+         }
+         self.after_rule = true;
+-        self.out_stmts
+-            .lock()
+-            .push(RuleStmt::new(rule_loc, rule_lhs, rule_sep, rule_rhs));
++        self.out_stmts.lock().push(RuleStmt::new(
++            rule_loc,
++            rule_lhs,
++            rule_sep,
++            rule_rhs,
++            rule_orig_rhs,
++        ));
+         Ok(())
+     }
+ 
+diff --git a/src-rs/rule.rs b/src-rs/rule.rs
+index f6a3c03..3b7bc1f 100644
+--- a/src-rs/rule.rs
++++ b/src-rs/rule.rs
+@@ -24,7 +24,7 @@ use memchr::memchr;
+ use crate::expr::Value;
+ use crate::loc::Loc;
+ use crate::stmt::{RuleSep, RuleStmt};
+-use crate::strutil::{Pattern, trim_leading_curdir, word_scanner};
++use crate::strutil::{Pattern, find_outside_paren, trim_leading_curdir, word_scanner};
+ use crate::symtab::{Symbol, intern};
+ use crate::{error_loc, warn_loc};
+ 
+@@ -35,8 +35,13 @@ pub struct Rule {
+     pub order_only_inputs: Vec<Symbol>,
+     pub output_patterns: Vec<Symbol>,
+     pub validations: Vec<Symbol>,
++    // Prerequisites left for the second expansion (.SECONDEXPANSION). As in
++    // make, the whole list waits, so its own words are not in its $< or $^.
++    pub secondary_inputs: Option<Bytes>,
+     pub is_double_colon: bool,
+     pub is_suffix_rule: bool,
++    // Whether `inputs` come from the second expansion, with the stem in them.
++    pub is_secondary_expanded: bool,
+     pub cmds: Vec<Arc<Value>>,
+     pub loc: Loc,
+     pub cmd_loc: Option<Loc>,
+@@ -50,8 +55,10 @@ impl Rule {
+             order_only_inputs: Vec::new(),
+             output_patterns: Vec::new(),
+             validations: Vec::new(),
++            secondary_inputs: None,
+             is_double_colon,
+             is_suffix_rule: false,
++            is_secondary_expanded: false,
+             cmds: Vec::new(),
+             loc,
+             cmd_loc: None,
+@@ -79,6 +86,7 @@ impl Rule {
+         line: &Bytes,
+         separator_pos: Option<usize>,
+         rule_stmt: &RuleStmt,
++        second_expansion: bool,
+     ) -> Result<()> {
+         // line is either
+         //    prerequisites [ ; command ]
+@@ -96,8 +104,19 @@ impl Rule {
+             prereq_string = line.slice(..separator_pos);
+         }
+ 
+-        let Some(separator_pos) = memchr(b':', &prereq_string) else {
++        // After .SECONDEXPANSION, a colon inside a reference left for the second
++        // expansion, like `$$(SRCS:.c=.o)`, does not start a static pattern.
++        let colon = if second_expansion {
++            find_outside_paren(&prereq_string, b":")
++        } else {
++            memchr(b':', &prereq_string)
++        };
++        let Some(separator_pos) = colon else {
+             // Simple prerequisites
++            if second_expansion && memchr(b'$', &prereq_string).is_some() {
++                self.secondary_inputs = Some(prereq_string);
++                return Ok(());
++            }
+             self.parse_inputs(&prereq_string);
+             return Ok(());
+         };
+@@ -142,6 +161,10 @@ impl Rule {
+         if !is_pattern_rule(&self.output_patterns.first().unwrap().as_bytes()) {
+             error_loc!(Some(&self.loc), "*** target pattern contains no '%'.");
+         }
++        if second_expansion && memchr(b'$', &prereq_patterns).is_some() {
++            self.secondary_inputs = Some(prereq_patterns);
++            return Ok(());
++        }
+         self.parse_inputs(&prereq_patterns);
+         Ok(())
+     }
+@@ -156,6 +179,9 @@ impl Debug for Rule {
+         if !self.output_patterns.is_empty() {
+             write!(f, " output_patterns={:?}", self.output_patterns)?;
+         }
++        if let Some(secondary_inputs) = &self.secondary_inputs {
++            write!(f, " secondary_inputs={secondary_inputs:?}")?;
++        }
+         if self.is_double_colon {
+             write!(f, " is_double_colon")?;
+         }
+diff --git a/src-rs/stmt.rs b/src-rs/stmt.rs
+index 16a904f..5d67e25 100644
+--- a/src-rs/stmt.rs
++++ b/src-rs/stmt.rs
+@@ -74,6 +74,7 @@ pub struct RuleStmt {
+     pub lhs: Arc<Value>,
+     pub sep: RuleSep,
+     pub rhs: Option<Arc<Value>>,
++    pub orig_rhs: Bytes,
+ }
+ 
+ impl Statement for RuleStmt {
+@@ -101,13 +102,20 @@ impl Debug for RuleStmt {
+ }
+ 
+ impl RuleStmt {
+-    pub fn new(loc: Loc, lhs: Arc<Value>, sep: RuleSep, rhs: Option<Arc<Value>>) -> Arc<RuleStmt> {
++    pub fn new(
++        loc: Loc,
++        lhs: Arc<Value>,
++        sep: RuleSep,
++        rhs: Option<Arc<Value>>,
++        orig_rhs: Bytes,
++    ) -> Arc<RuleStmt> {
+         Arc::new(RuleStmt {
+             loc,
+             orig: Bytes::new(),
+             lhs,
+             sep,
+             rhs,
++            orig_rhs,
+         })
+     }
+ }
+diff --git a/src-rs/var.rs b/src-rs/var.rs
+index 45fe249..7ff966d 100644
+--- a/src-rs/var.rs
++++ b/src-rs/var.rs
+@@ -93,6 +93,7 @@ pub enum InnerVar {
+     AutoCommand(Symbol, AutoCommandVar),
+     ShellStatus,
+     VariableNames { name: Bytes, all: bool },
++    Appended { outer: Var, own: Var },
+ }
+ 
+ impl Variable {
+@@ -118,6 +119,7 @@ impl Variable {
+             InnerVar::AutoCommand(_, _) => "undefined",
+             InnerVar::ShellStatus => "simple",
+             InnerVar::VariableNames { .. } => "kati_variable_names",
++            InnerVar::Appended { .. } => "recursive",
+         }
+     }
+     pub fn used(&self, ev: &Evaluator, sym: &Symbol) -> Result<()> {
+@@ -166,6 +168,7 @@ impl Variable {
+             }
+             InnerVar::ShellStatus => panic!(),
+             InnerVar::VariableNames { .. } => panic!(),
++            InnerVar::Appended { .. } => panic!(),
+         }
+         Ok(())
+     }
+@@ -192,6 +195,7 @@ impl Variable {
+             }
+             InnerVar::ShellStatus => panic!(),
+             InnerVar::VariableNames { .. } => panic!(),
++            InnerVar::Appended { .. } => panic!(),
+         }
+         Ok(())
+     }
+@@ -235,6 +239,8 @@ impl Variable {
+                 })
+             }
+             InnerVar::VariableNames { name, .. } => Cow::Borrowed(name),
++            // As in make, $(value) gives only the appended text.
++            InnerVar::Appended { own, .. } => Cow::Owned(own.read().string()?.into_owned()),
+         })
+     }
+ 
+@@ -296,6 +302,25 @@ impl Variable {
+         })))
+     }
+ 
++    // A `+=` on a target-specific or pattern-specific variable as its own target
++    // sees it: the value from outside, a space unless that value is empty, and
++    // the appended text. As in make, the appended text is expanded where the
++    // variable is used, even when the value from outside is simple.
++    pub fn new_appended(outer: Var, own: Var) -> Var {
++        let origin = own.read().origin();
++        Arc::new(RwLock::new(Self {
++            loc: None,
++            definition: None,
++            origin,
++            assign_op: None,
++            readonly: false,
++            deprecated: None,
++            obsolete: None,
++            visibility_prefix: None,
++            value: InnerVar::Appended { outer, own },
++        }))
++    }
++
+     pub fn new_recursive(
+         v: Arc<Value>,
+         origin: VarOrigin,
+@@ -374,6 +399,14 @@ impl Evaluable for Variable {
+             InnerVar::AutoCommand(_, a) => {
+                 a.eval(ev, out)?;
+             }
++            InnerVar::Appended { outer, own } => {
++                let s = outer.read().eval_to_buf(ev)?;
++                if !s.is_empty() {
++                    out.put_slice(&s);
++                    out.put_u8(b' ');
++                }
++                own.read().eval(ev, out)?;
++            }
+             InnerVar::ShellStatus => {
+                 if ev.is_evaluating_command {
+                     error_loc!(
+@@ -414,6 +447,7 @@ impl Evaluable for Variable {
+             InnerVar::AutoCommand(_, _) => true,
+             InnerVar::ShellStatus => false,
+             InnerVar::VariableNames { .. } => false,
++            InnerVar::Appended { outer, own } => outer.read().is_func() || own.read().is_func(),
+         }
+     }
+ }
+diff --git a/src/dep.cc b/src/dep.cc
+index 5b6e5d0..045a5f0 100644
+--- a/src/dep.cc
++++ b/src/dep.cc
+@@ -38,6 +38,33 @@ namespace {
+ 
+ static std::vector<std::unique_ptr<DepNode>> g_dep_node_pool;
+ 
++// The names make gives as $@ and $% for a target: an archive member
++// `lib(member)' is `lib' and `member', anything else is the target and "".
++static std::pair<std::string_view, std::string_view> SplitArchiveMember(
++    std::string_view name) {
++  size_t paren = name.find('(');
++  if (paren == std::string_view::npos || paren == 0 ||
++      name.size() <= paren + 2 || name.back() != ')' ||
++      (name[paren + 1] == '(' && name[name.size() - 2] == ')')) {
++    return {name, ""};
++  }
++  return {name.substr(0, paren),
++          name.substr(paren + 1, name.size() - paren - 2)};
++}
++
++// The suffixes make 4.2.1 knows until a makefile changes .SUFFIXES.
++static const char kDefaultSuffixes[] =
++    ".out .a .ln .o .c .cc .C .cpp .p .f .F .m .r .y .l .ym .yl .s .S .mod "
++    ".sym .def .h .info .dvi .tex .texinfo .texi .txinfo .w .ch .web .sh .elc "
++    ".el";
++
++// The name make uses for a file in $^, $+ and $|, and to find the $* of a
++// target without a pattern: an archive member by its member name.
++static std::string_view ListedName(std::string_view name) {
++  std::string_view member = SplitArchiveMember(name).second;
++  return member.empty() ? name : member;
++}
++
+ static Symbol ReplaceSuffix(Symbol s, Symbol newsuf) {
+   std::string r{StripExt(s.str())};
+   r += '.';
+@@ -57,7 +84,7 @@ void ApplyOutputPattern(const Rule& r,
+     }
+     return;
+   }
+-  if (r.output_patterns.empty()) {
++  if (r.output_patterns.empty() || r.is_secondary_expanded) {
+     copy(inputs.begin(), inputs.end(), back_inserter(*out_inputs));
+     return;
+   }
+@@ -138,9 +165,44 @@ bool IsSuffixRule(Symbol output) {
+   return true;
+ }
+ 
++// A `+=' on a target-specific or pattern-specific variable as its own target
++// sees it: the value from outside, a space unless that value is empty, and the
++// appended text. As in make, the appended text is expanded where the variable
++// is used, even when the value from outside is simple.
++class AppendedVar : public Var {
++ public:
++  AppendedVar(Var* outer, Var* own)
++      : Var(own->Origin(), nullptr, Loc()), outer_(outer), own_(own) {}
++
++  virtual const char* Flavor() const override { return "recursive"; }
++
++  virtual bool IsFunc(Evaluator* ev) const override {
++    return outer_->IsFunc(ev) || own_->IsFunc(ev);
++  }
++
++  virtual void Eval(Evaluator* ev, std::string* s) const override {
++    size_t len = s->size();
++    outer_->Eval(ev, s);
++    if (s->size() > len)
++      *s += ' ';
++    own_->Eval(ev, s);
++  }
++
++  // As in make, $(value) gives only the appended text.
++  virtual std::string_view String() const override { return own_->String(); }
++
++  virtual std::string DebugString() const override {
++    return outer_->DebugString() + " += " + own_->DebugString();
++  }
++
++ private:
++  Var* outer_;
++  Var* own_;
++};
++
+ struct RuleMerger {
+   std::vector<const Rule*> rules;
+-  std::vector<std::pair<Symbol, RuleMerger*>> implicit_outputs;
++  std::vector<std::pair<Symbol, const RuleMerger*>> implicit_outputs;
+   std::vector<Symbol> validations;
+   const Rule* primary_rule;
+   const RuleMerger* parent;
+@@ -150,7 +212,7 @@ struct RuleMerger {
+   RuleMerger()
+       : primary_rule(nullptr), parent(nullptr), is_double_colon(false) {}
+ 
+-  void AddImplicitOutput(Symbol output, RuleMerger* merger) {
++  void AddImplicitOutput(Symbol output, const RuleMerger* merger) {
+     implicit_outputs.push_back(std::make_pair(output, merger));
+   }
+ 
+@@ -299,6 +361,16 @@ class DepBuilder {
+     LOG_STAT("%zu implicit rules", implicit_rules_->size());
+     LOG_STAT("%zu suffix rules", suffix_rules_.size());
+ 
++    // Like make, expand the prerequisites of every target once all makefiles
++    // are read, whether or not the target is built. That includes suffix rule
++    // declarations such as `.c.o': make 4.2.1 expands them too, and only the
++    // suffix rules made from them leave the result unused.
++    if (has_secondary_inputs_) {
++      InitSuffixes();
++      for (const auto& p : rules_)
++        ExpandSecondaryRules(p.first, &p.second);
++    }
++
+     HandleSpecialTargets();
+   }
+ 
+@@ -327,7 +399,6 @@ class DepBuilder {
+                                                        ".PRECIOUS",
+                                                        ".INTERMEDIATE",
+                                                        ".SECONDARY",
+-                                                       ".SECONDEXPANSION",
+                                                        ".IGNORE",
+                                                        ".LOW_RESOLUTION_TIME",
+                                                        ".SILENT",
+@@ -357,7 +428,7 @@ class DepBuilder {
+       for (const auto& p : rules_) {
+         if (IsSpecialTarget(p.first))
+           continue;
+-        for (const Rule* r : p.second.rules) {
++        for (const Rule* r : LookupRuleMerger(p.first)->rules) {
+           for (Symbol t : r->inputs)
+             non_root_targets.insert(t);
+           for (Symbol t : r->order_only_inputs)
+@@ -392,20 +463,351 @@ class DepBuilder {
+   }
+ 
+   bool GetRuleInputs(Symbol s, std::vector<Symbol>* o, Loc* l) {
+-    auto found = rules_.find(s);
+-    if (found == rules_.end())
++    const RuleMerger* merger = LookupRuleMerger(s);
++    if (!merger)
+       return false;
+ 
+     o->clear();
+-    CHECK(!found->second.rules.empty());
+-    *l = found->second.rules.front()->loc;
+-    for (const Rule* r : found->second.rules) {
++    CHECK(!merger->rules.empty());
++    *l = merger->rules.front()->loc;
++    for (const Rule* r : merger->rules) {
+       for (Symbol i : r->inputs)
+         o->push_back(i);
+     }
+     return true;
+   }
+ 
++  // What a prerequisite list gets its second expansion with: the automatic
++  // variables, and the location messages are reported at.
++  struct SecondaryContext {
++    Symbol output;
++    std::string stem;
++    std::string first_input;
++    std::vector<Symbol> inputs;
++    std::vector<Symbol> order_only_inputs;
++    Loc loc;
++  };
++
++  void AddSecondaryVar(Vars* scope,
++                       std::vector<std::unique_ptr<Var>>* owned,
++                       const std::string& name,
++                       const std::string& value) {
++    std::string dirs, bases;
++    WordWriter dw(&dirs), bw(&bases);
++    for (std::string_view tok : WordScanner(value)) {
++      dw.Write(Dirname(tok));
++      bw.Write(Basename(tok));
++    }
++    const std::pair<std::string, std::string> vars[] = {
++        {name, value}, {name + "D", dirs}, {name + "F", bases}};
++    for (const auto& p : vars) {
++      owned->emplace_back(
++          new SimpleVar(p.second, VarOrigin::AUTOMATIC, nullptr, Loc()));
++      (*scope)[Intern(p.first)] = owned->back().get();
++    }
++  }
++
++  // The value a target-specific or pattern-specific variable has for its own
++  // target, without anything inherited from the targets that need it. |scope|
++  // holds what the target sees so far; outside of it is the global value. A
++  // pattern's `?=' gives way to a global value, as make decides it when the
++  // target's variables are set up; a target's own `?=' was decided when its
++  // line was read.
++  Var* OwnRuleVar(Symbol name,
++                  Var* var,
++                  bool from_pattern,
++                  const Vars& scope,
++                  std::vector<std::unique_ptr<Var>>* owned) {
++    auto found = scope.find(name);
++    Var* outer = found != scope.end() ? found->second : name.GetGlobalVar();
++    if (var->op() == AssignOp::PLUS_EQ && outer->IsDefined()) {
++      owned->emplace_back(new AppendedVar(outer, var));
++      return owned->back().get();
++    }
++    if (from_pattern && var->op() == AssignOp::QUESTION_EQ &&
++        name.GetGlobalVar()->IsDefined())
++      return nullptr;
++    return var;
++  }
++
++  // Replaces `%' with `$*' the way make does before the second expansion:
++  // every `%' of a static pattern rule, but only the first `%' of each word
++  // of a pattern rule. A variable reference stays inside its word.
++  static std::string SubstSecondaryStem(const Rule& r) {
++    const std::string& in = r.secondary_inputs;
++    std::string out;
++    if (r.output_patterns.empty())
++      return in;
++    if (!r.outputs.empty()) {
++      for (char c : in) {
++        if (c == '%')
++          out += "$*";
++        else
++          out += c;
++      }
++      return out;
++    }
++    size_t i = 0;
++    while (i < in.size()) {
++      if (isspace(in[i])) {
++        out += in[i++];
++        continue;
++      }
++      size_t beg = i;
++      while (i < in.size() && !isspace(in[i])) {
++        char c = in[i++];
++        if (c == '|')
++          break;
++        if (c != '$' || i == in.size())
++          continue;
++        char open = in[i++];
++        if (open != '(' && open != '{')
++          continue;
++        char close = open == '(' ? ')' : '}';
++        for (int depth = 0; i < in.size(); i++) {
++          if (in[i] == open) {
++            depth++;
++          } else if (in[i] == close && --depth < 0) {
++            i++;
++            break;
++          }
++        }
++      }
++      std::string_view word(in.data() + beg, i - beg);
++      size_t pct = word.find('%');
++      if (pct == std::string::npos) {
++        out += word;
++      } else {
++        out += word.substr(0, pct);
++        out += "$*";
++        out += word.substr(pct + 1);
++      }
++    }
++    return out;
++  }
++
++  // Expands the prerequisites |r| left for the second expansion.
++  void ExpandSecondaryInputs(const Rule* r,
++                             const SecondaryContext& ctx,
++                             Vars* pattern_vars,
++                             Vars* target_vars,
++                             std::vector<Symbol>* inputs,
++                             std::vector<Symbol>* order_only_inputs) {
++    Vars scope;
++    std::vector<std::unique_ptr<Var>> owned;
++    for (Vars* vars : {pattern_vars, target_vars}) {
++      if (!vars)
++        continue;
++      for (const auto& p : *vars) {
++        Var* v =
++            OwnRuleVar(p.first, p.second, vars == pattern_vars, scope, &owned);
++        if (v)
++          scope[p.first] = v;
++      }
++    }
++
++    std::string all, uniq, order_only;
++    WordWriter all_writer(&all), uniq_writer(&uniq),
++        order_only_writer(&order_only);
++    std::unordered_set<std::string_view> seen;
++    for (Symbol i : ctx.inputs) {
++      all_writer.Write(ListedName(i.str()));
++      if (seen.insert(i.str()).second)
++        uniq_writer.Write(ListedName(i.str()));
++    }
++    for (Symbol i : ctx.order_only_inputs) {
++      if (seen.insert(i.str()).second)
++        order_only_writer.Write(ListedName(i.str()));
++    }
++    const auto [archive, member] = SplitArchiveMember(ctx.output.str());
++    AddSecondaryVar(&scope, &owned, "@", std::string(archive));
++    AddSecondaryVar(&scope, &owned, "%", std::string(member));
++    AddSecondaryVar(&scope, &owned, "*", ctx.stem);
++    AddSecondaryVar(&scope, &owned, "<", ctx.first_input);
++    AddSecondaryVar(&scope, &owned, "^", uniq);
++    AddSecondaryVar(&scope, &owned, "+", all);
++    AddSecondaryVar(&scope, &owned, "|", order_only);
++
++    const std::string text = SubstSecondaryStem(*r);
++    Loc loc = r->loc;
++    // The line's comments are gone already, so a `#' the first expansion
++    // produced stays in the list.
++    std::unique_ptr<Value> value(ParseExpr(&loc, text, ParseExprOpt::DEFINE));
++    Vars* orig_scope = ev_->current_scope();
++    const Loc orig_loc = ev_->loc();
++    ev_->set_current_scope(&scope);
++    // Like make, report messages at the target's recipe, if it has one.
++    ev_->set_loc(ctx.loc);
++    const std::string expanded = value->Eval(ev_);
++    ev_->set_loc(orig_loc);
++    ev_->set_current_scope(orig_scope);
++    // |scope| does not own the target-specific variables.
++    scope.clear();
++
++    bool is_order_only = false;
++    for (std::string_view input : WordScanner(expanded)) {
++      if (input == "|") {
++        is_order_only = true;
++        continue;
++      }
++      Symbol sym = Intern(TrimLeadingCurdir(input));
++      (is_order_only ? order_only_inputs : inputs)->push_back(sym);
++    }
++  }
++
++  // The suffix list as make keeps it: the built-in suffixes, emptied by each
++  // `.SUFFIXES:' rule without prerequisites and extended by the others. Like
++  // make, .SUFFIXES gets its second expansion before the targets whose $* the
++  // list decides.
++  void InitSuffixes() {
++    for (std::string_view s : WordScanner(kDefaultSuffixes))
++      suffixes_.push_back(s);
++    auto found = rules_.find(Intern(".SUFFIXES"));
++    if (found == rules_.end())
++      return;
++    const RuleMerger* merger =
++        ExpandSecondaryRules(found->first, &found->second);
++    for (const Rule* r : merger->rules) {
++      if (r->inputs.empty() && !r->is_secondary_expanded)
++        suffixes_.clear();
++      for (Symbol s : r->inputs)
++        suffixes_.push_back(s.str());
++    }
++  }
++
++  // $* for a prerequisite list of |merger| that is not from a pattern: like
++  // make, the stem of the target's static pattern rule, or else the target
++  // name less the first known suffix it ends with.
++  std::string PlainStem(Symbol output, const RuleMerger* merger) const {
++    for (auto it = merger->rules.rbegin(); it != merger->rules.rend(); ++it) {
++      if (!(*it)->output_patterns.empty()) {
++        return std::string(
++            Pattern((*it)->output_patterns[0].str()).Stem(output.str()));
++      }
++    }
++    std::string_view name = ListedName(output.str());
++    for (std::string_view suffix : suffixes_) {
++      if (name.size() > suffix.size() && HasSuffix(name, suffix))
++        return std::string(name.substr(0, name.size() - suffix.size()));
++    }
++    return "";
++  }
++
++  // Where make reports messages from the second expansion of a target whose
++  // recipe is |r|: the first line of the recipe, which is the rule's own line
++  // for a recipe after `;'. Without a recipe there is no location.
++  static Loc RecipeLoc(const Rule* r) {
++    if (!r || r->cmds.empty())
++      return Loc();
++    return r->cmd_lineno ? r->cmd_loc() : r->loc;
++  }
++
++  // Returns |merger| with the second expansion done for |output|. The
++  // prerequisites of the rule with the recipe come first, as in make, and the
++  // lists are expanded in that order; $< and $^ see what is known by then. A
++  // double-colon rule stands alone, with only its own prerequisites and recipe.
++  const RuleMerger* ExpandSecondaryRules(Symbol output,
++                                         const RuleMerger* merger) {
++    if (!has_secondary_inputs_)
++      return merger;
++    auto found = expanded_rule_mergers_.find(output);
++    if (found != expanded_rule_mergers_.end())
++      return found->second.get();
++
++    bool needs_expansion = false;
++    for (const Rule* r : merger->rules) {
++      if (!r->secondary_inputs.empty())
++        needs_expansion = true;
++    }
++    std::vector<const RuleMerger*> implicit_output_mergers;
++    for (const auto& p : merger->implicit_outputs) {
++      implicit_output_mergers.push_back(LookupRuleMerger(p.first));
++      if (implicit_output_mergers.back() != p.second)
++        needs_expansion = true;
++    }
++    if (!needs_expansion)
++      return merger;
++
++    RuleMerger* expanded = new RuleMerger(*merger);
++    expanded_rule_mergers_[output].reset(expanded);
++    for (size_t i = 0; i < implicit_output_mergers.size(); i++)
++      expanded->implicit_outputs[i].second = implicit_output_mergers[i];
++
++    const bool alone = merger->is_double_colon;
++    const Rule* first = alone ? nullptr : merger->primary_rule;
++    std::vector<const Rule*> order;
++    if (first)
++      order.push_back(first);
++    for (const Rule* r : merger->rules) {
++      if (r != first)
++        order.push_back(r);
++    }
++
++    std::vector<std::vector<Symbol>> known(order.size());
++    std::vector<std::vector<Symbol>> known_order_only(order.size());
++    std::vector<bool> pending(order.size());
++    for (size_t i = 0; i < order.size(); i++) {
++      pending[i] = !order[i]->secondary_inputs.empty();
++      if (!pending[i]) {
++        ApplyOutputPattern(*order[i], output, order[i]->inputs, &known[i]);
++        ApplyOutputPattern(*order[i], output, order[i]->order_only_inputs,
++                           &known_order_only[i]);
++      }
++    }
++
++    for (size_t i = 0; i < order.size(); i++) {
++      if (!pending[i])
++        continue;
++      const Rule* r = order[i];
++      SecondaryContext ctx;
++      ctx.output = output;
++      ctx.loc = RecipeLoc(alone ? r : merger->primary_rule);
++      Vars* pattern_vars = nullptr;
++      if (!r->output_patterns.empty()) {
++        ctx.stem = std::string(
++            Pattern(r->output_patterns[0].str()).Stem(output.str()));
++        pattern_vars = LookupRuleVars(r->output_patterns[0]);
++      } else {
++        ctx.stem = PlainStem(output, merger);
++      }
++      for (size_t j = 0; j < order.size() && !alone; j++) {
++        if (pending[j])
++          break;
++        if (!known[j].empty()) {
++          ctx.first_input = std::string(known[j][0].str());
++          break;
++        }
++      }
++      for (size_t j = 0; j < order.size() && !alone; j++) {
++        if (pending[j])
++          continue;
++        ctx.inputs.insert(ctx.inputs.end(), known[j].begin(), known[j].end());
++        ctx.order_only_inputs.insert(ctx.order_only_inputs.end(),
++                                     known_order_only[j].begin(),
++                                     known_order_only[j].end());
++      }
++
++      Rule* e = new Rule(*r);
++      expanded_rules_.emplace_back(e);
++      e->secondary_inputs.clear();
++      e->inputs.clear();
++      e->order_only_inputs.clear();
++      e->is_secondary_expanded = true;
++      ExpandSecondaryInputs(r, ctx, pattern_vars, LookupRuleVars(output),
++                            &e->inputs, &e->order_only_inputs);
++      known[i] = e->inputs;
++      known_order_only[i] = e->order_only_inputs;
++      pending[i] = false;
++      for (const Rule*& rule : expanded->rules) {
++        if (rule == r)
++          rule = e;
++      }
++      if (expanded->primary_rule == r)
++        expanded->primary_rule = e;
++    }
++    return expanded;
++  }
++
+   void PopulateRules(const std::vector<const Rule*>& rules) {
+     for (const Rule* rule : rules) {
+       if (rule->outputs.empty()) {
+@@ -466,6 +868,10 @@ class DepBuilder {
+     std::shared_ptr<Rule> r = std::make_shared<Rule>(*rule);
+     r->inputs.clear();
+     r->inputs.push_back(Intern(input_suffix));
++    // The suffix rule takes none of the declaration's prerequisites, also not
++    // the ones left for the second expansion; the declaration itself is still
++    // expanded with every other target.
++    r->secondary_inputs.clear();
+     r->is_suffix_rule = true;
+     suffix_rules_[output_suffix].push_back(r);
+     return true;
+@@ -479,6 +885,8 @@ class DepBuilder {
+       rules_[output].AddRule(output, rule);
+       PopulateSuffixRule(rule, output);
+     }
++    if (!rule->secondary_inputs.empty())
++      has_secondary_inputs_ = true;
+   }
+ 
+   static bool IsIgnorableImplicitRule(const Rule* rule) {
+@@ -514,7 +922,7 @@ class DepBuilder {
+   const RuleMerger* LookupRuleMerger(Symbol o) {
+     auto found = rules_.find(o);
+     if (found != rules_.end()) {
+-      return &found->second;
++      return ExpandSecondaryRules(o, &found->second);
+     }
+     return nullptr;
+   }
+@@ -528,17 +936,42 @@ class DepBuilder {
+ 
+   bool CanPickImplicitRule(const Rule* rule,
+                            Symbol output,
++                           const SecondaryContext& explicit_ctx,
+                            DepNode* n,
+                            std::shared_ptr<Rule>* out_rule) {
+     Symbol matched;
++    std::shared_ptr<Rule> expanded;
+     for (Symbol output_pattern : rule->output_patterns) {
+       Pattern pat(output_pattern.str());
+       if (pat.Match(output.str())) {
++        if (!rule->secondary_inputs.empty()) {
++          SecondaryContext ctx = explicit_ctx;
++          ctx.stem = std::string(pat.Stem(output.str()));
++          expanded = std::make_shared<Rule>(*rule);
++          expanded->secondary_inputs.clear();
++          expanded->is_secondary_expanded = true;
++          ExpandSecondaryInputs(rule, ctx, LookupRuleVars(output_pattern),
++                                LookupRuleVars(output), &expanded->inputs,
++                                &expanded->order_only_inputs);
++        }
++
++        std::vector<Symbol> names;
++        if (expanded) {
++          // make rejects the rule when any expanded prerequisite, order-only
++          // ones included, cannot be made.
++          names = expanded->inputs;
++          names.insert(names.end(), expanded->order_only_inputs.begin(),
++                       expanded->order_only_inputs.end());
++        } else {
++          for (Symbol input : rule->inputs) {
++            std::string buf;
++            pat.AppendSubst(output.str(), input.str(), &buf);
++            names.push_back(Intern(buf));
++          }
++        }
+         bool ok = true;
+-        for (Symbol input : rule->inputs) {
+-          std::string buf;
+-          pat.AppendSubst(output.str(), input.str(), &buf);
+-          if (!Exists(Intern(buf))) {
++        for (Symbol name : names) {
++          if (!Exists(name)) {
+             ok = false;
+             break;
+           }
+@@ -553,7 +986,7 @@ class DepBuilder {
+     if (!matched.IsValid())
+       return false;
+ 
+-    *out_rule = std::make_shared<Rule>(*rule);
++    *out_rule = expanded ? expanded : std::make_shared<Rule>(*rule);
+     if ((*out_rule)->output_patterns.size() > 1) {
+       // We should mark all other output patterns as used.
+       Pattern pat(matched.str());
+@@ -602,10 +1035,24 @@ class DepBuilder {
+       return true;
+     }
+ 
++    // A pattern rule's second expansion gets $<, $^ and $| from the target's
++    // other rules. make tries the rule before the target has a recipe, so its
++    // messages have no location.
++    SecondaryContext explicit_ctx;
++    explicit_ctx.output = output;
++    if (rule_merger) {
++      for (const Rule* r : rule_merger->rules) {
++        ApplyOutputPattern(*r, output, r->inputs, &explicit_ctx.inputs);
++        ApplyOutputPattern(*r, output, r->order_only_inputs,
++                           &explicit_ctx.order_only_inputs);
++      }
++      if (!explicit_ctx.inputs.empty())
++        explicit_ctx.first_input = std::string(explicit_ctx.inputs[0].str());
++    }
+     std::vector<const Rule*> irules;
+     implicit_rules_->Get(output.str(), &irules);
+     for (auto iter = irules.rbegin(); iter != irules.rend(); ++iter) {
+-      if (!CanPickImplicitRule(*iter, output, n, pattern_rule))
++      if (!CanPickImplicitRule(*iter, output, explicit_ctx, n, pattern_rule))
+         continue;
+       if (rule_merger) {
+         return true;
+@@ -898,6 +1345,11 @@ class DepBuilder {
+     }
+   };
+   std::map<Symbol, RuleMerger, TargetComp> rules_;
++  bool has_secondary_inputs_ = false;
++  std::unordered_map<Symbol, std::unique_ptr<RuleMerger>>
++      expanded_rule_mergers_;
++  std::vector<std::unique_ptr<Rule>> expanded_rules_;
++  std::vector<std::string_view> suffixes_;
+   const std::unordered_map<Symbol, Vars*>& rule_vars_;
+   std::unique_ptr<Vars> cur_rule_vars_;
+ 
+diff --git a/src/eval.cc b/src/eval.cc
+index 61a0588..5252749 100644
+--- a/src/eval.cc
++++ b/src/eval.cc
+@@ -160,6 +160,8 @@ Evaluator::Evaluator()
+       eval_depth_(0),
+       posix_sym_(Intern(".POSIX")),
+       is_posix_(false),
++      second_expansion_sym_(Intern(".SECONDEXPANSION")),
++      second_expansion_(false),
+       export_error_(false) {
+ #if defined(__APPLE__)
+   stack_size_ = pthread_get_stacksize_np(pthread_self());
+@@ -426,7 +428,18 @@ void Evaluator::EvalRuleSpecificAssign(const std::vector<Symbol>& targets,
+       p.first->second = new Vars;
+     }
+ 
++    // Like make, a target's `?=' does nothing when the variable already has a
++    // global value as the line is read. A pattern's waits until it is used.
++    if (assign_op == AssignOp::QUESTION_EQ &&
++        !Rule::IsPatternRule(target.str()) &&
++        var_sym.GetGlobalVar()->IsDefined()) {
++      continue;
++    }
++
+     Value* rhs;
++    // The text $(value) gives. Text from the expanded targets goes away with
++    // this rule, so it is kept as a symbol.
++    std::string_view orig_rhs = stmt->orig_rhs;
+     if (rhs_string.empty()) {
+       rhs = stmt->rhs;
+     } else if (stmt->rhs) {
+@@ -434,8 +447,12 @@ void Evaluator::EvalRuleSpecificAssign(const std::vector<Symbol>& targets,
+                                                                 : " = ");
+       rhs = Value::NewExpr(loc_, Value::NewLiteral(rhs_string),
+                            Value::NewLiteral(sep), stmt->rhs);
++      orig_rhs =
++          Intern(std::string(rhs_string).append(sep).append(stmt->orig_rhs))
++              .str();
+     } else {
+       rhs = Value::NewLiteral(rhs_string);
++      orig_rhs = Intern(rhs_string).str();
+     }
+ 
+     current_scope_ = p.first->second;
+@@ -443,8 +460,8 @@ void Evaluator::EvalRuleSpecificAssign(const std::vector<Symbol>& targets,
+       MarkVarsReadonly(rhs);
+     } else {
+       bool needs_assign;
+-      Var* rhs_var = EvalRHS(var_sym, rhs, std::string_view("*TODO*"),
+-                             assign_op, false, &needs_assign);
++      Var* rhs_var =
++          EvalRHS(var_sym, rhs, orig_rhs, assign_op, false, &needs_assign);
+       if (needs_assign) {
+         bool readonly;
+         rhs_var->SetAssignOp(assign_op);
+@@ -487,7 +504,11 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
+   // It is an assignment when either after_targets contains an assignment token
+   // or separator is an assignment token, but only if there is no ';' before the
+   // first assignment token.
+-  size_t separator_pos = after_targets.find_first_of("=;");
++  // After .SECONDEXPANSION, an `=' or `;' inside a reference left for the
++  // second expansion, like `$$(SRCS:.c=.o)', belongs to the prerequisites.
++  size_t separator_pos = second_expansion_
++                             ? FindTwoOutsideParen(after_targets, '=', ';')
++                             : after_targets.find_first_of("=;");
+   char separator = '\0';
+   if (separator_pos != std::string::npos) {
+     separator = after_targets[separator_pos];
+@@ -519,7 +540,8 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
+   } else {
+     rule->outputs.swap(targets);
+   }
+-  rule->ParsePrerequisites(after_targets, separator_pos, stmt);
++  rule->ParsePrerequisites(after_targets, separator_pos, stmt,
++                           second_expansion_);
+ 
+   if (stmt->sep == RuleStmt::SEP_SEMICOLON) {
+     rule->cmds.push_back(stmt->rhs);
+@@ -528,6 +550,9 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
+   for (Symbol o : rule->outputs) {
+     if (o == posix_sym_)
+       is_posix_ = true;
++    // Only the rules read after .SECONDEXPANSION get the second expansion.
++    if (o == second_expansion_sym_)
++      second_expansion_ = true;
+   }
+ 
+   LOG("Rule: %s", rule->DebugString().c_str());
+diff --git a/src/eval.h b/src/eval.h
+index 6c4199f..ecc6934 100644
+--- a/src/eval.h
++++ b/src/eval.h
+@@ -160,6 +160,7 @@ class Evaluator {
+   void in_command_line();
+   void in_toplevel_makefile();
+ 
++  Vars* current_scope() const { return current_scope_; }
+   void set_current_scope(Vars* v) { current_scope_ = v; }
+ 
+   bool avoid_io() const { return avoid_io_; }
+@@ -273,6 +274,8 @@ class Evaluator {
+ 
+   Symbol posix_sym_;
+   bool is_posix_;
++  Symbol second_expansion_sym_;
++  bool second_expansion_;
+ 
+   void* stack_addr_;
+   size_t stack_size_;
+diff --git a/src/main.cc b/src/main.cc
+index f6dcc7c..02e9dcf 100644
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -188,7 +188,7 @@ void SegfaultHandler::handle(int sig, siginfo_t* info, void* context) {
+   // Avoid fprintf in case it allocates or tries to do anything else that may
+   // hang.
+   dumpstr("*kati*: Segmentation fault, last evaluated line was ");
+-  dumpstr(ev_->loc().filename);
++  dumpstr(ev_->loc().filename ? ev_->loc().filename : "(null)");
+   dumpstr(":");
+   dumpint(ev_->loc().lineno);
+   dumpstr("\n");
+diff --git a/src/ninja.cc b/src/ninja.cc
+index acfef40..ba7313b 100644
+--- a/src/ninja.cc
++++ b/src/ninja.cc
+@@ -723,7 +723,7 @@ class NinjaGenerator {
+       DumpString(fp, cr->shellflag);
+       DumpString(fp, cr->cmd);
+       DumpString(fp, cr->result);
+-      DumpString(fp, cr->loc.filename);
++      DumpString(fp, cr->loc.filename ? cr->loc.filename : "");
+       DumpInt(fp, cr->loc.lineno);
+ 
+       if (cr->op == CommandOp::FIND) {
+diff --git a/src/parser.cc b/src/parser.cc
+index 5f2016d..76f7c1a 100644
+--- a/src/parser.cc
++++ b/src/parser.cc
+@@ -194,8 +194,8 @@ class Parser {
+       ParseExprOpt opt = rule_stmt->sep == RuleStmt::SEP_SEMICOLON
+                              ? ParseExprOpt::COMMAND
+                              : ParseExprOpt::NORMAL;
+-      rule_stmt->rhs =
+-          ParseExpr(&mutable_loc, TrimLeftSpace(line.substr(found + 1)), opt);
++      rule_stmt->orig_rhs = TrimLeftSpace(line.substr(found + 1));
++      rule_stmt->rhs = ParseExpr(&mutable_loc, rule_stmt->orig_rhs, opt);
+     } else {
+       rule_stmt->lhs = ParseExpr(&mutable_loc, line);
+       rule_stmt->sep = RuleStmt::SEP_NULL;
+diff --git a/src/rule.cc b/src/rule.cc
+index 01692d1..2fb8f8e 100644
+--- a/src/rule.cc
++++ b/src/rule.cc
+@@ -23,7 +23,11 @@
+ #include "strutil.h"
+ #include "symtab.h"
+ 
+-Rule::Rule() : is_double_colon(false), is_suffix_rule(false), cmd_lineno(0) {}
++Rule::Rule()
++    : is_double_colon(false),
++      is_suffix_rule(false),
++      is_secondary_expanded(false),
++      cmd_lineno(0) {}
+ 
+ void Rule::ParseInputs(const std::string_view& inputs_str) {
+   bool is_order_only = false;
+@@ -39,7 +43,8 @@ void Rule::ParseInputs(const std::string_view& inputs_str) {
+ 
+ void Rule::ParsePrerequisites(const std::string_view& line,
+                               size_t separator_pos,
+-                              const RuleStmt* rule_stmt) {
++                              const RuleStmt* rule_stmt,
++                              bool second_expansion) {
+   // line is either
+   //    prerequisites [ ; command ]
+   // or
+@@ -56,8 +61,16 @@ void Rule::ParsePrerequisites(const std::string_view& line,
+     prereq_string = line.substr(0, separator_pos);
+   }
+ 
+-  if ((separator_pos = prereq_string.find(':')) == std::string::npos) {
++  // After .SECONDEXPANSION, a colon inside a reference left for the second
++  // expansion, like `$$(SRCS:.c=.o)', does not start a static pattern.
++  separator_pos = second_expansion ? FindOutsideParen(prereq_string, ':')
++                                   : prereq_string.find(':');
++  if (separator_pos == std::string::npos) {
+     // Simple prerequisites
++    if (second_expansion && prereq_string.find('$') != std::string::npos) {
++      secondary_inputs = std::string(prereq_string);
++      return;
++    }
+     ParseInputs(prereq_string);
+     return;
+   }
+@@ -96,6 +109,10 @@ void Rule::ParsePrerequisites(const std::string_view& line,
+   if (!IsPatternRule(output_patterns[0].str())) {
+     ERROR_LOC(loc, "*** target pattern contains no '%%'.");
+   }
++  if (second_expansion && prereq_patterns.find('$') != std::string::npos) {
++    secondary_inputs = std::string(prereq_patterns);
++    return;
++  }
+   ParseInputs(prereq_patterns);
+ }
+ 
+@@ -111,6 +128,10 @@ std::string Rule::DebugString() const {
+     v.push_back(StringPrintf("output_patterns=[%s]",
+                              JoinSymbols(output_patterns, ",").c_str()));
+   }
++  if (!secondary_inputs.empty()) {
++    v.push_back(
++        StringPrintf("secondary_inputs=[%s]", secondary_inputs.c_str()));
++  }
+   if (is_double_colon)
+     v.push_back("is_double_colon");
+   if (is_suffix_rule)
+diff --git a/src/rule.h b/src/rule.h
+index 59f6de6..218c7ec 100644
+--- a/src/rule.h
++++ b/src/rule.h
+@@ -39,7 +39,8 @@ class Rule {
+ 
+   void ParsePrerequisites(const std::string_view& line,
+                           size_t pos,
+-                          const RuleStmt* rule_stmt);
++                          const RuleStmt* rule_stmt,
++                          bool second_expansion);
+ 
+   static bool IsPatternRule(const std::string_view& target_string) {
+     return target_string.find('%') != std::string::npos;
+@@ -50,8 +51,13 @@ class Rule {
+   std::vector<Symbol> order_only_inputs;
+   std::vector<Symbol> output_patterns;
+   std::vector<Symbol> validations;
++  // Prerequisites left for the second expansion (.SECONDEXPANSION). As in
++  // make, the whole list waits, so its own words are not in its $< or $^.
++  std::string secondary_inputs;
+   bool is_double_colon;
+   bool is_suffix_rule;
++  // Whether |inputs| come from the second expansion, with the stem in them.
++  bool is_secondary_expanded;
+   std::vector<Value*> cmds;
+   Loc loc;
+   int cmd_lineno;
+diff --git a/src/stmt.h b/src/stmt.h
+index 1173f1b..968bf90 100644
+--- a/src/stmt.h
++++ b/src/stmt.h
+@@ -77,6 +77,7 @@ struct RuleStmt : public Stmt {
+   Value* lhs;
+   enum { SEP_NULL, SEP_SEMICOLON, SEP_EQ, SEP_FINALEQ } sep;
+   Value* rhs;
++  std::string_view orig_rhs;
+ 
+   virtual ~RuleStmt();
+ 
+diff --git a/src/var.cc b/src/var.cc
+index 9907409..8264cbb 100644
+--- a/src/var.cc
++++ b/src/var.cc
+@@ -100,9 +100,10 @@ void Var::CheckCurrentReferencingFile(Loc loc, const char* name) {
+   if (prefixes.size() == 0) {
+     return;
+   }
++  const char* filename = loc.filename ? loc.filename : "";
+   bool valid = false;
+   for (const std::string& prefix : prefixes) {
+-    if (HasPathPrefix(loc.filename, prefix)) {
++    if (HasPathPrefix(filename, prefix)) {
+       valid = true;
+       break;
+     }
+@@ -116,7 +117,7 @@ void Var::CheckCurrentReferencingFile(Loc loc, const char* name) {
+     ERROR(
+         "%s is not a valid file to reference variable %s. Line #%d.\nValid "
+         "file prefixes:\n%s",
+-        loc.filename, name, loc.lineno, prefixesString.c_str());
++        filename, name, loc.lineno, prefixesString.c_str());
+   }
+ }
+ 

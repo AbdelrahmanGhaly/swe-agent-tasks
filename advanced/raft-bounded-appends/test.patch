@@ -1,0 +1,2659 @@
+diff --git a/appendlimit_a366de/append_limit_a366de_test.go b/appendlimit_a366de/append_limit_a366de_test.go
+new file mode 100644
+index 0000000..8f682c0
+--- /dev/null
++++ b/appendlimit_a366de/append_limit_a366de_test.go
+@@ -0,0 +1,1312 @@
++package appendlimit
++
++import (
++	"bytes"
++	"fmt"
++	"slices"
++	"testing"
++
++	"google.golang.org/protobuf/proto"
++
++	"go.etcd.io/raft/v3"
++	pb "go.etcd.io/raft/v3/raftpb"
++)
++
++func proposeSizes(c *cluster, id uint64, sizes []int) [][]byte {
++	var want [][]byte
++	for i, size := range sizes {
++		data := payload(size, byte('a'+i))
++		want = append(want, data)
++		c.propose(id, data)
++	}
++	return want
++}
++
++func requirePages(t *testing.T, pages [][]*pb.Entry, want [][]byte, limit uint64) {
++	t.Helper()
++	var ents []*pb.Entry
++	for _, page := range pages {
++		ents = append(ents, page...)
++	}
++	var got [][]byte
++	for _, e := range ents {
++		got = append(got, e.GetData())
++	}
++	if !slices.EqualFunc(got, want, bytes.Equal) {
++		t.Fatalf("entries handed out in %d batches do not match the %d proposals in order", len(pages), len(want))
++	}
++	if g, w := pageIndexes(pages), greedyPages(ents, limit); !slices.EqualFunc(g, w, slices.Equal) {
++		t.Fatalf("batches %v, want %v for limit %d", g, w, limit)
++	}
++}
++
++func TestReadyHandsOutTheLongestRunOfEntriesThatFits(t *testing.T) {
++	run(t, func() {
++		c := newCluster(t, false, map[uint64]uint64{1: 160}, 1)
++		c.campaign(1)
++		before := len(c.nodes[1].pages)
++		want := proposeSizes(c, 1, []int{40, 90, 10, 150, 60, 60, 60, 5, 200, 30})
++		c.settle()
++		pages := c.nodes[1].pages[before:]
++		if len(pages) < 5 {
++			t.Fatalf("handed out the proposals in %d batches", len(pages))
++		}
++		requirePages(t, pages, want, 160)
++		if c.nodes[1].applied != lastIndex(c.nodes[1].storage) {
++			t.Fatalf("applied %d of %d entries", c.nodes[1].applied, lastIndex(c.nodes[1].storage))
++		}
++	})
++}
++
++func TestEntryLargerThanTheLimitIsHandedOutAlone(t *testing.T) {
++	run(t, func() {
++		c := newCluster(t, false, map[uint64]uint64{1: 100}, 1)
++		c.campaign(1)
++		before := len(c.nodes[1].pages)
++		want := proposeSizes(c, 1, []int{300, 20, 20, 300, 20})
++		c.settle()
++		pages := c.nodes[1].pages[before:]
++		var sizes []int
++		for _, page := range pages {
++			sizes = append(sizes, len(page))
++		}
++		if !slices.Equal(sizes, []int{1, 2, 1, 1}) {
++			t.Fatalf("batch lengths %v, want [1 2 1 1]", sizes)
++		}
++		requirePages(t, pages, want, 100)
++	})
++}
++
++func TestEntriesThatExactlyFillTheLimitShareABatch(t *testing.T) {
++	run(t, func() {
++		sizes := []int{30, 50, 70, 10}
++		probe := newCluster(t, false, nil, 1)
++		probe.campaign(1)
++		before := len(probe.handedOut(1))
++		proposeSizes(probe, 1, sizes)
++		probe.settle()
++		ents := probe.handedOut(1)[before:]
++		limit := uint64(proto.Size(ents[0]) + proto.Size(ents[1]) + proto.Size(ents[2]))
++
++		c := newCluster(t, false, map[uint64]uint64{1: limit}, 1)
++		c.campaign(1)
++		first := len(c.nodes[1].pages)
++		want := proposeSizes(c, 1, sizes)
++		c.settle()
++		pages := c.nodes[1].pages[first:]
++		if len(pages) != 2 || len(pages[0]) != 3 {
++			t.Fatalf("batches %v with limit %d, want the first three entries together", pageIndexes(pages), limit)
++		}
++		requirePages(t, pages, want, limit)
++	})
++}
++
++func TestZeroLimitHandsOutAllEntriesAtOnce(t *testing.T) {
++	run(t, func() {
++		c := newCluster(t, false, nil, 1, 2, 3)
++		c.campaign(1)
++		before := map[uint64]int{}
++		for _, id := range c.ids {
++			before[id] = len(c.nodes[id].pages)
++		}
++		want := proposeSizes(c, 1, []int{200, 180, 160, 140, 120, 100, 80, 60, 40, 20})
++		c.settle()
++		for _, id := range c.ids {
++			pages := c.nodes[id].pages[before[id]:]
++			if len(pages) != 1 || len(pages[0]) != len(want) {
++				t.Fatalf("node %d handed out batches %v, want all %d entries in one", id, pageIndexes(pages), len(want))
++			}
++		}
++		c.converge()
++	})
++}
++
++func TestAsyncStorageAppendsHandOutTheLongestRunThatFits(t *testing.T) {
++	run(t, func() {
++		c := newCluster(t, true, map[uint64]uint64{1: 160}, 1)
++		c.campaign(1)
++		before := len(c.nodes[1].pages)
++		want := proposeSizes(c, 1, []int{40, 90, 10, 150, 60, 60, 60, 5, 200, 30})
++		c.settle()
++		pages := c.nodes[1].pages[before:]
++		if len(pages) < 5 {
++			t.Fatalf("handed out the proposals in %d storage appends", len(pages))
++		}
++		requirePages(t, pages, want, 160)
++		if c.nodes[1].applied != lastIndex(c.nodes[1].storage) {
++			t.Fatalf("applied %d of %d entries", c.nodes[1].applied, lastIndex(c.nodes[1].storage))
++		}
++	})
++}
++
++func backlogOnFollower(t *testing.T, async bool, follower uint64, limits map[uint64]uint64) *cluster {
++	c := newCluster(t, async, limits, 1, 2, 3)
++	c.campaign(1)
++	c.block(1, follower)
++	proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++	c.settle()
++	c.heal()
++	c.tick(1)
++	return c
++}
++
++func requireCaughtUp(t *testing.T, c *cluster, lead, id uint64) {
++	t.Helper()
++	last := lastIndex(c.nodes[lead].storage)
++	if got := c.nodes[lead].rn.Status().Progress[id].Match; got != last {
++		t.Fatalf("leader %d has node %d matched at %d, want %d", lead, id, got, last)
++	}
++	if n := c.nodes[id]; n.applied != last || lastIndex(n.storage) != last {
++		t.Fatalf("node %d persisted %d and applied %d, want %d", id, lastIndex(n.storage), n.applied, last)
++	}
++}
++
++func TestFollowerAcknowledgesEntriesOnlyAfterPersistingThem(t *testing.T) {
++	run(t, func() {
++		c := newCluster(t, false, map[uint64]uint64{2: 250}, 1, 2, 3)
++		c.campaign(1)
++		before := len(c.nodes[2].pages)
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		if pages := c.nodes[2].pages[before:]; len(pages) < 3 {
++			t.Fatalf("node 2 persisted the entries in %d batches", len(pages))
++		}
++		requireCaughtUp(t, c, 1, 2)
++	})
++}
++
++func TestRepeatedAppendIsAcknowledgedOnlyAfterPersisting(t *testing.T) {
++	run(t, func() {
++		c := newCluster(t, false, map[uint64]uint64{2: 250}, 1, 2, 3)
++		c.campaign(1)
++		c.block(1, 2)
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.heal()
++		c.dup = func(m *pb.Message) bool {
++			return m.GetType() == pb.MsgApp && m.GetTo() == 2 && len(m.GetEntries()) > 0
++		}
++		c.tick(1)
++		c.settle()
++		requireCaughtUp(t, c, 1, 2)
++	})
++}
++
++func TestLeaderCountsItsOwnEntriesOnlyAfterPersistingThem(t *testing.T) {
++	run(t, func() {
++		c := newCluster(t, false, map[uint64]uint64{1: 250}, 1, 2, 3)
++		c.campaign(1)
++		c.isolate(3)
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.ready(1)
++		c.paused[1] = true
++		c.settle()
++		if commit, persisted := c.nodes[1].rn.BasicStatus().HardState.GetCommit(), lastIndex(c.nodes[1].storage); commit > persisted {
++			t.Fatalf("leader committed index %d with only node 2 and its own entries up to %d persisted", commit, persisted)
++		}
++		c.paused[1] = false
++		c.settle()
++		requireCaughtUp(t, c, 1, 2)
++		c.converge()
++	})
++}
++
++func TestFollowerLearningTheCommitIndexEarlyKeepsItsStateConsistent(t *testing.T) {
++	run(t, func() {
++		c := backlogOnFollower(t, false, 2, map[uint64]uint64{2: 250})
++		before := len(c.nodes[2].pages)
++		c.settle()
++		if pages := c.nodes[2].pages[before:]; len(pages) < 3 {
++			t.Fatalf("node 2 persisted the entries in %d batches", len(pages))
++		}
++		requireCaughtUp(t, c, 1, 2)
++		states := c.nodes[2].states
++		if commit := states[len(states)-1].GetCommit(); commit != lastIndex(c.nodes[2].storage) {
++			t.Fatalf("node 2 last persisted commit index %d, want %d", commit, lastIndex(c.nodes[2].storage))
++		}
++	})
++}
++
++func TestAsyncFollowerLearningTheCommitIndexEarlyKeepsItsStateConsistent(t *testing.T) {
++	run(t, func() {
++		c := backlogOnFollower(t, true, 2, map[uint64]uint64{2: 250})
++		before := len(c.nodes[2].pages)
++		c.settle()
++		if pages := c.nodes[2].pages[before:]; len(pages) < 3 {
++			t.Fatalf("node 2 persisted the entries in %d storage appends", len(pages))
++		}
++		requireCaughtUp(t, c, 1, 2)
++	})
++}
++
++func testFollowerRestartsFromStorageAfterAnyReady(t *testing.T, async bool) {
++	run(t, func() {
++		c := backlogOnFollower(t, async, 2, map[uint64]uint64{1: 250, 2: 250, 3: 250})
++		c.crash[2] = true
++		for round := 0; ; round++ {
++			if round == 100 {
++				t.Fatalf("node 2 did not catch up: %s", c.describe())
++			}
++			c.settle()
++			if n := c.nodes[2]; lastIndex(n.storage) == lastIndex(c.nodes[1].storage) && n.applied == lastIndex(n.storage) {
++				break
++			}
++			c.tick(1)
++		}
++		c.converge()
++	})
++}
++
++func TestFollowerRestartsFromStorageAfterAnyReady(t *testing.T) {
++	testFollowerRestartsFromStorageAfterAnyReady(t, false)
++}
++
++func TestAsyncFollowerRestartsFromStorageAfterAnyAppend(t *testing.T) {
++	testFollowerRestartsFromStorageAfterAnyReady(t, true)
++}
++
++func testLeaderRestartsFromStorageInTheMiddleOfItsBacklog(t *testing.T, async bool) {
++	run(t, func() {
++		sizes := []int{100, 100, 100, 100, 100, 100, 100, 100, 100, 100}
++		for crashAfter := 1; crashAfter <= 4; crashAfter++ {
++			c := newCluster(t, async, map[uint64]uint64{1: 250}, 1, 2, 3)
++			c.label = fmt.Sprintf("crash after batch %d: ", crashAfter)
++			c.campaign(1)
++			proposeSizes(c, 1, sizes)
++			for batch := 1; batch <= crashAfter; batch++ {
++				c.ready(1)
++				for len(c.nodes[1].local) > 0 {
++					c.processLocal(1)
++				}
++				if batch == 1 {
++					c.paused[1] = true
++					c.settle()
++					c.paused[1] = false
++				}
++			}
++			n := c.nodes[1]
++			persisted := lastIndex(n.storage)
++			if persisted >= 12 {
++				c.fatalf("leader persisted its whole backlog (up to %d) before restarting", persisted)
++			}
++			c.restart(1)
++			st := n.rn.BasicStatus()
++			if commit := st.HardState.GetCommit(); commit > persisted || n.applied > commit {
++				c.fatalf("restarted leader has commit index %d, applied %d and entries up to %d", commit, n.applied, persisted)
++			}
++			c.converge()
++		}
++	})
++}
++
++func TestLeaderRestartsFromStorageInTheMiddleOfItsBacklog(t *testing.T) {
++	testLeaderRestartsFromStorageInTheMiddleOfItsBacklog(t, false)
++}
++
++func TestAsyncLeaderRestartsFromStorageInTheMiddleOfItsBacklog(t *testing.T) {
++	testLeaderRestartsFromStorageInTheMiddleOfItsBacklog(t, true)
++}
++
++func TestAsyncAcknowledgementsWaitForTheirOwnEntries(t *testing.T) {
++	run(t, func() {
++		c := newCluster(t, true, map[uint64]uint64{1: 250, 2: 250}, 1, 2, 3)
++		c.campaign(1)
++		c.isolate(3)
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		requireCaughtUp(t, c, 1, 2)
++		c.converge()
++	})
++}
++
++func testAcknowledgementOfReplacedEntriesIsNeverSent(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3, 4, 5)
++		c.campaign(1)
++		for _, id := range []uint64{3, 4, 5} {
++			c.block(1, id)
++		}
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.paused[2] = true
++		c.settle()
++		n := c.nodes[2]
++		c.ready(2)
++		for len(n.local) > 0 {
++			c.processLocal(2)
++		}
++		kept := lastIndex(n.storage)
++		c.isolate(1)
++		if err := c.nodes[3].rn.Campaign(); err != nil {
++			t.Fatal(err)
++		}
++		c.settle()
++		if st := c.nodes[3].rn.BasicStatus(); st.RaftState != raft.StateLeader {
++			t.Fatalf("node 3 did not become leader: %s", c.describe())
++		}
++		c.paused[2] = false
++		c.settle()
++		proposeSizes(c, 3, []int{100, 100, 100, 100, 100, 100, 100, 100})
++		c.settle()
++		for _, a := range c.acks {
++			if a.from == 2 && a.to == 1 && a.index > kept {
++				t.Fatalf("node 2 acknowledged index %d to node 1 in term %d after node 3 replaced its entries past %d", a.index, a.term, kept)
++			}
++		}
++		requireCaughtUp(t, c, 3, 2)
++		c.converge()
++	})
++}
++
++func TestAcknowledgementOfReplacedEntriesIsNeverSent(t *testing.T) {
++	testAcknowledgementOfReplacedEntriesIsNeverSent(t, false)
++}
++
++func TestAsyncAcknowledgementOfReplacedEntriesIsNeverSent(t *testing.T) {
++	testAcknowledgementOfReplacedEntriesIsNeverSent(t, true)
++}
++
++func testFollowerHandsOutTheLongestRunThatFits(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 160}, 1, 2, 3)
++		c.campaign(1)
++		before := len(c.nodes[2].pages)
++		want := proposeSizes(c, 1, []int{40, 90, 10, 150, 60, 60, 60, 5, 200, 30})
++		c.settle()
++		pages := c.nodes[2].pages[before:]
++		if len(pages) < 5 {
++			t.Fatalf("node 2 persisted the proposals in %d batches", len(pages))
++		}
++		requirePages(t, pages, want, 160)
++		requireCaughtUp(t, c, 1, 2)
++	})
++}
++
++func TestFollowerHandsOutTheLongestRunThatFits(t *testing.T) {
++	testFollowerHandsOutTheLongestRunThatFits(t, false)
++}
++
++func TestAsyncFollowerHandsOutTheLongestRunThatFits(t *testing.T) {
++	testFollowerHandsOutTheLongestRunThatFits(t, true)
++}
++
++func TestAsyncEntryLargerThanTheLimitIsHandedOutAlone(t *testing.T) {
++	run(t, func() {
++		c := newCluster(t, true, map[uint64]uint64{1: 100}, 1)
++		c.campaign(1)
++		before := len(c.nodes[1].pages)
++		want := proposeSizes(c, 1, []int{300, 20, 20, 300, 20})
++		c.settle()
++		pages := c.nodes[1].pages[before:]
++		var sizes []int
++		for _, page := range pages {
++			sizes = append(sizes, len(page))
++		}
++		if !slices.Equal(sizes, []int{1, 2, 1, 1}) {
++			t.Fatalf("storage append lengths %v, want [1 2 1 1]", sizes)
++		}
++		requirePages(t, pages, want, 100)
++	})
++}
++
++func testWithheldAcknowledgementIsSentOnceItsEntriesAreHandedOut(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3)
++		c.campaign(1)
++		c.paused[2] = true
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		before := len(c.acks)
++		c.ready(2)
++		for len(c.nodes[2].local) > 0 {
++			c.processLocal(2)
++		}
++		persisted := lastIndex(c.nodes[2].storage)
++		if persisted >= 8 {
++			t.Fatalf("node 2 persisted the whole backlog (up to %d) in one batch", persisted)
++		}
++		for _, a := range c.acks[before:] {
++			if a.from == 2 && a.index > persisted {
++				t.Fatalf("node 2 acknowledged index %d with entries handed out only up to %d", a.index, persisted)
++			}
++		}
++		c.paused[2] = false
++		c.settle()
++		sent := false
++		for _, a := range c.acks[before:] {
++			if a.from == 2 && a.to == 1 && a.index == 8 {
++				sent = true
++			}
++		}
++		if !sent {
++			t.Fatalf("node 2 never acknowledged index 8 to the leader")
++		}
++		requireCaughtUp(t, c, 1, 2)
++	})
++}
++
++func TestWithheldAcknowledgementIsSentOnceItsEntriesAreHandedOut(t *testing.T) {
++	testWithheldAcknowledgementIsSentOnceItsEntriesAreHandedOut(t, false)
++}
++
++func TestAsyncWithheldAcknowledgementIsSentOnceItsEntriesAreHandedOut(t *testing.T) {
++	testWithheldAcknowledgementIsSentOnceItsEntriesAreHandedOut(t, true)
++}
++
++func testVoteResponseDoesNotWaitForTheBacklog(t *testing.T, async, prevote bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3)
++		if prevote {
++			c.enablePreVote()
++		}
++		c.campaign(1)
++		c.paused[2] = true
++		c.drop = func(m *pb.Message) bool {
++			if m.GetType() != pb.MsgApp || m.GetTo() != 3 {
++				return false
++			}
++			for _, e := range m.GetEntries() {
++				if e.GetIndex() >= 6 {
++					return true
++				}
++			}
++			return false
++		}
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		if last := lastIndex(c.nodes[3].storage); last != 5 {
++			t.Fatalf("node 3 persisted up to %d, want 5", last)
++		}
++		c.drop = nil
++		c.isolate(1)
++		if err := c.nodes[3].rn.Campaign(); err != nil {
++			t.Fatal(err)
++		}
++		c.settle()
++		c.ready(2)
++		for len(c.nodes[2].local) > 0 {
++			c.processLocal(2)
++		}
++		if last := c.nodes[2].last; last >= 8 {
++			t.Fatalf("node 2 handed out its whole backlog (up to %d) in one batch", last)
++		}
++		want := pb.MsgVoteResp
++		if prevote {
++			want = pb.MsgPreVoteResp
++		}
++		answered := false
++		for _, v := range c.votes {
++			if v.from == 2 && v.to == 3 && v.typ == want {
++				answered = true
++			}
++		}
++		if !answered {
++			t.Fatalf("node 2 did not send its %s to node 3 with its next batch, entries handed out only up to %d", want, c.nodes[2].last)
++		}
++		c.paused[2] = false
++		c.converge()
++	})
++}
++
++func TestVoteResponseDoesNotWaitForTheBacklog(t *testing.T) {
++	testVoteResponseDoesNotWaitForTheBacklog(t, false, false)
++}
++
++func TestAsyncVoteResponseDoesNotWaitForTheBacklog(t *testing.T) {
++	testVoteResponseDoesNotWaitForTheBacklog(t, true, false)
++}
++
++func TestPreVoteResponseDoesNotWaitForTheBacklog(t *testing.T) {
++	testVoteResponseDoesNotWaitForTheBacklog(t, false, true)
++}
++
++func TestAsyncPreVoteResponseDoesNotWaitForTheBacklog(t *testing.T) {
++	testVoteResponseDoesNotWaitForTheBacklog(t, true, true)
++}
++
++func testAppendRejectionDoesNotWaitForTheBacklog(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3)
++		c.campaign(1)
++		c.paused[2] = true
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.block(1, 2)
++		proposeSizes(c, 1, []int{100, 100})
++		c.settle()
++		c.heal()
++		proposeSizes(c, 1, []int{100})
++		c.settle()
++		c.ready(2)
++		for len(c.nodes[2].local) > 0 {
++			c.processLocal(2)
++		}
++		if last := c.nodes[2].last; last >= 8 {
++			t.Fatalf("node 2 handed out its whole backlog (up to %d) in one batch", last)
++		}
++		rejected := false
++		for _, r := range c.rejects {
++			if r.from == 2 && r.to == 1 {
++				rejected = true
++			}
++		}
++		if !rejected {
++			t.Fatalf("node 2 did not reject the append that skipped its missing entries with its next batch, entries handed out only up to %d", c.nodes[2].last)
++		}
++		c.paused[2] = false
++		c.settle()
++		for round := 0; c.nodes[1].rn.Status().Progress[2].Match != lastIndex(c.nodes[1].storage); round++ {
++			if round == 20 {
++				t.Fatalf("node 2 did not catch up: %s", c.describe())
++			}
++			c.tick(1)
++			c.settle()
++		}
++		requireCaughtUp(t, c, 1, 2)
++	})
++}
++
++func TestAppendRejectionDoesNotWaitForTheBacklog(t *testing.T) {
++	testAppendRejectionDoesNotWaitForTheBacklog(t, false)
++}
++
++func TestAsyncAppendRejectionDoesNotWaitForTheBacklog(t *testing.T) {
++	testAppendRejectionDoesNotWaitForTheBacklog(t, true)
++}
++
++func testAcknowledgementReplacedBeforeAnyBatchIsNeverSent(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 1000}, 1, 2, 3, 4, 5)
++		c.campaign(1)
++		for _, id := range []uint64{3, 4, 5} {
++			c.block(1, id)
++		}
++		kept := lastIndex(c.nodes[2].storage)
++		c.paused[2] = true
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.isolate(1)
++		if err := c.nodes[3].rn.Campaign(); err != nil {
++			t.Fatal(err)
++		}
++		c.settle()
++		if st := c.nodes[3].rn.BasicStatus(); st.RaftState != raft.StateLeader {
++			t.Fatalf("node 3 did not become leader: %s", c.describe())
++		}
++		proposeSizes(c, 3, []int{100, 100, 100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.paused[2] = false
++		c.settle()
++		for _, a := range c.acks {
++			if a.from == 2 && a.to == 1 && a.index > kept {
++				t.Fatalf("node 2 acknowledged index %d to node 1 in term %d after node 3 replaced its entries past %d", a.index, a.term, kept)
++			}
++		}
++		requireCaughtUp(t, c, 3, 2)
++		c.converge()
++	})
++}
++
++func TestAcknowledgementReplacedBeforeAnyBatchIsNeverSent(t *testing.T) {
++	testAcknowledgementReplacedBeforeAnyBatchIsNeverSent(t, false)
++}
++
++func TestAsyncAcknowledgementReplacedBeforeAnyBatchIsNeverSent(t *testing.T) {
++	testAcknowledgementReplacedBeforeAnyBatchIsNeverSent(t, true)
++}
++
++func TestAsyncZeroLimitHandsOutAllEntriesAtOnce(t *testing.T) {
++	run(t, func() {
++		c := newCluster(t, true, nil, 1, 2, 3)
++		c.campaign(1)
++		before := map[uint64]int{}
++		for _, id := range c.ids {
++			before[id] = len(c.nodes[id].pages)
++		}
++		want := proposeSizes(c, 1, []int{200, 180, 160, 140, 120, 100, 80, 60, 40, 20})
++		c.settle()
++		for _, id := range c.ids {
++			pages := c.nodes[id].pages[before[id]:]
++			if len(pages) != 1 || len(pages[0]) != len(want) {
++				t.Fatalf("node %d handed out storage appends %v, want all %d entries in one", id, pageIndexes(pages), len(want))
++			}
++		}
++		c.converge()
++	})
++}
++
++func testLeaderSendsOnlyEntriesItHasHandedOut(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{1: 250}, 1, 2, 3)
++		c.campaign(1)
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.ready(1)
++		for len(c.nodes[1].local) > 0 {
++			c.processLocal(1)
++		}
++		for _, m := range c.net {
++			for _, e := range m.GetEntries() {
++				if m.GetType() == pb.MsgApp && e.GetIndex() > c.nodes[1].last {
++					t.Fatalf("leader sent entry %d with entries handed out only up to %d", e.GetIndex(), c.nodes[1].last)
++				}
++			}
++		}
++		c.settle()
++		requireCaughtUp(t, c, 1, 2)
++		requireCaughtUp(t, c, 1, 3)
++	})
++}
++
++func TestLeaderSendsOnlyEntriesItHasHandedOut(t *testing.T) {
++	testLeaderSendsOnlyEntriesItHasHandedOut(t, false)
++}
++
++func TestAsyncLeaderSendsOnlyEntriesItHasHandedOut(t *testing.T) {
++	testLeaderSendsOnlyEntriesItHasHandedOut(t, true)
++}
++
++func testCandidateAdvertisesOnlyEntriesItHasHandedOut(t *testing.T, async, prevote bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3)
++		if prevote {
++			c.enablePreVote()
++		}
++		c.campaign(1)
++		c.paused[2] = true
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.isolate(1)
++		if err := c.nodes[2].rn.Campaign(); err != nil {
++			t.Fatal(err)
++		}
++		c.ready(2)
++		for len(c.nodes[2].local) > 0 {
++			c.processLocal(2)
++		}
++		for _, m := range c.net {
++			if (m.GetType() == pb.MsgVote || m.GetType() == pb.MsgPreVote) && m.GetIndex() > c.nodes[2].last {
++				t.Fatalf("node 2 advertised index %d with entries handed out only up to %d", m.GetIndex(), c.nodes[2].last)
++			}
++		}
++		c.paused[2] = false
++		c.settle()
++		if st := c.nodes[2].rn.BasicStatus(); st.RaftState != raft.StateLeader {
++			t.Fatalf("node 2 did not win its election: %s", c.describe())
++		}
++		c.converge()
++	})
++}
++
++func TestCandidateAdvertisesOnlyEntriesItHasHandedOut(t *testing.T) {
++	testCandidateAdvertisesOnlyEntriesItHasHandedOut(t, false, false)
++}
++
++func TestAsyncCandidateAdvertisesOnlyEntriesItHasHandedOut(t *testing.T) {
++	testCandidateAdvertisesOnlyEntriesItHasHandedOut(t, true, false)
++}
++
++func TestPreCandidateAdvertisesOnlyEntriesItHasHandedOut(t *testing.T) {
++	testCandidateAdvertisesOnlyEntriesItHasHandedOut(t, false, true)
++}
++
++func TestAsyncPreCandidateAdvertisesOnlyEntriesItHasHandedOut(t *testing.T) {
++	testCandidateAdvertisesOnlyEntriesItHasHandedOut(t, true, true)
++}
++
++func testFollowerReadStateWaitsForTheEntriesItHolds(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3)
++		c.campaign(1)
++		c.paused[2] = true
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.nodes[2].rn.ReadIndex([]byte("read"))
++		c.ready(2)
++		for len(c.nodes[2].local) > 0 {
++			c.processLocal(2)
++		}
++		c.settle()
++		c.ready(2)
++		for len(c.nodes[2].local) > 0 {
++			c.processLocal(2)
++		}
++		c.paused[2] = false
++		c.settle()
++		reads := c.nodes[2].reads
++		if len(reads) != 1 || reads[0].index != 8 {
++			t.Fatalf("node 2 returned read states %+v, want one at index 8", reads)
++		}
++		if reads[0].handed < 8 {
++			t.Fatalf("node 2 returned a read state at index 8 with entries handed out only up to %d", reads[0].handed)
++		}
++		requireCaughtUp(t, c, 1, 2)
++	})
++}
++
++func TestFollowerReadStateWaitsForTheEntriesItHolds(t *testing.T) {
++	testFollowerReadStateWaitsForTheEntriesItHolds(t, false)
++}
++
++func TestAsyncFollowerReadStateWaitsForTheEntriesItHolds(t *testing.T) {
++	testFollowerReadStateWaitsForTheEntriesItHolds(t, true)
++}
++
++func testReadStateAheadOfTheLogWaitsForItsEntries(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3)
++		c.campaign(1)
++		proposeSizes(c, 1, []int{100, 100, 100})
++		c.settle()
++		c.drop = func(m *pb.Message) bool {
++			if m.GetType() != pb.MsgApp || m.GetTo() != 2 {
++				return false
++			}
++			for _, e := range m.GetEntries() {
++				if e.GetIndex() >= 6 {
++					return true
++				}
++			}
++			return false
++		}
++		proposeSizes(c, 1, []int{100, 100, 100})
++		c.settle()
++		if last := lastIndex(c.nodes[2].storage); last != 5 {
++			t.Fatalf("node 2 persisted up to %d, want 5", last)
++		}
++		c.nodes[2].rn.ReadIndex([]byte("read"))
++		c.settle()
++		c.drop = nil
++		for round := 0; c.nodes[1].rn.Status().Progress[2].Match != lastIndex(c.nodes[1].storage); round++ {
++			if round == 20 {
++				t.Fatalf("node 2 did not catch up: %s", c.describe())
++			}
++			c.tick(1)
++			c.settle()
++		}
++		reads := c.nodes[2].reads
++		if len(reads) != 1 || reads[0].index != 8 {
++			t.Fatalf("node 2 returned read states %+v, want one at index 8", reads)
++		}
++		if reads[0].handed < 8 {
++			t.Fatalf("node 2 returned a read state at index 8 with entries handed out only up to %d", reads[0].handed)
++		}
++	})
++}
++
++func TestReadStateAheadOfTheLogWaitsForItsEntries(t *testing.T) {
++	testReadStateAheadOfTheLogWaitsForItsEntries(t, false)
++}
++
++func TestAsyncReadStateAheadOfTheLogWaitsForItsEntries(t *testing.T) {
++	testReadStateAheadOfTheLogWaitsForItsEntries(t, true)
++}
++
++func testZeroLimitHandsOutALargeBacklogAtOnce(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, nil, 1, 2, 3)
++		c.campaign(1)
++		before := map[uint64]int{}
++		for _, id := range c.ids {
++			before[id] = len(c.nodes[id].pages)
++		}
++		sizes := make([]int, 50)
++		for i := range sizes {
++			sizes[i] = 20000
++		}
++		want := proposeSizes(c, 1, sizes)
++		c.settle()
++		for _, id := range c.ids {
++			pages := c.nodes[id].pages[before[id]:]
++			if len(pages) != 1 || len(pages[0]) != len(want) {
++				t.Fatalf("node %d handed out %d batches for %d entries of %d bytes in total", id, len(pages), len(want), entsSize(c.handedOut(id)[len(c.handedOut(id))-len(want):]))
++			}
++		}
++		c.converge()
++	})
++}
++
++func TestZeroLimitHandsOutALargeBacklogAtOnce(t *testing.T) {
++	testZeroLimitHandsOutALargeBacklogAtOnce(t, false)
++}
++
++func TestAsyncZeroLimitHandsOutALargeBacklogAtOnce(t *testing.T) {
++	testZeroLimitHandsOutALargeBacklogAtOnce(t, true)
++}
++
++func testRestartAfterEveryBatchOfASnapshotCatchUp(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{3: 250}, 1, 2, 3)
++		c.campaign(1)
++		c.isolate(3)
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.compact(1)
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.heal()
++		c.crash[3] = true
++		for round := 0; ; round++ {
++			if round == 100 {
++				t.Fatalf("node 3 did not catch up: %s", c.describe())
++			}
++			c.tick(1)
++			c.settle()
++			if n := c.nodes[3]; lastIndex(n.storage) == lastIndex(c.nodes[1].storage) && n.applied == lastIndex(n.storage) {
++				break
++			}
++		}
++		if snapIndex(c.nodes[3].storage) <= 1 {
++			t.Fatalf("node 3 did not receive a snapshot: %s", c.describe())
++		}
++		c.converge()
++	})
++}
++
++func TestRestartAfterEveryBatchOfASnapshotCatchUp(t *testing.T) {
++	testRestartAfterEveryBatchOfASnapshotCatchUp(t, false)
++}
++
++func TestAsyncRestartAfterEveryBatchOfASnapshotCatchUp(t *testing.T) {
++	testRestartAfterEveryBatchOfASnapshotCatchUp(t, true)
++}
++
++func testRestartAfterAHardStateOnlyBatch(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3)
++		c.campaign(1)
++		c.isolate(1)
++		if err := c.nodes[3].rn.Campaign(); err != nil {
++			t.Fatal(err)
++		}
++		term := c.nodes[3].rn.BasicStatus().HardState.GetTerm()
++		c.ready(3)
++		for len(c.nodes[3].local) > 0 {
++			c.processLocal(3)
++		}
++		c.deliver()
++		n := c.nodes[2]
++		pages, states := len(n.pages), len(n.states)
++		c.crash[2] = true
++		c.ready(2)
++		for len(n.local) > 0 {
++			c.processLocal(2)
++		}
++		if len(n.pages) != pages || len(n.states) != states+1 {
++			t.Fatalf("node 2 handled %d batches of entries and %d hard states, want only one hard state", len(n.pages)-pages, len(n.states)-states)
++		}
++		c.crash[2] = false
++		if st := n.rn.BasicStatus(); st.HardState.GetTerm() != term || st.HardState.GetVote() != 3 {
++			t.Fatalf("node 2 restarted with term %d and vote %d, want node 3's campaign term %d and its vote for node 3", st.HardState.GetTerm(), st.HardState.GetVote(), term)
++		}
++		c.settle()
++		if st := c.nodes[3].rn.BasicStatus(); st.RaftState != raft.StateLeader {
++			t.Fatalf("node 3 did not win its election: %s", c.describe())
++		}
++		c.converge()
++	})
++}
++
++func TestRestartAfterAHardStateOnlyBatch(t *testing.T) {
++	testRestartAfterAHardStateOnlyBatch(t, false)
++}
++
++func TestAsyncRestartAfterAHardStateOnlyBatch(t *testing.T) {
++	testRestartAfterAHardStateOnlyBatch(t, true)
++}
++
++func testAcknowledgementOfEntriesReplacedByASnapshotIsNeverSent(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3, 4, 5)
++		c.campaign(1)
++		for _, id := range []uint64{3, 4, 5} {
++			c.block(1, id)
++		}
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.paused[2] = true
++		c.settle()
++		handOut := func() {
++			c.ready(2)
++			for len(c.nodes[2].local) > 0 {
++				c.processLocal(2)
++			}
++		}
++		handOut()
++		c.isolate(1)
++		c.block(2, 3)
++		c.campaign(3)
++		proposeSizes(c, 3, []int{100, 100, 100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.compact(3)
++		c.heal()
++		c.isolate(1)
++		c.tick(3)
++		c.work(3)
++		c.deliver()
++		handOut()
++		c.deliver()
++		c.work(3)
++		c.deliver()
++		kept := c.nodes[2].last
++		if kept >= 8 {
++			t.Fatalf("node 2 handed out its entries up to %d before the snapshot replaced them", kept)
++		}
++		c.paused[2] = false
++		for round := 0; c.nodes[3].rn.Status().Progress[2].Match != lastIndex(c.nodes[3].storage); round++ {
++			if round == 20 {
++				t.Fatalf("node 2 did not catch up: %s", c.describe())
++			}
++			c.tick(3)
++			c.settle()
++		}
++		if snapIndex(c.nodes[2].storage) <= 8 {
++			t.Fatalf("node 2 caught up without the snapshot: %s", c.describe())
++		}
++		for _, a := range c.acks {
++			if a.from == 2 && a.to == 1 && a.index > kept {
++				t.Fatalf("node 2 acknowledged index %d to node 1 in term %d after a snapshot from node 3 replaced its entries past %d", a.index, a.term, kept)
++			}
++		}
++		c.converge()
++	})
++}
++
++func TestAcknowledgementOfEntriesReplacedByASnapshotIsNeverSent(t *testing.T) {
++	testAcknowledgementOfEntriesReplacedByASnapshotIsNeverSent(t, false)
++}
++
++func TestAsyncAcknowledgementOfEntriesReplacedByASnapshotIsNeverSent(t *testing.T) {
++	testAcknowledgementOfEntriesReplacedByASnapshotIsNeverSent(t, true)
++}
++
++func testWaitingVoteRequestForEntriesReplacedByASnapshotIsNeverSent(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3, 4, 5)
++		c.campaign(1)
++		term := c.nodes[1].rn.BasicStatus().HardState.GetTerm()
++		for _, id := range []uint64{3, 4, 5} {
++			c.block(1, id)
++		}
++		c.paused[2] = true
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		handOut := func() {
++			c.ready(2)
++			for len(c.nodes[2].local) > 0 {
++				c.processLocal(2)
++			}
++		}
++		handOut()
++		if err := c.nodes[2].rn.Campaign(); err != nil {
++			t.Fatal(err)
++		}
++		c.isolate(1)
++		c.block(2, 3)
++		c.campaign(3)
++		proposeSizes(c, 3, []int{100, 100, 100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.compact(3)
++		c.heal()
++		c.isolate(1)
++		c.tick(3)
++		c.work(3)
++		c.deliver()
++		handOut()
++		c.deliver()
++		c.work(3)
++		c.deliver()
++		kept := c.nodes[2].last
++		if kept >= 8 {
++			t.Fatalf("node 2 handed out its entries up to %d before the snapshot replaced them", kept)
++		}
++		c.paused[2] = false
++		for round := 0; c.nodes[3].rn.Status().Progress[2].Match != lastIndex(c.nodes[3].storage); round++ {
++			if round == 20 {
++				t.Fatalf("node 2 did not catch up: %s", c.describe())
++			}
++			c.tick(3)
++			c.settle()
++		}
++		if snapIndex(c.nodes[2].storage) <= 8 {
++			t.Fatalf("node 2 caught up without the snapshot: %s", c.describe())
++		}
++		for _, m := range c.outbox {
++			if m.GetFrom() != 2 || (m.GetType() != pb.MsgVote && m.GetType() != pb.MsgPreVote) {
++				continue
++			}
++			if m.GetLogTerm() == term && m.GetIndex() > kept {
++				t.Fatalf("node 2 sent %s naming entry %d of term %d, which a snapshot from node 3 replaced before it was handed out", m.GetType(), m.GetIndex(), m.GetLogTerm())
++			}
++		}
++		c.converge()
++	})
++}
++
++func TestWaitingVoteRequestForEntriesReplacedByASnapshotIsNeverSent(t *testing.T) {
++	testWaitingVoteRequestForEntriesReplacedByASnapshotIsNeverSent(t, false)
++}
++
++func TestAsyncWaitingVoteRequestForEntriesReplacedByASnapshotIsNeverSent(t *testing.T) {
++	testWaitingVoteRequestForEntriesReplacedByASnapshotIsNeverSent(t, true)
++}
++
++func testWaitingAppendOfEntriesReplacedByASnapshotIsNeverSent(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3, 4, 5)
++		c.campaign(2)
++		term := c.nodes[2].rn.BasicStatus().HardState.GetTerm()
++		c.paused[2] = true
++		proposeSizes(c, 2, []int{100, 100, 100, 100, 100, 100})
++		c.isolate(2)
++		handOut := func() {
++			c.ready(2)
++			for len(c.nodes[2].local) > 0 {
++				c.processLocal(2)
++			}
++		}
++		handOut()
++		c.settle()
++		c.campaign(3)
++		proposeSizes(c, 3, []int{100, 100, 100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.compact(3)
++		c.heal()
++		c.isolate(1)
++		c.tick(3)
++		c.work(3)
++		c.deliver()
++		handOut()
++		c.deliver()
++		c.work(3)
++		c.deliver()
++		kept := c.nodes[2].last
++		if kept >= 8 {
++			t.Fatalf("node 2 handed out its entries up to %d before the snapshot replaced them", kept)
++		}
++		c.paused[2] = false
++		for round := 0; c.nodes[3].rn.Status().Progress[2].Match != lastIndex(c.nodes[3].storage); round++ {
++			if round == 20 {
++				t.Fatalf("node 2 did not catch up: %s", c.describe())
++			}
++			c.tick(3)
++			c.settle()
++		}
++		if snapIndex(c.nodes[2].storage) <= 8 {
++			t.Fatalf("node 2 caught up without the snapshot: %s", c.describe())
++		}
++		for _, m := range c.outbox {
++			if m.GetFrom() != 2 || m.GetType() != pb.MsgApp {
++				continue
++			}
++			if m.GetLogTerm() == term && m.GetIndex() > kept {
++				t.Fatalf("node 2 sent MsgApp to node %d naming entry %d of term %d, which a snapshot from node 3 replaced before it was handed out", m.GetTo(), m.GetIndex(), m.GetLogTerm())
++			}
++			for _, e := range m.GetEntries() {
++				if e.GetTerm() == term && e.GetIndex() > kept {
++					t.Fatalf("node 2 sent entry %d of term %d to node %d, which a snapshot from node 3 replaced before it was handed out", e.GetIndex(), e.GetTerm(), m.GetTo())
++				}
++			}
++		}
++		c.converge()
++	})
++}
++
++func TestWaitingAppendOfEntriesReplacedByASnapshotIsNeverSent(t *testing.T) {
++	testWaitingAppendOfEntriesReplacedByASnapshotIsNeverSent(t, false)
++}
++
++func TestAsyncWaitingAppendOfEntriesReplacedByASnapshotIsNeverSent(t *testing.T) {
++	testWaitingAppendOfEntriesReplacedByASnapshotIsNeverSent(t, true)
++}
++
++func testWaitingVoteRequestForReplacedEntriesIsNeverSent(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{2: 250}, 1, 2, 3, 4, 5)
++		c.campaign(1)
++		for _, id := range []uint64{3, 4, 5} {
++			c.block(1, id)
++		}
++		c.paused[2] = true
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		handOutOne := func() {
++			c.ready(2)
++			for len(c.nodes[2].local) > 0 {
++				c.processLocal(2)
++			}
++		}
++		handOutOne()
++		if last := c.nodes[2].last; last >= 6 {
++			t.Fatalf("node 2 handed out its entries up to %d in one batch", last)
++		}
++		if err := c.nodes[2].rn.Campaign(); err != nil {
++			t.Fatal(err)
++		}
++		c.isolate(1)
++		c.block(2, 3)
++		c.campaign(3)
++		proposeSizes(c, 3, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.heal()
++		c.isolate(1)
++		c.tick(3)
++		c.work(3)
++		c.deliver()
++		handOutOne()
++		c.deliver()
++		c.work(3)
++		c.deliver()
++		if last := c.nodes[2].last; last >= 8 {
++			t.Fatalf("node 2 handed out its entries up to %d before the new leader replaced them", last)
++		}
++		c.paused[2] = false
++		for round := 0; c.nodes[3].rn.Status().Progress[2].Match != lastIndex(c.nodes[3].storage); round++ {
++			if round == 20 {
++				t.Fatalf("node 2 did not catch up: %s", c.describe())
++			}
++			c.tick(3)
++			c.settle()
++		}
++		for _, m := range c.outbox {
++			if m.GetFrom() != 2 || (m.GetType() != pb.MsgVote && m.GetType() != pb.MsgPreVote) {
++				continue
++			}
++			if !c.nodes[2].wasHandedOut(m.GetIndex(), m.GetLogTerm()) {
++				t.Fatalf("node 2 sent %s naming entry %d of term %d, which it never handed out", m.GetType(), m.GetIndex(), m.GetLogTerm())
++			}
++		}
++		c.converge()
++	})
++}
++
++func TestWaitingVoteRequestForReplacedEntriesIsNeverSent(t *testing.T) {
++	testWaitingVoteRequestForReplacedEntriesIsNeverSent(t, false)
++}
++
++func TestAsyncWaitingVoteRequestForReplacedEntriesIsNeverSent(t *testing.T) {
++	testWaitingVoteRequestForReplacedEntriesIsNeverSent(t, true)
++}
++
++func TestBootstrapHandsOutItsConfChangesInBatches(t *testing.T) {
++	run(t, func() {
++		boot := func(limit uint64) ([][]*pb.Entry, *pb.ConfState) {
++			st := raft.NewMemoryStorage()
++			rn, err := raft.NewRawNode(&raft.Config{
++				ID:                    1,
++				ElectionTick:          10,
++				HeartbeatTick:         1,
++				Storage:               st,
++				MaxSizePerMsg:         1 << 20,
++				MaxInflightMsgs:       256,
++				MaxAppendSizePerReady: limit,
++				Logger:                discard,
++			})
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err := rn.Bootstrap([]raft.Peer{{ID: 1}, {ID: 2}, {ID: 3}, {ID: 4}, {ID: 5}}); err != nil {
++				t.Fatal(err)
++			}
++			var pages [][]*pb.Entry
++			var cs *pb.ConfState
++			var applied uint64
++			for k := 0; rn.HasReady(); k++ {
++				if k == 100 {
++					t.Fatalf("node keeps reporting a Ready")
++				}
++				rd := rn.Ready()
++				if len(rd.Entries) > 1 && limit != 0 && entsSize(rd.Entries) > limit {
++					t.Fatalf("handed out %d bytes of entries with limit %d", entsSize(rd.Entries), limit)
++				}
++				if err := st.Append(rd.Entries); err != nil {
++					t.Fatal(err)
++				}
++				if len(rd.Entries) > 0 {
++					pages = append(pages, rd.Entries)
++				}
++				if !raft.IsEmptyHardState(rd.HardState) {
++					if rd.HardState.GetCommit() > lastIndex(st) {
++						t.Fatalf("asked to persist commit index %d with entries only up to %d", rd.HardState.GetCommit(), lastIndex(st))
++					}
++					if err := st.SetHardState(rd.HardState); err != nil {
++						t.Fatal(err)
++					}
++				}
++				for _, e := range rd.CommittedEntries {
++					if e.GetIndex() != applied+1 || e.GetIndex() > lastIndex(st) {
++						t.Fatalf("applied entry %d after %d with entries persisted up to %d", e.GetIndex(), applied, lastIndex(st))
++					}
++					applied = e.GetIndex()
++					var cc pb.ConfChange
++					if err := proto.Unmarshal(e.GetData(), &cc); err != nil {
++						t.Fatal(err)
++					}
++					cs = rn.ApplyConfChange(&cc)
++				}
++				rn.Advance(rd)
++			}
++			if applied != 5 {
++				t.Fatalf("applied %d of the 5 bootstrap entries", applied)
++			}
++			return pages, cs
++		}
++		pages, _ := boot(0)
++		if len(pages) != 1 || len(pages[0]) != 5 {
++			t.Fatalf("without a limit the bootstrap entries came in batches %v", pageIndexes(pages))
++		}
++		limit := uint64(proto.Size(pages[0][0]) + proto.Size(pages[0][1]))
++		pages, cs := boot(limit)
++		if g, w := pageIndexes(pages), [][]uint64{{1, 2}, {3, 4}, {5}}; !slices.EqualFunc(g, w, slices.Equal) {
++			t.Fatalf("bootstrap batches %v, want %v", g, w)
++		}
++		if voters := cs.GetVoters(); !slices.Equal(voters, []uint64{1, 2, 3, 4, 5}) {
++			t.Fatalf("voters %v after bootstrap", voters)
++		}
++	})
++}
++
++func testSnapshotFollowedByEntriesInBatches(t *testing.T, async bool) {
++	run(t, func() {
++		c := newCluster(t, async, map[uint64]uint64{3: 250}, 1, 2, 3)
++		c.campaign(1)
++		c.isolate(3)
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.compact(1)
++		proposeSizes(c, 1, []int{100, 100, 100, 100, 100, 100})
++		c.settle()
++		c.heal()
++		before := len(c.nodes[3].pages)
++		c.tick(1)
++		c.settle()
++		if snapIndex(c.nodes[3].storage) <= 1 {
++			t.Fatalf("node 3 did not receive a snapshot: %s", c.describe())
++		}
++		if pages := c.nodes[3].pages[before:]; len(pages) < 3 {
++			t.Fatalf("node 3 persisted the entries after the snapshot in %d batches", len(pages))
++		}
++		requireCaughtUp(t, c, 1, 3)
++	})
++}
++
++func TestSnapshotFollowedByEntriesInBatches(t *testing.T) {
++	testSnapshotFollowedByEntriesInBatches(t, false)
++}
++
++func TestAsyncSnapshotFollowedByEntriesInBatches(t *testing.T) {
++	testSnapshotFollowedByEntriesInBatches(t, true)
++}
++
++func TestRandomClustersKeepEveryInvariant(t *testing.T) {
++	run(t, func() {
++		for seed := int64(1); seed <= 200; seed++ {
++			randomOps(t, false, seed)
++		}
++	})
++}
++
++func TestRandomAsyncClustersKeepEveryInvariant(t *testing.T) {
++	run(t, func() {
++		for seed := int64(1); seed <= 200; seed++ {
++			randomOps(t, true, seed)
++		}
++	})
++}
+diff --git a/appendlimit_a366de/harness_a366de_test.go b/appendlimit_a366de/harness_a366de_test.go
+new file mode 100644
+index 0000000..c7b4dd1
+--- /dev/null
++++ b/appendlimit_a366de/harness_a366de_test.go
+@@ -0,0 +1,791 @@
++package appendlimit
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"log"
++	"math/rand"
++	"runtime/debug"
++	"slices"
++	"testing"
++
++	"google.golang.org/protobuf/proto"
++
++	"go.etcd.io/raft/v3"
++	pb "go.etcd.io/raft/v3/raftpb"
++)
++
++var discard = &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)}
++
++type node struct {
++	id      uint64
++	limit   uint64
++	storage *raft.MemoryStorage
++	rn      *raft.RawNode
++	applied uint64
++	local   []*pb.Message
++	pages   [][]*pb.Entry
++	states  []*pb.HardState
++	ever    map[[2]uint64]bool
++	cur     map[uint64]uint64
++	last    uint64
++	highest uint64
++	reads   []readState
++}
++
++type readState struct {
++	index, handed uint64
++}
++
++type ack struct {
++	from, to, term, index uint64
++}
++
++type response struct {
++	from, to, term uint64
++	typ            pb.MessageType
++	reject         bool
++}
++
++type cluster struct {
++	t       *testing.T
++	label   string
++	async   bool
++	prevote bool
++	ids     []uint64
++	nodes   map[uint64]*node
++	net     []*pb.Message
++	blocked map[[2]uint64]bool
++	paused  map[uint64]bool
++	crash   map[uint64]bool
++	dup     func(m *pb.Message) bool
++	drop    func(m *pb.Message) bool
++	applied map[uint64]uint64
++	sent    map[[3]uint64]uint64
++	acks    []ack
++	outbox  []*pb.Message
++	votes   []response
++	rejects []response
++}
++
++func (c *cluster) fatalf(format string, args ...any) {
++	c.t.Helper()
++	c.t.Fatalf(c.label+format, args...)
++}
++
++func run(t *testing.T, f func()) {
++	t.Helper()
++	defer func() {
++		if r := recover(); r != nil {
++			t.Fatalf("panic: %v\n%s", r, debug.Stack())
++		}
++	}()
++	f()
++}
++
++func newCluster(t *testing.T, async bool, limits map[uint64]uint64, ids ...uint64) *cluster {
++	c := &cluster{
++		t:       t,
++		async:   async,
++		ids:     ids,
++		nodes:   map[uint64]*node{},
++		blocked: map[[2]uint64]bool{},
++		paused:  map[uint64]bool{},
++		crash:   map[uint64]bool{},
++		applied: map[uint64]uint64{},
++		sent:    map[[3]uint64]uint64{},
++	}
++	for _, id := range ids {
++		st := raft.NewMemoryStorage()
++		snap := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{
++			Index:     proto.Uint64(1),
++			Term:      proto.Uint64(1),
++			ConfState: &pb.ConfState{Voters: slices.Clone(ids)},
++		}}
++		if err := st.ApplySnapshot(snap); err != nil {
++			t.Fatal(err)
++		}
++		if err := st.SetHardState(&pb.HardState{Term: proto.Uint64(1), Commit: proto.Uint64(1)}); err != nil {
++			t.Fatal(err)
++		}
++		n := &node{id: id, limit: limits[id], storage: st, applied: 1}
++		c.nodes[id] = n
++		c.start(n)
++	}
++	return c
++}
++
++func (c *cluster) start(n *node) {
++	cfg := &raft.Config{
++		ID:                    n.id,
++		ElectionTick:          10,
++		HeartbeatTick:         1,
++		Storage:               n.storage,
++		Applied:               n.applied,
++		MaxSizePerMsg:         1 << 20,
++		MaxInflightMsgs:       256,
++		MaxAppendSizePerReady: n.limit,
++		AsyncStorageWrites:    c.async,
++		PreVote:               c.prevote,
++		Logger:                discard,
++	}
++	rn, err := raft.NewRawNode(cfg)
++	if err != nil {
++		c.fatalf("node %d: NewRawNode: %v", n.id, err)
++	}
++	n.rn = rn
++	n.local = nil
++	if n.ever == nil {
++		n.ever = map[[2]uint64]bool{}
++	}
++	n.cur = map[uint64]uint64{}
++	n.last = lastIndex(n.storage)
++	n.highest = max(n.highest, n.last)
++}
++
++func (c *cluster) enablePreVote() {
++	c.prevote = true
++	for _, id := range c.ids {
++		c.restart(id)
++	}
++}
++
++func (n *node) handOut(snap *pb.Snapshot, ents []*pb.Entry) {
++	if snap != nil && snap.GetMetadata().GetIndex() != 0 {
++		n.ever[[2]uint64{snap.GetMetadata().GetIndex(), snap.GetMetadata().GetTerm()}] = true
++		n.cur = map[uint64]uint64{snap.GetMetadata().GetIndex(): snap.GetMetadata().GetTerm()}
++		n.last = snap.GetMetadata().GetIndex()
++		n.highest = max(n.highest, n.last)
++	}
++	if len(ents) == 0 {
++		return
++	}
++	for i := ents[0].GetIndex(); i <= n.last; i++ {
++		delete(n.cur, i)
++	}
++	for _, e := range ents {
++		n.ever[[2]uint64{e.GetIndex(), e.GetTerm()}] = true
++		n.cur[e.GetIndex()] = e.GetTerm()
++	}
++	n.last = ents[len(ents)-1].GetIndex()
++	n.highest = max(n.highest, n.last)
++}
++
++func (n *node) wasHandedOut(index, term uint64) bool {
++	if n.ever[[2]uint64{index, term}] {
++		return true
++	}
++	if index <= snapIndex(n.storage) {
++		return true
++	}
++	t, err := n.storage.Term(index)
++	return err == nil && t == term
++}
++
++func (n *node) overwritten(index, term uint64) bool {
++	at := min(index, n.last)
++	t, ok := n.cur[at]
++	if !ok {
++		var err error
++		if t, err = n.storage.Term(at); err != nil {
++			return false
++		}
++	}
++	return t > term
++}
++
++func (c *cluster) checkRefs(n *node, m *pb.Message) {
++	var refs []uint64
++	var id [2]uint64
++	switch m.GetType() {
++	case pb.MsgApp:
++		id = [2]uint64{m.GetIndex(), m.GetLogTerm()}
++		if ents := m.GetEntries(); len(ents) > 0 {
++			id = [2]uint64{ents[len(ents)-1].GetIndex(), ents[len(ents)-1].GetTerm()}
++		}
++		refs = []uint64{id[0], m.GetCommit()}
++	case pb.MsgVote, pb.MsgPreVote:
++		id = [2]uint64{m.GetIndex(), m.GetLogTerm()}
++		refs = []uint64{id[0]}
++	case pb.MsgHeartbeat:
++		refs = []uint64{m.GetCommit()}
++	case pb.MsgReadIndexResp:
++		refs = []uint64{m.GetIndex()}
++	default:
++		return
++	}
++	if n.limit == 0 && id[0] != 0 && !n.wasHandedOut(id[0], id[1]) && n.overwritten(id[0], id[1]) {
++		return
++	}
++	for _, ref := range refs {
++		if ref > n.highest {
++			c.fatalf("node %d sent %s to node %d referring to index %d with entries handed out only up to %d", n.id, m.GetType(), m.GetTo(), ref, n.highest)
++		}
++	}
++	if id[0] != 0 && !n.wasHandedOut(id[0], id[1]) {
++		c.fatalf("node %d sent %s to node %d naming entry %d of term %d, which it never handed out", n.id, m.GetType(), m.GetTo(), id[0], id[1])
++	}
++}
++
++func (c *cluster) restart(id uint64) {
++	c.start(c.nodes[id])
++}
++
++func (c *cluster) quorum() int { return len(c.ids)/2 + 1 }
++
++func lastIndex(st *raft.MemoryStorage) uint64 {
++	last, err := st.LastIndex()
++	if err != nil {
++		panic(err)
++	}
++	return last
++}
++
++func snapIndex(st *raft.MemoryStorage) uint64 {
++	first, err := st.FirstIndex()
++	if err != nil {
++		panic(err)
++	}
++	return first - 1
++}
++
++func persisted(st *raft.MemoryStorage, index, term uint64) bool {
++	if index <= snapIndex(st) {
++		return true
++	}
++	t, err := st.Term(index)
++	return err == nil && t == term
++}
++
++func (c *cluster) durableOn(index, term uint64) int {
++	count := 0
++	for _, id := range c.ids {
++		if persisted(c.nodes[id].storage, index, term) {
++			count++
++		}
++	}
++	return count
++}
++
++func entsSize(ents []*pb.Entry) uint64 {
++	var size uint64
++	for _, e := range ents {
++		size += uint64(proto.Size(e))
++	}
++	return size
++}
++
++func (c *cluster) checkBatch(n *node, ents []*pb.Entry) {
++	for i := 1; i < len(ents); i++ {
++		if ents[i].GetIndex() != ents[i-1].GetIndex()+1 {
++			c.fatalf("node %d handed out entries %d and %d next to each other", n.id, ents[i-1].GetIndex(), ents[i].GetIndex())
++		}
++	}
++	if n.limit != 0 && len(ents) > 1 {
++		if size := entsSize(ents); size > n.limit {
++			c.fatalf("node %d handed out %d entries of %d bytes in one batch, limit %d", n.id, len(ents), size, n.limit)
++		}
++	}
++}
++
++func (c *cluster) persistSnapshot(n *node, snap *pb.Snapshot) {
++	if err := n.storage.ApplySnapshot(snap); err != nil {
++		c.fatalf("node %d: ApplySnapshot: %v", n.id, err)
++	}
++	n.applied = max(n.applied, snap.GetMetadata().GetIndex())
++}
++
++func (c *cluster) persistEntries(n *node, ents []*pb.Entry) {
++	if len(ents) == 0 {
++		return
++	}
++	if err := n.storage.Append(ents); err != nil {
++		c.fatalf("node %d: Append: %v", n.id, err)
++	}
++	n.pages = append(n.pages, ents)
++}
++
++func (c *cluster) persistHardState(n *node, hs *pb.HardState) {
++	if last := lastIndex(n.storage); hs.GetCommit() > last {
++		c.fatalf("node %d asked to persist commit index %d with entries only up to %d", n.id, hs.GetCommit(), last)
++	}
++	if err := n.storage.SetHardState(hs); err != nil {
++		c.fatalf("node %d: SetHardState: %v", n.id, err)
++	}
++	n.states = append(n.states, proto.Clone(hs).(*pb.HardState))
++}
++
++func (c *cluster) apply(n *node, ents []*pb.Entry) {
++	for _, e := range ents {
++		index, term := e.GetIndex(), e.GetTerm()
++		if index != n.applied+1 {
++			c.fatalf("node %d applied entry %d right after %d", n.id, index, n.applied)
++		}
++		if !persisted(n.storage, index, term) {
++			c.fatalf("node %d applied entry %d (term %d) before persisting it", n.id, index, term)
++		}
++		if k := c.durableOn(index, term); k < c.quorum() {
++			c.fatalf("node %d applied entry %d (term %d) persisted on only %d nodes", n.id, index, term, k)
++		}
++		if prev, ok := c.applied[index]; ok && prev != term {
++			c.fatalf("node %d applied entry %d with term %d, another node applied term %d", n.id, index, term, prev)
++		}
++		c.applied[index] = term
++		n.applied = index
++		switch e.GetType() {
++		case pb.EntryConfChange:
++			var cc pb.ConfChange
++			if err := proto.Unmarshal(e.GetData(), &cc); err != nil {
++				c.fatalf("%v", err)
++			}
++			n.rn.ApplyConfChange(&cc)
++		case pb.EntryConfChangeV2:
++			var cc pb.ConfChangeV2
++			if err := proto.Unmarshal(e.GetData(), &cc); err != nil {
++				c.fatalf("%v", err)
++			}
++			n.rn.ApplyConfChange(&cc)
++		}
++	}
++}
++
++func (c *cluster) entryTerm(from *node, msgTerm, index uint64) uint64 {
++	if index > snapIndex(from.storage) {
++		if t, err := from.storage.Term(index); err == nil {
++			return t
++		}
++	}
++	return c.sent[[3]uint64{from.id, msgTerm, index}]
++}
++
++func (c *cluster) check(from *node, m *pb.Message) {
++	switch m.GetType() {
++	case pb.MsgVoteResp, pb.MsgPreVoteResp:
++		c.votes = append(c.votes, response{from: from.id, to: m.GetTo(), term: m.GetTerm(), typ: m.GetType(), reject: m.GetReject()})
++	case pb.MsgAppResp:
++		if m.GetReject() {
++			c.rejects = append(c.rejects, response{from: from.id, to: m.GetTo(), term: m.GetTerm(), reject: true})
++			return
++		}
++		index := m.GetIndex()
++		if last := lastIndex(from.storage); index > last {
++			c.fatalf("node %d acknowledged index %d to node %d with entries persisted only up to %d", from.id, index, m.GetTo(), last)
++		}
++		c.acks = append(c.acks, ack{from: from.id, to: m.GetTo(), term: m.GetTerm(), index: index})
++	case pb.MsgApp, pb.MsgHeartbeat:
++		for _, e := range m.GetEntries() {
++			c.sent[[3]uint64{from.id, m.GetTerm(), e.GetIndex()}] = e.GetTerm()
++		}
++		commit := m.GetCommit()
++		if commit <= 1 {
++			return
++		}
++		term := c.entryTerm(from, m.GetTerm(), commit)
++		if term == 0 {
++			return
++		}
++		if k := c.durableOn(commit, term); k < c.quorum() {
++			c.fatalf("node %d announced commit index %d (term %d) persisted on only %d nodes", from.id, commit, term, k)
++		}
++	}
++}
++
++func (c *cluster) send(from *node, m *pb.Message) {
++	c.outbox = append(c.outbox, m)
++	c.check(from, m)
++	c.checkRefs(from, m)
++	c.net = append(c.net, m)
++}
++
++func (c *cluster) ready(id uint64) {
++	n := c.nodes[id]
++	rd := n.rn.Ready()
++	if c.async {
++		for _, m := range rd.Messages {
++			if m.GetType() == pb.MsgStorageAppend {
++				n.handOut(m.GetSnapshot(), m.GetEntries())
++			}
++		}
++		for _, rs := range rd.ReadStates {
++			n.reads = append(n.reads, readState{index: rs.Index, handed: n.last})
++		}
++		for _, m := range rd.Messages {
++			if m.GetTo() == raft.LocalAppendThread || m.GetTo() == raft.LocalApplyThread {
++				n.local = append(n.local, m)
++			} else {
++				c.send(n, m)
++			}
++		}
++		return
++	}
++	c.checkBatch(n, rd.Entries)
++	n.handOut(rd.Snapshot, rd.Entries)
++	for _, rs := range rd.ReadStates {
++		n.reads = append(n.reads, readState{index: rs.Index, handed: n.last})
++	}
++	if !raft.IsEmptySnap(rd.Snapshot) {
++		c.persistSnapshot(n, rd.Snapshot)
++	}
++	c.persistEntries(n, rd.Entries)
++	if !raft.IsEmptyHardState(rd.HardState) {
++		c.persistHardState(n, rd.HardState)
++	}
++	for _, m := range rd.Messages {
++		c.send(n, m)
++	}
++	c.apply(n, rd.CommittedEntries)
++	n.rn.Advance(rd)
++	if c.crash[id] {
++		c.restart(id)
++	}
++}
++
++func (c *cluster) respond(n *node, m *pb.Message) {
++	if m.GetTo() != n.id {
++		c.send(n, m)
++		return
++	}
++	c.check(n, m)
++	if err := n.rn.Step(m); err != nil {
++		c.fatalf("node %d: stepping %s: %v", n.id, m.GetType(), err)
++	}
++}
++
++func (c *cluster) processLocal(id uint64) {
++	n := c.nodes[id]
++	m := n.local[0]
++	n.local = n.local[1:]
++	switch m.GetType() {
++	case pb.MsgStorageAppend:
++		c.checkBatch(n, m.GetEntries())
++		if m.GetSnapshot() != nil {
++			c.persistSnapshot(n, m.GetSnapshot())
++		}
++		c.persistEntries(n, m.GetEntries())
++		if m.Term != nil || m.Vote != nil || m.Commit != nil {
++			c.persistHardState(n, &pb.HardState{Term: m.Term, Vote: m.Vote, Commit: m.Commit})
++		}
++	case pb.MsgStorageApply:
++		c.apply(n, m.GetEntries())
++	default:
++		c.fatalf("node %d: unexpected local message %s", id, m.GetType())
++	}
++	for _, r := range m.GetResponses() {
++		c.respond(n, r)
++	}
++	if c.crash[id] && m.GetType() == pb.MsgStorageAppend {
++		c.restart(id)
++	}
++}
++
++func (c *cluster) block(a, b uint64) {
++	c.blocked[[2]uint64{a, b}] = true
++	c.blocked[[2]uint64{b, a}] = true
++}
++
++func (c *cluster) isolate(id uint64) {
++	for _, other := range c.ids {
++		if other != id {
++			c.block(id, other)
++		}
++	}
++}
++
++func (c *cluster) heal() {
++	c.blocked = map[[2]uint64]bool{}
++}
++
++func (c *cluster) deliver() bool {
++	if len(c.net) == 0 {
++		return false
++	}
++	msgs := c.net
++	c.net = nil
++	for _, m := range msgs {
++		if c.blocked[[2]uint64{m.GetFrom(), m.GetTo()}] || (c.drop != nil && c.drop(m)) {
++			if m.GetType() == pb.MsgSnap {
++				c.nodes[m.GetFrom()].rn.ReportSnapshot(m.GetTo(), raft.SnapshotFailure)
++			}
++			continue
++		}
++		n := c.nodes[m.GetTo()]
++		if n == nil {
++			continue
++		}
++		_ = n.rn.Step(m)
++		if m.GetType() == pb.MsgSnap {
++			c.nodes[m.GetFrom()].rn.ReportSnapshot(m.GetTo(), raft.SnapshotFinish)
++		}
++		if c.dup != nil && c.dup(m) {
++			_ = n.rn.Step(proto.Clone(m).(*pb.Message))
++		}
++	}
++	return true
++}
++
++func (c *cluster) work(id uint64) bool {
++	n := c.nodes[id]
++	busy := false
++	for k := 0; n.rn.HasReady(); k++ {
++		if k == 1000 {
++			c.fatalf("node %d keeps reporting a Ready", id)
++		}
++		c.ready(id)
++		busy = true
++	}
++	for len(n.local) > 0 {
++		c.processLocal(id)
++		busy = true
++		for k := 0; n.rn.HasReady(); k++ {
++			if k == 1000 {
++				c.fatalf("node %d keeps reporting a Ready", id)
++			}
++			c.ready(id)
++		}
++	}
++	return busy
++}
++
++func (c *cluster) settle() {
++	for round := 0; ; round++ {
++		if round == 2000 {
++			c.fatalf("cluster did not settle")
++		}
++		busy := false
++		for _, id := range c.ids {
++			if !c.paused[id] && c.work(id) {
++				busy = true
++			}
++		}
++		if c.deliver() {
++			busy = true
++		}
++		if !busy {
++			return
++		}
++	}
++}
++
++func (c *cluster) leader() uint64 {
++	var lead, term uint64
++	for _, id := range c.ids {
++		if st := c.nodes[id].rn.BasicStatus(); st.RaftState == raft.StateLeader && st.HardState.GetTerm() > term {
++			lead, term = id, st.HardState.GetTerm()
++		}
++	}
++	return lead
++}
++
++func (c *cluster) maxTerm() uint64 {
++	var term uint64
++	for _, id := range c.ids {
++		term = max(term, c.nodes[id].rn.BasicStatus().HardState.GetTerm())
++	}
++	return term
++}
++
++func (c *cluster) campaign(id uint64) {
++	if err := c.nodes[id].rn.Campaign(); err != nil {
++		c.fatalf("%v", err)
++	}
++	c.settle()
++	if st := c.nodes[id].rn.BasicStatus(); st.RaftState != raft.StateLeader {
++		c.fatalf("node %d did not become leader: %s", id, st.RaftState)
++	}
++}
++
++func payload(n int, tag byte) []byte {
++	return bytes.Repeat([]byte{tag}, n)
++}
++
++func (c *cluster) propose(id uint64, data []byte) {
++	if err := c.nodes[id].rn.Propose(data); err != nil {
++		c.fatalf("node %d: Propose: %v", id, err)
++	}
++}
++
++func (c *cluster) tick(id uint64) {
++	c.nodes[id].rn.Tick()
++}
++
++func (c *cluster) converge() {
++	c.heal()
++	c.paused = map[uint64]bool{}
++	c.crash = map[uint64]bool{}
++	c.settle()
++	next, proposed := 0, false
++	for round := 0; ; round++ {
++		if round == 200 {
++			c.fatalf("cluster did not converge: %s", c.describe())
++		}
++		lead := c.leader()
++		if lead == 0 || c.nodes[lead].rn.BasicStatus().HardState.GetTerm() < c.maxTerm() {
++			id := c.ids[next%len(c.ids)]
++			next++
++			if id != lead {
++				_ = c.nodes[id].rn.Campaign()
++			}
++			c.settle()
++			continue
++		}
++		if !proposed {
++			proposed = c.nodes[lead].rn.Propose([]byte("barrier")) == nil
++			c.settle()
++		}
++		if proposed && c.caughtUp(lead) {
++			break
++		}
++		c.tick(lead)
++		c.settle()
++	}
++	c.checkLogsMatch()
++}
++
++func (c *cluster) caughtUp(lead uint64) bool {
++	want := lastIndex(c.nodes[lead].storage)
++	for _, id := range c.ids {
++		n := c.nodes[id]
++		if lastIndex(n.storage) != want || n.applied != want {
++			return false
++		}
++	}
++	return true
++}
++
++func (c *cluster) describe() string {
++	var buf bytes.Buffer
++	for _, id := range c.ids {
++		n := c.nodes[id]
++		st := n.rn.BasicStatus()
++		fmt.Fprintf(&buf, "[node %d %s term %d commit %d applied %d persisted %d] ", id, st.RaftState, st.HardState.GetTerm(), st.HardState.GetCommit(), n.applied, lastIndex(n.storage))
++	}
++	return buf.String()
++}
++
++func (c *cluster) checkLogsMatch() {
++	ref := c.nodes[c.ids[0]].storage
++	for _, id := range c.ids[1:] {
++		st := c.nodes[id].storage
++		lo := max(snapIndex(ref), snapIndex(st)) + 1
++		hi := lastIndex(ref)
++		if lastIndex(st) != hi {
++			c.fatalf("node %d persisted up to %d, node %d up to %d", c.ids[0], hi, id, lastIndex(st))
++		}
++		for i := lo; i <= hi; i++ {
++			a, _ := ref.Term(i)
++			b, _ := st.Term(i)
++			if a != b {
++				c.fatalf("entry %d has term %d on node %d and term %d on node %d", i, a, c.ids[0], b, id)
++			}
++		}
++	}
++}
++
++func (c *cluster) compact(id uint64) {
++	n := c.nodes[id]
++	if n.applied <= snapIndex(n.storage) {
++		return
++	}
++	if _, err := n.storage.CreateSnapshot(n.applied, &pb.ConfState{Voters: slices.Clone(c.ids)}, nil); err != nil {
++		c.fatalf("%v", err)
++	}
++	if err := n.storage.Compact(n.applied); err != nil {
++		c.fatalf("%v", err)
++	}
++}
++
++func (c *cluster) handedOut(id uint64) []*pb.Entry {
++	var ents []*pb.Entry
++	for _, page := range c.nodes[id].pages {
++		ents = append(ents, page...)
++	}
++	return ents
++}
++
++func greedyPages(ents []*pb.Entry, limit uint64) [][]uint64 {
++	var pages [][]uint64
++	for len(ents) > 0 {
++		n, size := 1, uint64(proto.Size(ents[0]))
++		for n < len(ents) && size+uint64(proto.Size(ents[n])) <= limit {
++			size += uint64(proto.Size(ents[n]))
++			n++
++		}
++		var page []uint64
++		for _, e := range ents[:n] {
++			page = append(page, e.GetIndex())
++		}
++		pages = append(pages, page)
++		ents = ents[n:]
++	}
++	return pages
++}
++
++func pageIndexes(pages [][]*pb.Entry) [][]uint64 {
++	var out [][]uint64
++	for _, page := range pages {
++		var idx []uint64
++		for _, e := range page {
++			idx = append(idx, e.GetIndex())
++		}
++		out = append(out, idx)
++	}
++	return out
++}
++
++func randomOps(t *testing.T, async bool, seed int64) {
++	defer func() {
++		if r := recover(); r != nil {
++			panic(fmt.Sprintf("seed %d: %v", seed, r))
++		}
++	}()
++	rng := rand.New(rand.NewSource(seed))
++	ids := []uint64{1, 2, 3}
++	if rng.Intn(3) == 0 {
++		ids = []uint64{1, 2, 3, 4, 5}
++	}
++	limits := map[uint64]uint64{}
++	for _, id := range ids {
++		limits[id] = []uint64{0, 60, 150, 400}[rng.Intn(4)]
++	}
++	c := newCluster(t, async, limits, ids...)
++	c.label = fmt.Sprintf("seed %d: ", seed)
++	c.campaign(ids[rng.Intn(len(ids))])
++	for step := 0; step < 60; step++ {
++		id := ids[rng.Intn(len(ids))]
++		n := c.nodes[id]
++		switch op := rng.Intn(20); {
++		case op < 6:
++			if lead := c.leader(); lead != 0 {
++				for k := rng.Intn(5) + 1; k > 0; k-- {
++					_ = c.nodes[lead].rn.Propose(payload(rng.Intn(240)+1, byte('a'+step%26)))
++				}
++			}
++		case op < 10:
++			if n.rn.HasReady() {
++				c.ready(id)
++			}
++		case op < 12:
++			if len(n.local) > 0 {
++				c.processLocal(id)
++			}
++		case op < 14:
++			c.deliver()
++		case op < 15:
++			c.isolate(id)
++		case op < 16:
++			c.heal()
++		case op < 17:
++			_ = n.rn.Campaign()
++		case op < 18:
++			c.restart(id)
++		case op < 19:
++			c.compact(id)
++		default:
++			if lead := c.leader(); lead != 0 {
++				c.tick(lead)
++			}
++		}
++	}
++	c.converge()
++}
+diff --git a/appendlimit_a366de/node_a366de_test.go b/appendlimit_a366de/node_a366de_test.go
+new file mode 100644
+index 0000000..4476c92
+--- /dev/null
++++ b/appendlimit_a366de/node_a366de_test.go
+@@ -0,0 +1,355 @@
++package appendlimit
++
++import (
++	"context"
++	"slices"
++	"testing"
++	"time"
++
++	"google.golang.org/protobuf/proto"
++
++	"go.etcd.io/raft/v3"
++	pb "go.etcd.io/raft/v3/raftpb"
++)
++
++type nodeRun struct {
++	t       *testing.T
++	async   bool
++	limit   uint64
++	n       raft.Node
++	st      *raft.MemoryStorage
++	state   raft.StateType
++	term    uint64
++	pages   [][]*pb.Entry
++	ever    map[[2]uint64]bool
++	last    uint64
++	applied uint64
++}
++
++func startNode(t *testing.T, async bool, limit uint64) *nodeRun {
++	st := raft.NewMemoryStorage()
++	snap := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{
++		Index:     proto.Uint64(1),
++		Term:      proto.Uint64(1),
++		ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},
++	}}
++	if err := st.ApplySnapshot(snap); err != nil {
++		t.Fatal(err)
++	}
++	if err := st.SetHardState(&pb.HardState{Term: proto.Uint64(1), Commit: proto.Uint64(1)}); err != nil {
++		t.Fatal(err)
++	}
++	n := raft.RestartNode(&raft.Config{
++		ID:                    1,
++		ElectionTick:          10,
++		HeartbeatTick:         1,
++		Storage:               st,
++		Applied:               1,
++		MaxSizePerMsg:         1 << 20,
++		MaxInflightMsgs:       256,
++		MaxAppendSizePerReady: limit,
++		AsyncStorageWrites:    async,
++		Logger:                discard,
++	})
++	t.Cleanup(n.Stop)
++	return &nodeRun{t: t, async: async, limit: limit, n: n, st: st, term: 1, ever: map[[2]uint64]bool{}, last: 1, applied: 1}
++}
++
++func (r *nodeRun) ctx() context.Context {
++	ctx, cancel := context.WithTimeout(r.t.Context(), 10*time.Second)
++	r.t.Cleanup(cancel)
++	return ctx
++}
++
++func (r *nodeRun) step(m *pb.Message) {
++	if err := r.n.Step(r.ctx(), m); err != nil {
++		r.t.Fatalf("stepping %s: %v", m.GetType(), err)
++	}
++}
++
++func (r *nodeRun) propose(data []byte) {
++	if err := r.n.Propose(r.ctx(), data); err != nil {
++		r.t.Fatalf("Propose: %v", err)
++	}
++}
++
++func (r *nodeRun) next() raft.Ready {
++	select {
++	case rd := <-r.n.Ready():
++		return rd
++	case <-time.After(10 * time.Second):
++		r.t.Fatalf("no Ready arrived: state %s, entries handed out up to %d, applied %d", r.state, r.last, r.applied)
++	}
++	return raft.Ready{}
++}
++
++func (r *nodeRun) handedOut(index, term uint64) bool {
++	return index <= 1 || r.ever[[2]uint64{index, term}]
++}
++
++func (r *nodeRun) handOut(ents []*pb.Entry) {
++	if len(ents) == 0 {
++		return
++	}
++	for i := 1; i < len(ents); i++ {
++		if ents[i].GetIndex() != ents[i-1].GetIndex()+1 {
++			r.t.Fatalf("handed out entries %d and %d next to each other", ents[i-1].GetIndex(), ents[i].GetIndex())
++		}
++	}
++	if r.limit != 0 && len(ents) > 1 && entsSize(ents) > r.limit {
++		r.t.Fatalf("handed out %d entries of %d bytes in one batch, limit %d", len(ents), entsSize(ents), r.limit)
++	}
++	if err := r.st.Append(ents); err != nil {
++		r.t.Fatalf("Append: %v", err)
++	}
++	for _, e := range ents {
++		r.ever[[2]uint64{e.GetIndex(), e.GetTerm()}] = true
++	}
++	r.pages = append(r.pages, ents)
++	r.last = ents[len(ents)-1].GetIndex()
++}
++
++func (r *nodeRun) setHardState(hs *pb.HardState) {
++	if hs.GetCommit() > r.last {
++		r.t.Fatalf("handed out commit index %d with entries handed out only up to %d", hs.GetCommit(), r.last)
++	}
++	if err := r.st.SetHardState(hs); err != nil {
++		r.t.Fatalf("SetHardState: %v", err)
++	}
++	r.term = hs.GetTerm()
++}
++
++func (r *nodeRun) apply(ents []*pb.Entry) {
++	for _, e := range ents {
++		if e.GetIndex() > r.last || !r.handedOut(e.GetIndex(), e.GetTerm()) {
++			r.t.Fatalf("applied entry %d of term %d with entries handed out only up to %d", e.GetIndex(), e.GetTerm(), r.last)
++		}
++		if e.GetType() == pb.EntryConfChange {
++			var cc pb.ConfChange
++			if err := proto.Unmarshal(e.GetData(), &cc); err != nil {
++				r.t.Fatal(err)
++			}
++			r.n.ApplyConfChange(&cc)
++		}
++		r.applied = e.GetIndex()
++	}
++}
++
++func (r *nodeRun) checkSent(m *pb.Message) {
++	switch m.GetType() {
++	case pb.MsgApp:
++		if !r.handedOut(m.GetIndex(), m.GetLogTerm()) {
++			r.t.Fatalf("sent MsgApp to node %d after entry %d of term %d, which it never handed out", m.GetTo(), m.GetIndex(), m.GetLogTerm())
++		}
++		for _, e := range m.GetEntries() {
++			if !r.handedOut(e.GetIndex(), e.GetTerm()) {
++				r.t.Fatalf("sent MsgApp to node %d carrying entry %d of term %d, which it never handed out", m.GetTo(), e.GetIndex(), e.GetTerm())
++			}
++		}
++		if m.GetCommit() > r.last {
++			r.t.Fatalf("sent MsgApp to node %d with commit index %d and entries handed out only up to %d", m.GetTo(), m.GetCommit(), r.last)
++		}
++	case pb.MsgVote, pb.MsgPreVote:
++		if !r.handedOut(m.GetIndex(), m.GetLogTerm()) {
++			r.t.Fatalf("sent %s naming entry %d of term %d, which it never handed out", m.GetType(), m.GetIndex(), m.GetLogTerm())
++		}
++	case pb.MsgHeartbeat:
++		if m.GetCommit() > r.last {
++			r.t.Fatalf("sent MsgHeartbeat with commit index %d and entries handed out only up to %d", m.GetCommit(), r.last)
++		}
++	}
++}
++
++func (r *nodeRun) handle(rd raft.Ready) []*pb.Message {
++	if rd.SoftState != nil {
++		r.state = rd.SoftState.RaftState
++	}
++	var sent []*pb.Message
++	if !r.async {
++		r.handOut(rd.Entries)
++		if !raft.IsEmptyHardState(rd.HardState) {
++			r.setHardState(rd.HardState)
++		}
++		for _, m := range rd.Messages {
++			r.checkSent(m)
++			sent = append(sent, m)
++		}
++		r.apply(rd.CommittedEntries)
++		r.n.Advance()
++		return sent
++	}
++	var local []*pb.Message
++	for _, m := range rd.Messages {
++		if m.GetTo() == raft.LocalAppendThread || m.GetTo() == raft.LocalApplyThread {
++			local = append(local, m)
++			if m.GetType() == pb.MsgStorageAppend {
++				r.handOut(m.GetEntries())
++			}
++		}
++	}
++	for _, m := range rd.Messages {
++		if m.GetTo() != raft.LocalAppendThread && m.GetTo() != raft.LocalApplyThread {
++			r.checkSent(m)
++			sent = append(sent, m)
++		}
++	}
++	for _, m := range local {
++		switch m.GetType() {
++		case pb.MsgStorageAppend:
++			if m.Term != nil || m.Vote != nil || m.Commit != nil {
++				r.setHardState(&pb.HardState{Term: m.Term, Vote: m.Vote, Commit: m.Commit})
++			}
++		case pb.MsgStorageApply:
++			r.apply(m.GetEntries())
++		}
++		for _, resp := range m.GetResponses() {
++			if resp.GetTo() == 1 || raft.IsLocalMsgTarget(resp.GetFrom()) {
++				r.step(resp)
++				continue
++			}
++			r.checkSent(resp)
++			sent = append(sent, resp)
++		}
++	}
++	return sent
++}
++
++func (r *nodeRun) answer(sent []*pb.Message) {
++	for _, m := range sent {
++		switch m.GetType() {
++		case pb.MsgVote:
++			r.step(&pb.Message{Type: pb.MsgVoteResp.Enum(), From: proto.Uint64(m.GetTo()), To: proto.Uint64(1), Term: proto.Uint64(m.GetTerm())})
++		case pb.MsgApp:
++			index := m.GetIndex() + uint64(len(m.GetEntries()))
++			r.step(&pb.Message{Type: pb.MsgAppResp.Enum(), From: proto.Uint64(m.GetTo()), To: proto.Uint64(1), Term: proto.Uint64(m.GetTerm()), Index: proto.Uint64(index)})
++		}
++	}
++}
++
++func (r *nodeRun) drive(done func() bool, peersAnswer bool) {
++	for k := 0; !done(); k++ {
++		if k == 200 {
++			r.t.Fatalf("node did not get there: state %s, entries handed out up to %d, applied %d", r.state, r.last, r.applied)
++		}
++		sent := r.handle(r.next())
++		if peersAnswer {
++			r.answer(sent)
++		}
++	}
++}
++
++func (r *nodeRun) elect() {
++	if err := r.n.Campaign(r.ctx()); err != nil {
++		r.t.Fatalf("Campaign: %v", err)
++	}
++	r.drive(func() bool { return r.state == raft.StateLeader && r.last > 1 && r.applied == r.last }, true)
++}
++
++func testNodeHandsOutTheLongestRunThatFits(t *testing.T, async bool) {
++	run(t, func() {
++		r := startNode(t, async, 270)
++		r.elect()
++		before, last := len(r.pages), r.last+4
++		var want [][]byte
++		for i := 0; i < 4; i++ {
++			want = append(want, payload(100, byte('a'+i)))
++			r.propose(want[i])
++		}
++		r.drive(func() bool { return r.applied >= last }, true)
++		pages := r.pages[before:]
++		if len(pages) != 2 {
++			t.Fatalf("Node.Ready handed out the 4 proposals in batches %v, want two batches of two", pageIndexes(pages))
++		}
++		requirePages(t, pages, want, 270)
++	})
++}
++
++func TestNodeHandsOutTheLongestRunThatFits(t *testing.T) {
++	testNodeHandsOutTheLongestRunThatFits(t, false)
++}
++
++func TestAsyncNodeHandsOutTheLongestRunThatFits(t *testing.T) {
++	testNodeHandsOutTheLongestRunThatFits(t, true)
++}
++
++func testNodeNeverSendsEntriesItDidNotHandOut(t *testing.T, async bool) {
++	run(t, func() {
++		r := startNode(t, async, 270)
++		r.elect()
++		base, term := r.last, r.term
++		for i := 0; i < 4; i++ {
++			r.propose(payload(100, byte('a'+i)))
++		}
++		r.drive(func() bool { return r.last >= base+2 }, true)
++		if r.last >= base+4 {
++			t.Fatalf("Node.Ready handed out the whole backlog (up to %d) in one batch", r.last)
++		}
++		ents := []*pb.Entry{
++			{Term: proto.Uint64(term + 1), Index: proto.Uint64(base + 3)},
++			{Term: proto.Uint64(term + 1), Index: proto.Uint64(base + 4), Data: payload(100, 'x')},
++			{Term: proto.Uint64(term + 1), Index: proto.Uint64(base + 5), Data: payload(100, 'y')},
++		}
++		r.step(&pb.Message{
++			Type:    pb.MsgApp.Enum(),
++			From:    proto.Uint64(2),
++			To:      proto.Uint64(1),
++			Term:    proto.Uint64(term + 1),
++			Index:   proto.Uint64(base + 2),
++			LogTerm: proto.Uint64(term),
++			Entries: ents,
++			Commit:  proto.Uint64(base + 2),
++		})
++		r.drive(func() bool { return r.state == raft.StateFollower && r.last >= base+5 }, false)
++		if !r.handedOut(base+5, term+1) {
++			t.Fatalf("node 1 did not hand out the new leader's entry %d of term %d", base+5, term+1)
++		}
++	})
++}
++
++func TestNodeNeverSendsEntriesItDidNotHandOut(t *testing.T) {
++	testNodeNeverSendsEntriesItDidNotHandOut(t, false)
++}
++
++func TestAsyncNodeNeverSendsEntriesItDidNotHandOut(t *testing.T) {
++	testNodeNeverSendsEntriesItDidNotHandOut(t, true)
++}
++
++func testStartNodeHandsOutItsBootstrapEntriesInBatches(t *testing.T, async bool) {
++	run(t, func() {
++		boot := func(limit uint64) [][]*pb.Entry {
++			st := raft.NewMemoryStorage()
++			n := raft.StartNode(&raft.Config{
++				ID:                    1,
++				ElectionTick:          10,
++				HeartbeatTick:         1,
++				Storage:               st,
++				MaxSizePerMsg:         1 << 20,
++				MaxInflightMsgs:       256,
++				MaxAppendSizePerReady: limit,
++				AsyncStorageWrites:    async,
++				Logger:                discard,
++			}, []raft.Peer{{ID: 1}, {ID: 2}, {ID: 3}, {ID: 4}, {ID: 5}})
++			t.Cleanup(n.Stop)
++			r := &nodeRun{t: t, async: async, limit: limit, n: n, st: st, ever: map[[2]uint64]bool{}}
++			r.drive(func() bool { return r.applied >= 5 }, false)
++			return r.pages
++		}
++		pages := boot(0)
++		if len(pages) != 1 || len(pages[0]) != 5 {
++			t.Fatalf("without a limit Node.Ready handed out the bootstrap entries in batches %v", pageIndexes(pages))
++		}
++		limit := uint64(proto.Size(pages[0][0]) + proto.Size(pages[0][1]))
++		pages = boot(limit)
++		if g, w := pageIndexes(pages), [][]uint64{{1, 2}, {3, 4}, {5}}; !slices.EqualFunc(g, w, slices.Equal) {
++			t.Fatalf("Node.Ready handed out the bootstrap entries in batches %v, want %v", g, w)
++		}
++	})
++}
++
++func TestStartNodeHandsOutItsBootstrapEntriesInBatches(t *testing.T) {
++	testStartNodeHandsOutItsBootstrapEntriesInBatches(t, false)
++}
++
++func TestAsyncStartNodeHandsOutItsBootstrapEntriesInBatches(t *testing.T) {
++	testStartNodeHandsOutItsBootstrapEntriesInBatches(t, true)
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..9d71607
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,177 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || { echo "missing value for --output_path" >&2; usage; }
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 2
++
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++if [ -n "${GOCACHE:-}" ] && [ ! -w "$GOCACHE" ]; then
++  export GOCACHE="/tmp/go-build-$(id -u)"
++fi
++
++NEW_DIR="appendlimit_a366de"
++NEW_PKG="go.etcd.io/raft/v3/$NEW_DIR"
++LOG="$(mktemp)"
++LIST_ERR="$(mktemp)"
++trap 'rm -f "$LOG" "$LIST_ERR"' EXIT
++LIST_STATUS=0
++
++if [ "$MODE" = "base" ]; then
++  PKGS="$(go list ./... 2>"$LIST_ERR")"
++  LIST_STATUS=$?
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    PKGS="$(go list -e ./... 2>/dev/null)"
++  fi
++  cat "$LIST_ERR" >>"$LOG"
++  PKGS="$(printf '%s\n' "$PKGS" | grep -v -e '^$' -e "/$NEW_DIR\$")"
++  if [ -n "$PKGS" ]; then
++    go test -v -count=1 -timeout 20m $PKGS >>"$LOG" 2>&1
++    STATUS=$?
++  else
++    STATUS=1
++  fi
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    echo "[setup failed] go list ./... exited with status $LIST_STATUS" >>"$LOG"
++    [ "$STATUS" -eq 0 ] && STATUS="$LIST_STATUS"
++  fi
++else
++  go test -v -count=1 -timeout 20m "./$NEW_DIR/" >>"$LOG" 2>&1
++  STATUS=$?
++fi
++
++if ! grep -qE '^ *--- (PASS|FAIL|SKIP):' "$LOG"; then
++  echo "no tests were collected in mode $MODE" >>"$LOG"
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++cat "$LOG"
++
++expected_tests() {
++  grep -ho '^func Test[A-Za-z0-9_]*' "$NEW_DIR"/*_test.go | sed 's/^func //'
++}
++
++xml_escape() {
++  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
++}
++
++add_failures() {
++  suite="$1"
++  message="$2"
++  detail="$3"
++  shift 3
++  grep -q '</testsuites>' "$OUTPUT_PATH" 2>/dev/null || printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++  EXTRA="$(mktemp)"
++  MERGED="$(mktemp)"
++  {
++    echo "<testsuite name=\"$suite\" tests=\"$#\" failures=\"$#\" errors=\"0\">"
++    for name in "$@"; do
++      echo "<testcase name=\"$name\" classname=\"$suite\"><failure message=\"$message\">$detail</failure></testcase>"
++    done
++    echo '</testsuite>'
++  } >"$EXTRA"
++  awk -v extra="$EXTRA" '/<\/testsuites>/ { while ((getline line < extra) > 0) print line } { print }' "$OUTPUT_PATH" >"$MERGED"
++  TESTS="$(grep -c '<testcase ' "$MERGED")"
++  FAILURES="$(grep -c '<failure' "$MERGED")"
++  ERRORS="$(grep -c '<error' "$MERGED")"
++  sed -E "1,/<testsuites/ s#<testsuites[^>]*>#<testsuites tests=\"$TESTS\" failures=\"$FAILURES\" errors=\"$ERRORS\">#" "$MERGED" >"$OUTPUT_PATH"
++  rm -f "$EXTRA" "$MERGED"
++}
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  go-junit-report <"$LOG" >"$OUTPUT_PATH" 2>/dev/null || true
++  PANICKED="$(awk '/^--- FAIL: /{name=$3} /^panic: /{print name; exit}' "$LOG")"
++  if [ -n "$PANICKED" ] && grep -q "<testcase name=\"$PANICKED\"" "$OUTPUT_PATH" 2>/dev/null; then
++    PANIC_TEXT="$(mktemp)"
++    PATCHED="$(mktemp)"
++    sed -n '/^panic: /,$p' "$LOG" | head -n 40 | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' >"$PANIC_TEXT"
++    awk -v name="$PANICKED" -v text="$PANIC_TEXT" '
++      index($0, "<testcase name=\"" name "\"") { inside = 1 }
++      inside && /<failure message="Failed"><\/failure>/ {
++        sub(/<failure message="Failed"><\/failure>/, "<failure message=\"panic\">")
++        printf "%s", $0
++        while ((getline line < text) > 0) print line
++        print "</failure>"
++        inside = 0
++        next
++      }
++      /<\/testcase>/ { inside = 0 }
++      { print }
++    ' "$OUTPUT_PATH" >"$PATCHED" && cat "$PATCHED" >"$OUTPUT_PATH"
++    rm -f "$PANIC_TEXT" "$PATCHED"
++  fi
++  RAN=0
++  NAMES=""
++  if [ "$MODE" = "new" ]; then
++    SUITE="$NEW_PKG"
++    for name in $(expected_tests); do
++      if grep -q "<testcase name=\"$name\"" "$OUTPUT_PATH" 2>/dev/null; then
++        RAN=1
++      else
++        NAMES="$NAMES $name"
++      fi
++    done
++  else
++    SUITE="go.etcd.io/raft/v3"
++    if grep -q '<testcase ' "$OUTPUT_PATH" 2>/dev/null; then
++      RAN=1
++    else
++      NAMES="build"
++    fi
++  fi
++  if [ -n "$NAMES" ]; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    DETAIL="$(grep -E '^# |\.go:[0-9]+:[0-9]+: |\[(build|setup) failed\]|^panic' "$LOG" | head -n 40)"
++    [ -n "$DETAIL" ] || DETAIL="$(tail -n 40 "$LOG")"
++    DETAIL="$(printf '%s\n' "$DETAIL" | xml_escape)"
++    if [ "$RAN" -eq 1 ] && [ -n "$PANICKED" ]; then
++      MESSAGE="not run: the test binary exited after $PANICKED panicked"
++    elif [ "$RAN" -eq 1 ]; then
++      MESSAGE="not run: the test binary exited before reaching this test"
++    else
++      MESSAGE="the test package failed to build or run"
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++    fi
++    add_failures "$SUITE" "$MESSAGE" "$DETAIL" $NAMES
++  fi
++  if [ "$LIST_STATUS" -ne 0 ]; then
++    DETAIL="$(head -n 40 "$LIST_ERR" | xml_escape)"
++    add_failures "$SUITE" "package discovery failed: go list ./... exited with status $LIST_STATUS" "$DETAIL" package_discovery
++  fi
++fi
++
++exit "$STATUS"

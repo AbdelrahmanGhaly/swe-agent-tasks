@@ -1,0 +1,1479 @@
+diff --git a/loadobjects_085bf1/loadobjects_b79dd0_test.go b/loadobjects_085bf1/loadobjects_b79dd0_test.go
+new file mode 100644
+index 0000000..a0cec87
+--- /dev/null
++++ b/loadobjects_085bf1/loadobjects_b79dd0_test.go
+@@ -0,0 +1,1150 @@
++// Copyright 2026 Google Inc. All rights reserved
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package loadobjects
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++)
++
++const pluginHeader = `#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <gnumake.h>
++
++static char *copy_out(const char *s) {
++  char *r = gmk_alloc(strlen(s) + 1);
++  strcpy(r, s);
++  return r;
++}
++`
++
++var pluginSources = map[string]string{
++	"textfns": pluginHeader + `
++int plugin_is_GPL_compatible;
++
++static char *show_args(const char *nm, unsigned int argc, char **argv) {
++  size_t len = 16;
++  for (unsigned int i = 0; i < argc; i++)
++    len += strlen(argv[i]) + 2;
++  char *r = gmk_alloc(len);
++  sprintf(r, "%u", argc);
++  for (unsigned int i = 0; i < argc; i++) {
++    strcat(r, "[");
++    strcat(r, argv[i]);
++    strcat(r, "]");
++  }
++  return r;
++}
++
++static char *upper(const char *nm, unsigned int argc, char **argv) {
++  char *r = copy_out(argv[0]);
++  for (char *p = r; *p; p++)
++    if (*p >= 'a' && *p <= 'z')
++      *p -= 'a' - 'A';
++  return r;
++}
++
++static char *nothing(const char *nm, unsigned int argc, char **argv) {
++  return NULL;
++}
++
++static char *dollar_text(const char *nm, unsigned int argc, char **argv) {
++  return copy_out("$(ZZ)");
++}
++
++int textfns_gmk_setup(const gmk_floc *floc) {
++  gmk_add_function("show", show_args, 0, 0, GMK_FUNC_DEFAULT);
++  gmk_add_function("show2", show_args, 0, 2, GMK_FUNC_DEFAULT);
++  gmk_add_function("show-raw", show_args, 0, 3, GMK_FUNC_NOEXPAND);
++  gmk_add_function("pair", show_args, 2, 2, GMK_FUNC_DEFAULT);
++  gmk_add_function("upper", upper, 1, 1, GMK_FUNC_DEFAULT);
++  gmk_add_function("nothing", nothing, 0, 0, GMK_FUNC_DEFAULT);
++  gmk_add_function("dollar.text", dollar_text, 0, 0, GMK_FUNC_DEFAULT);
++  return 1;
++}
++`,
++	"callback": pluginHeader + `
++int plugin_is_GPL_compatible;
++
++static char *expand(const char *nm, unsigned int argc, char **argv) {
++  char *e = gmk_expand(argv[0]);
++  char *r = copy_out(e);
++  gmk_free(e);
++  return r;
++}
++
++static char *loud_expand(const char *nm, unsigned int argc, char **argv) {
++  printf("expanding %s\n", argv[0]);
++  char *e = gmk_expand(argv[0]);
++  printf("expanded to %s\n", e);
++  gmk_free(e);
++  return NULL;
++}
++
++static char *run(const char *nm, unsigned int argc, char **argv) {
++  gmk_eval(argv[0], NULL);
++  return NULL;
++}
++
++static char *run_at(const char *nm, unsigned int argc, char **argv) {
++  gmk_floc floc = {argv[1], strtoul(argv[2], NULL, 10)};
++  gmk_eval(argv[0], &floc);
++  return NULL;
++}
++
++static char *run_expanded_at(const char *nm, unsigned int argc, char **argv) {
++  gmk_floc floc = {argv[1], strtoul(argv[2], NULL, 10)};
++  char *text = gmk_expand(argv[0]);
++  gmk_eval(text, &floc);
++  gmk_free(text);
++  return NULL;
++}
++
++int callback_gmk_setup(const gmk_floc *floc) {
++  gmk_add_function("expand", expand, 1, 1, GMK_FUNC_NOEXPAND);
++  gmk_add_function("loud-expand", loud_expand, 1, 1, GMK_FUNC_NOEXPAND);
++  gmk_add_function("run", run, 1, 1, GMK_FUNC_NOEXPAND);
++  gmk_add_function("run-at", run_at, 3, 3, GMK_FUNC_NOEXPAND);
++  gmk_add_function("run-expanded-at", run_expanded_at, 3, 3, GMK_FUNC_NOEXPAND);
++  return 1;
++}
++`,
++	"talk": pluginHeader + `
++int plugin_is_GPL_compatible;
++
++static char *say(const char *nm, unsigned int argc, char **argv) {
++  printf("say: %s\n", argv[0]);
++  return NULL;
++}
++
++int talk_gmk_setup(const gmk_floc *floc) {
++  printf("talk loaded at %s:%lu\n", floc->filenm, floc->lineno);
++  gmk_add_function("say", say, 1, 1, GMK_FUNC_DEFAULT);
++  return 1;
++}
++`,
++	"partial": pluginHeader + `
++int plugin_is_GPL_compatible;
++
++static char *part(const char *nm, unsigned int argc, char **argv) {
++  printf("<%s>", argv[0]);
++  return NULL;
++}
++
++int partial_gmk_setup(const gmk_floc *floc) {
++  printf("partial loaded ");
++  gmk_add_function("part", part, 1, 1, GMK_FUNC_DEFAULT);
++  return 1;
++}
++`,
++	"named": pluginHeader + `
++int plugin_is_GPL_compatible;
++
++int named_init(const gmk_floc *floc) {
++  printf("named_init from %s:%lu\n", floc->filenm, floc->lineno);
++  return 1;
++}
++`,
++	"my-ext": pluginHeader + `
++int plugin_is_GPL_compatible;
++
++int my_gmk_setup(const gmk_floc *floc) {
++  printf("my_gmk_setup ran\n");
++  return 1;
++}
++`,
++	"nogpl": pluginHeader + `
++int nogpl_gmk_setup(const gmk_floc *floc) {
++  printf("nogpl setup ran\n");
++  return 1;
++}
++`,
++	"refuse": pluginHeader + `
++int plugin_is_GPL_compatible;
++
++static char *refused(const char *nm, unsigned int argc, char **argv) {
++  return copy_out("still callable");
++}
++
++int refuse_gmk_setup(const gmk_floc *floc) {
++  printf("refuse setup ran\n");
++  gmk_add_function("refused-fn", refused, 0, 0, GMK_FUNC_DEFAULT);
++  return 0;
++}
++`,
++	"negative": pluginHeader + `
++int plugin_is_GPL_compatible;
++
++static char *negative_fn(const char *nm, unsigned int argc, char **argv) {
++  return copy_out("from negative");
++}
++
++int negative_gmk_setup(const gmk_floc *floc) {
++  printf("negative setup ran at %s:%lu\n", floc->filenm, floc->lineno);
++  gmk_add_function("negative-fn", negative_fn, 0, 0, GMK_FUNC_DEFAULT);
++  return -1;
++}
++`,
++	"register": pluginHeader + `
++int plugin_is_GPL_compatible;
++
++static char *registered(const char *nm, unsigned int argc, char **argv) {
++  return copy_out(nm);
++}
++
++int register_gmk_setup(const gmk_floc *floc) {
++  printf("registering [%s]\n", getenv("FUNC_NAME"));
++  gmk_add_function(getenv("FUNC_NAME"), registered,
++                   strtoul(getenv("FUNC_MIN"), NULL, 10),
++                   strtoul(getenv("FUNC_MAX"), NULL, 10), GMK_FUNC_DEFAULT);
++  return 1;
++}
++`,
++	"config": pluginHeader + `
++int plugin_is_GPL_compatible;
++
++static char *config_name(const char *nm, unsigned int argc, char **argv) {
++  char *r = gmk_alloc(strlen(nm) + strlen(argv[0]) + 2);
++  sprintf(r, "%s:%s", nm, argv[0]);
++  return r;
++}
++
++int config_gmk_setup(const gmk_floc *floc) {
++  char *prefix = gmk_expand("$(CONFIG_PREFIX)");
++  static char name[256];
++  snprintf(name, sizeof(name), "%s-name", prefix);
++  gmk_free(prefix);
++  gmk_add_function(name, config_name, 1, 1, GMK_FUNC_DEFAULT);
++  gmk_eval("CONFIG_READY := yes", NULL);
++  gmk_eval("config-rule: ; @echo from config rule", NULL);
++  return 1;
++}
++`,
++}
++
++type scenario struct {
++	name    string
++	files   map[string]string
++	objects map[string]string
++	env     []string
++	args    []string
++}
++
++func one(name string) map[string]string {
++	return map[string]string{name + ".so": name}
++}
++
++var scenarios = []scenario{
++	{
++		name: "functions_work_on_lines_after_load",
++		files: map[string]string{"Makefile": `load textfns.so
++$(info $(upper hello) $(show a,b))
++all: ; @echo "$(upper $@)"
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "one_line_loads_several_objects_and_named_symbols",
++		files: map[string]string{"Makefile": `load my-ext.so named.so(named_init) talk.so
++$(info [$(.LOADED)] $(say done))
++all: ; @:
++`},
++		objects: map[string]string{"my-ext.so": "my-ext", "named.so": "named", "talk.so": "talk"},
++	},
++	{
++		name: "object_names_come_from_expansion_and_may_have_directories",
++		files: map[string]string{"Makefile": `OBJS = textfns.so sub/talk.so
++load $(OBJS)
++$(info [$(.LOADED)] $(upper ok))
++all: ; @:
++`},
++		objects: map[string]string{"textfns.so": "textfns", "sub/talk.so": "talk"},
++	},
++	{
++		name: "object_in_current_directory_wins_over_library_path",
++		files: map[string]string{"Makefile": `load talk.so
++$(info [$(.LOADED)])
++all: ; @:
++`},
++		objects: map[string]string{"talk.so": "talk", "lib/talk.so": "my-ext"},
++		env:     []string{"LD_LIBRARY_PATH=lib"},
++	},
++	{
++		name: "loading_an_object_again_does_nothing",
++		files: map[string]string{"Makefile": `load talk.so
++load talk.so talk.so
++$(eval load talk.so)
++-load talk.so
++$(info [$(.LOADED)])
++all: ; @:
++`},
++		objects: one("talk"),
++	},
++	{
++		name: "loaded_variable_before_and_after_loading",
++		files: map[string]string{"Makefile": `$(info [$(.LOADED)])
++load textfns.so
++-load named.so(named_init)
++$(info [$(.LOADED)])
++all: ; @:
++`},
++		objects: map[string]string{"textfns.so": "textfns", "named.so": "named"},
++	},
++	{
++		name: "setup_is_told_where_the_load_was_read",
++		files: map[string]string{
++			"Makefile": `# loads come from three places
++
++include more.mk
++LOADER = $(eval load named.so(named_init))
++$(LOADER)
++all: ; @:
++`,
++			"more.mk": `
++
++load talk.so
++`,
++		},
++		objects: map[string]string{"talk.so": "talk", "named.so": "named"},
++	},
++	{
++		name: "load_in_untaken_conditional_is_skipped",
++		files: map[string]string{"Makefile": `ifdef WANT_TALK
++load talk.so
++else
++load textfns.so
++endif
++$(info [$(.LOADED)] [$(say hi)] $(upper ok))
++all: ; @:
++`},
++		objects: map[string]string{"talk.so": "talk", "textfns.so": "textfns"},
++	},
++	{
++		name: "load_lines_without_names_do_nothing",
++		files: map[string]string{"Makefile": `load
++NONE :=
++load $(NONE)
++-load
++$(info [$(.LOADED)])
++load textfns.so
++all: ; @echo $(upper done)
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "missing_object_stops_make",
++		files: map[string]string{"Makefile": `$(info before)
++load missing.so
++$(info after)
++all: ; @:
++`},
++	},
++	{
++		name: "missing_object_with_directory_stops_make",
++		files: map[string]string{"Makefile": `load textfns.so
++load nowhere/missing.so
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "missing_setup_symbol_stops_make",
++		files: map[string]string{"Makefile": `load named.so
++all: ; @:
++`},
++		objects: one("named"),
++	},
++	{
++		name: "missing_named_symbol_stops_make",
++		files: map[string]string{"Makefile": `load textfns.so(no_such_init)
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "object_must_declare_gpl_compatibility",
++		files: map[string]string{"Makefile": `-load nogpl.so
++all: ; @:
++`},
++		objects: one("nogpl"),
++	},
++	{
++		name: "setup_failure_stops_load",
++		files: map[string]string{"Makefile": `load refuse.so
++$(info not reached)
++all: ; @:
++`},
++		objects: one("refuse"),
++	},
++	{
++		name: "setup_failure_with_dash_load_continues",
++		files: map[string]string{"Makefile": `load talk.so
++-load refuse.so
++$(info [$(.LOADED)] [$(refused-fn )])
++all: ; @echo still running
++`},
++		objects: map[string]string{"talk.so": "talk", "refuse.so": "refuse"},
++	},
++	{
++		name: "dash_load_of_an_unloadable_object_continues",
++		files: map[string]string{
++			"Makefile": `all: ; @echo [$(.LOADED)] $(upper done)
++-load broken.so
++load textfns.so
++$(info after [$(.LOADED)] $(upper parsed))
++`,
++			"broken.so": "not an object\n",
++		},
++		objects: one("textfns"),
++	},
++	{
++		name: "negative_setup_results_are_not_recorded",
++		files: map[string]string{"Makefile": `load negative.so
++$(info [$(.LOADED)] [$(negative-fn )])
++load negative.so
++-load negative.so
++$(info [$(.LOADED)])
++all: ; @echo still running
++`},
++		objects: one("negative"),
++	},
++	{
++		name: "function_names_may_use_dots_dashes_and_underscores",
++		files: map[string]string{"Makefile": `load register.so
++$(info $(my-fn_v1.2 x) [$(.LOADED)])
++all: ; @:
++`},
++		objects: one("register"),
++		env:     []string{"FUNC_NAME=my-fn_v1.2", "FUNC_MIN=0", "FUNC_MAX=0"},
++	},
++	{
++		name: "function_name_starting_with_dot_stops_make",
++		files: map[string]string{"Makefile": `load register.so
++all: ; @:
++`},
++		objects: one("register"),
++		env:     []string{"FUNC_NAME=.hidden", "FUNC_MIN=0", "FUNC_MAX=0"},
++	},
++	{
++		name: "function_name_with_other_characters_stops_make",
++		files: map[string]string{"Makefile": `load register.so
++all: ; @:
++`},
++		objects: one("register"),
++		env:     []string{"FUNC_NAME=bad+name", "FUNC_MIN=0", "FUNC_MAX=0"},
++	},
++	{
++		name: "empty_function_name_stops_make",
++		files: map[string]string{"Makefile": `load register.so
++all: ; @:
++`},
++		objects: one("register"),
++		env:     []string{"FUNC_NAME=", "FUNC_MIN=0", "FUNC_MAX=0"},
++	},
++	{
++		name: "maximum_below_minimum_stops_make",
++		files: map[string]string{"Makefile": `load register.so
++all: ; @:
++`},
++		objects: one("register"),
++		env:     []string{"FUNC_NAME=counted", "FUNC_MIN=3", "FUNC_MAX=2"},
++	},
++	{
++		name: "argument_counts_over_255_stop_make",
++		files: map[string]string{"Makefile": `load register.so
++all: ; @:
++`},
++		objects: one("register"),
++		env:     []string{"FUNC_NAME=counted", "FUNC_MIN=0", "FUNC_MAX=256"},
++	},
++	{
++		name: "minimum_over_255_stops_make",
++		files: map[string]string{"Makefile": `load register.so
++all: ; @:
++`},
++		objects: one("register"),
++		env:     []string{"FUNC_NAME=counted", "FUNC_MIN=256", "FUNC_MAX=0"},
++	},
++	{
++		name: "argument_counts_of_255_are_accepted",
++		files: map[string]string{"Makefile": `load register.so
++$(info [$(.LOADED)])
++all: ; @:
++`},
++		objects: one("register"),
++		env:     []string{"FUNC_NAME=counted", "FUNC_MIN=255", "FUNC_MAX=255"},
++	},
++	{
++		name: "function_name_of_255_characters_is_accepted",
++		files: map[string]string{"Makefile": "load register.so\n" +
++			"$(info $(" + strings.Repeat("n", 255) + " x))\n" +
++			"all: ; @:\n"},
++		objects: one("register"),
++		env:     []string{"FUNC_NAME=" + strings.Repeat("n", 255), "FUNC_MIN=0", "FUNC_MAX=0"},
++	},
++	{
++		name: "function_name_over_255_characters_stops_make",
++		files: map[string]string{"Makefile": `load register.so
++all: ; @:
++`},
++		objects: one("register"),
++		env:     []string{"FUNC_NAME=" + strings.Repeat("n", 256), "FUNC_MIN=0", "FUNC_MAX=0"},
++	},
++	{
++		name: "arguments_split_like_builtin_functions",
++		files: map[string]string{"Makefile": `load textfns.so
++$(info $(show a,b,c))
++$(info $(show a,(b,c),d))
++$(info $(show a,{b,c}))
++$(info ${show a,{b,c},(d,e)})
++$(info $(show   lead, mid ,trail ))
++$(info $(show ,,))
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "arguments_split_only_at_the_calls_own_brackets",
++		files: map[string]string{"Makefile": `load textfns.so
++$(info $(show ${x}a,b))
++$(info [$(show ${subst a,b,c},tail)])
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "last_allowed_argument_takes_the_rest",
++		files: map[string]string{"Makefile": `load textfns.so
++$(info $(show2 a,b,c,d))
++$(info $(show2 one))
++$(info $(show-raw a,b,c,d,e))
++$(info $(upper x,y,z))
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "commas_from_expansions_stay_in_their_argument",
++		files: map[string]string{"Makefile": `load textfns.so
++COMMA := ,
++LIST = x,y
++$(info $(show a$(COMMA)b,$(LIST)))
++$(info $(show2 $(LIST),$(LIST),z))
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "space_after_name_passes_one_empty_argument",
++		files: map[string]string{"Makefile": `load textfns.so
++show = the variable
++$(info [$(show)] [$(show )] [${show }])
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "tab_may_end_a_loaded_function_name",
++		files: map[string]string{"Makefile": "X = $(upper\tearly)\n" +
++			"load textfns.so\n" +
++			"$(info [$(upper\thello)] [${upper\tx}] [$(show\ta,\tb)] [$(X)])\n" +
++			"all: ; @:\n"},
++		objects: one("textfns"),
++	},
++	{
++		name: "noexpand_arguments_are_passed_as_written",
++		files: map[string]string{"Makefile": `load textfns.so
++X = expanded
++$(info $(show-raw $(X),$$(X),$(upper q)))
++$(info $(show-raw  ${X} ))
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "escaped_hashes_in_arguments_on_assignment_lines",
++		files: map[string]string{"Makefile": `X = $(upper a\#b)
++load textfns.so
++Y := $(upper a\#b) $(show a\#b,c\#d)
++Z := $(show-raw a\#b,c\#d)
++$(info [$(X)] [$(Y)] [$(Z)])
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "too_few_arguments_fail_only_when_expanded",
++		files: map[string]string{"Makefile": `load textfns.so
++UNUSED = $(pair lonely)
++$(info ok so far)
++$(info $(pair lonely))
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "results_are_not_expanded_again",
++		files: map[string]string{"Makefile": `load textfns.so
++ZZ = expanded
++$(info $(dollar.text ))
++V := $(dollar.text )
++W = $(dollar.text )
++$(info [$(V)] [$(W)])
++all: ; @echo '$(dollar.text )'
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "null_results_expand_to_nothing",
++		files: map[string]string{"Makefile": `load textfns.so
++$(info [$(nothing )] [$(nothing a,b)])
++all: ; @echo "[$(nothing )]"
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "conditions_split_around_loaded_calls",
++		files: map[string]string{"Makefile": `load textfns.so
++ifeq ($(show a,b),2[a][b])
++$(info matched)
++else
++$(error not matched)
++endif
++ifneq ($(show2 x,y,z),2[x][y,z])
++$(error not matched)
++endif
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "variable_named_load_stays_a_variable",
++		files: map[string]string{"Makefile": `load := textfns.so
++load $(load)
++$(info $(upper ok) [$(load)])
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "continued_arguments_in_a_recipe",
++		files: map[string]string{"Makefile": `load textfns.so
++all:
++	@echo '$(show a,\
++	b)'
++	@echo "$(upper hello \
++	world)"
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "noexpand_text_is_not_read_as_calls",
++		files: map[string]string{"Makefile": `load textfns.so
++$(info $(show-raw $(if x),$(word 2)))
++all: ; @echo '$(show-raw $(subst a,b))'
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "loaded_calls_nest",
++		files: map[string]string{"Makefile": `load textfns.so
++$(info $(upper $(show a,b)))
++$(info $(show $(show x),$(show2 y,z)))
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "loaded_functions_inside_builtin_functions",
++		files: map[string]string{"Makefile": `load textfns.so
++$(info $(foreach w,a b,$(upper $(w))))
++$(info $(if $(nothing ),yes,no) $(if $(upper x),yes,no))
++$(info $(subst A,_,$(upper banana)))
++define double
++$(upper $(1))$(upper $(1))
++endef
++$(info $(call double,ab))
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "references_before_load_are_variables",
++		files: map[string]string{"Makefile": `empty :=
++space := $(empty) $(empty)
++upper$(space)x = the variable named upper x
++EARLY := [$(upper x)]
++$(info before: $(EARLY) [$(show a,b)])
++load textfns.so
++$(info after: $(EARLY) [$(show a,b)] [$(upper x)])
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "recursive_values_defined_before_load_call_functions",
++		files: map[string]string{"Makefile": `GREETING = $(upper hello) $(show $(NAME))
++NAME = world
++load textfns.so
++$(info $(GREETING))
++all: ; @echo "$(GREETING)"
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "define_and_eval_text_call_functions",
++		files: map[string]string{"Makefile": `all: out-a out-b
++define rule_for
++out-$(1): ; @echo "building $$@ as $(upper $(1))"
++endef
++load textfns.so
++$(foreach n,a b,$(eval $(call rule_for,$(n))))
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "included_makefiles_share_loaded_functions",
++		files: map[string]string{
++			"Makefile": `load textfns.so
++include rules.mk
++$(info $(say from parent) [$(RULES)])
++`,
++			"rules.mk": `RULES := $(upper rules)
++load talk.so
++all: ; @echo "$(upper $@)"
++`,
++		},
++		objects: map[string]string{"textfns.so": "textfns", "talk.so": "talk"},
++	},
++	{
++		name: "loaded_functions_name_included_makefiles",
++		files: map[string]string{
++			"Makefile": `load textfns.so
++include $(upper part).mk
++-include $(upper none).mk
++$(info [$(PART)])
++all: ; @echo [$(PART)]
++`,
++			"PART.mk": `PART := $(upper included) $(show a,b)
++`,
++		},
++		objects: one("textfns"),
++	},
++	{
++		name: "computed_names_are_never_functions",
++		files: map[string]string{"Makefile": `load textfns.so
++FN := upper
++$(info [$($(FN) x)] [$(call $(FN),x)])
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "functions_in_rules_and_target_variables",
++		files: map[string]string{"Makefile": `load textfns.so
++all: out-$(upper a).txt ; @cat $<
++out-$(upper a).txt: NAME = $(upper $@)
++out-%.txt: ; @echo "$(NAME) $(show $*)" > $@
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "call_passes_every_argument",
++		files: map[string]string{"Makefile": `load textfns.so
++$(info $(call show2,p,q,r) $(call show) $(call show,) $(call  upper ,x))
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "call_prefers_the_loaded_function",
++		files: map[string]string{"Makefile": `load textfns.so
++upper = the variable
++$(info [$(upper)] [$(call upper,abc)] [$(origin upper)])
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "call_checks_the_minimum",
++		files: map[string]string{"Makefile": `load textfns.so
++$(info $(call pair,one,two))
++$(info $(call pair,one))
++all: ; @:
++`},
++		objects: one("textfns"),
++	},
++	{
++		name: "expand_sees_automatic_variables",
++		files: map[string]string{"Makefile": `load callback.so
++all: out.x
++out.x: a.in b.in ; @echo "$(expand $@ <$< ^$^)"
++%.in: ; @echo "$(expand $* for $@)"
++`},
++		objects: one("callback"),
++	},
++	{
++		name: "expand_sees_target_specific_variables",
++		files: map[string]string{"Makefile": `load callback.so
++MODE = global
++all: one two
++one: MODE = for-one
++one two: ; @echo "$@: $(expand $(MODE))"
++`},
++		objects: one("callback"),
++	},
++	{
++		name: "expand_sees_foreach_and_call_variables",
++		files: map[string]string{"Makefile": `load callback.so
++$(info $(foreach v,1 2 3,$(expand <$(v)>)))
++define twice
++$(expand $(1)$(1))
++endef
++$(info $(call twice,ab))
++all: ; @:
++`},
++		objects: one("callback"),
++	},
++	{
++		name: "call_of_a_loaded_function_keeps_the_callers_variables",
++		files: map[string]string{"Makefile": `load callback.so
++define outer
++[$(call expand,$$(1))] [$(call expand,x$$(2)y)]
++endef
++define set
++$(call run,V := $$(1))
++endef
++$(info top: [$(call expand,$$(1))])
++$(info inside: $(call outer,first,second))
++$(call set,from-call)
++$(call run,W := [$$(1)])
++$(info V=[$(V)] W=$(W))
++all: ; @:
++`},
++		objects: one("callback"),
++	},
++	{
++		name: "eval_defines_variables_and_rules",
++		files: map[string]string{"Makefile": `all: made
++load callback.so
++$(run GENERATED := from-eval)
++$(run made: ; @echo made $@ with $(GENERATED))
++$(info [$(GENERATED)])
++`},
++		objects: one("callback"),
++	},
++	{
++		name: "eval_in_a_recipe_uses_the_recipe_context",
++		files: map[string]string{"Makefile": `load callback.so
++MODE = global
++all: MODE = local
++all:
++	@echo "first $(run SEEN := $@ $(MODE))[$(SEEN)]"
++	@echo "second [$(SEEN)]"
++`},
++		objects: one("callback"),
++	},
++	{
++		name: "eval_errors_use_the_location_given",
++		files: map[string]string{"Makefile": `load callback.so
++$(run-at bogus text,generated.mk,7)
++all: ; @:
++`},
++		objects: one("callback"),
++	},
++	{
++		name: "eval_errors_without_location_use_the_current_line",
++		files: map[string]string{"Makefile": `load callback.so
++
++$(run also bogus)
++all: ; @:
++`},
++		objects: one("callback"),
++	},
++	{
++		name: "eval_text_given_a_location_keeps_its_line",
++		files: map[string]string{"Makefile": `load callback.so
++define TEXT
++$$(warning first)
++$$(warning second)
++endef
++$(run-expanded-at $(TEXT),generated.mk,7)
++all: ; @:
++`},
++		objects: one("callback"),
++	},
++	{
++		name: "error_inside_expand_stops_at_once",
++		files: map[string]string{"Makefile": `load callback.so
++$(info $(loud-expand $(error stopped here)))
++$(info not reached)
++all: ; @:
++`},
++		objects: one("callback"),
++	},
++	{
++		name: "setup_can_expand_and_eval",
++		files: map[string]string{"Makefile": `all: config-rule
++CONFIG_PREFIX = site
++load config.so
++$(info $(site-name x) [$(CONFIG_READY)])
++`},
++		objects: one("config"),
++	},
++	{
++		name: "object_output_keeps_its_place",
++		files: map[string]string{"Makefile": `$(info first)
++load talk.so
++$(info second)
++$(info $(say third))
++X := $(say fourth)
++$(info fifth)
++all: ; @echo recipe
++`},
++		objects: one("talk"),
++	},
++	{
++		name: "object_output_without_a_newline_keeps_its_place",
++		files: map[string]string{"Makefile": `load partial.so
++$(info after setup)
++X := $(part a)$(part b)
++$(info after calls)
++Y := $(part c)
++all: ; @echo "recipe $(part d)"
++`},
++		objects: one("partial"),
++	},
++	{
++		name: "object_output_in_a_recipe_comes_before_the_command",
++		files: map[string]string{"Makefile": `load talk.so
++all: ; @echo "recipe $(say sixth)"
++`},
++		objects: one("talk"),
++	},
++	{
++		name: "object_output_comes_before_a_later_error",
++		files: map[string]string{"Makefile": `load talk.so
++X := $(say last words)
++$(error stopping here)
++all: ; @:
++`},
++		objects: one("talk"),
++	},
++}
++
++type rewrite struct {
++	re   *regexp.Regexp
++	with string
++}
++
++var quoteRewrite = rewrite{regexp.MustCompile("([`'\"]|\xe2\x80\x98|\xe2\x80\x99)"), `"`}
++
++var makeRewrites = []rewrite{
++	quoteRewrite,
++	{regexp.MustCompile(`make(?:\[\d+\])?: (Entering|Leaving) directory[^\n]*\n`), ""},
++	{regexp.MustCompile(`make(?:\[\d+\])?: `), ""},
++	{regexp.MustCompile(`\s+Stop\.`), ""},
++	{regexp.MustCompile(`\[\S+:\d+: `), "["},
++}
++
++var katiRewrites = []rewrite{
++	quoteRewrite,
++	{regexp.MustCompile(`\*kati\*[^\n]*`), ""},
++	{regexp.MustCompile(`c?kati: `), ""},
++}
++
++func normalize(out []byte, rewrites []rewrite) []byte {
++	for _, r := range rewrites {
++		out = r.re.ReplaceAll(out, []byte(r.with))
++	}
++	return out
++}
++
++var objectDir string
++var objectErr error
++
++func buildObjects() error {
++	dir, err := os.MkdirTemp("", "loadobjects")
++	if err != nil {
++		return err
++	}
++	for name, src := range pluginSources {
++		c := filepath.Join(dir, name+".c")
++		if err := os.WriteFile(c, []byte(src), 0644); err != nil {
++			return err
++		}
++		out, err := exec.Command("cc", "-shared", "-fPIC", "-o", filepath.Join(dir, name+".so"), c).CombinedOutput()
++		if err != nil {
++			return fmt.Errorf("compiling %s: %v\n%s", name, err, out)
++		}
++	}
++	objectDir = dir
++	return nil
++}
++
++func TestMain(m *testing.M) {
++	os.Unsetenv("MAKEFLAGS")
++	os.Unsetenv("MAKELEVEL")
++	os.Unsetenv("LD_LIBRARY_PATH")
++	objectErr = buildObjects()
++	code := m.Run()
++	os.RemoveAll(objectDir)
++	os.Exit(code)
++}
++
++func copyFile(t *testing.T, from, to string) {
++	data, err := os.ReadFile(from)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(filepath.Dir(to), 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(to, data, 0755); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func setUp(t *testing.T, sc scenario) string {
++	dir := t.TempDir()
++	for path, content := range sc.files {
++		full := filepath.Join(dir, path)
++		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	for path, plugin := range sc.objects {
++		copyFile(t, filepath.Join(objectDir, plugin+".so"), filepath.Join(dir, path))
++	}
++	return dir
++}
++
++var generatedByKati = regexp.MustCompile(`^(\..*|kati.*)$`)
++
++func outputFiles(t *testing.T, dir string) string {
++	var files []string
++	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
++		if err != nil {
++			return err
++		}
++		if !info.Mode().IsRegular() {
++			return nil
++		}
++		rel, err := filepath.Rel(dir, path)
++		if err != nil {
++			return err
++		}
++		if !strings.Contains(rel, "/") && generatedByKati.MatchString(rel) {
++			return nil
++		}
++		files = append(files, rel)
++		return nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	sort.Strings(files)
++	return strings.Join(files, "\n")
++}
++
++type result struct {
++	output string
++	ok     bool
++	files  string
++}
++
++func execute(dir string, env []string, name string, args ...string) ([]byte, bool) {
++	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, name, args...)
++	cmd.Dir = dir
++	cmd.Env = append(os.Environ(), env...)
++	out, err := cmd.CombinedOutput()
++	if ctx.Err() != nil {
++		out = append(out, []byte("\n(timed out)")...)
++	}
++	return out, err == nil
++}
++
++func runMake(t *testing.T, sc scenario) result {
++	dir := setUp(t, sc)
++	out, ok := execute(dir, sc.env, "make", sc.args...)
++	return result{string(normalize(out, makeRewrites)), ok, outputFiles(t, dir)}
++}
++
++func runKati(t *testing.T, sc scenario, kati string) result {
++	dir := setUp(t, sc)
++	args := append([]string{"--use_find_emulator"}, sc.args...)
++	out, ok := execute(dir, sc.env, kati, args...)
++	return result{string(normalize(out, katiRewrites)), ok, outputFiles(t, dir)}
++}
++
++func TestLoadedObjects(t *testing.T) {
++	version, err := exec.Command("make", "--version").Output()
++	if err != nil || !bytes.HasPrefix(version, []byte("GNU Make 4.2.1\n")) {
++		t.Fatalf("GNU make 4.2.1 must be installed as make: %q %v", version, err)
++	}
++	root, err := filepath.Abs("..")
++	if err != nil {
++		t.Fatal(err)
++	}
++	engines := []struct{ name, path string }{
++		{"ckati", filepath.Join(root, "ckati")},
++		{"rkati", filepath.Join(root, "target", "debug", "rkati")},
++	}
++	for _, sc := range scenarios {
++		sc := sc
++		t.Run(sc.name, func(t *testing.T) {
++			t.Parallel()
++			var want result
++			if objectErr == nil {
++				want = runMake(t, sc)
++			}
++			for _, e := range engines {
++				t.Run(e.name, func(t *testing.T) {
++					if objectErr != nil {
++						t.Fatal(objectErr)
++					}
++					if _, err := os.Stat(e.path); err != nil {
++						t.Fatalf("%s is not built: %v", e.name, err)
++					}
++					got := runKati(t, sc, e.path)
++					if got.output != want.output {
++						t.Errorf("output differs from make\nmake:\n%s\n%s:\n%s", want.output, e.name, got.output)
++					}
++					if got.ok != want.ok {
++						t.Errorf("make succeeded: %v, %s succeeded: %v", want.ok, e.name, got.ok)
++					}
++					if want.ok && got.files != want.files {
++						t.Errorf("files differ from make\nmake:\n%s\n%s:\n%s", want.files, e.name, got.files)
++					}
++				})
++			}
++		})
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..02b1966
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,317 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++mode=""
++modes_given=0
++output_path=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      mode="$1"
++      modes_given=$((modes_given + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      if [ $# -lt 1 ] || [ -z "$1" ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      output_path="$1"
++      shift
++      ;;
++    --output_path=*)
++      output_path="${1#--output_path=}"
++      if [ -z "$output_path" ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$modes_given" -eq 1 ] || usage
++case "$output_path" in
++  ""|/*) ;;
++  *) output_path="$PWD/$output_path" ;;
++esac
++
++cd "$(dirname "$0")" || exit 2
++
++# The script may run as another uid, offline, with HOME, PATH, CARGO_HOME,
++# RUSTUP_HOME, GOPATH or other build settings unset or pointing where this uid
++# cannot build, and in a checkout it cannot write. git and cargo read their
++# configuration from HOME, so the run gets a private HOME; it prefers the
++# image's tools, and falls back to the image's toolchains when the given ones
++# cannot build offline.
++export PATH="/opt/cargo/bin:/usr/local/bin:${PATH:-}:/usr/bin:/bin"
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export CARGO_NET_OFFLINE=true
++export RUSTC_BOOTSTRAP=1
++unset CARGO_BUILD_TARGET
++if [ -n "${TMPDIR:-}" ] && ! { [ -d "$TMPDIR" ] && [ -w "$TMPDIR" ]; }; then
++  export TMPDIR=/tmp
++fi
++work="$(mktemp -d)"
++trap 'rm -rf "$work"' EXIT
++mkdir -p "$work/home"
++export HOME="$work/home"
++unset XDG_CONFIG_HOME XDG_CACHE_HOME
++notes=""
++
++# The engines, their unit tests, the repo's test runner and base mode's
++# restored files are all written inside the checkout. When this uid cannot
++# write every part of it, the run works on a copy.
++if [ -n "$(find . -path ./.git/objects -prune -o ! -writable -print -quit 2>/dev/null)" ]; then
++  notes="uid $(id -u) cannot write all of the checkout; running on a copy"
++  cp -a . "$work/repo" 2>/dev/null || notes="$notes (some files could not be copied)"
++  chmod -R u+w "$work/repo" 2>/dev/null
++  cd "$work/repo" || exit 2
++fi
++export CARGO_TARGET_DIR="$PWD/target"
++
++# Leaves the image's Rust toolchain and registry, and no other Rust settings
++# but job and thread limits.
++use_image_rust() {
++  local var
++  for var in $(compgen -e); do
++    case "$var" in
++      CARGO_BUILD_JOBS|RUST_TEST_THREADS|RUST_MIN_STACK) ;;
++      CARGO_*|RUST*) unset "$var" ;;
++    esac
++  done
++  export CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup CARGO_NET_OFFLINE=true RUSTC_BOOTSTRAP=1
++  export CARGO_TARGET_DIR="$PWD/target"
++}
++if ! cargo fetch --offline >/dev/null 2>&1; then
++  notes="${notes}${notes:+; }cargo could not build offline with CARGO_HOME=${CARGO_HOME:-} RUSTUP_HOME=${RUSTUP_HOME:-}; using /opt/cargo and /opt/rustup"
++  use_image_rust
++fi
++gocache="$(go env GOCACHE 2>/dev/null)"
++case "$gocache" in
++  /*) ;;
++  *) gocache="" ;;
++esac
++if [ -z "$gocache" ] || ! mkdir -p "$gocache" 2>/dev/null || [ ! -w "$gocache" ] ||
++  [ -n "$(find "$gocache" -mindepth 1 -maxdepth 1 -type d ! -writable -print -quit 2>/dev/null)" ]; then
++  export GOCACHE="${TMPDIR:-/tmp}/go-build-$(id -u)"
++fi
++if ! go list -m all >/dev/null 2>&1; then
++  notes="${notes}${notes:+; }go could not list modules offline with GOPATH=${GOPATH:-}; using /opt/go"
++  export GOPATH=/opt/go
++  unset GOMODCACHE
++fi
++
++base_commit=55ea1e26f4da6d52a4ddca8f36a130dc26120525
++build_log="$work/build.log"
++go_log="$work/go.log"
++cargo_json="$work/cargo.json"
++: >"$build_log"
++: >"$go_log"
++: >"$cargo_json"
++[ -z "$notes" ] || echo "$notes" >>"$build_log"
++status=0
++build_status=0
++go_status=0
++cargo_status=0
++
++build_engines() {
++  rm -rf out ckati find_test ninja_test strutil_test target/debug/rkati
++  if ! make -j"$(nproc)" ckati "$@" >>"$build_log" 2>&1; then
++    echo "make ckati $* failed" >>"$build_log"
++    build_status=1
++  fi
++  if ! cargo build --offline >>"$build_log" 2>&1; then
++    echo "cargo build failed" >>"$build_log"
++    build_status=1
++  fi
++}
++
++# Runs go test and appends its -v output, naming the top-level test $1.
++go_test() {
++  local name="$1"
++  shift
++  go test -v -count=1 -timeout 30m "$@" >"$work/run.log" 2>&1
++  local s=$?
++  if [ "$name" = TestKati ]; then
++    cat "$work/run.log" >>"$go_log"
++  else
++    sed "s/\bTestKati\b/$name/g" "$work/run.log" >>"$go_log"
++  fi
++  if [ "$s" -ne 0 ]; then
++    go_status=1
++    status=1
++  fi
++}
++
++if [ "$mode" = base ]; then
++  # The repo's own runner and testcases, as they are at the base commit. Some
++  # testcases are marked as expecting kati to differ from make; when a change
++  # makes one match, the runner's "Expected failure, but output is the same"
++  # is kept as a log line instead of a failure.
++  cases=""
++  if git -c safe.directory='*' cat-file -e "$base_commit^{commit}" 2>/dev/null; then
++    git -c safe.directory='*' checkout -q "$base_commit" -- run_test.go testcase/ >>"$build_log" 2>&1
++    cases="$(git -c safe.directory='*' ls-tree --name-only "$base_commit" testcase/ | sed 's#^testcase/##')"
++  fi
++  [ -n "$cases" ] || cases="$(ls testcase)"
++  sed -i 's/t\.Errorf("Expected failure, but output is the same")/t.Logf("Expected failure, but output is the same")/' run_test.go
++  pattern="$(printf '%s\n' "$cases" | grep -E '\.(mk|sh)$' | sed 's/\./\\./g' | paste -sd '|' -)"
++  build_engines ckati_tests
++  go_test TestKati -run "^TestKati\$/^($pattern)\$" .
++  go_test TestKati_ninja -run "^TestKati\$/^($pattern)\$" . --ninja
++  go_test TestKati_rkati -run "^TestKati\$/^($pattern)\$" . --rkati
++  go_test TestKati_rkati_ninja -run "^TestKati\$/^($pattern)\$" . --rkati --ninja
++
++  unit_status=0
++  for t in find_test ninja_test strutil_test; do
++    echo "=== RUN   TestCkatiUnit/$t"
++    if [ -x "./$t" ] && "./$t" >"$work/unit.log" 2>&1; then
++      echo "--- PASS: TestCkatiUnit/$t (0.00s)"
++    else
++      [ -x "./$t" ] || echo "$t was not built" >"$work/unit.log"
++      sed 's/^/    /' "$work/unit.log"
++      echo "--- FAIL: TestCkatiUnit/$t (0.00s)"
++      unit_status=1
++    fi
++  done >>"$go_log"
++  if [ "$unit_status" -eq 0 ]; then
++    printf 'ok  \tgithub.com/google/kati/ckati_unit\t0.000s\n' >>"$go_log"
++  else
++    printf 'FAIL\tgithub.com/google/kati/ckati_unit\t0.000s\n' >>"$go_log"
++    go_status=1
++    status=1
++  fi
++
++  cargo test --offline -- -Z unstable-options --format json --report-time >"$cargo_json" 2>"$work/cargo.err"
++  cargo_status=$?
++  cat "$work/cargo.err" >>"$build_log"
++  [ "$cargo_status" -eq 0 ] || status=1
++else
++  build_engines
++  go_test TestLoadedObjects ./loadobjects_085bf1/
++fi
++
++[ "$build_status" -eq 0 ] || status=1
++if ! grep -qE '^ *--- (PASS|FAIL|SKIP):' "$go_log"; then
++  echo "no test results were produced in $mode mode" >>"$go_log"
++  status=1
++fi
++
++cat "$build_log" "$go_log"
++
++if [ -n "$output_path" ]; then
++  mkdir -p "$(dirname "$output_path")"
++  : >"$work/convert.err"
++  go-junit-report <"$go_log" >"$work/go.xml" 2>>"$work/convert.err"
++  go_convert=$?
++  cargo_convert=0
++  if [ -s "$cargo_json" ]; then
++    grep '^{' "$cargo_json" | cargo2junit >"$work/cargo.xml" 2>>"$work/convert.err"
++    cargo_convert=$?
++  fi
++  if ! python3 - "$output_path" "$work" "$build_status" "$go_status" "$go_convert" \
++      "$cargo_status" "$cargo_convert" <<'PY'
++import os
++import re
++import sys
++import xml.etree.ElementTree as ET
++
++out, work = sys.argv[1], sys.argv[2]
++build_status, go_status, go_convert, cargo_status, cargo_convert = (int(a) for a in sys.argv[3:8])
++bad_chars = re.compile("\x1b\\[[0-9;]*[A-Za-z]|[\x00-\x08\x0b\x0c\x0e-\x1f]")
++
++
++def read(name, lines=150):
++    try:
++        with open(os.path.join(work, name), errors="replace") as f:
++            return bad_chars.sub("", "".join(f.readlines()[-lines:]))
++    except OSError:
++        return ""
++
++
++def suites(name):
++    try:
++        top = ET.parse(os.path.join(work, name)).getroot()
++    except (OSError, ET.ParseError):
++        return []
++    return [top] if top.tag == "testsuite" else list(top.iter("testsuite"))
++
++
++def failing_case(suite_name, case_name, message, text):
++    suite = ET.Element("testsuite", name=suite_name)
++    case = ET.SubElement(suite, "testcase", classname=suite_name, name=case_name)
++    ET.SubElement(case, "failure", message=message).text = text
++    return suite
++
++
++def has_failure(found):
++    return any(c.find("failure") is not None or c.find("error") is not None
++               for s in found for c in s.iter("testcase"))
++
++
++root = ET.Element("testsuites")
++if build_status:
++    root.append(failing_case("kati_build", "build", "ckati or rkati did not build", read("build.log")))
++
++go_suites = suites("go.xml")
++if go_convert:
++    root.append(failing_case("go_test", "junit_conversion", "go-junit-report failed",
++                             read("convert.err") + read("go.log")))
++if not any(True for s in go_suites for _ in s.iter("testcase")):
++    root.append(failing_case("go_test", "results", "no go test results could be read",
++                             read("convert.err") + read("go.log")))
++else:
++    if go_status and not has_failure(go_suites):
++        root.append(failing_case("go_test", "exit_status", "go test failed without a failing test",
++                                 read("go.log")))
++    root.extend(go_suites)
++
++if os.path.getsize(os.path.join(work, "cargo.json")) or cargo_status:
++    if cargo_convert:
++        root.append(failing_case("rkati_unit", "junit_conversion", "cargo2junit failed",
++                                 read("convert.err") + read("cargo.json")))
++    cargo_suites = suites("cargo.xml")
++    if not any(True for s in cargo_suites for _ in s.iter("testcase")):
++        root.append(failing_case("rkati_unit", "results", "no cargo test results could be read",
++                                 read("convert.err") + read("cargo.err") + read("cargo.json")))
++    else:
++        if cargo_status and not has_failure(cargo_suites):
++            root.append(failing_case("rkati_unit", "exit_status",
++                                     "cargo test failed without a failing test", read("cargo.err")))
++        root.extend(cargo_suites)
++
++for element in root.iter():
++    for key, value in list(element.attrib.items()):
++        element.set(key, bad_chars.sub("", value))
++    if element.text:
++        element.text = bad_chars.sub("", element.text)
++for suite in root.iter("testsuite"):
++    cases = suite.findall("testcase")
++    suite.set("tests", str(len(cases)))
++    suite.set("failures", str(sum(c.find("failure") is not None for c in cases)))
++    suite.set("errors", str(sum(c.find("error") is not None for c in cases)))
++ET.ElementTree(root).write(out, encoding="UTF-8", xml_declaration=True)
++PY
++  then
++    echo "could not write $output_path" >&2
++    status=1
++  fi
++  if [ "$go_convert" -ne 0 ] || [ "$cargo_convert" -ne 0 ]; then
++    echo "a JUnit converter failed" >&2
++    status=1
++  fi
++fi
++
++exit "$status"

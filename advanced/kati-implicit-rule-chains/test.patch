@@ -1,0 +1,2298 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..3c89f61
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,321 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || { echo "missing value for --output_path" >&2; usage; }
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 2
++
++# A runner may start this script as another uid, offline, with an environment the image did not set:
++# a PATH without the image's tools, or CARGO_HOME, RUSTUP_HOME, GOPATH and similar variables unset or
++# naming places this uid cannot use. Put the image's tools first on PATH, and use its toolchains and
++# caches unless an offline build already works with the ones the environment names.
++export PATH="/opt/make421:/opt/cargo/bin:${PATH:-}:/usr/local/bin:/usr/bin:/bin"
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export CARGO_NET_OFFLINE=true
++export RUSTC_BOOTSTRAP=1
++export CARGO_TARGET_DIR="$PWD/target"
++if [ -n "${TMPDIR:-}" ] && ! { [ -d "$TMPDIR" ] && [ -w "$TMPDIR" ]; }; then
++  export TMPDIR=/tmp
++fi
++TOOLCHAIN_NOTES=""
++if ! cargo fetch --offline >/dev/null 2>&1; then
++  TOOLCHAIN_NOTES="cargo cannot build offline with CARGO_HOME=${CARGO_HOME:-} RUSTUP_HOME=${RUSTUP_HOME:-}, using the image's"
++  export CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup
++  unset RUSTUP_TOOLCHAIN
++fi
++GOCACHE_DIR="$(go env GOCACHE 2>/dev/null)"
++if [ -z "$GOCACHE_DIR" ] || ! mkdir -p "$GOCACHE_DIR" 2>/dev/null || [ ! -w "$GOCACHE_DIR" ]; then
++  export GOCACHE="/tmp/go-build-$(id -u)"
++fi
++if ! go list -m all >/dev/null 2>&1; then
++  TOOLCHAIN_NOTES="$TOOLCHAIN_NOTES${TOOLCHAIN_NOTES:+; }go cannot list modules offline with GOPATH=${GOPATH:-}, using the image's"
++  export GOPATH=/opt/go
++  unset GOMODCACHE
++fi
++
++NEW_DIR="testcase/chains_29e905"
++BASE_COMMIT="55ea1e26f4da6d52a4ddca8f36a130dc26120525"
++# "# TODO" cases that expect kati to differ from make; a correct change can make them match,
++# which the harness reports as "Expected failure, but output is the same". chain2 needs implicit
++# rule chains; blank_line_before_command differs only in where a failed recipe's output lands;
++# delete_on_error needs .DELETE_ON_ERROR outside --ninja mode.
++EXCLUDED_BASE_CASES="implicit_pattern_rule_chain2.mk
++blank_line_before_command.mk
++delete_on_error.mk"
++WORK="$(mktemp -d)"
++trap 'rm -rf "$WORK"' EXIT
++LOG="$WORK/go.log"
++BUILD_LOG="$WORK/build.log"
++CARGO_JSON="$WORK/cargo.json"
++: >"$LOG"
++: >"$BUILD_LOG"
++: >"$CARGO_JSON"
++[ -z "$TOOLCHAIN_NOTES" ] || echo "$TOOLCHAIN_NOTES" >>"$BUILD_LOG"
++STATUS=0
++BUILD_STATUS=0
++GO_STATUS=0
++CARGO_STATUS=0
++
++build_kati() {
++  rm -rf out ckati find_test ninja_test strutil_test target/debug/rkati
++  if ! make -j"$(nproc)" ckati "$@" >>"$BUILD_LOG" 2>&1; then
++    echo "[build failed] make ckati $*" >>"$BUILD_LOG"
++    BUILD_STATUS=1
++  fi
++  if ! cargo build --offline >>"$BUILD_LOG" 2>&1; then
++    echo "[build failed] cargo build" >>"$BUILD_LOG"
++    BUILD_STATUS=1
++  fi
++}
++
++run_go() {
++  name="$1"
++  shift
++  go test -v -count=1 -timeout 20m "$@" >"$WORK/run.log" 2>&1
++  s=$?
++  if [ "$name" = "TestKati" ]; then
++    cat "$WORK/run.log" >>"$LOG"
++  else
++    sed "s/TestKati/$name/g" "$WORK/run.log" >>"$LOG"
++  fi
++  if [ "$s" -ne 0 ]; then
++    STATUS="$s"
++    GO_STATUS="$s"
++  fi
++}
++
++if [ "$MODE" = "base" ]; then
++  # Regression mode runs the repo's own test runner on the testcases of the base commit, as they
++  # are there; testcases a change adds are not part of it.
++  BASE_CASES=""
++  if git -c safe.directory='*' cat-file -e "$BASE_COMMIT^{commit}" 2>/dev/null; then
++    git -c safe.directory='*' checkout -q "$BASE_COMMIT" -- run_test.go testcase/ >>"$BUILD_LOG" 2>&1
++    BASE_CASES="$(git -c safe.directory='*' ls-tree --name-only "$BASE_COMMIT" testcase/ | sed 's#^testcase/##')"
++  fi
++  [ -n "$BASE_CASES" ] || BASE_CASES="$(cd testcase && ls -1)"
++  build_kati ckati_tests
++  CASES="$(printf '%s\n' "$BASE_CASES" | grep -E '[.](mk|sh)$' | grep -v -x -F -e "$EXCLUDED_BASE_CASES" | sed 's/[.]/\\./g' | paste -sd '|' -)"
++  RUN="^TestKati\$/^(${CASES})\$"
++  run_go TestKati -run "$RUN" .
++  run_go TestKati_ninja -run "$RUN" . --ninja
++  run_go TestKati_rkati -run "$RUN" . --rkati
++  run_go TestKati_rkati_ninja -run "$RUN" . --rkati --ninja
++
++  UNIT_STATUS=0
++  for t in find_test ninja_test strutil_test; do
++    echo "=== RUN   TestCkatiUnit/$t"
++    if [ -x "./$t" ] && "./$t" >"$WORK/unit.log" 2>&1; then
++      echo "--- PASS: TestCkatiUnit/$t (0.00s)"
++    else
++      sed 's/^/    /' "$WORK/unit.log" 2>/dev/null
++      [ -x "./$t" ] || echo "    $t was not built"
++      echo "--- FAIL: TestCkatiUnit/$t (0.00s)"
++      UNIT_STATUS=1
++    fi
++  done >>"$LOG"
++  if [ "$UNIT_STATUS" -eq 0 ]; then
++    printf 'ok  \tgithub.com/google/kati/ckati_unit\t0.000s\n' >>"$LOG"
++  else
++    printf 'FAIL\tgithub.com/google/kati/ckati_unit\t0.000s\n' >>"$LOG"
++    STATUS=1
++    GO_STATUS=1
++  fi
++
++  cargo test --offline -- -Z unstable-options --format json --report-time >"$CARGO_JSON" 2>"$WORK/cargo.err"
++  CARGO_STATUS=$?
++  cat "$WORK/cargo.err" >>"$BUILD_LOG"
++  [ "$CARGO_STATUS" -ne 0 ] && STATUS="$CARGO_STATUS"
++else
++  build_kati
++  run_go TestImplicitChains "./$NEW_DIR/"
++fi
++
++[ "$BUILD_STATUS" -ne 0 ] && [ "$STATUS" -eq 0 ] && STATUS=1
++if ! grep -qE '^ *--- (PASS|FAIL|SKIP):' "$LOG"; then
++  echo "no tests were collected in mode $MODE" >>"$LOG"
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++cat "$BUILD_LOG"
++cat "$LOG"
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  : >"$WORK/convert.err"
++  go-junit-report <"$LOG" >"$WORK/go.xml" 2>>"$WORK/convert.err"
++  GO_CONVERT_STATUS=$?
++  CARGO_CONVERT_STATUS=0
++  if [ -s "$CARGO_JSON" ]; then
++    cargo2junit <"$CARGO_JSON" >"$WORK/cargo.xml" 2>>"$WORK/convert.err"
++    CARGO_CONVERT_STATUS=$?
++  fi
++  python3 - "$OUTPUT_PATH" "$MODE" "$BUILD_STATUS" "$BUILD_LOG" "$LOG" "$GO_STATUS" "$GO_CONVERT_STATUS" \
++    "$CARGO_STATUS" "$CARGO_CONVERT_STATUS" "$CARGO_JSON" "$WORK/cargo.err" "$WORK/convert.err" \
++    "$WORK/go.xml" "$WORK/cargo.xml" <<'PY'
++import os
++import re
++import sys
++import xml.etree.ElementTree as ET
++
++(out, mode, build_status, build_log, go_log, go_status, go_convert_status, cargo_status,
++ cargo_convert_status, cargo_json, cargo_err, convert_err, go_xml, cargo_xml) = sys.argv[1:15]
++
++root = ET.Element("testsuites")
++
++
++def load(path):
++    if not os.path.exists(path) or os.path.getsize(path) == 0:
++        return None
++    try:
++        top = ET.parse(path).getroot()
++    except ET.ParseError:
++        return None
++    return [top] if top.tag == "testsuite" else top.findall("testsuite")
++
++
++def count(suites, what):
++    return sum(len(suite.findall("testcase" + what)) for suite in suites or [])
++
++
++go_suites = load(go_xml)
++cargo_suites = load(cargo_xml)
++for suites in (go_suites, cargo_suites):
++    for suite in suites or []:
++        root.append(suite)
++
++
++def tail(path, lines=60):
++    try:
++        with open(path, errors="replace") as f:
++            return "".join(f.readlines()[-lines:])
++    except OSError:
++        return ""
++
++
++def add_failure(suite_name, case_name, message, detail):
++    suite = ET.SubElement(root, "testsuite", name=suite_name, tests="1", failures="1", errors="0")
++    case = ET.SubElement(suite, "testcase", name=case_name, classname=suite_name)
++    failure = ET.SubElement(case, "failure", message=message)
++    failure.text = detail
++
++
++try:
++    with open(go_log, errors="replace") as f:
++        go_lines = f.read().splitlines()
++except OSError:
++    go_lines = []
++
++
++def go_details(name):
++    details = []
++    current = None
++    for line in go_lines:
++        text = line.strip()
++        started = re.match(r"=== (?:RUN|CONT|PAUSE|NAME)\s+(\S+)", text)
++        if started:
++            current = started.group(1)
++        elif text.startswith("--- FAIL: " + name + "/"):
++            details.append(text)
++        elif current and (current == name or current.startswith(name + "/")) and line.startswith("    ") \
++                and not text.startswith(("--- ", "=== ")):
++            details.append(current + ": " + text)
++    return "\n".join(details[-200:])
++
++
++for case in root.iter("testcase"):
++    failure = case.find("failure")
++    if failure is not None and not (failure.text or "").strip():
++        detail = go_details(case.get("name", ""))
++        if detail:
++            failure.text = detail
++
++reporting_failed = False
++go_ran = any(re.match(r"\s*--- (PASS|FAIL|SKIP):", line) for line in go_lines)
++if go_convert_status != "0" or (go_ran and count(go_suites, "") == 0):
++    add_failure("kati_go_results", "convert", "go test results could not be converted to JUnit",
++                tail(convert_err) + tail(go_log))
++    reporting_failed = True
++elif go_status != "0" and count(go_suites, "/failure") + count(go_suites, "/error") == 0:
++    add_failure("kati_go_results", "go_test", "go test failed without reporting a failing test", tail(go_log))
++
++cargo_ran = os.path.exists(cargo_json) and os.path.getsize(cargo_json) > 0
++if cargo_convert_status != "0" or (cargo_ran and cargo_suites is None):
++    add_failure("kati_rust_tests", "convert", "cargo test results could not be converted to JUnit",
++                tail(convert_err) + tail(cargo_err))
++    reporting_failed = True
++elif cargo_status != "0" and count(cargo_suites, "/failure") + count(cargo_suites, "/error") == 0:
++    add_failure("kati_rust_tests", "cargo_test", "cargo test failed without reporting a failing test", tail(cargo_err))
++
++if build_status != "0":
++    add_failure("kati_build", "build", "ckati or rkati failed to build", tail(build_log))
++if root.find(".//testcase") is None:
++    add_failure("kati_" + mode, "collect", "no test results were produced", tail(build_log) + tail(go_log))
++
++ansi = re.compile(r"[\x1b\ufffd]\[[0-9;?]*[ -/]*[@-~]")
++not_xml = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
++
++
++def clean(text):
++    return not_xml.sub("", ansi.sub("", text))
++
++
++for element in root.iter():
++    if element.text:
++        element.text = clean(element.text)
++    if element.tail:
++        element.tail = clean(element.tail)
++    for key, value in list(element.attrib.items()):
++        element.set(key, clean(value))
++
++for suite in root.findall("testsuite"):
++    suite.set("tests", str(len(suite.findall("testcase"))))
++    suite.set("failures", str(len(suite.findall("testcase/failure"))))
++    suite.set("errors", str(len(suite.findall("testcase/error"))))
++root.set("tests", str(len(root.findall(".//testcase"))))
++root.set("failures", str(len(root.findall(".//failure"))))
++root.set("errors", str(len(root.findall(".//error"))))
++ET.ElementTree(root).write(out, encoding="UTF-8", xml_declaration=True)
++sys.exit(3 if reporting_failed else 0)
++PY
++  WRITE_STATUS=$?
++  if [ "$WRITE_STATUS" -ne 0 ] && [ "$WRITE_STATUS" -ne 3 ]; then
++    echo "could not write $OUTPUT_PATH" >&2
++  fi
++  [ "$WRITE_STATUS" -ne 0 ] && [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++exit "$STATUS"
+diff --git a/testcase/chains_29e905/chain_four_rules.mk b/testcase/chains_29e905/chain_four_rules.mk
+new file mode 100644
+index 0000000..075d6b0
+--- /dev/null
++++ b/testcase/chains_29e905/chain_four_rules.mk
+@@ -0,0 +1,21 @@
++test1:
++	echo source > doc.src
++
++test2: doc.final
++
++test3:
++	touch -d 2001-01-01 doc.final
++
++test4: doc.final
++
++%.final: %.stage3
++	cat $< > $@
++
++%.stage3: %.stage2
++	cat $< > $@
++
++%.stage2: %.stage1
++	cat $< > $@
++
++%.stage1: %.src
++	cat $< > $@
+diff --git a/testcase/chains_29e905/chain_in_makefile_without_explicit_rules.mk b/testcase/chains_29e905/chain_in_makefile_without_explicit_rules.mk
+new file mode 100644
+index 0000000..1df6d49
+--- /dev/null
++++ b/testcase/chains_29e905/chain_in_makefile_without_explicit_rules.mk
+@@ -0,0 +1,14 @@
++# test1 goals: foo.out
++
++# test2 goals: foo.out
++
++# test3 goals: bar.res
++
++%.out: %.mid
++	cp $< $@
++
++%.mid:
++	echo made > $@
++
++%.res: %.out
++	cp $< $@
+diff --git a/testcase/chains_29e905/chain_in_subdirectory.mk b/testcase/chains_29e905/chain_in_subdirectory.mk
+new file mode 100644
+index 0000000..20e95c0
+--- /dev/null
++++ b/testcase/chains_29e905/chain_in_subdirectory.mk
+@@ -0,0 +1,10 @@
++test1:
++	mkdir -p sub/deeper; echo s > sub/deeper/foo.src
++
++test2: sub/deeper/foo.out
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/chain_several_goals_one_rm_line.mk b/testcase/chains_29e905/chain_several_goals_one_rm_line.mk
+new file mode 100644
+index 0000000..51d44f5
+--- /dev/null
++++ b/testcase/chains_29e905/chain_several_goals_one_rm_line.mk
+@@ -0,0 +1,10 @@
++test1:
++	for n in zeta alpha mid beta; do echo $$n > $$n.src; done
++
++test2: zeta.out alpha.out mid.out beta.out
++
++%.out: %.mid
++	@cp $< $@
++
++%.mid: %.src
++	@cp $< $@
+diff --git a/testcase/chains_29e905/chain_shared_intermediate_deleted_once.mk b/testcase/chains_29e905/chain_shared_intermediate_deleted_once.mk
+new file mode 100644
+index 0000000..1770624
+--- /dev/null
++++ b/testcase/chains_29e905/chain_shared_intermediate_deleted_once.mk
+@@ -0,0 +1,10 @@
++test1:
++	echo a > a.src; echo b > b.src; echo c > common.src
++
++test2: a.out b.out
++
++%.out: %.mid common.mid
++	cat $^ > $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/chain_target_named_as_goal.mk b/testcase/chains_29e905/chain_target_named_as_goal.mk
+new file mode 100644
+index 0000000..da06855
+--- /dev/null
++++ b/testcase/chains_29e905/chain_target_named_as_goal.mk
+@@ -0,0 +1,19 @@
++test1:
++	echo src > foo.src
++
++# test2 goals: foo.out foo.mid
++
++test3:
++	rm foo.mid foo.out
++
++# test4 goals: foo.mid foo.out
++
++# test5 goals: bar.out bar.mid
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
++
++# test6 goals: bar.mid
+diff --git a/testcase/chains_29e905/chain_three_rules.mk b/testcase/chains_29e905/chain_three_rules.mk
+new file mode 100644
+index 0000000..ff35663
+--- /dev/null
++++ b/testcase/chains_29e905/chain_three_rules.mk
+@@ -0,0 +1,13 @@
++test1:
++	echo source > doc.src
++
++test2: doc.final
++
++%.final: %.stage2
++	cat $< > $@
++
++%.stage2: %.stage1
++	cat $< > $@
++
++%.stage1: %.src
++	cat $< > $@
+diff --git a/testcase/chains_29e905/chain_two_rules_deletes_intermediate.mk b/testcase/chains_29e905/chain_two_rules_deletes_intermediate.mk
+new file mode 100644
+index 0000000..4a8deee
+--- /dev/null
++++ b/testcase/chains_29e905/chain_two_rules_deletes_intermediate.mk
+@@ -0,0 +1,10 @@
++test1:
++	echo source > foo.src
++
++test2: foo.out
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/chains_29e905_test.go b/testcase/chains_29e905/chains_29e905_test.go
+new file mode 100644
+index 0000000..cf1a7a1
+--- /dev/null
++++ b/testcase/chains_29e905/chains_29e905_test.go
+@@ -0,0 +1,210 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package chains
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"testing"
++)
++
++type replacement struct {
++	re   *regexp.Regexp
++	with string
++}
++
++var quotes = replacement{regexp.MustCompile("([`'\"]|\xe2\x80\x98|\xe2\x80\x99)"), `"`}
++
++var makeReplacements = []replacement{
++	quotes,
++	{regexp.MustCompile(`make(?:\[\d+\])?: (Entering|Leaving) directory[^\n]*\n`), ""},
++	{regexp.MustCompile(`make(?:\[\d+\])?: `), ""},
++	{regexp.MustCompile(" recipe for target "), " commands for target "},
++	{regexp.MustCompile(" recipe commences "), " commands commence "},
++	{regexp.MustCompile("missing rule before recipe."), "missing rule before commands."},
++	{regexp.MustCompile(" (did you mean TAB instead of 8 spaces?)"), ""},
++	{regexp.MustCompile("Extraneous text after"), "extraneous text after"},
++	{regexp.MustCompile(`\s+Stop\.`), ""},
++	{regexp.MustCompile(`Makefile:\d+: commands for target ".*?" failed\n`), ""},
++	{regexp.MustCompile(`/bin/(ba)?sh: line 1: `), ""},
++	{regexp.MustCompile(`(: \S+: No such file or directory)\n\*\*\* No rule to make target "[^"]+".`), "$1"},
++	{regexp.MustCompile(`\[\S+:\d+: `), "["},
++}
++
++var katiReplacements = []replacement{
++	quotes,
++	{regexp.MustCompile(`\*kati\*[^\n]*`), ""},
++	{regexp.MustCompile(`r?c?kati: `), ""},
++	{regexp.MustCompile(`/bin/(ba)?sh: line 1: `), ""},
++	{regexp.MustCompile(`/bin/sh: `), ""},
++	{regexp.MustCompile(`.*: warning for parse error in an unevaluated line: [^\n]*`), ""},
++	{regexp.MustCompile(`([^\n ]+: )?FindEmulator: `), ""},
++	{regexp.MustCompile(` (\./+)+kati\.\S+`), ""},
++	{regexp.MustCompile(` (\./+)+test\S+.json`), ""},
++	{regexp.MustCompile(`(: )open (\S+): n(o such file or directory)\nNOTE:[^\n]*`), "${1}${2}: N${3}"},
++	{regexp.MustCompile(`Too many symbolic links encountered`), "Too many levels of symbolic links"},
++	{regexp.MustCompile(` \(os error \d+\)`), ""},
++}
++
++var circularRE = regexp.MustCompile(`(Circular .* dropped\.\n)`)
++
++var stepRE = regexp.MustCompile(`(?m)^(test\d+):`)
++var goalsRE = regexp.MustCompile(`(?m)^# (test\d+) goals: (.+)$`)
++var rmRE = regexp.MustCompile(`(?m)^rm (.*)$`)
++
++func normalize(out string, replacements []replacement) string {
++	var circular []string
++	for _, m := range circularRE.FindAllStringSubmatch(out, -1) {
++		circular = append(circular, m[1])
++	}
++	out = strings.Join(circular, "") + circularRE.ReplaceAllString(out, "")
++	for _, r := range replacements {
++		out = r.re.ReplaceAllString(out, r.with)
++	}
++	return rmRE.ReplaceAllStringFunc(out, func(line string) string {
++		names := strings.Fields(strings.TrimPrefix(line, "rm "))
++		sort.Strings(names)
++		return "rm " + strings.Join(names, " ")
++	})
++}
++
++type result struct {
++	out   string
++	ok    bool
++	files []string
++}
++
++func listFiles(t *testing.T, dir string) []string {
++	var files []string
++	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
++		if err != nil {
++			return err
++		}
++		rel, _ := filepath.Rel(dir, path)
++		if rel == "." || rel == "Makefile" {
++			return nil
++		}
++		files = append(files, rel)
++		return nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	sort.Strings(files)
++	return files
++}
++
++type step struct {
++	name  string
++	goals []string
++}
++
++func steps(makefile string) []step {
++	goals := map[string][]string{}
++	for _, m := range stepRE.FindAllStringSubmatch(makefile, -1) {
++		goals[m[1]] = []string{m[1]}
++	}
++	for _, m := range goalsRE.FindAllStringSubmatch(makefile, -1) {
++		goals[m[1]] = strings.Fields(m[2])
++	}
++	var result []step
++	for name, g := range goals {
++		result = append(result, step{name, g})
++	}
++	sort.Slice(result, func(i, j int) bool { return result[i].name < result[j].name })
++	return result
++}
++
++func runSteps(t *testing.T, bin string, env []string, makefile string, all []step, flags []string, replacements []replacement) []result {
++	dir := t.TempDir()
++	if err := os.WriteFile(filepath.Join(dir, "Makefile"), []byte(makefile), 0666); err != nil {
++		t.Fatal(err)
++	}
++	var results []result
++	for _, s := range all {
++		args := append(append(append([]string{}, flags...), "SHELL=/bin/bash"), s.goals...)
++		cmd := exec.Command(bin, args...)
++		cmd.Dir = dir
++		cmd.Env = env
++		out, err := cmd.CombinedOutput()
++		results = append(results, result{
++			out:   normalize(string(out), replacements),
++			ok:    err == nil,
++			files: listFiles(t, dir),
++		})
++	}
++	return results
++}
++
++func TestImplicitChains(t *testing.T) {
++	ckati, _ := filepath.Abs("../../ckati")
++	rkati, _ := filepath.Abs("../../target/debug/rkati")
++	makeBin := os.Getenv("KATI_TEST_MAKE")
++	if makeBin == "" {
++		makeBin = "make"
++	}
++
++	cases, err := filepath.Glob("*.mk")
++	if err != nil || len(cases) == 0 {
++		t.Fatalf("no testcases: %v", err)
++	}
++	for _, c := range cases {
++		c := c
++		name := strings.TrimSuffix(c, ".mk")
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++			data, err := os.ReadFile(c)
++			if err != nil {
++				t.Fatal(err)
++			}
++			makefile := string(data)
++			names := steps(makefile)
++			var flags []string
++			if strings.HasPrefix(name, "silent_") {
++				flags = append(flags, "-s")
++			}
++
++			env := append(os.Environ(), "MAKEFLAGS=", "MAKELEVEL=")
++			want := runSteps(t, makeBin, env, makefile, names, flags, makeReplacements)
++
++			for _, tool := range []struct{ name, bin string }{{"ckati", ckati}, {"rkati", rkati}} {
++				tool := tool
++				t.Run(tool.name, func(t *testing.T) {
++					if _, err := os.Stat(tool.bin); err != nil {
++						t.Fatalf("%s is not built: %v", tool.name, err)
++					}
++					got := runSteps(t, tool.bin, env, makefile, names, flags, katiReplacements)
++					for i, s := range names {
++						step := s.name
++						w, g := want[i], got[i]
++						if w.out != g.out {
++							t.Errorf("%s: output differs from make\n--- make ---\n%s--- %s ---\n%s", step, w.out, tool.name, g.out)
++						}
++						if w.ok != g.ok {
++							t.Errorf("%s: make succeeded=%v, %s succeeded=%v", step, w.ok, tool.name, g.ok)
++						}
++						if strings.Join(w.files, " ") != strings.Join(g.files, " ") {
++							t.Errorf("%s: files left differ\nmake: %q\n%s: %q", step, w.files, tool.name, g.files)
++						}
++					}
++				})
++			}
++		})
++	}
++}
+diff --git a/testcase/chains_29e905/empty_static_pattern_before_pattern_rules.mk b/testcase/chains_29e905/empty_static_pattern_before_pattern_rules.mk
+new file mode 100644
+index 0000000..96918d7
+--- /dev/null
++++ b/testcase/chains_29e905/empty_static_pattern_before_pattern_rules.mk
+@@ -0,0 +1,15 @@
++EMPTY :=
++
++test1:
++	echo s > foo.src
++
++test2: foo.out
++
++$(EMPTY): %.o: %.c
++	echo never
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/equal_stems_take_first_rule.mk b/testcase/chains_29e905/equal_stems_take_first_rule.mk
+new file mode 100644
+index 0000000..ccfa843
+--- /dev/null
++++ b/testcase/chains_29e905/equal_stems_take_first_rule.mk
+@@ -0,0 +1,24 @@
++test1:
++	touch foo.aa foo.bb
++
++test2: foo.out
++
++test3: bar.res
++
++%.out: %.aa
++	@echo first $<
++
++%.out: %.bb
++	@echo second $<
++
++bar.%: bar.chain
++	@echo chain rule $<
++
++bar.%: bar.direct
++	@echo direct rule $<
++
++%.chain: %.src
++	cp $< $@
++
++bar.direct bar.src:
++	touch $@
+diff --git a/testcase/chains_29e905/error_function_in_chained_recipe.mk b/testcase/chains_29e905/error_function_in_chained_recipe.mk
+new file mode 100644
+index 0000000..977fd49
+--- /dev/null
++++ b/testcase/chains_29e905/error_function_in_chained_recipe.mk
+@@ -0,0 +1,10 @@
++test1:
++	echo s > foo.src
++
++test2: foo.out
++
++%.out: %.mid
++	$(error cannot make $@)
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/existing_intermediate_is_kept.mk b/testcase/chains_29e905/existing_intermediate_is_kept.mk
+new file mode 100644
+index 0000000..a80de31
+--- /dev/null
++++ b/testcase/chains_29e905/existing_intermediate_is_kept.mk
+@@ -0,0 +1,15 @@
++test1:
++	echo source > foo.src; echo kept > foo.mid
++
++test2: foo.out
++
++test3:
++	rm foo.mid foo.out
++
++test4: foo.out
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/existing_named_intermediate_from_pattern_rule.mk b/testcase/chains_29e905/existing_named_intermediate_from_pattern_rule.mk
+new file mode 100644
+index 0000000..848c33d
+--- /dev/null
++++ b/testcase/chains_29e905/existing_named_intermediate_from_pattern_rule.mk
+@@ -0,0 +1,17 @@
++test1:
++	echo s > foo.src; touch -d 2002-01-01 foo.src; echo m > foo.mid; touch -d 2001-01-01 foo.mid
++
++test2: foo.out
++
++test3:
++	touch -d 2001-01-01 foo.mid; touch -d 2002-06-01 foo.out; touch -d 2003-01-01 foo.src
++
++test4: foo.out
++
++.INTERMEDIATE: foo.mid
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/existing_named_intermediate_older_than_source.mk b/testcase/chains_29e905/existing_named_intermediate_older_than_source.mk
+new file mode 100644
+index 0000000..d4bcac1
+--- /dev/null
++++ b/testcase/chains_29e905/existing_named_intermediate_older_than_source.mk
+@@ -0,0 +1,26 @@
++test1:
++	for n in foo bar baz; do echo m > $$n.mid; echo s > $$n.src; echo o > $$n.out; touch -d 2001-01-01 $$n.mid; touch -d 2002-01-01 $$n.src; touch -d 2003-01-01 $$n.out; done
++
++test2: foo.out
++
++test3: bar.out
++
++test4: baz.out
++
++test5: foo.out
++
++.INTERMEDIATE: foo.mid baz.mid
++
++.SECONDARY: bar.mid
++
++foo.out: foo.mid
++	cp $< $@
++
++foo.mid: foo.src
++	cp $< $@
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/existing_other_target_of_multi_target_rule.mk b/testcase/chains_29e905/existing_other_target_of_multi_target_rule.mk
+new file mode 100644
+index 0000000..4dd3dd8
+--- /dev/null
++++ b/testcase/chains_29e905/existing_other_target_of_multi_target_rule.mk
+@@ -0,0 +1,17 @@
++test1:
++	echo s > foo.src; echo s > bar.src; touch -d 2002-01-01 foo.src bar.src; echo old > foo.h; echo old > bar.h; touch -d 2001-01-01 foo.h bar.h
++
++test2: foo.res
++
++test3: bar.res
++
++.INTERMEDIATE: foo.h bar.h
++
++foo.res: foo.c foo.h
++	cat $^ > $@
++
++bar.res: bar.h bar.c
++	cat $^ > $@
++
++%.c %.h: %.src
++	cp $< $*.c; cp $< $*.h
+diff --git a/testcase/chains_29e905/existing_prerequisite_beats_shorter_chain.mk b/testcase/chains_29e905/existing_prerequisite_beats_shorter_chain.mk
+new file mode 100644
+index 0000000..63ee9b8
+--- /dev/null
++++ b/testcase/chains_29e905/existing_prerequisite_beats_shorter_chain.mk
+@@ -0,0 +1,18 @@
++test1:
++	echo source > foo.src; touch foo.direct; echo bar > bar.src
++
++test2: foo.out
++
++test3: bar.out
++
++f%.out: f%.mid
++	@echo chain $<
++
++%.mid: %.src
++	cp $< $@
++
++%.out: %.direct
++	@echo direct $<
++
++%.direct: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/explicit_target_with_chained_prerequisite.mk b/testcase/chains_29e905/explicit_target_with_chained_prerequisite.mk
+new file mode 100644
+index 0000000..5ff17e4
+--- /dev/null
++++ b/testcase/chains_29e905/explicit_target_with_chained_prerequisite.mk
+@@ -0,0 +1,13 @@
++test1:
++	echo source > prog.src
++
++test2: prog.bin
++
++prog.bin: prog.lnk
++	cp $< $@
++
++%.lnk: %.obj
++	cp $< $@
++
++%.obj: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/failed_search_stays_impossible_for_later_goals.mk b/testcase/chains_29e905/failed_search_stays_impossible_for_later_goals.mk
+new file mode 100644
+index 0000000..6c23998
+--- /dev/null
++++ b/testcase/chains_29e905/failed_search_stays_impossible_for_later_goals.mk
+@@ -0,0 +1,24 @@
++foo:
++	touch $@
++
++foo.gz.src:
++	touch $@
++
++# test1 goals: foo.gz.gz foo.res
++
++test2:
++	rm -f foo foo.gz.gz foo.gz.src foo.res
++
++# test3 goals: foo.res foo.gz.gz
++
++%.gz: %
++	cp $< $@
++
++%.gz: %.alt
++	cp $< $@
++
++%.alt: %.src
++	cp $< $@
++
++%.res: %.gz
++	cp $< $@
+diff --git a/testcase/chains_29e905/failure_deletes_intermediate_other_targets.mk b/testcase/chains_29e905/failure_deletes_intermediate_other_targets.mk
+new file mode 100644
+index 0000000..6c4646b
+--- /dev/null
++++ b/testcase/chains_29e905/failure_deletes_intermediate_other_targets.mk
+@@ -0,0 +1,21 @@
++test1:
++	echo s > foo.src; echo s > bar.src; echo s > baz.src; echo s > qux.src
++
++test2: foo.res
++
++test3: bar.o
++
++test4: baz.o
++
++test5: qux.h
++
++.INTERMEDIATE: foo.h bar.h qux.c
++
++foo.res: foo.c foo.h
++	cat $^ > $@
++
++%.o: %.c
++	cat $< > $@
++
++%.c %.h: %.src
++	cp $< $*.c; cp $< $*.h; false
+diff --git a/testcase/chains_29e905/failure_in_intermediate_recipe.mk b/testcase/chains_29e905/failure_in_intermediate_recipe.mk
+new file mode 100644
+index 0000000..748a888
+--- /dev/null
++++ b/testcase/chains_29e905/failure_in_intermediate_recipe.mk
+@@ -0,0 +1,13 @@
++test1:
++	echo s > foo.src; echo s > bar.src
++
++test2: foo.out bar.out
++
++foo.out: foo.mid
++	cp $< $@
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	@if [ $* = bar ]; then false; fi; cp $< $@
+diff --git a/testcase/chains_29e905/failure_still_deletes_intermediates.mk b/testcase/chains_29e905/failure_still_deletes_intermediates.mk
+new file mode 100644
+index 0000000..0d0be60
+--- /dev/null
++++ b/testcase/chains_29e905/failure_still_deletes_intermediates.mk
+@@ -0,0 +1,10 @@
++test1:
++	echo s > foo.src; echo b > bar.src
++
++test2: foo.out bar.out
++
++%.out: %.mid
++	cat $< > $@; false
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/ignored_error_keeps_target.mk b/testcase/chains_29e905/ignored_error_keeps_target.mk
+new file mode 100644
+index 0000000..7876891
+--- /dev/null
++++ b/testcase/chains_29e905/ignored_error_keeps_target.mk
+@@ -0,0 +1,17 @@
++test1:
++	echo s > foo.src
++
++test2: out
++
++test3: foo.res
++
++.DELETE_ON_ERROR:
++
++out:
++	-echo partial > out; false
++
++%.res: %.mid
++	-cat $< > $@; false
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/intermediate_other_target_of_multi_target_rule.mk b/testcase/chains_29e905/intermediate_other_target_of_multi_target_rule.mk
+new file mode 100644
+index 0000000..9e37b61
+--- /dev/null
++++ b/testcase/chains_29e905/intermediate_other_target_of_multi_target_rule.mk
+@@ -0,0 +1,24 @@
++test1:
++	echo s > foo.src; echo s > bar.src; echo s > qux.src
++
++test2: foo.res
++
++test3: foo.res
++
++test4: bar.res
++
++test5: qux.res
++
++.INTERMEDIATE: foo.h bar.c bar.h qux.h
++
++foo.res: foo.c foo.h
++	cat $^ > $@
++
++bar.res: bar.c bar.h
++	cat $^ > $@
++
++qux.res: qux.c
++	cat $^ > $@
++
++%.c %.h: %.src
++	cp $< $*.c; cp $< $*.h
+diff --git a/testcase/chains_29e905/intermediate_special_target_deletes_named_file.mk b/testcase/chains_29e905/intermediate_special_target_deletes_named_file.mk
+new file mode 100644
+index 0000000..8567615
+--- /dev/null
++++ b/testcase/chains_29e905/intermediate_special_target_deletes_named_file.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo source > foo.src
++
++test2: foo.out
++
++.INTERMEDIATE: foo.step
++
++foo.step: foo.src
++	cp $< $@
++
++%.out: %.step
++	cp $< $@
+diff --git a/testcase/chains_29e905/intermediate_special_target_existing_file_kept.mk b/testcase/chains_29e905/intermediate_special_target_existing_file_kept.mk
+new file mode 100644
+index 0000000..f09f5d7
+--- /dev/null
++++ b/testcase/chains_29e905/intermediate_special_target_existing_file_kept.mk
+@@ -0,0 +1,17 @@
++test1:
++	echo source > foo.src; touch -d 2001-01-01 foo.src; echo step > foo.step
++
++test2: foo.out
++
++test3: bar.out
++
++.INTERMEDIATE: foo.step bar.step
++
++foo.step: foo.src
++	cp $< $@
++
++bar.step:
++	echo bar > $@
++
++%.out: %.step
++	cp $< $@
+diff --git a/testcase/chains_29e905/intermediate_without_names_marks_nothing.mk b/testcase/chains_29e905/intermediate_without_names_marks_nothing.mk
+new file mode 100644
+index 0000000..7d37a49
+--- /dev/null
++++ b/testcase/chains_29e905/intermediate_without_names_marks_nothing.mk
+@@ -0,0 +1,17 @@
++.INTERMEDIATE:
++
++test1: dep
++
++test2:
++	echo s > foo.src
++
++test3: foo.out
++
++dep:
++	touch $@
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/match_anything_dropped_for_specific_target.mk b/testcase/chains_29e905/match_anything_dropped_for_specific_target.mk
+new file mode 100644
+index 0000000..04d56c9
+--- /dev/null
++++ b/testcase/chains_29e905/match_anything_dropped_for_specific_target.mk
+@@ -0,0 +1,18 @@
++test1:
++	touch foo.out.x; echo b > bar.src
++
++test2: foo.out
++
++test3: bar.out
++
++%: %.x
++	@echo anything $<
++
++%.out: %.y
++	@echo specific $<
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/match_anything_never_makes_intermediate.mk b/testcase/chains_29e905/match_anything_never_makes_intermediate.mk
+new file mode 100644
+index 0000000..0b97d06
+--- /dev/null
++++ b/testcase/chains_29e905/match_anything_never_makes_intermediate.mk
+@@ -0,0 +1,15 @@
++test1:
++	echo source > foo.mid.src; echo other > bar.src
++
++test2: foo.out
++
++test3: bar.out
++
++%.out: %.mid
++	cp $< $@
++
++%: %.src
++	cp $< $@
++
++b%.mid: b%.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/match_anything_target_drops_whole_rule.mk b/testcase/chains_29e905/match_anything_target_drops_whole_rule.mk
+new file mode 100644
+index 0000000..bf5baa8
+--- /dev/null
++++ b/testcase/chains_29e905/match_anything_target_drops_whole_rule.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo s > foo.src; echo s > bar.in
++
++test2: foo.out
++
++test3: bar.done
++
++%.out %: %.src
++	cp $< $@
++
++%.done %:: %.in
++	cp $< $@
+diff --git a/testcase/chains_29e905/mentioned_source_wins_over_fallback_chain.mk b/testcase/chains_29e905/mentioned_source_wins_over_fallback_chain.mk
+new file mode 100644
+index 0000000..1a04b00
+--- /dev/null
++++ b/testcase/chains_29e905/mentioned_source_wins_over_fallback_chain.mk
+@@ -0,0 +1,18 @@
++test1:
++	echo r > foo.real
++
++test2: foo.out
++
++other: foo.src
++
++%.out: %.mid
++	@echo via mid; cp $< $@
++
++%.mid: %.src
++	cp $< $@
++
++%.out: %.alt
++	@echo via alt; cp $< $@
++
++%.alt: %.real
++	cp $< $@
+diff --git a/testcase/chains_29e905/missing_prerequisite_remakes_target.mk b/testcase/chains_29e905/missing_prerequisite_remakes_target.mk
+new file mode 100644
+index 0000000..8d3bf08
+--- /dev/null
++++ b/testcase/chains_29e905/missing_prerequisite_remakes_target.mk
+@@ -0,0 +1,17 @@
++test1:
++	echo s > foo.src; echo s > bar.src; touch -d 2001-01-01 foo.src bar.src; echo old > foo.out; echo old > bar.res; touch -d 2002-01-01 foo.out bar.res
++
++test2: foo.out
++
++# test3 goals: bar.h bar.res
++
++FORCE:
++
++%.out: %.src FORCE
++	cp $< $@
++
++bar.res: bar.c
++	echo res > $@
++
++%.c %.h: %.src
++	echo made > $@
+diff --git a/testcase/chains_29e905/missing_source_has_no_rule.mk b/testcase/chains_29e905/missing_source_has_no_rule.mk
+new file mode 100644
+index 0000000..05ccefe
+--- /dev/null
++++ b/testcase/chains_29e905/missing_source_has_no_rule.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo s > ok.src
++
++test2: ok.out
++
++test3: lost.out
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/multi_target_rule_in_chain.mk b/testcase/chains_29e905/multi_target_rule_in_chain.mk
+new file mode 100644
+index 0000000..e014d63
+--- /dev/null
++++ b/testcase/chains_29e905/multi_target_rule_in_chain.mk
+@@ -0,0 +1,22 @@
++test1:
++	echo src > foo.src; echo src > bar.src
++
++test2: foo.o foo.h
++
++test3: foo.o foo.h
++
++test4:
++	rm foo.h
++
++test5: foo.o foo.h
++
++test6: bar.x
++
++%.x: %.o
++	cp $< $@
++
++%.o: %.c
++	cat $< > $@
++
++%.c %.h: %.src
++	cp $< $*.c; cp $< $*.h; echo made $@
+diff --git a/testcase/chains_29e905/multi_target_rule_not_replaced_by_one_target.mk b/testcase/chains_29e905/multi_target_rule_not_replaced_by_one_target.mk
+new file mode 100644
+index 0000000..6de700d
+--- /dev/null
++++ b/testcase/chains_29e905/multi_target_rule_not_replaced_by_one_target.mk
+@@ -0,0 +1,20 @@
++test1:
++	echo s > foo.src; echo s > bar.src; echo s > baz.in
++
++test2: foo.c
++
++test3: bar.h
++
++test4: baz.x
++
++%.c %.h: %.src
++	@echo multi $@; touch $*.c $*.h
++
++%.c: %.src
++	@echo single $@; touch $@
++
++%.x %.y: %.in
++	@echo first $@; touch $*.x $*.y
++
++%.x %.y: %.in
++	@echo second $@; touch $*.x $*.y
+diff --git a/testcase/chains_29e905/named_intermediate_made_by_earlier_goal.mk b/testcase/chains_29e905/named_intermediate_made_by_earlier_goal.mk
+new file mode 100644
+index 0000000..a5078e3
+--- /dev/null
++++ b/testcase/chains_29e905/named_intermediate_made_by_earlier_goal.mk
+@@ -0,0 +1,17 @@
++.INTERMEDIATE: foo.step
++
++first:
++	echo side > foo.step
++
++second: foo.step
++	cat $< > $@
++
++foo.step:
++	echo made > $@
++
++# test1 goals: first second
++
++test2:
++	rm foo.step second
++
++# test3 goals: second first
+diff --git a/testcase/chains_29e905/order_only_prerequisite_chains.mk b/testcase/chains_29e905/order_only_prerequisite_chains.mk
+new file mode 100644
+index 0000000..91013a3
+--- /dev/null
++++ b/testcase/chains_29e905/order_only_prerequisite_chains.mk
+@@ -0,0 +1,20 @@
++test1:
++	echo s > foo.src; touch -d 2001-01-01 foo.src; echo out > foo.out; echo b > bar.src
++
++test2: foo.out
++
++test3:
++	echo m > foo.mid; touch -d 2001-01-01 foo.mid; touch -d 2002-01-01 foo.src
++
++test4: foo.out
++
++test5: bar.out
++
++%.out: | %.mid
++	@echo making $@; echo made > $@
++
++%.mid: %.stage
++	cp $< $@
++
++%.stage: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/order_only_prerequisite_of_intermediate.mk b/testcase/chains_29e905/order_only_prerequisite_of_intermediate.mk
+new file mode 100644
+index 0000000..e204216
+--- /dev/null
++++ b/testcase/chains_29e905/order_only_prerequisite_of_intermediate.mk
+@@ -0,0 +1,28 @@
++test1:
++	echo src > foo.src; echo src > bar.in; touch need.x
++
++test2: foo.out bar.end
++
++test3:
++	rm stamp need.x
++
++test4: foo.out
++
++test5: bar.end
++
++other: need.x
++
++stamp:
++	touch stamp
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src | stamp
++	cp $< $@
++
++%.end: %.half
++	cp $< $@
++
++%.half: %.in | need.x
++	cp $< $@
+diff --git a/testcase/chains_29e905/other_target_of_chained_rule_as_goal.mk b/testcase/chains_29e905/other_target_of_chained_rule_as_goal.mk
+new file mode 100644
+index 0000000..325a5ff
+--- /dev/null
++++ b/testcase/chains_29e905/other_target_of_chained_rule_as_goal.mk
+@@ -0,0 +1,17 @@
++test1:
++	echo src > foo.src
++
++# test2 goals: foo.o foo.h
++
++# test3 goals: foo.o foo.h
++
++test4:
++	rm foo.h
++
++# test5 goals: foo.o foo.h
++
++%.o: %.c
++	cat $< > $@
++
++%.c %.h: %.src
++	cp $< $*.c; cp $< $*.h
+diff --git a/testcase/chains_29e905/other_target_of_prefixed_pattern_in_subdirectory.mk b/testcase/chains_29e905/other_target_of_prefixed_pattern_in_subdirectory.mk
+new file mode 100644
+index 0000000..9f2a3c3
+--- /dev/null
++++ b/testcase/chains_29e905/other_target_of_prefixed_pattern_in_subdirectory.mk
+@@ -0,0 +1,9 @@
++test1:
++	mkdir -p lib; echo s > lib/pfoo.src; echo s > lib/pbar.src
++
++# test2 goals: lib/pfoo.out lib/pfoo.h
++
++# test3 goals: lib/pbar.out plib/bar.h
++
++p%.out p%.h: p%.src
++	@echo making $@ stem $*; touch $@
+diff --git a/testcase/chains_29e905/pattern_rule_prerequisite_is_not_mentioned.mk b/testcase/chains_29e905/pattern_rule_prerequisite_is_not_mentioned.mk
+new file mode 100644
+index 0000000..41b81a9
+--- /dev/null
++++ b/testcase/chains_29e905/pattern_rule_prerequisite_is_not_mentioned.mk
+@@ -0,0 +1,28 @@
++test1:
++	echo s > foo.src; echo s > bar.src; echo a > bar.alt
++
++test2: foo.out
++
++test3: bar.res
++
++test4:
++	touch config; rm foo.out bar.res
++
++test5: foo.out
++
++test6: bar.res
++
++%.out: config
++	@echo via config; touch $@
++
++%.out: %.src
++	@echo via src; cp $< $@
++
++%.res: %.mid config
++	@echo via mid; cat $< > $@
++
++%.mid: %.src
++	cp $< $@
++
++%.res: %.alt
++	@echo via alt; cp $< $@
+diff --git a/testcase/chains_29e905/pattern_variables_and_stem_in_chained_recipe.mk b/testcase/chains_29e905/pattern_variables_and_stem_in_chained_recipe.mk
+new file mode 100644
+index 0000000..026c198
+--- /dev/null
++++ b/testcase/chains_29e905/pattern_variables_and_stem_in_chained_recipe.mk
+@@ -0,0 +1,12 @@
++test1:
++	mkdir -p dir; echo source > dir/foo.src
++
++test2: dir/foo.out
++
++%.mid: NOTE = from-pattern
++
++%.out: %.mid
++	@echo out stem=$* note=$(NOTE); cp $< $@
++
++%.mid: %.src
++	@echo mid stem=$* note=$(NOTE); cp $< $@
+diff --git a/testcase/chains_29e905/pattern_with_slash_uses_whole_name.mk b/testcase/chains_29e905/pattern_with_slash_uses_whole_name.mk
+new file mode 100644
+index 0000000..ce2ac5e
+--- /dev/null
++++ b/testcase/chains_29e905/pattern_with_slash_uses_whole_name.mk
+@@ -0,0 +1,10 @@
++test1:
++	mkdir -p in gen; echo i > in/foo.src
++
++test2: gen/foo.out
++
++gen/%.out: gen/%.mid
++	@echo stem=$*; cp $< $@
++
++gen/%.mid: in/%.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/phony_other_target_of_multi_target_rule.mk b/testcase/chains_29e905/phony_other_target_of_multi_target_rule.mk
+new file mode 100644
+index 0000000..24c5246
+--- /dev/null
++++ b/testcase/chains_29e905/phony_other_target_of_multi_target_rule.mk
+@@ -0,0 +1,11 @@
++test1:
++	echo s > foo.src; touch -d 2001-01-01 foo.src; echo s > bar.src; touch -d 2001-01-01 bar.src; echo c > bar.c
++
++# test2 goals: foo.c foo.h
++
++# test3 goals: bar.c bar.h
++
++.PHONY: foo.h bar.h
++
++%.c %.h: %.src
++	cp $< $*.c; cp $< $*.h
+diff --git a/testcase/chains_29e905/phony_prerequisite_is_never_chained.mk b/testcase/chains_29e905/phony_prerequisite_is_never_chained.mk
+new file mode 100644
+index 0000000..b8a6de9
+--- /dev/null
++++ b/testcase/chains_29e905/phony_prerequisite_is_never_chained.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo s > foo.src
++
++test2: foo.out
++
++.PHONY: foo.mid
++
++%.out: %.mid
++	@test -f $< && cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/precious_kept_when_later_recipe_fails.mk b/testcase/chains_29e905/precious_kept_when_later_recipe_fails.mk
+new file mode 100644
+index 0000000..1ddb0cd
+--- /dev/null
++++ b/testcase/chains_29e905/precious_kept_when_later_recipe_fails.mk
+@@ -0,0 +1,23 @@
++test1:
++	echo src > foo.src; echo src > bar.src
++
++test2: foo.out
++
++test3: bar.end
++
++.PRECIOUS: foo.mid %.b
++
++%.out: %.mid
++	false
++
++%.mid: %.src
++	cp $< $@
++
++%.end: %.a
++	false
++
++%.a: %.b
++	cp $< $@
++
++%.b: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/precious_name_is_not_deleted.mk b/testcase/chains_29e905/precious_name_is_not_deleted.mk
+new file mode 100644
+index 0000000..480ee17
+--- /dev/null
++++ b/testcase/chains_29e905/precious_name_is_not_deleted.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo source > foo.src; echo b > bar.src
++
++test2: foo.out bar.out
++
++.PRECIOUS: foo.mid
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/precious_other_target_kept_when_recipe_fails.mk b/testcase/chains_29e905/precious_other_target_kept_when_recipe_fails.mk
+new file mode 100644
+index 0000000..689e8ae
+--- /dev/null
++++ b/testcase/chains_29e905/precious_other_target_kept_when_recipe_fails.mk
+@@ -0,0 +1,13 @@
++test1:
++	echo s > foo.src; touch -d 2001-01-01 foo.src; echo c > foo.c; echo s > bar.src; touch -d 2001-01-01 bar.src; echo h > bar.h
++
++# test2 goals: foo.c foo.h
++
++# test3 goals: bar.h bar.c
++
++.DELETE_ON_ERROR:
++
++.PRECIOUS: foo.h bar.c
++
++%.c %.h: %.src
++	echo made > $@; false
+diff --git a/testcase/chains_29e905/precious_pattern_keeps_matching_intermediates.mk b/testcase/chains_29e905/precious_pattern_keeps_matching_intermediates.mk
+new file mode 100644
+index 0000000..2ed5985
+--- /dev/null
++++ b/testcase/chains_29e905/precious_pattern_keeps_matching_intermediates.mk
+@@ -0,0 +1,18 @@
++test1:
++	echo source > foo.src; echo other > foo.txt
++
++test2: foo.out foo.res
++
++.PRECIOUS: %.mid
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
++
++%.res: %.tmp
++	cp $< $@
++
++%.tmp: %.txt
++	cp $< $@
+diff --git a/testcase/chains_29e905/precious_pattern_keeps_named_intermediate.mk b/testcase/chains_29e905/precious_pattern_keeps_named_intermediate.mk
+new file mode 100644
+index 0000000..5875918
+--- /dev/null
++++ b/testcase/chains_29e905/precious_pattern_keeps_named_intermediate.mk
+@@ -0,0 +1,27 @@
++test1:
++	echo s > foo.src; echo s > bar.src; echo s > baz.src
++
++test2: foo.out
++
++test3: bar.end
++
++test4: baz.out
++
++.INTERMEDIATE: foo.mid bar.mid baz.mid
++
++.PRECIOUS: %.mid
++
++foo.out: foo.mid
++	cp $< $@
++
++bar.end: bar.mid
++	false
++
++baz.out: baz.mid
++	cp $< $@
++
++baz.mid: baz.src
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/precious_pattern_must_equal_rule_pattern.mk b/testcase/chains_29e905/precious_pattern_must_equal_rule_pattern.mk
+new file mode 100644
+index 0000000..bf73c41
+--- /dev/null
++++ b/testcase/chains_29e905/precious_pattern_must_equal_rule_pattern.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo source > foo.src
++
++test2: foo.out
++
++.PRECIOUS: %.mid
++
++%.out: %.mid
++	cp $< $@
++
++f%.mid: f%.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/prerequisite_mentioned_elsewhere_ought_to_exist.mk b/testcase/chains_29e905/prerequisite_mentioned_elsewhere_ought_to_exist.mk
+new file mode 100644
+index 0000000..028fc8a
+--- /dev/null
++++ b/testcase/chains_29e905/prerequisite_mentioned_elsewhere_ought_to_exist.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo source > foo.src
++
++test2: foo.out
++
++foo.out: foo.mid
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/prerequisite_of_another_target_is_not_intermediate.mk b/testcase/chains_29e905/prerequisite_of_another_target_is_not_intermediate.mk
+new file mode 100644
+index 0000000..78eb13c
+--- /dev/null
++++ b/testcase/chains_29e905/prerequisite_of_another_target_is_not_intermediate.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo source > foo.src
++
++test2: foo.out
++
++bar.list: foo.mid
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/recipeless_rule_cancels_earlier_one.mk b/testcase/chains_29e905/recipeless_rule_cancels_earlier_one.mk
+new file mode 100644
+index 0000000..dbf43b5
+--- /dev/null
++++ b/testcase/chains_29e905/recipeless_rule_cancels_earlier_one.mk
+@@ -0,0 +1,22 @@
++test1:
++	echo source > foo.src; echo z > zed.src; touch zed.other; echo b > bar.src
++
++test2: foo.out
++
++test3: zed.out
++
++test4: bar.res
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
++
++%.out: %.mid
++
++%.out: %.other
++	@echo fallback $<
++
++%.res: %.mid
++	cp $< $@
+diff --git a/testcase/chains_29e905/redefined_rule_moves_last.mk b/testcase/chains_29e905/redefined_rule_moves_last.mk
+new file mode 100644
+index 0000000..40b7499
+--- /dev/null
++++ b/testcase/chains_29e905/redefined_rule_moves_last.mk
+@@ -0,0 +1,27 @@
++test1:
++	touch foo.aa foo.bb
++
++test2: foo.out
++
++test3: x.tbl
++
++%.out: %.aa
++	@echo rule aa $<
++
++%.out: %.bb
++	@echo rule bb $<
++
++%.out: %.aa
++	@echo rule aa again $<
++
++%.tbl: %.row
++	cp $< $@
++
++%.row: %.src
++	cp $< $@
++
++%.tbl: %.row
++	@echo redefined tbl; cp $< $@
++
++x.src:
++	echo x > $@
+diff --git a/testcase/chains_29e905/redefined_rule_with_order_only_prerequisites.mk b/testcase/chains_29e905/redefined_rule_with_order_only_prerequisites.mk
+new file mode 100644
+index 0000000..6fd6bae
+--- /dev/null
++++ b/testcase/chains_29e905/redefined_rule_with_order_only_prerequisites.mk
+@@ -0,0 +1,24 @@
++test1:
++	touch foo.a foo.b foo.c bar.a bar.b bar.c
++
++test2: foo.o
++
++test3: bar.p
++
++%.o: %.a | %.b
++	@echo first $@
++
++%.o: %.a %.b
++	@echo second $@
++
++%.o: %.c
++	@echo third $@
++
++%.p: %.a %.b
++	@echo first $@
++
++%.p: %.a | %.b
++	@echo second $@
++
++%.p: %.c
++	@echo third $@
+diff --git a/testcase/chains_29e905/rerun_older_target_rebuilds_chain.mk b/testcase/chains_29e905/rerun_older_target_rebuilds_chain.mk
+new file mode 100644
+index 0000000..34ce5fe
+--- /dev/null
++++ b/testcase/chains_29e905/rerun_older_target_rebuilds_chain.mk
+@@ -0,0 +1,15 @@
++test1:
++	echo source > foo.src
++
++test2: foo.out
++
++test3:
++	touch -d 2001-01-01 foo.out
++
++test4: foo.out
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/rerun_three_rules_older_target.mk b/testcase/chains_29e905/rerun_three_rules_older_target.mk
+new file mode 100644
+index 0000000..a267e26
+--- /dev/null
++++ b/testcase/chains_29e905/rerun_three_rules_older_target.mk
+@@ -0,0 +1,18 @@
++test1:
++	echo source > doc.src
++
++test2: doc.final
++
++test3:
++	touch -d 2001-01-01 doc.final
++
++test4: doc.final
++
++%.final: %.stage2
++	cat $< > $@
++
++%.stage2: %.stage1
++	cat $< > $@
++
++%.stage1: %.src
++	cat $< > $@
+diff --git a/testcase/chains_29e905/rerun_up_to_date_skips_missing_intermediate.mk b/testcase/chains_29e905/rerun_up_to_date_skips_missing_intermediate.mk
+new file mode 100644
+index 0000000..c100768
+--- /dev/null
++++ b/testcase/chains_29e905/rerun_up_to_date_skips_missing_intermediate.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo source > foo.src
++
++test2: foo.out
++
++test3: foo.out
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/rule_not_used_twice_in_chain.mk b/testcase/chains_29e905/rule_not_used_twice_in_chain.mk
+new file mode 100644
+index 0000000..5d04a4c
+--- /dev/null
++++ b/testcase/chains_29e905/rule_not_used_twice_in_chain.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo data > foo; echo s > bar.src
++
++test2: foo.gz.gz
++
++test3: bar.txt.gz
++
++%.gz: %
++	cp $< $@
++
++%.txt: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/secondary_named_files_are_kept.mk b/testcase/chains_29e905/secondary_named_files_are_kept.mk
+new file mode 100644
+index 0000000..a2e13f7
+--- /dev/null
++++ b/testcase/chains_29e905/secondary_named_files_are_kept.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo a > a.src; echo b > b.src
++
++test2: a.out b.out
++
++.SECONDARY: a.mid
++
++%.out: %.mid
++	@cp $< $@
++
++%.mid: %.src
++	@cp $< $@
+diff --git a/testcase/chains_29e905/secondary_named_rerun_rebuilds_from_newer_source.mk b/testcase/chains_29e905/secondary_named_rerun_rebuilds_from_newer_source.mk
+new file mode 100644
+index 0000000..614b56e
+--- /dev/null
++++ b/testcase/chains_29e905/secondary_named_rerun_rebuilds_from_newer_source.mk
+@@ -0,0 +1,17 @@
++test1:
++	echo a > a.src
++
++test2: a.out
++
++test3:
++	touch -d 2001-01-01 a.out a.mid
++
++test4: a.out
++
++.SECONDARY: a.mid
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/secondary_without_names_keeps_everything.mk b/testcase/chains_29e905/secondary_without_names_keeps_everything.mk
+new file mode 100644
+index 0000000..c16c1d1
+--- /dev/null
++++ b/testcase/chains_29e905/secondary_without_names_keeps_everything.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo source > foo.src
++
++test2: foo.out
++
++.SECONDARY:
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/secondary_without_names_skips_missing_files.mk b/testcase/chains_29e905/secondary_without_names_skips_missing_files.mk
+new file mode 100644
+index 0000000..19a3d3a
+--- /dev/null
++++ b/testcase/chains_29e905/secondary_without_names_skips_missing_files.mk
+@@ -0,0 +1,17 @@
++test1:
++	echo source > foo.src; touch -d 2001-01-01 foo.src; echo out > foo.out
++
++test2: foo.out
++
++test3:
++	touch -d 2001-01-01 foo.out; touch -d 2002-01-01 foo.src
++
++test4: foo.out
++
++.SECONDARY:
++
++foo.out: foo.mid
++	cp $< $@
++
++foo.mid: foo.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/shortest_stem_wins_over_definition_order.mk b/testcase/chains_29e905/shortest_stem_wins_over_definition_order.mk
+new file mode 100644
+index 0000000..f52eab7
+--- /dev/null
++++ b/testcase/chains_29e905/shortest_stem_wins_over_definition_order.mk
+@@ -0,0 +1,24 @@
++test1:
++	touch report.in lzz.data
++
++test2: report.out
++
++test3: lzz.res
++
++%.out: %.in
++	@echo generic $* $<
++
++rep%.out: rep%.in
++	@echo specific $* $<
++
++%.res: %.alt
++	@echo generic res $* $<
++
++l%.res: l%.mid
++	@echo short stem res $* $<
++
++%.alt: %.data
++	cp $< $@
++
++%.mid: %.data
++	cp $< $@
+diff --git a/testcase/chains_29e905/silent_chain_several_goals.mk b/testcase/chains_29e905/silent_chain_several_goals.mk
+new file mode 100644
+index 0000000..0264de2
+--- /dev/null
++++ b/testcase/chains_29e905/silent_chain_several_goals.mk
+@@ -0,0 +1,13 @@
++test1:
++	for n in zeta alpha mid beta; do echo $$n > $$n.src; done
++
++test2: zeta.final alpha.final mid.final beta.final
++
++%.final: %.stage2
++	cat $< > $@
++
++%.stage2: %.stage1
++	cat $< > $@
++
++%.stage1: %.src
++	cat $< > $@
+diff --git a/testcase/chains_29e905/silent_failure_still_deletes_intermediates.mk b/testcase/chains_29e905/silent_failure_still_deletes_intermediates.mk
+new file mode 100644
+index 0000000..0d0be60
+--- /dev/null
++++ b/testcase/chains_29e905/silent_failure_still_deletes_intermediates.mk
+@@ -0,0 +1,10 @@
++test1:
++	echo s > foo.src; echo b > bar.src
++
++test2: foo.out bar.out
++
++%.out: %.mid
++	cat $< > $@; false
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/silent_goals_after_chain.mk b/testcase/chains_29e905/silent_goals_after_chain.mk
+new file mode 100644
+index 0000000..b278029
+--- /dev/null
++++ b/testcase/chains_29e905/silent_goals_after_chain.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo src > foo.src
++
++# test2 goals: foo.o foo.h
++
++# test3 goals: foo.o foo.h
++
++%.o: %.c
++	cat $< > $@
++
++%.c %.h: %.src
++	cp $< $*.c; cp $< $*.h; echo made $*
+diff --git a/testcase/chains_29e905/silent_missing_source_has_no_rule.mk b/testcase/chains_29e905/silent_missing_source_has_no_rule.mk
+new file mode 100644
+index 0000000..cf6a50e
+--- /dev/null
++++ b/testcase/chains_29e905/silent_missing_source_has_no_rule.mk
+@@ -0,0 +1,17 @@
++test1:
++	echo s > ok.src; echo t > ok.alt; echo u > up.src
++
++test2: ok.out
++
++test3: up.out
++
++test4: lost.out
++
++%.out: %.mid
++	@echo using mid for $@; cp $< $@
++
++o%.out: o%.alt
++	@echo using alt for $@; cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/silent_mode_deletes_without_rm_line.mk b/testcase/chains_29e905/silent_mode_deletes_without_rm_line.mk
+new file mode 100644
+index 0000000..4a8deee
+--- /dev/null
++++ b/testcase/chains_29e905/silent_mode_deletes_without_rm_line.mk
+@@ -0,0 +1,10 @@
++test1:
++	echo source > foo.src
++
++test2: foo.out
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/silent_special_targets.mk b/testcase/chains_29e905/silent_special_targets.mk
+new file mode 100644
+index 0000000..4379791
+--- /dev/null
++++ b/testcase/chains_29e905/silent_special_targets.mk
+@@ -0,0 +1,26 @@
++test1:
++	echo a > a.src; echo b > b.src; echo c > c.src
++
++test2: a.out b.out c.out
++
++.INTERMEDIATE: a.step
++.PRECIOUS: %.mid
++.SECONDARY: c.tmp
++
++a.out: a.step
++	cp $< $@
++
++a.step: a.src
++	cp $< $@
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
++
++c.out: c.tmp
++	cp $< $@
++
++%.tmp: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/slashless_pattern_matches_file_name.mk b/testcase/chains_29e905/slashless_pattern_matches_file_name.mk
+new file mode 100644
+index 0000000..c4bffa1
+--- /dev/null
++++ b/testcase/chains_29e905/slashless_pattern_matches_file_name.mk
+@@ -0,0 +1,10 @@
++test1:
++	mkdir -p lib; echo p > lib/pfoo.src
++
++test2: lib/pfoo.out
++
++p%.out: p%.mid
++	@echo stem=$* from=$<; cp $< $@
++
++p%.mid: p%.src
++	@echo stem=$* from=$<; cp $< $@
+diff --git a/testcase/chains_29e905/source_made_during_run_is_not_seen.mk b/testcase/chains_29e905/source_made_during_run_is_not_seen.mk
+new file mode 100644
+index 0000000..7268df0
+--- /dev/null
++++ b/testcase/chains_29e905/source_made_during_run_is_not_seen.mk
+@@ -0,0 +1,15 @@
++test1:
++	echo s > bar.src
++
++test2: generate foo.out
++
++test3: bar.out
++
++generate:
++	echo s > foo.src
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/special_targets_with_and_without_names.mk b/testcase/chains_29e905/special_targets_with_and_without_names.mk
+new file mode 100644
+index 0000000..b65c25d
+--- /dev/null
++++ b/testcase/chains_29e905/special_targets_with_and_without_names.mk
+@@ -0,0 +1,23 @@
++.INTERMEDIATE:
++
++.INTERMEDIATE: listed
++
++.SECONDARY:
++
++.SECONDARY: kept.mid
++
++test1:
++	echo s > other.src; echo s > kept.src
++
++test2: other.out kept.out
++
++test3: listed
++
++listed:
++	touch $@
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/target_specific_variable_mentions_file.mk b/testcase/chains_29e905/target_specific_variable_mentions_file.mk
+new file mode 100644
+index 0000000..8214511
+--- /dev/null
++++ b/testcase/chains_29e905/target_specific_variable_mentions_file.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo source > foo.src
++
++test2: foo.out
++
++foo.mid: NOTE := hello
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	@echo $(NOTE); cp $< $@
+diff --git a/testcase/chains_29e905/terminal_match_anything_still_applies.mk b/testcase/chains_29e905/terminal_match_anything_still_applies.mk
+new file mode 100644
+index 0000000..b67bd2b
+--- /dev/null
++++ b/testcase/chains_29e905/terminal_match_anything_still_applies.mk
+@@ -0,0 +1,18 @@
++test1:
++	touch foo.out.x; echo b > bar.src
++
++test2: foo.out
++
++test3: bar.out
++
++%:: %.x
++	@echo terminal anything $<
++
++%.out: %.y
++	@echo specific $<
++
++%.out: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/terminal_rule_makes_intermediate.mk b/testcase/chains_29e905/terminal_rule_makes_intermediate.mk
+new file mode 100644
+index 0000000..9213113
+--- /dev/null
++++ b/testcase/chains_29e905/terminal_rule_makes_intermediate.mk
+@@ -0,0 +1,10 @@
++test1:
++	echo source > foo.src
++
++test2: foo.out
++
++%.out: %.mid
++	cp $< $@
++
++%.mid:: %.src
++	cp $< $@
+diff --git a/testcase/chains_29e905/terminal_rule_never_uses_chain.mk b/testcase/chains_29e905/terminal_rule_never_uses_chain.mk
+new file mode 100644
+index 0000000..4eca935
+--- /dev/null
++++ b/testcase/chains_29e905/terminal_rule_never_uses_chain.mk
+@@ -0,0 +1,15 @@
++test1:
++	echo source > foo.src; echo other > bar.src
++
++test2: foo.out
++
++test3: bar.res
++
++%.out:: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@
++
++%.res: %.mid
++	cp $< $@
+diff --git a/testcase/chains_29e905/terminal_rule_prerequisite_is_not_remade.mk b/testcase/chains_29e905/terminal_rule_prerequisite_is_not_remade.mk
+new file mode 100644
+index 0000000..c2b1fb7
+--- /dev/null
++++ b/testcase/chains_29e905/terminal_rule_prerequisite_is_not_remade.mk
+@@ -0,0 +1,22 @@
++test1:
++	echo d > foo.d; touch -d 2001-01-01 foo.d; echo e > foo.e; touch -d 2002-01-01 foo.e
++	echo s > bar.src; touch -d 2001-01-01 bar.src; echo r > bar.raw; touch -d 2002-01-01 bar.raw
++
++test2: foo.b
++
++test3: bar.out
++
++%.b:: %.d
++	cat $< > $@
++
++%.d: %.e
++	cp $< $@
++
++%.out: %.mid
++	cp $< $@
++
++%.mid:: %.src
++	cp $< $@
++
++%.src: %.raw
++	cp $< $@
+diff --git a/testcase/chains_29e905/terminal_rule_prerequisite_named_as_goal.mk b/testcase/chains_29e905/terminal_rule_prerequisite_named_as_goal.mk
+new file mode 100644
+index 0000000..d7df37a
+--- /dev/null
++++ b/testcase/chains_29e905/terminal_rule_prerequisite_named_as_goal.mk
+@@ -0,0 +1,12 @@
++test1:
++	echo s > foo.src; echo s > bar.src
++
++# test2 goals: foo.out foo.mid
++
++# test3 goals: bar.mid bar.out
++
++%.out:: %.mid
++	cp $< $@
++
++%.mid: %.src
++	cp $< $@

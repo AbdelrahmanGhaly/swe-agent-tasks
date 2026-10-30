@@ -1,0 +1,1329 @@
+diff --git a/src/hardfault_a92d3d.spec.ts b/src/hardfault_a92d3d.spec.ts
+new file mode 100644
+index 0000000..6c633ed
+--- /dev/null
++++ b/src/hardfault_a92d3d.spec.ts
+@@ -0,0 +1,1217 @@
++import { describe, expect, it, vi } from 'vitest';
++import { MockClock } from './clock/mock-clock.js';
++import { SYSM_CONTROL, SYSM_MSP, SYSM_PSP } from './cortex-m0-core.js';
++import { GDBServer } from './gdb/gdb-server.js';
++import { RP2040 } from './rp2040.js';
++import {
++  opcodeADDS2,
++  opcodeBL,
++  opcodeBT2,
++  opcodeBX,
++  opcodeLDMIA,
++  opcodeLDRB,
++  opcodeLDRBreg,
++  opcodeLDRH,
++  opcodeLDRHreg,
++  opcodeLDRimm,
++  opcodeLDRlit,
++  opcodeLDRreg,
++  opcodeLDRSB,
++  opcodeLDRSH,
++  opcodeLDRsp,
++  opcodeMOVS,
++  opcodeMSR,
++  opcodeNOP,
++  opcodePOP,
++  opcodePUSH,
++  opcodeSTMIA,
++  opcodeSTR,
++  opcodeSTRB,
++  opcodeSTRBreg,
++  opcodeSTRH,
++  opcodeSTRHreg,
++  opcodeSTRreg,
++  opcodeSTRsp,
++  opcodeSUBS2,
++  opcodeUDF,
++  opcodeUDF2,
++} from './utils/assembler.js';
++
++const r0 = 0;
++const r1 = 1;
++const r2 = 2;
++const r3 = 3;
++const r4 = 4;
++const r5 = 5;
++const r6 = 6;
++const r7 = 7;
++const lr = 14;
++
++const VTOR = 0xe000ed08;
++const ICSR = 0xe000ed04;
++const NVIC_ISER = 0xe000e100;
++const NVIC_ISPR = 0xe000e200;
++const NVIC_IPR6 = 0xe000e418;
++const NMIPENDSET = 1 << 31;
++
++const CODE = 0x20000000;
++const VECTORS = 0x20040000;
++const MSP_TOP = 0x20020000;
++const PSP_TOP = 0x20024000;
++const HARDFAULT_HANDLER = 0x20030000;
++const NMI_HANDLER = 0x20030100;
++const IRQ_HANDLER = 0x20030300;
++const DATA = 0x20008000;
++const SRAM_END = 0x20042000;
++const LOCKUP = 0xfffffffe;
++
++const EXC_NMI = 2;
++const EXC_HARDFAULT = 3;
++const USER_IRQ = 26;
++const EXC_USER_IRQ = 16 + USER_IRQ;
++
++const SELF_LOOP = opcodeBT2(-4);
++const CPSID_I = 0xb672;
++
++const CH0_READ_ADDR = 0x50000000;
++const CH0_WRITE_ADDR = 0x50000004;
++const CH0_TRANS_COUNT = 0x50000008;
++const CH0_CTRL_TRIG = 0x5000000c;
++const DMA_EN = 1 << 0;
++const DMA_WORD = 2 << 2;
++const DMA_TREQ_PERMANENT = 0x3f << 15;
++const DMA_BUSY = 1 << 24;
++
++function bkpt(imm8: number) {
++  return 0xbe00 | (imm8 & 0xff);
++}
++
++function writeCode(rp2040: RP2040, address: number, code: number[]) {
++  for (const opcode of code) {
++    rp2040.writeUint16(address, opcode & 0xffff);
++    address += 2;
++    if (opcode > 0xffff) {
++      rp2040.writeUint16(address, opcode >>> 16);
++      address += 2;
++    }
++  }
++}
++
++interface Handlers {
++  hardFault?: number[];
++  nmi?: number[];
++  irq?: number[];
++}
++
++function createCore(code: number[], handlers: Handlers = {}, clock?: MockClock) {
++  const rp2040 = new RP2040(clock);
++  rp2040.writeUint32(VTOR, VECTORS);
++  rp2040.writeUint32(VECTORS, MSP_TOP);
++  rp2040.writeUint32(VECTORS + 4, CODE | 1);
++  rp2040.writeUint32(VECTORS + EXC_NMI * 4, NMI_HANDLER | 1);
++  rp2040.writeUint32(VECTORS + EXC_HARDFAULT * 4, HARDFAULT_HANDLER | 1);
++  rp2040.writeUint32(VECTORS + EXC_USER_IRQ * 4, IRQ_HANDLER | 1);
++  writeCode(rp2040, HARDFAULT_HANDLER, handlers.hardFault ?? [SELF_LOOP]);
++  writeCode(rp2040, NMI_HANDLER, handlers.nmi ?? [SELF_LOOP]);
++  writeCode(rp2040, IRQ_HANDLER, handlers.irq ?? [SELF_LOOP]);
++  writeCode(rp2040, CODE, code);
++  rp2040.core.SP = MSP_TOP;
++  rp2040.core.PC = CODE;
++  return rp2040;
++}
++
++function run(rp2040: RP2040, steps: number) {
++  for (let i = 0; i < steps; i++) {
++    rp2040.step();
++  }
++}
++
++function pc(rp2040: RP2040) {
++  return (rp2040.core.PC & ~1) >>> 0;
++}
++
++function frameAt(rp2040: RP2040, address: number) {
++  const word = (offset: number) => rp2040.readUint32(address + offset) >>> 0;
++  return {
++    r0: word(0),
++    r1: word(4),
++    r2: word(8),
++    r3: word(12),
++    r12: word(16),
++    lr: word(20),
++    pc: word(24),
++    xpsr: word(28),
++  };
++}
++
++function stackedFrame(rp2040: RP2040) {
++  return frameAt(rp2040, rp2040.core.SP);
++}
++
++function expectHardFault(rp2040: RP2040, returnAddress: number) {
++  expect(rp2040.core.IPSR).toEqual(EXC_HARDFAULT);
++  expect(pc(rp2040)).toEqual(HARDFAULT_HANDLER);
++  expect(stackedFrame(rp2040).pc).toEqual(returnAddress);
++}
++
++function expectNoFault(rp2040: RP2040, expectedPC: number) {
++  expect(rp2040.core.IPSR).toEqual(0);
++  expect(pc(rp2040)).toEqual(expectedPC);
++}
++
++function snapshot(rp2040: RP2040) {
++  const { core } = rp2040;
++  return {
++    registers: Array.from(core.registers),
++    IPSR: core.IPSR,
++    xPSR: core.xPSR >>> 0,
++    frame: stackedFrame(rp2040),
++  };
++}
++
++function expectLockedUp(rp2040: RP2040, ipsr: number) {
++  expect(rp2040.core.PC >>> 0).toEqual(LOCKUP);
++  expect(rp2040.core.IPSR).toEqual(ipsr);
++  const before = snapshot(rp2040);
++  run(rp2040, 6);
++  expect(snapshot(rp2040)).toEqual(before);
++  expect(rp2040.core.PC >>> 0).toEqual(LOCKUP);
++}
++
++function expectStuck(rp2040: RP2040) {
++  expect(rp2040.core.PC >>> 0).toEqual(LOCKUP);
++  const before = snapshot(rp2040);
++  run(rp2040, 6);
++  expect(snapshot(rp2040)).toEqual(before);
++  expect(rp2040.core.PC >>> 0).toEqual(LOCKUP);
++}
++
++function pendNMI(rp2040: RP2040) {
++  rp2040.writeUint32(ICSR, NMIPENDSET);
++}
++
++function raiseUserIRQ(rp2040: RP2040, priority: number) {
++  rp2040.writeUint32(NVIC_IPR6, (priority & 0x3) << (8 * (USER_IRQ % 4) + 6));
++  rp2040.writeUint32(NVIC_ISER, 1 << USER_IRQ);
++  rp2040.writeUint32(NVIC_ISPR, 1 << USER_IRQ);
++}
++
++describe('HardFault', () => {
++  describe('bkpt and udf', () => {
++    it('faults on udf with the udf address stacked', () => {
++      const rp2040 = createCore([opcodeNOP(), opcodeUDF(0x42), opcodeNOP()]);
++      run(rp2040, 4);
++      expectHardFault(rp2040, CODE + 2);
++    });
++
++    it('faults on the 32-bit udf.w with its first halfword address stacked', () => {
++      const rp2040 = createCore([opcodeMOVS(r4, 1), opcodeUDF2(0x1234), opcodeNOP()]);
++      run(rp2040, 4);
++      expectHardFault(rp2040, CODE + 2);
++      expect(rp2040.core.registers[r4]).toEqual(1);
++    });
++
++    it('faults on bkpt when onBreak is not overridden', () => {
++      const rp2040 = createCore([bkpt(0x22), opcodeNOP()]);
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++    });
++
++    it('passes bkpt to an overridden onBreak and still faults on a later bad access', () => {
++      const rp2040 = createCore([bkpt(0x31), opcodeMOVS(r5, 9), opcodeLDRimm(r0, r1, 0)]);
++      const onBreak = vi.fn();
++      rp2040.onBreak = onBreak;
++      rp2040.core.registers[r1] = 0x30000000;
++      run(rp2040, 5);
++      expect(onBreak).toHaveBeenCalledTimes(1);
++      expect(onBreak).toHaveBeenCalledWith(0x31);
++      expectHardFault(rp2040, CODE + 4);
++      expect(rp2040.core.registers[r5]).toEqual(9);
++    });
++
++    it('passes udf.w to an overridden onBreak and still faults on a later bad access', () => {
++      const rp2040 = createCore([opcodeUDF2(0xbeef), opcodeMOVS(r5, 3), opcodeLDRimm(r0, r1, 0)]);
++      const onBreak = vi.fn();
++      rp2040.onBreak = onBreak;
++      rp2040.core.registers[r1] = 0x30000000;
++      run(rp2040, 5);
++      expect(onBreak).toHaveBeenCalledTimes(1);
++      expect(onBreak).toHaveBeenCalledWith(0xbeef);
++      expectHardFault(rp2040, CODE + 6);
++      expect(rp2040.core.registers[r5]).toEqual(3);
++    });
++  });
++
++  describe('unbacked addresses', () => {
++    it('faults on a load from an address with no memory behind it', () => {
++      const rp2040 = createCore([opcodeLDRimm(r0, r1, 0), opcodeNOP()]);
++      rp2040.core.registers[r0] = 0x5a;
++      rp2040.core.registers[r1] = 0x30000000;
++      rp2040.core.N = true;
++      rp2040.core.Z = true;
++      rp2040.core.C = true;
++      rp2040.core.V = true;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++      expect(stackedFrame(rp2040).r0).toEqual(0x5a);
++      expect(stackedFrame(rp2040).xpsr >>> 28).toEqual(0xf);
++    });
++
++    it('faults on a store to an address with no memory behind it', () => {
++      const rp2040 = createCore([opcodeNOP(), opcodeSTR(r0, r1, 0), opcodeNOP()]);
++      rp2040.core.registers[r1] = 0x60000000;
++      run(rp2040, 4);
++      expectHardFault(rp2040, CODE + 2);
++    });
++
++    it('faults just past the end of SRAM but not on its last word', () => {
++      const good = createCore([opcodeLDRimm(r0, r1, 0), SELF_LOOP]);
++      good.writeUint32(SRAM_END - 4, 0x13579bdf);
++      good.core.registers[r1] = SRAM_END - 4;
++      run(good, 3);
++      expectNoFault(good, CODE + 2);
++      expect(good.core.registers[r0]).toEqual(0x13579bdf);
++
++      const bad = createCore([opcodeLDRimm(r0, r1, 0), SELF_LOOP]);
++      bad.core.registers[r1] = SRAM_END;
++      run(bad, 3);
++      expectHardFault(bad, CODE);
++    });
++
++    it('faults on a byte load past the end of the boot ROM but not inside it', () => {
++      const good = createCore([opcodeLDRB(r0, r1, 0), SELF_LOOP]);
++      good.core.registers[r1] = 0x3fff;
++      run(good, 3);
++      expectNoFault(good, CODE + 2);
++
++      const bad = createCore([opcodeLDRB(r0, r1, 0), SELF_LOOP]);
++      bad.core.registers[r0] = 0x5b;
++      bad.core.registers[r1] = 0x4000;
++      run(bad, 3);
++      expectHardFault(bad, CODE);
++      expect(stackedFrame(bad).r0).toEqual(0x5b);
++    });
++
++    it('keeps the RP2040 areas the emulator does not model fault free and faults outside them', () => {
++      const rp2040 = createCore([
++        opcodeSTR(r0, r1, 4),
++        opcodeLDRimm(r0, r3, 0),
++        opcodeLDRimm(r0, r4, 0),
++        opcodeLDRimm(r0, r5, 0),
++        opcodeLDRimm(r0, r6, 0),
++        opcodeLDRimm(r0, r7, 0),
++        opcodeLDRimm(r0, r2, 0),
++        opcodeLDRimm(r0, r2, 4),
++      ]);
++      rp2040.core.registers[r0] = 1;
++      rp2040.core.registers[r1] = 0x14000000;
++      rp2040.core.registers[r2] = 0x2103fffc;
++      rp2040.core.registers[r3] = 0x15000000;
++      rp2040.core.registers[r4] = 0x21000000;
++      rp2040.core.registers[r5] = 0x50400000;
++      rp2040.core.registers[r6] = 0x40068000;
++      rp2040.core.registers[r7] = 0xe0002000;
++      run(rp2040, 10);
++      expectHardFault(rp2040, CODE + 14);
++      expect(stackedFrame(rp2040).r2).toEqual(0x2103fffc);
++    });
++
++    it('faults on a halfword load from unbacked memory', () => {
++      const rp2040 = createCore([opcodeLDRH(r0, r1, 0), opcodeNOP()]);
++      rp2040.core.registers[r0] = 0x66;
++      rp2040.core.registers[r1] = 0x00004002;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++      expect(stackedFrame(rp2040).r0).toEqual(0x66);
++    });
++
++    it('faults on a halfword store to unbacked memory', () => {
++      const rp2040 = createCore([opcodeSTRH(r0, r1, 0), opcodeNOP()]);
++      rp2040.core.registers[r1] = 0x9ffffff0;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++    });
++
++    it('loads from SIO, the system control space and XIP flash before faulting on unbacked memory', () => {
++      const rp2040 = createCore([
++        opcodeLDRimm(r0, r1, 0),
++        opcodeLDRimm(r2, r3, 0),
++        opcodeLDRimm(r4, r5, 0),
++        opcodeLDRimm(r6, r7, 0),
++      ]);
++      rp2040.writeUint32(0x10000100, 0x2468ace0);
++      rp2040.core.registers[r1] = 0xd0000000;
++      rp2040.core.registers[r3] = 0xe000ed00;
++      rp2040.core.registers[r5] = 0x13000100;
++      rp2040.core.registers[r7] = 0x00004000;
++      run(rp2040, 6);
++      expectHardFault(rp2040, CODE + 6);
++      expect(stackedFrame(rp2040).r2).toEqual(rp2040.readUint32(0xe000ed00) >>> 0);
++      expect(rp2040.core.registers[r4]).toEqual(0x2468ace0);
++    });
++
++    it('faults on a register-offset word load whose sum is unbacked', () => {
++      const rp2040 = createCore([opcodeNOP(), opcodeLDRreg(r3, r1, r2), opcodeNOP()]);
++      rp2040.core.registers[r1] = SRAM_END - 4;
++      rp2040.core.registers[r2] = 4;
++      rp2040.core.registers[r3] = 0x33;
++      run(rp2040, 4);
++      expectHardFault(rp2040, CODE + 2);
++      expect(stackedFrame(rp2040).r3).toEqual(0x33);
++    });
++
++    it('faults on register-offset word, halfword and byte stores to unbacked memory', () => {
++      const word = createCore([opcodeSTRreg(r0, r1, r2), opcodeNOP()]);
++      word.core.registers[r1] = 0x5ffffffc;
++      word.core.registers[r2] = 4;
++      run(word, 3);
++      expectHardFault(word, CODE);
++
++      const halfword = createCore([opcodeSTRHreg(r0, r1, r2), opcodeNOP()]);
++      halfword.core.registers[r1] = 0x2103fffe;
++      halfword.core.registers[r2] = 2;
++      run(halfword, 3);
++      expectHardFault(halfword, CODE);
++
++      const byte = createCore([opcodeSTRBreg(r0, r1, r2), opcodeNOP()]);
++      byte.core.registers[r1] = SRAM_END - 1;
++      byte.core.registers[r2] = 1;
++      run(byte, 3);
++      expectHardFault(byte, CODE);
++    });
++
++    it('faults on register-offset byte and halfword loads past the end of memory', () => {
++      const byte = createCore([opcodeLDRBreg(r0, r1, r2), opcodeNOP()]);
++      byte.core.registers[r0] = 0x71;
++      byte.core.registers[r1] = 0x2103ffff;
++      byte.core.registers[r2] = 1;
++      run(byte, 3);
++      expectHardFault(byte, CODE);
++      expect(stackedFrame(byte).r0).toEqual(0x71);
++
++      const halfword = createCore([opcodeLDRHreg(r0, r1, r2), opcodeNOP()]);
++      halfword.core.registers[r0] = 0x72;
++      halfword.core.registers[r1] = SRAM_END - 2;
++      halfword.core.registers[r2] = 2;
++      run(halfword, 3);
++      expectHardFault(halfword, CODE);
++      expect(stackedFrame(halfword).r0).toEqual(0x72);
++    });
++
++    it('faults on signed byte and halfword loads from unbacked memory', () => {
++      const halfword = createCore([opcodeLDRSH(r0, r1, r2), opcodeNOP()]);
++      halfword.core.registers[r0] = 0x77;
++      halfword.core.registers[r1] = 0x30000000;
++      halfword.core.registers[r2] = 2;
++      run(halfword, 3);
++      expectHardFault(halfword, CODE);
++      expect(stackedFrame(halfword).r0).toEqual(0x77);
++
++      const byte = createCore([opcodeLDRSB(r0, r1, r2), opcodeNOP()]);
++      byte.core.registers[r0] = 0x78;
++      byte.core.registers[r1] = 0x3fff;
++      byte.core.registers[r2] = 1;
++      run(byte, 3);
++      expectHardFault(byte, CODE);
++      expect(stackedFrame(byte).r0).toEqual(0x78);
++    });
++
++    it('faults on sp-relative loads and stores past the end of SRAM', () => {
++      const load = createCore([opcodeLDRsp(r1, 4), opcodeLDRsp(r0, 8), opcodeNOP()]);
++      load.writeUint32(SRAM_END - 4, 0x13572468);
++      load.core.SP = SRAM_END - 8;
++      load.core.registers[r0] = 0x5a5a;
++      run(load, 4);
++      expectHardFault(load, CODE + 2);
++      expect(load.core.SP).toEqual(SRAM_END - 0x28);
++      expect(stackedFrame(load).r0).toEqual(0x5a5a);
++      expect(stackedFrame(load).r1).toEqual(0x13572468);
++
++      const store = createCore([opcodeSTRsp(r0, 12), opcodeNOP()]);
++      store.core.SP = SRAM_END - 8;
++      run(store, 3);
++      expectHardFault(store, CODE);
++    });
++
++    it('faults on loads that start inside a region and end past it', () => {
++      const word = createCore([opcodeLDRimm(r0, r1, 0), opcodeNOP()]);
++      word.core.registers[r0] = 0x61;
++      word.core.registers[r1] = SRAM_END - 2;
++      run(word, 3);
++      expectHardFault(word, CODE);
++      expect(stackedFrame(word).r0).toEqual(0x61);
++
++      const halfword = createCore([opcodeLDRH(r0, r1, 0), opcodeNOP()]);
++      halfword.core.registers[r0] = 0x62;
++      halfword.core.registers[r1] = 0x3fff;
++      run(halfword, 3);
++      expectHardFault(halfword, CODE);
++      expect(stackedFrame(halfword).r0).toEqual(0x62);
++
++      const alias = createCore([opcodeLDRimm(r0, r1, 0), opcodeNOP()]);
++      alias.core.registers[r0] = 0x63;
++      alias.core.registers[r1] = 0x2103fffd;
++      run(alias, 3);
++      expectHardFault(alias, CODE);
++      expect(stackedFrame(alias).r0).toEqual(0x63);
++    });
++
++    it('faults on stores that start inside sram and end past it without writing', () => {
++      const word = createCore([opcodeSTR(r0, r1, 0), opcodeNOP()]);
++      word.writeUint32(SRAM_END - 4, 0x44332211);
++      word.core.registers[r0] = 0xdeadbeef;
++      word.core.registers[r1] = SRAM_END - 2;
++      run(word, 3);
++      expectHardFault(word, CODE);
++      expect(word.readUint32(SRAM_END - 4)).toEqual(0x44332211);
++
++      const halfword = createCore([opcodeSTRH(r0, r1, 0), opcodeNOP()]);
++      halfword.writeUint32(SRAM_END - 4, 0x44332211);
++      halfword.core.registers[r0] = 0xbeef;
++      halfword.core.registers[r1] = SRAM_END - 1;
++      run(halfword, 3);
++      expectHardFault(halfword, CODE);
++      expect(halfword.readUint32(SRAM_END - 4)).toEqual(0x44332211);
++    });
++
++    it.each([
++      [
++        'the boot rom and faults on a word load past its end',
++        0x0,
++        0x1000,
++        0x3ffc,
++        0x4000,
++        opcodeLDRimm(r0, r3, 0),
++      ],
++      [
++        'the xip region and faults on a byte store below it',
++        0x10000000,
++        0x1c000000,
++        0x1ffffffc,
++        0x0fffffff,
++        opcodeSTRB(r0, r3, 0),
++      ],
++      [
++        'sram and faults on a halfword store past its end',
++        0x20000000,
++        0x20010000,
++        0x20041ffc,
++        0x20042000,
++        opcodeSTRH(r0, r3, 0),
++      ],
++      [
++        'the sram alias and faults on a word load below it',
++        0x21000000,
++        0x21020000,
++        0x2103fffc,
++        0x20fffffc,
++        opcodeLDRimm(r0, r3, 0),
++      ],
++      [
++        'the sram alias and faults on a byte load past its end',
++        0x21000000,
++        0x21020000,
++        0x2103fffc,
++        0x21040000,
++        opcodeLDRB(r0, r3, 0),
++      ],
++      [
++        'the peripherals and faults on a halfword load below them',
++        0x40000000,
++        0x48000000,
++        0x5ffffffc,
++        0x3ffffffe,
++        opcodeLDRH(r0, r3, 0),
++      ],
++      [
++        'the peripherals and faults on a word store past their end',
++        0x40000000,
++        0x48000000,
++        0x5ffffffc,
++        0x60000000,
++        opcodeSTR(r0, r3, 0),
++      ],
++      [
++        'the sio block and faults on a word store below it',
++        0xd0000000,
++        0xd8000000,
++        0xdffffffc,
++        0xcffffffc,
++        opcodeSTR(r0, r3, 0),
++      ],
++      [
++        'the ppb and faults on a byte store past its end',
++        0xe0000000,
++        0xe0080000,
++        0xe00ffffc,
++        0xe0100000,
++        opcodeSTRB(r0, r3, 0),
++      ],
++      [
++        'the ppb and faults on a word load at the top of memory',
++        0xe0000000,
++        0xe0080000,
++        0xe00ffffc,
++        0xfffffffc,
++        opcodeLDRimm(r0, r3, 0),
++      ],
++    ])(
++      'accesses the first, an inner and the last word of %s',
++      (_name, first, inner, last, outside, faulting) => {
++        const rp2040 = createCore([
++          opcodeLDRimm(r4, r1, 0),
++          opcodeLDRimm(r4, r6, 0),
++          opcodeSTR(r5, r6, 0),
++          opcodeLDRimm(r4, r2, 0),
++          opcodeLDRH(r4, r2, 2),
++          opcodeLDRB(r4, r2, 3),
++          opcodeSTR(r5, r2, 0),
++          opcodeSTRH(r5, r2, 2),
++          opcodeSTRB(r5, r2, 3),
++          faulting,
++        ]);
++        rp2040.core.registers[r0] = 0x5a;
++        rp2040.core.registers[r1] = first;
++        rp2040.core.registers[r2] = last;
++        rp2040.core.registers[r3] = outside;
++        rp2040.core.registers[r6] = inner;
++        run(rp2040, 12);
++        expectHardFault(rp2040, CODE + 18);
++        expect(stackedFrame(rp2040).r0).toEqual(0x5a);
++      },
++    );
++
++    it.each([
++      ['word load', 'the end of the boot rom', 0x00003ffe, opcodeLDRimm(r0, r1, 0)],
++      ['word load', 'the start of the xip region', 0x0ffffffe, opcodeLDRimm(r0, r1, 0)],
++      ['halfword store', 'the start of the sram alias', 0x20ffffff, opcodeSTRH(r0, r1, 0)],
++      ['word store', 'the end of the sram alias', 0x2103fffe, opcodeSTR(r0, r1, 0)],
++      ['halfword load', 'the start of the peripherals', 0x3fffffff, opcodeLDRH(r0, r1, 0)],
++      ['word load', 'the end of the peripherals', 0x5ffffffd, opcodeLDRimm(r0, r1, 0)],
++      ['word store', 'the start of the sio block', 0xcffffffe, opcodeSTR(r0, r1, 0)],
++      ['halfword load', 'the end of the ppb', 0xe00fffff, opcodeLDRH(r0, r1, 0)],
++      ['word store', 'the end of the ppb', 0xe00ffffe, opcodeSTR(r0, r1, 0)],
++    ])('faults on a %s that crosses %s', (_kind, _boundary, address, faulting) => {
++      const rp2040 = createCore([faulting, opcodeNOP()]);
++      rp2040.core.registers[r0] = 0x5c;
++      rp2040.core.registers[r1] = address;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++      expect(stackedFrame(rp2040).r0).toEqual(0x5c);
++      expect(stackedFrame(rp2040).r1).toEqual(address);
++    });
++
++    it('faults on a literal load past the end of sram without loading', () => {
++      const rp2040 = createCore([]);
++      writeCode(rp2040, SRAM_END - 8, [opcodeLDRlit(r1, 0), opcodeLDRlit(r0, 4)]);
++      rp2040.writeUint32(SRAM_END - 4, 0x13572468);
++      rp2040.core.PC = SRAM_END - 8;
++      rp2040.core.registers[r0] = 0x5d;
++      run(rp2040, 4);
++      expectHardFault(rp2040, SRAM_END - 6);
++      expect(stackedFrame(rp2040).r0).toEqual(0x5d);
++      expect(stackedFrame(rp2040).r1).toEqual(0x13572468);
++    });
++
++    it('faults on register-offset stores that cross the end of sram without writing', () => {
++      const word = createCore([opcodeSTRreg(r0, r1, r2), opcodeNOP()]);
++      word.writeUint32(SRAM_END - 4, 0x44332211);
++      word.core.registers[r0] = 0xdeadbeef;
++      word.core.registers[r1] = SRAM_END - 4;
++      word.core.registers[r2] = 2;
++      run(word, 3);
++      expectHardFault(word, CODE);
++      expect(word.readUint32(SRAM_END - 4)).toEqual(0x44332211);
++      expect(stackedFrame(word).r1).toEqual(SRAM_END - 4);
++
++      const halfword = createCore([opcodeSTRHreg(r0, r1, r2), opcodeNOP()]);
++      halfword.writeUint32(SRAM_END - 4, 0x44332211);
++      halfword.core.registers[r0] = 0xbeef;
++      halfword.core.registers[r1] = SRAM_END - 2;
++      halfword.core.registers[r2] = 1;
++      run(halfword, 3);
++      expectHardFault(halfword, CODE);
++      expect(halfword.readUint32(SRAM_END - 4)).toEqual(0x44332211);
++    });
++  });
++
++  describe('instruction fetch', () => {
++    it.each([
++      ['peripheral', 0x40000000],
++      ['USB DPRAM', 0x50100000],
++      ['SIO', 0xd0000000],
++      ['system control space', 0xe000e000],
++      ['SRAM alias', 0x21000000],
++      ['XIP control', 0x14000000],
++      ['unbacked', 0x30000000],
++      ['past the end of SRAM', SRAM_END],
++    ])('faults when branching to %s memory with the target stacked', (_name, target) => {
++      const rp2040 = createCore([opcodeBX(r0), opcodeNOP()]);
++      rp2040.core.registers[r0] = target + 1;
++      run(rp2040, 3);
++      expectHardFault(rp2040, target >>> 0);
++    });
++
++    it('faults on a 32-bit instruction whose second halfword lies past the end of SRAM', () => {
++      const rp2040 = createCore([]);
++      writeCode(rp2040, SRAM_END - 2, [opcodeBL(0x100) & 0xffff]);
++      rp2040.core.PC = SRAM_END - 2;
++      rp2040.core.LR = 0x20000501;
++      run(rp2040, 3);
++      expectHardFault(rp2040, SRAM_END - 2);
++      expect(stackedFrame(rp2040).lr).toEqual(0x20000501);
++    });
++
++    it('faults on a 32-bit instruction whose second halfword lies past the XIP flash windows', () => {
++      const rp2040 = createCore([]);
++      writeCode(rp2040, 0x10fffffe, [opcodeBL(0x100) & 0xffff]);
++      rp2040.core.PC = 0x13fffffe;
++      rp2040.core.LR = 0x20000501;
++      run(rp2040, 3);
++      expectHardFault(rp2040, 0x13fffffe);
++      expect(stackedFrame(rp2040).lr).toEqual(0x20000501);
++    });
++
++    it('faults when execution runs off the end of SRAM', () => {
++      const rp2040 = createCore([]);
++      writeCode(rp2040, SRAM_END - 4, [opcodeMOVS(r6, 1), opcodeMOVS(r7, 2)]);
++      rp2040.core.PC = SRAM_END - 4;
++      run(rp2040, 4);
++      expectHardFault(rp2040, SRAM_END);
++      expect(rp2040.core.registers[r6]).toEqual(1);
++      expect(rp2040.core.registers[r7]).toEqual(2);
++    });
++
++    it('treats an EXC_RETURN value branched to in Thread mode as an address', () => {
++      const rp2040 = createCore([opcodeBX(lr), opcodeNOP()]);
++      rp2040.core.LR = 0xfffffff9;
++      run(rp2040, 3);
++      expectHardFault(rp2040, 0xfffffff8);
++    });
++
++    it('executes from the XIP flash windows and the boot ROM, faulting on a udf there', () => {
++      const rp2040 = createCore([]);
++      writeCode(rp2040, 0x10000200, [opcodeMOVS(r5, 0x15), opcodeBX(r0)]);
++      writeCode(rp2040, 0x00000100, [opcodeMOVS(r6, 0x16), opcodeUDF(5)]);
++      rp2040.core.PC = 0x13000200;
++      rp2040.core.registers[r0] = 0x00000101;
++      run(rp2040, 6);
++      expectHardFault(rp2040, 0x00000102);
++      expect(rp2040.core.registers[r5]).toEqual(0x15);
++      expect(rp2040.core.registers[r6]).toEqual(0x16);
++    });
++  });
++
++  describe('exception entry', () => {
++    it('stacks the faulting context on the main stack from Thread mode', () => {
++      const rp2040 = createCore([opcodeMOVS(r0, 1), opcodeMOVS(r3, 4), opcodeLDRimm(r2, r1, 0)]);
++      rp2040.core.registers[r1] = 0x30000000;
++      rp2040.core.registers[r2] = 3;
++      rp2040.core.registers[12] = 0xc0ffee;
++      rp2040.core.LR = 0x20000123;
++      rp2040.core.C = true;
++      rp2040.core.V = true;
++      run(rp2040, 5);
++      expectHardFault(rp2040, CODE + 4);
++      expect(rp2040.core.SP).toEqual(MSP_TOP - 0x20);
++      expect(rp2040.core.LR >>> 0).toEqual(0xfffffff9);
++      expect(stackedFrame(rp2040)).toEqual({
++        r0: 1,
++        r1: 0x30000000,
++        r2: 3,
++        r3: 4,
++        r12: 0xc0ffee,
++        lr: 0x20000123,
++        pc: CODE + 4,
++        xpsr: 0x31000000,
++      });
++    });
++
++    it('stacks on the process stack when Thread mode uses it', () => {
++      const rp2040 = createCore([opcodeMSR(SYSM_CONTROL, r6), opcodeLDRimm(r0, r1, 0)]);
++      rp2040.core.writeSpecialRegister(SYSM_PSP, PSP_TOP);
++      rp2040.core.registers[r0] = 0x10;
++      rp2040.core.registers[r1] = 0x30000000;
++      rp2040.core.registers[r2] = 0x12;
++      rp2040.core.registers[r3] = 0x13;
++      rp2040.core.registers[r6] = 2;
++      rp2040.core.registers[12] = 0x1c;
++      rp2040.core.LR = 0x20000555;
++      run(rp2040, 4);
++      expect(rp2040.core.IPSR).toEqual(EXC_HARDFAULT);
++      expect(pc(rp2040)).toEqual(HARDFAULT_HANDLER);
++      expect(rp2040.core.LR >>> 0).toEqual(0xfffffffd);
++      expect(rp2040.core.SP).toEqual(MSP_TOP);
++      const psp = rp2040.core.readSpecialRegister(SYSM_PSP) >>> 0;
++      expect(psp).toEqual(PSP_TOP - 0x20);
++      expect(frameAt(rp2040, psp)).toEqual({
++        r0: 0x10,
++        r1: 0x30000000,
++        r2: 0x12,
++        r3: 0x13,
++        r12: 0x1c,
++        lr: 0x20000555,
++        pc: CODE + 4,
++        xpsr: 0x01000000,
++      });
++    });
++
++    it('marks a realigned frame in the stacked xPSR', () => {
++      const rp2040 = createCore([opcodeLDRimm(r0, r1, 0)]);
++      rp2040.core.SP = MSP_TOP - 4;
++      rp2040.core.registers[r0] = 0x20;
++      rp2040.core.registers[r1] = 0x30000000;
++      rp2040.core.registers[r2] = 0x22;
++      rp2040.core.registers[r3] = 0x23;
++      rp2040.core.registers[12] = 0x2c;
++      rp2040.core.LR = 0x20000777;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++      expect(rp2040.core.SP).toEqual(MSP_TOP - 0x28);
++      expect(stackedFrame(rp2040)).toEqual({
++        r0: 0x20,
++        r1: 0x30000000,
++        r2: 0x22,
++        r3: 0x23,
++        r12: 0x2c,
++        lr: 0x20000777,
++        pc: CODE,
++        xpsr: 0x01000200,
++      });
++    });
++
++    it('preempts an interrupt handler and returns to Handler mode', () => {
++      const rp2040 = createCore([opcodeNOP(), SELF_LOOP], {
++        irq: [opcodeMOVS(r4, 0x44), opcodeLDRimm(r0, r1, 0)],
++      });
++      rp2040.core.registers[r0] = 0x30;
++      rp2040.core.registers[r1] = 0x30000000;
++      rp2040.core.registers[r2] = 0x32;
++      rp2040.core.registers[r3] = 0x33;
++      rp2040.core.registers[12] = 0x3c;
++      raiseUserIRQ(rp2040, 1);
++      run(rp2040, 6);
++      expectHardFault(rp2040, IRQ_HANDLER + 2);
++      expect(rp2040.core.LR >>> 0).toEqual(0xfffffff1);
++      expect(stackedFrame(rp2040)).toEqual({
++        r0: 0x30,
++        r1: 0x30000000,
++        r2: 0x32,
++        r3: 0x33,
++        r12: 0x3c,
++        lr: 0xfffffff9,
++        pc: IRQ_HANDLER + 2,
++        xpsr: 0x01000000 | EXC_USER_IRQ,
++      });
++      expect(rp2040.core.registers[r4]).toEqual(0x44);
++    });
++
++    it('is not held off by PRIMASK', () => {
++      const rp2040 = createCore([CPSID_I, opcodeLDRimm(r0, r1, 0)]);
++      rp2040.core.registers[r1] = 0x30000000;
++      run(rp2040, 4);
++      expectHardFault(rp2040, CODE + 2);
++      expect(rp2040.core.PM).toEqual(true);
++    });
++
++    it('returns to the faulting instruction so a handler can skip it and resume', () => {
++      const rp2040 = createCore(
++        [opcodeMOVS(r0, 5), opcodeLDRimm(r1, r2, 0), opcodeMOVS(r6, 0x77), SELF_LOOP],
++        {
++          hardFault: [opcodeLDRsp(r0, 24), opcodeADDS2(r0, 2), opcodeSTRsp(r0, 24), opcodeBX(lr)],
++        },
++      );
++      rp2040.core.registers[r1] = 0x1111;
++      rp2040.core.registers[r2] = 0x30000000;
++      run(rp2040, 12);
++      expectNoFault(rp2040, CODE + 6);
++      expect(rp2040.core.SP).toEqual(MSP_TOP);
++      expect(rp2040.core.registers[r0]).toEqual(5);
++      expect(rp2040.core.registers[r1]).toEqual(0x1111);
++      expect(rp2040.core.registers[r6]).toEqual(0x77);
++    });
++
++    it('re-executes the faulting instruction when the handler returns to it', () => {
++      const rp2040 = createCore([opcodeLDRimm(r0, r4, 0), opcodeMOVS(r6, 0x66), SELF_LOOP], {
++        hardFault: [opcodeSUBS2(r4, 8), opcodeBX(lr)],
++      });
++      rp2040.writeUint32(SRAM_END - 8, 0xabcdef01);
++      rp2040.core.registers[r4] = SRAM_END;
++      run(rp2040, 10);
++      expectNoFault(rp2040, CODE + 4);
++      expect(rp2040.core.registers[r0] >>> 0).toEqual(0xabcdef01);
++      expect(rp2040.core.registers[r6]).toEqual(0x66);
++    });
++  });
++
++  describe('multi-word accesses', () => {
++    it('leaves memory and the base untouched when stm runs past the end of SRAM', () => {
++      const rp2040 = createCore([opcodeSTMIA(r0, (1 << r1) | (1 << r2) | (1 << r3)), opcodeNOP()]);
++      rp2040.writeUint32(SRAM_END - 8, 0x88888888);
++      rp2040.writeUint32(SRAM_END - 4, 0x44444444);
++      rp2040.core.registers[r0] = SRAM_END - 8;
++      rp2040.core.registers[r1] = 1;
++      rp2040.core.registers[r2] = 2;
++      rp2040.core.registers[r3] = 3;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++      expect(rp2040.readUint32(SRAM_END - 8)).toEqual(0x88888888);
++      expect(rp2040.readUint32(SRAM_END - 4)).toEqual(0x44444444);
++      expect(stackedFrame(rp2040).r0).toEqual(SRAM_END - 8);
++    });
++
++    it('leaves the loaded registers and the base untouched when ldm runs past the end of SRAM', () => {
++      const rp2040 = createCore([opcodeLDMIA(r0, (1 << r1) | (1 << r2) | (1 << r3)), opcodeNOP()]);
++      rp2040.writeUint32(SRAM_END - 8, 0x88888888);
++      rp2040.writeUint32(SRAM_END - 4, 0x44444444);
++      rp2040.core.registers[r0] = SRAM_END - 8;
++      rp2040.core.registers[r1] = 1;
++      rp2040.core.registers[r2] = 2;
++      rp2040.core.registers[r3] = 3;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++      const frame = stackedFrame(rp2040);
++      expect(frame.r0).toEqual(SRAM_END - 8);
++      expect(frame.r1).toEqual(1);
++      expect(frame.r2).toEqual(2);
++      expect(frame.r3).toEqual(3);
++    });
++
++    it('leaves the registers and SP untouched when pop runs past the end of SRAM', () => {
++      const rp2040 = createCore([opcodePOP(false, (1 << r0) | (1 << r1) | (1 << r2)), opcodeNOP()]);
++      rp2040.writeUint32(SRAM_END - 8, 0x88888888);
++      rp2040.writeUint32(SRAM_END - 4, 0x44444444);
++      rp2040.core.SP = SRAM_END - 8;
++      rp2040.core.registers[r0] = 0x10;
++      rp2040.core.registers[r1] = 0x11;
++      rp2040.core.registers[r2] = 0x12;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++      expect(rp2040.core.SP).toEqual(SRAM_END - 0x28);
++      const frame = stackedFrame(rp2040);
++      expect(frame.r0).toEqual(0x10);
++      expect(frame.r1).toEqual(0x11);
++      expect(frame.r2).toEqual(0x12);
++    });
++
++    it('faults on a push whose lowest word falls below flash and keeps SP', () => {
++      const rp2040 = createCore([]);
++      writeCode(rp2040, CODE + 0x1000, [opcodePUSH(true, 0xff), opcodeNOP()]);
++      rp2040.core.PC = CODE + 0x1000;
++      rp2040.core.SP = 0x10000020;
++      for (let i = r0; i <= r7; i++) {
++        rp2040.core.registers[i] = 0x100 + i;
++      }
++      rp2040.core.LR = 0x20000701;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE + 0x1000);
++      expect(rp2040.core.SP).toEqual(0x10000000);
++      expect(stackedFrame(rp2040)).toEqual({
++        r0: 0x100,
++        r1: 0x101,
++        r2: 0x102,
++        r3: 0x103,
++        r12: 0,
++        lr: 0x20000701,
++        pc: CODE + 0x1000,
++        xpsr: 0x01000000,
++      });
++      expect(rp2040.core.registers[r4]).toEqual(0x104);
++      expect(rp2040.core.registers[r7]).toEqual(0x107);
++    });
++
++    it('does not branch or move SP when pop of pc runs past the end of SRAM', () => {
++      const rp2040 = createCore([opcodePOP(true, 1 << r4), opcodeNOP()]);
++      rp2040.writeUint32(SRAM_END - 4, 0x20000101);
++      rp2040.core.SP = SRAM_END - 4;
++      rp2040.core.registers[r4] = 0x40;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++      expect(rp2040.core.registers[r4]).toEqual(0x40);
++      expect(rp2040.core.SP).toEqual(SRAM_END - 0x28);
++    });
++
++    it('runs an stm that ends on the last word of SRAM and faults on the next one', () => {
++      const rp2040 = createCore([
++        opcodeSTMIA(r0, (1 << r1) | (1 << r2)),
++        opcodeSTMIA(r0, 1 << r3),
++        opcodeNOP(),
++      ]);
++      rp2040.core.registers[r0] = SRAM_END - 8;
++      rp2040.core.registers[r1] = 0x1111;
++      rp2040.core.registers[r2] = 0x2222;
++      rp2040.core.registers[r3] = 0x3333;
++      run(rp2040, 4);
++      expectHardFault(rp2040, CODE + 2);
++      expect(rp2040.readUint32(SRAM_END - 8)).toEqual(0x1111);
++      expect(rp2040.readUint32(SRAM_END - 4)).toEqual(0x2222);
++      expect(stackedFrame(rp2040).r0).toEqual(SRAM_END);
++    });
++
++    it('leaves the registers untouched when ldm runs past the end of the SRAM bank alias', () => {
++      const rp2040 = createCore([opcodeLDMIA(r0, (1 << r1) | (1 << r2)), opcodeNOP()]);
++      rp2040.core.registers[r0] = 0x2103fffc;
++      rp2040.core.registers[r1] = 0x11;
++      rp2040.core.registers[r2] = 0x22;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++      const frame = stackedFrame(rp2040);
++      expect(frame.r0).toEqual(0x2103fffc);
++      expect(frame.r1).toEqual(0x11);
++      expect(frame.r2).toEqual(0x22);
++    });
++
++    it('leaves the registers untouched when an ldm from an unaligned base runs past the end of SRAM', () => {
++      const rp2040 = createCore([opcodeLDMIA(r0, (1 << r1) | (1 << r2)), opcodeNOP()]);
++      rp2040.core.registers[r0] = SRAM_END - 6;
++      rp2040.core.registers[r1] = 0x11;
++      rp2040.core.registers[r2] = 0x22;
++      run(rp2040, 3);
++      expectHardFault(rp2040, CODE);
++      const frame = stackedFrame(rp2040);
++      expect(frame.r0).toEqual(SRAM_END - 6);
++      expect(frame.r1).toEqual(0x11);
++      expect(frame.r2).toEqual(0x22);
++    });
++
++    it.each([
++      ['an ldm from xip into sram', 0x1ffffffc, opcodeLDMIA(r0, (1 << r1) | (1 << r2)), false],
++      ['an ldm from sio into the ppb', 0xdffffffc, opcodeLDMIA(r0, (1 << r1) | (1 << r2)), false],
++      ['an stm from sio into the ppb', 0xdffffffc, opcodeSTMIA(r0, (1 << r1) | (1 << r2)), false],
++      ['a pop from xip into sram', 0x1ffffffc, opcodePOP(false, (1 << r1) | (1 << r2)), true],
++      ['a push from sram into xip', 0x20000004, opcodePUSH(false, (1 << r1) | (1 << r2)), true],
++    ])('runs %s, whose words are all in listed regions', (_name, address, transfer, onStack) => {
++      const rp2040 = createCore([]);
++      writeCode(rp2040, CODE + 0x1000, [transfer, opcodeMOVS(r5, 7), opcodeLDRimm(r4, r3, 0)]);
++      rp2040.core.PC = CODE + 0x1000;
++      rp2040.core.registers[r0] = onStack ? 0 : address;
++      rp2040.core.registers[r3] = 0x30000000;
++      if (onStack) {
++        rp2040.core.SP = address;
++      }
++      run(rp2040, 5);
++      expect(rp2040.core.IPSR).toEqual(EXC_HARDFAULT);
++      expect(pc(rp2040)).toEqual(HARDFAULT_HANDLER);
++      expect(rp2040.core.registers[r5]).toEqual(7);
++    });
++
++    it('runs push, pop and ldm/stm inside memory before faulting on an ldm from unbacked memory', () => {
++      const rp2040 = createCore([
++        opcodePUSH(true, (1 << r0) | (1 << r1)),
++        opcodePOP(false, (1 << r2) | (1 << r3)),
++        opcodeSTMIA(r4, (1 << r2) | (1 << r3)),
++        opcodeLDMIA(r7, (1 << r5) | (1 << r6)),
++        opcodeLDMIA(r3, 1 << r1),
++      ]);
++      rp2040.core.registers[r0] = 0xa0;
++      rp2040.core.registers[r1] = 0x30000000;
++      rp2040.core.registers[r4] = DATA;
++      rp2040.core.registers[r7] = DATA;
++      run(rp2040, 7);
++      expectHardFault(rp2040, CODE + 8);
++      expect(rp2040.readUint32(DATA)).toEqual(0xa0);
++      expect(rp2040.readUint32(DATA + 4)).toEqual(0x30000000);
++      expect(rp2040.core.registers[r4]).toEqual(DATA + 8);
++      expect(rp2040.core.registers[r5]).toEqual(0xa0);
++      expect(rp2040.core.registers[r6]).toEqual(0x30000000);
++      expect(rp2040.core.registers[r7]).toEqual(DATA + 8);
++      expect(rp2040.core.SP).toEqual(MSP_TOP - 0x28);
++      expect(stackedFrame(rp2040).r1).toEqual(0x30000000);
++      expect(stackedFrame(rp2040).r3).toEqual(0x30000000);
++      expect(stackedFrame(rp2040).xpsr & (1 << 9)).toEqual(1 << 9);
++    });
++  });
++
++  describe('lockup', () => {
++    it('locks up on a fault inside the HardFault handler', () => {
++      const rp2040 = createCore([opcodeUDF(1)], {
++        hardFault: [opcodeMOVS(r5, 0x55), opcodeLDRimm(r0, r1, 0), opcodeNOP()],
++      });
++      rp2040.core.registers[r1] = 0x30000000;
++      run(rp2040, 5);
++      expectLockedUp(rp2040, EXC_HARDFAULT);
++      expect(rp2040.core.registers[r5]).toEqual(0x55);
++    });
++
++    it('locks up on udf inside the HardFault handler', () => {
++      const rp2040 = createCore([opcodeUDF(1)], { hardFault: [opcodeUDF(2)] });
++      run(rp2040, 4);
++      expectLockedUp(rp2040, EXC_HARDFAULT);
++    });
++
++    it('locks up on bkpt inside the HardFault handler', () => {
++      const rp2040 = createCore([bkpt(1)], { hardFault: [bkpt(2)] });
++      run(rp2040, 4);
++      expectLockedUp(rp2040, EXC_HARDFAULT);
++    });
++
++    it('locks up on an stm past the end of SRAM inside the HardFault handler without storing', () => {
++      const rp2040 = createCore([opcodeUDF(1)], {
++        hardFault: [opcodeSTMIA(r0, (1 << r1) | (1 << r2)), opcodeNOP()],
++      });
++      rp2040.writeUint32(SRAM_END - 4, 0x44444444);
++      rp2040.core.registers[r0] = SRAM_END - 4;
++      rp2040.core.registers[r1] = 0x1111;
++      rp2040.core.registers[r2] = 0x2222;
++      run(rp2040, 4);
++      expectLockedUp(rp2040, EXC_HARDFAULT);
++      expect(rp2040.readUint32(SRAM_END - 4)).toEqual(0x44444444);
++      expect(rp2040.core.registers[r0]).toEqual(SRAM_END - 4);
++    });
++
++    it('locks up when the HardFault handler cannot be fetched', () => {
++      const rp2040 = createCore([opcodeUDF(1)]);
++      rp2040.writeUint32(VECTORS + EXC_HARDFAULT * 4, 0x40000001);
++      run(rp2040, 4);
++      expectLockedUp(rp2040, EXC_HARDFAULT);
++    });
++
++    it.each([
++      ['below the start of the xip region', 0x10000010],
++      ['across the start of the sram alias', 0x21000010],
++      ['into unbacked memory', 0x30000020],
++    ])('locks up when the HardFault frame would be pushed %s', (_name, sp) => {
++      const rp2040 = createCore([opcodeMOVS(r5, 0x5e), opcodeLDRimm(r0, r1, 0), opcodeNOP()]);
++      rp2040.core.SP = sp;
++      rp2040.core.registers[r1] = 0x30000000;
++      run(rp2040, 4);
++      expectStuck(rp2040);
++      expect(rp2040.core.registers[r5]).toEqual(0x5e);
++    });
++
++    it('locks up when the HardFault frame would be pushed to an unbacked process stack', () => {
++      const rp2040 = createCore([
++        opcodeMSR(SYSM_CONTROL, r6),
++        opcodeMOVS(r5, 0x5e),
++        opcodeLDRimm(r0, r1, 0),
++      ]);
++      rp2040.core.writeSpecialRegister(SYSM_PSP, 0x30000020);
++      rp2040.core.registers[r6] = 2;
++      rp2040.core.registers[r1] = 0x30000000;
++      run(rp2040, 5);
++      expectStuck(rp2040);
++      expect(rp2040.core.registers[r5]).toEqual(0x5e);
++      expect(rp2040.core.readSpecialRegister(SYSM_MSP) >>> 0).toEqual(MSP_TOP);
++    });
++
++    it.each([
++      ['across the xip/sram seam', 0x20000010, 0x1ffffff0],
++      ['into xip space the emulator does not model', 0x14000100, 0x140000e0],
++      ['realigned to end exactly at the end of sram', SRAM_END + 4, SRAM_END - 0x20],
++    ])('takes the HardFault normally when its frame is pushed %s', (_name, sp, frame) => {
++      const rp2040 = createCore([opcodeLDRimm(r0, r1, 0), opcodeNOP()]);
++      rp2040.core.SP = sp;
++      rp2040.core.registers[r1] = 0x30000000;
++      run(rp2040, 3);
++      expect(rp2040.core.IPSR).toEqual(EXC_HARDFAULT);
++      expect(pc(rp2040)).toEqual(HARDFAULT_HANDLER);
++      expect(rp2040.core.SP).toEqual(frame);
++    });
++
++    it('locks up on a fault inside the NMI handler', () => {
++      const rp2040 = createCore([opcodeNOP(), SELF_LOOP], {
++        nmi: [opcodeMOVS(r4, 0x24), opcodeSTR(r0, r1, 0), opcodeNOP()],
++      });
++      rp2040.core.registers[r1] = 0x30000000;
++      pendNMI(rp2040);
++      run(rp2040, 5);
++      expectLockedUp(rp2040, EXC_NMI);
++      expect(rp2040.core.registers[r4]).toEqual(0x24);
++    });
++
++    it('locks up on bkpt inside the NMI handler', () => {
++      const rp2040 = createCore([opcodeNOP(), SELF_LOOP], { nmi: [bkpt(9), opcodeNOP()] });
++      pendNMI(rp2040);
++      run(rp2040, 4);
++      expectLockedUp(rp2040, EXC_NMI);
++    });
++
++    it('ignores an NMI after locking up in the NMI handler', () => {
++      const rp2040 = createCore([opcodeNOP(), SELF_LOOP], { nmi: [opcodeUDF(3)] });
++      pendNMI(rp2040);
++      run(rp2040, 4);
++      expectLockedUp(rp2040, EXC_NMI);
++      pendNMI(rp2040);
++      expectLockedUp(rp2040, EXC_NMI);
++    });
++
++    it('does not let a pending interrupt leave a lockup', () => {
++      const rp2040 = createCore([opcodeUDF(1)], { hardFault: [opcodeUDF(2)] });
++      run(rp2040, 4);
++      raiseUserIRQ(rp2040, 0);
++      expectLockedUp(rp2040, EXC_HARDFAULT);
++    });
++  });
++
++  describe('accesses that are not made by the core', () => {
++    it('lets the host read and write addresses that fault when the core uses them', () => {
++      const rp2040 = createCore([opcodeMOVS(r2, 1), opcodeLDRimm(r0, r1, 0)]);
++      expect(rp2040.readUint32(0x30000000) >>> 0).toEqual(0xffffffff);
++      expect(() => rp2040.writeUint32(0x30000000, 0x1234)).not.toThrow();
++      expect(() => rp2040.writeUint16(0x60000000, 0x1234)).not.toThrow();
++      expect(rp2040.core.IPSR).toEqual(0);
++      expect(pc(rp2040)).toEqual(CODE);
++      rp2040.core.registers[r1] = 0x30000000;
++      run(rp2040, 4);
++      expectHardFault(rp2040, CODE + 2);
++      expect(stackedFrame(rp2040).r2).toEqual(1);
++    });
++
++    it('lets DMA read unbacked memory that faults when the core reads it', () => {
++      const clock = new MockClock();
++      const rp2040 = createCore([opcodeMOVS(r2, 1), opcodeLDRimm(r0, r1, 0)], {}, clock);
++      rp2040.writeUint32(DATA, 0x12345678);
++      rp2040.writeUint32(CH0_READ_ADDR, 0x30000000);
++      rp2040.writeUint32(CH0_WRITE_ADDR, DATA);
++      rp2040.writeUint32(CH0_TRANS_COUNT, 1);
++      rp2040.writeUint32(CH0_CTRL_TRIG, DMA_EN | DMA_WORD | DMA_TREQ_PERMANENT);
++      clock.advance(32);
++      expect(rp2040.readUint32(DATA) >>> 0).toEqual(0xffffffff);
++      expect(rp2040.readUint32(CH0_TRANS_COUNT)).toEqual(0);
++      expect(rp2040.readUint32(CH0_CTRL_TRIG) & DMA_BUSY).toEqual(0);
++      expect(rp2040.core.IPSR).toEqual(0);
++      expect(pc(rp2040)).toEqual(CODE);
++      rp2040.core.registers[r1] = 0x30000000;
++      run(rp2040, 4);
++      expectHardFault(rp2040, CODE + 2);
++      expect(stackedFrame(rp2040).r2).toEqual(1);
++    });
++
++    it('lets DMA write unbacked memory that faults when the core writes it', () => {
++      const clock = new MockClock();
++      const rp2040 = createCore([opcodeMOVS(r2, 1), opcodeSTR(r0, r1, 0)], {}, clock);
++      rp2040.writeUint32(DATA, 0x12345678);
++      rp2040.writeUint32(CH0_READ_ADDR, DATA);
++      rp2040.writeUint32(CH0_WRITE_ADDR, 0x60000000);
++      rp2040.writeUint32(CH0_TRANS_COUNT, 1);
++      rp2040.writeUint32(CH0_CTRL_TRIG, DMA_EN | DMA_WORD | DMA_TREQ_PERMANENT);
++      clock.advance(32);
++      expect(rp2040.readUint32(CH0_TRANS_COUNT)).toEqual(0);
++      expect(rp2040.readUint32(CH0_CTRL_TRIG) & DMA_BUSY).toEqual(0);
++      expect(rp2040.core.IPSR).toEqual(0);
++      expect(pc(rp2040)).toEqual(CODE);
++      rp2040.core.registers[r1] = 0x60000000;
++      run(rp2040, 4);
++      expectHardFault(rp2040, CODE + 2);
++      expect(stackedFrame(rp2040).r2).toEqual(1);
++    });
++
++    it('lets GDB read and write memory that faults when the core uses it', () => {
++      const rp2040 = createCore([opcodeMOVS(r2, 1), opcodeLDRimm(r0, r1, 0)]);
++      const server = new GDBServer({
++        rp2040,
++        executing: false,
++        execute() {},
++        stop() {},
++      });
++      expect(server.processGDBMessage('m30000000,4')).toContain('ffffffff');
++      expect(server.processGDBMessage('M60000000,2:abcd')).toContain('OK');
++      expect(rp2040.core.IPSR).toEqual(0);
++      expect(pc(rp2040)).toEqual(CODE);
++      rp2040.core.registers[r1] = 0x30000000;
++      run(rp2040, 4);
++      expectHardFault(rp2040, CODE + 2);
++      expect(stackedFrame(rp2040).r2).toEqual(1);
++    });
++  });
++});
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..672ae86
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,100 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      if [ $# -lt 1 ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")"
++
++if [ -z "$OUTPUT_PATH" ]; then
++  OUTPUT_PATH="$(pwd)/test-results-${MODE}.xml"
++fi
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++rm -f "$OUTPUT_PATH"
++
++NEW_TEST="src/hardfault_a92d3d.spec.ts"
++VITEST="./node_modules/.bin/vitest"
++
++if [ "$MODE" = "new" ]; then
++  timeout 900 "$VITEST" run --reporter=default --reporter=junit --outputFile.junit="$OUTPUT_PATH" "$NEW_TEST"
++  STATUS=$?
++else
++  timeout 900 "$VITEST" run --reporter=default --reporter=junit --outputFile.junit="$OUTPUT_PATH" \
++    --exclude "$NEW_TEST" --exclude "**/node_modules/**" --exclude "**/dist/**"
++  STATUS=$?
++fi
++
++make_test_names_unique() {
++  node -e '
++const fs = require("fs");
++const file = process.argv[1];
++const seen = new Map();
++const xml = fs.readFileSync(file, "utf8").replace(
++  /<testcase classname="([^"]*)" name="([^"]*)"/g,
++  (match, classname, name) => {
++    const key = classname + "\u0000" + name;
++    const count = (seen.get(key) || 0) + 1;
++    seen.set(key, count);
++    return count === 1 ? match : `<testcase classname="${classname}" name="${name} (${count})"`;
++  },
++);
++fs.writeFileSync(file, xml);
++' "$1"
++}
++
++if [ -f "$OUTPUT_PATH" ]; then
++  make_test_names_unique "$OUTPUT_PATH"
++fi
++
++if [ "$STATUS" -ne 0 ] && ! grep -q '<testcase' "$OUTPUT_PATH" 2>/dev/null; then
++  if [ "$MODE" = "new" ]; then
++    SUITE="$NEW_TEST"
++  else
++    SUITE="base"
++  fi
++  cat > "$OUTPUT_PATH" <<XMLEOF
++<?xml version="1.0" encoding="UTF-8"?>
++<testsuites name="vitest tests" tests="1" failures="1" errors="0">
++<testsuite name="${SUITE}" tests="1" failures="1" errors="0">
++<testcase classname="${SUITE}" name="test run">
++<failure message="vitest exited with status ${STATUS} before reporting any test">vitest exited with status ${STATUS} before reporting any test</failure>
++</testcase>
++</testsuite>
++</testsuites>
++XMLEOF
++fi
++
++exit "$STATUS"

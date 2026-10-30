@@ -1,0 +1,1463 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6a07022..9324aaf 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,8 +9,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}/cmake/Modules/")
+ 
+-find_program(PATCHELF patchelf REQUIRED)
+-
+ # support for ccache
+ # call CMake with -DUSE_CCACHE=ON to make use of it
+ set(USE_CCACHE ON CACHE BOOL "")
+diff --git a/include/linuxdeploy/core/elf_file.h b/include/linuxdeploy/core/elf_file.h
+index 3ced6a2..7fdfdcb 100644
+--- a/include/linuxdeploy/core/elf_file.h
++++ b/include/linuxdeploy/core/elf_file.h
+@@ -48,13 +48,13 @@ namespace linuxdeploy {
+                     // linker would use
+                     std::vector<std::filesystem::path> traceDynamicDependencies(const std::vector<std::string>& excludeLibraryPatterns={});
+ 
+-                    // fetch rpath stored in binary
+-                    // it appears that according to the ELF standard, the rpath is ignored in libraries, therefore if the path
+-                    // points to an executable, an empty string is returned
++                    // fetch the search path stored in the binary: its DT_RUNPATH value, its DT_RPATH value if it has no
++                    // DT_RUNPATH entry, or an empty string if it has neither
+                     std::string getRPath();
+ 
+-                    // set rpath in ELF file
+-                    // returns true on success, false otherwise
++                    // set the search path in the ELF file: existing DT_RUNPATH and DT_RPATH entries keep their tags and get the
++                    // new value, a file with neither gets a DT_RUNPATH entry
++                    // returns true on success, false otherwise, in which case the file is left as it was
+                     bool setRPath(const std::string& value);
+ 
+                     // return ELF class
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 0632c70..6bd4a66 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -36,7 +36,7 @@ execute_process(
+ 
+ add_subdirectory(copyright)
+ 
+-add_library(linuxdeploy_core STATIC elf_file.cpp appdir.cpp ${HEADERS} appdir_root_setup.cpp)
++add_library(linuxdeploy_core STATIC elf_file.cpp elf_rpath.cpp appdir.cpp ${HEADERS} appdir_root_setup.cpp)
+ target_link_libraries(linuxdeploy_core PUBLIC
+     linuxdeploy_plugin linuxdeploy_log linuxdeploy_util linuxdeploy_desktopfile_static
+     CImg ${CMAKE_THREAD_LIBS_INIT}
+diff --git a/src/core/appdir.cpp b/src/core/appdir.cpp
+index 8f31102..f28c7fd 100644
+--- a/src/core/appdir.cpp
++++ b/src/core/appdir.cpp
+@@ -289,7 +289,6 @@ namespace linuxdeploy {
+                             elf_file::ElfFile elfFile(filePath);
+ 
+                             // no need to set rpath in debug symbols files
+-                            // also, patchelf crashes on such symbols
+                             if (isInDebugSymbolsLocation(filePath) || elfFile.isDebugSymbolsFile()) {
+                                 ldLog() << LD_WARNING << "Not setting rpath in debug symbols file:" << filePath
+                                         << std::endl;
+@@ -458,7 +457,6 @@ namespace linuxdeploy {
+                         }
+ 
+                         // no need to set rpath in debug symbols files
+-                        // also, patchelf crashes on such symbols
+                         if (!isInDebugSymbolsLocation(actualDestination)) {
+                             setElfRPathOperations[actualDestination] = rpath;
+                         }
+diff --git a/src/core/elf_file.cpp b/src/core/elf_file.cpp
+index c8772ac..4b53ccd 100644
+--- a/src/core/elf_file.cpp
++++ b/src/core/elf_file.cpp
+@@ -12,6 +12,7 @@
+ #include "linuxdeploy/log/log.h"
+ #include "linuxdeploy/util/util.h"
+ #include "linuxdeploy/subprocess/subprocess.h"
++#include "elf_rpath.h"
+ 
+ using namespace linuxdeploy::log;
+ 
+@@ -31,48 +32,6 @@ namespace linuxdeploy {
+                 public:
+                     explicit PrivateData(fs::path path) : path(std::move(path)) {}
+ 
+-                public:
+-                    static std::string getPatchelfPath() {
+-                        // by default, try to use a patchelf next to the linuxdeploy binary
+-                        // if that isn't available, fall back to searching for patchelf in the PATH
+-                        std::string patchelfPath;
+-
+-                        const auto envPatchelf = getenv("PATCHELF");
+-
+-                        // allows users to use a custom patchelf instead of the bundled one
+-                        if (envPatchelf != nullptr) {
+-                            ldLog() << LD_DEBUG << "Using patchelf specified in $PATCHELF:" << envPatchelf << std::endl;
+-                            patchelfPath = envPatchelf;
+-                        } else {
+-                            auto binDirPath = fs::path(util::getOwnExecutablePath());
+-                            auto localPatchelfPath = binDirPath.parent_path() / "patchelf";
+-
+-                            if (fs::exists(localPatchelfPath)) {
+-                                patchelfPath = localPatchelfPath.string();
+-                            } else {
+-                                for (const fs::path directory : util::split(getenv("PATH"), ':')) {
+-                                    if (!fs::is_directory(directory))
+-                                        continue;
+-
+-                                    auto path = directory / "patchelf";
+-
+-                                    if (fs::is_regular_file(path)) {
+-                                        patchelfPath = path.string();
+-                                        break;
+-                                    }
+-                                }
+-                            }
+-                        }
+-
+-                        if (!fs::is_regular_file(patchelfPath)) {
+-                            ldLog() << LD_ERROR << "Could not find patchelf: no such file:" << patchelfPath << std::endl;
+-                            throw std::runtime_error("Could not find patchelf");
+-                        }
+-
+-                        ldLog() << LD_DEBUG << "Using patchelf:" << patchelfPath << std::endl;
+-                        return patchelfPath;
+-                    }
+-
+                 private:
+                     template<typename Ehdr_T, typename Shdr_T, typename Phdr_T>
+                     void parseElfHeader(std::shared_ptr<uint8_t> data) {
+@@ -261,55 +220,22 @@ namespace linuxdeploy {
+             }
+ 
+             std::string ElfFile::getRPath() {
+-                // don't try to fetch patchelf path in a catchall to make sure the process exists when the tool cannot be found
+-                const auto patchelfPath = PrivateData::getPatchelfPath();
+-
+                 try {
+-                    subprocess::subprocess patchelfProc({patchelfPath, "--print-rpath", d->path.string()});
+-
+-                    const auto result = patchelfProc.run();
+-
+-                    if (result.exit_code() != 0) {
+-                        // if file is not an ELF executable, there is no need for a detailed error message
+-                        if (result.exit_code() == 1 && result.stderr_string().find("not an ELF executable") != std::string::npos) {
+-                            return "";
+-                        } else {
+-                            ldLog() << LD_ERROR << "Call to patchelf failed:" << std::endl << result.stderr_string();
+-                            return "";
+-                        }
+-                    }
+-
+-                    auto stdoutContents = result.stdout_string();
+-
+-                    util::trim(stdoutContents, '\n');
+-                    util::trim(stdoutContents);
+-
+-                    return stdoutContents;
+-                } catch (const std::exception&) {
++                    return readRPath(d->path);
++                } catch (const std::exception& e) {
++                    ldLog() << LD_ERROR << "Could not read rpath of" << d->path << LD_NO_SPACE << ":" << e.what() << std::endl;
+                     return "";
+                 }
+             }
+ 
+             bool ElfFile::setRPath(const std::string& value) {
+-                // don't try to fetch patchelf path in a catchall to make sure the process exists when the tool cannot be found
+-                const auto patchelfPath = PrivateData::getPatchelfPath();
+-
+-                // calling (older versions of) patchelf on symlinks can lead to weird behavior, e.g., patchelf copying the
+-                // original file and patching the copy instead of patching the symlink target
++                // the file a symlink points to is changed, instead of replacing the symlink with a changed copy
+                 const auto canonicalPath = fs::canonical(d->path);
+ 
+-                ldLog() << LD_DEBUG << "Calling patchelf on canonical path" << canonicalPath << "instead of original path" << d->path << std::endl;
+-
+                 try {
+-                    subprocess::subprocess patchelfProc({patchelfPath.c_str(), "--set-rpath", value.c_str(), canonicalPath.c_str()});
+-
+-                    const auto result = patchelfProc.run();
+-
+-                    if (result.exit_code() != 0) {
+-                        ldLog() << LD_ERROR << "Call to patchelf failed:" << std::endl << result.stderr_string() << std::endl;
+-                        return false;
+-                    }
+-                } catch (const std::exception&) {
++                    writeRPath(canonicalPath, value);
++                } catch (const std::exception& e) {
++                    ldLog() << LD_ERROR << "Could not set rpath of" << canonicalPath << LD_NO_SPACE << ":" << e.what() << std::endl;
+                     return false;
+                 }
+ 
+diff --git a/src/core/elf_rpath.cpp b/src/core/elf_rpath.cpp
+new file mode 100644
+index 0000000..bf477b2
+--- /dev/null
++++ b/src/core/elf_rpath.cpp
+@@ -0,0 +1,1237 @@
++// system headers
++#include <algorithm>
++#include <cerrno>
++#include <cstring>
++#include <elf.h>
++#include <fstream>
++#include <iterator>
++#include <limits>
++#include <optional>
++#include <stdexcept>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <vector>
++
++#ifdef __FreeBSD__
++#include <sys/extattr.h>
++#else
++#include <sys/xattr.h>
++#endif
++
++// local headers
++#include "elf_rpath.h"
++
++namespace fs = std::filesystem;
++
++namespace linuxdeploy {
++    namespace core {
++        namespace elf_file {
++            namespace {
++                // not every elf.h knows the RELR relocation format and the GNU property segment yet
++                constexpr uint32_t SECTION_TYPE_RELR = 19;
++                constexpr int64_t TAG_RELRSZ = 35;
++                constexpr int64_t TAG_RELR = 36;
++                constexpr uint32_t SEGMENT_TYPE_GNU_PROPERTY = 0x6474e553;
++
++                // zero-filled memory at the end of the last segment is written to the file to make room behind it only
++                // up to this size, so that a file reserving a lot of memory never grows by that much
++                constexpr uint64_t ZERO_FILLED_MEMORY_LIMIT = 32 * 1024;
++
++                template<typename Ehdr_T, typename Phdr_T, typename Shdr_T, typename Dyn_T, typename Sym_T>
++                struct ElfTypes {
++                    using Ehdr = Ehdr_T;
++                    using Phdr = Phdr_T;
++                    using Shdr = Shdr_T;
++                    using Dyn = Dyn_T;
++                    using Sym = Sym_T;
++                    using Addr = decltype(Ehdr_T{}.e_entry);
++                };
++
++                using Elf32Types = ElfTypes<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Dyn, Elf32_Sym>;
++                using Elf64Types = ElfTypes<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Dyn, Elf64_Sym>;
++
++                std::vector<char> readFile(const fs::path& path) {
++                    std::ifstream ifs(path, std::ios::binary);
++
++                    if (!ifs)
++                        throw std::runtime_error("Could not open file " + path.string());
++
++                    std::vector<char> data{std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>()};
++
++                    if (ifs.bad())
++                        throw std::runtime_error("Could not read file " + path.string());
++
++                    return data;
++                }
++
++#ifdef __FreeBSD__
++                // FreeBSD keeps extended attributes in separate namespaces and lists each name with its length in front
++                // of it
++                struct Attributes {
++                    static std::vector<int> namespaces() {
++                        return {EXTATTR_NAMESPACE_USER, EXTATTR_NAMESPACE_SYSTEM};
++                    }
++
++                    // like on Linux, a namespace the caller may not read has no attributes it could copy
++                    static ssize_t list(const char* path, int space, char* buffer, size_t size) {
++                        const auto length = extattr_list_file(path, space, buffer, size);
++                        return length < 0 && errno == EPERM && space == EXTATTR_NAMESPACE_SYSTEM ? 0 : length;
++                    }
++
++                    static ssize_t list(int fd, int space, char* buffer, size_t size) {
++                        const auto length = extattr_list_fd(fd, space, buffer, size);
++                        return length < 0 && errno == EPERM && space == EXTATTR_NAMESPACE_SYSTEM ? 0 : length;
++                    }
++
++                    static ssize_t get(const char* path, int space, const char* name, char* buffer, size_t size) {
++                        return extattr_get_file(path, space, name, buffer, size);
++                    }
++
++                    static bool set(int fd, int space, const char* name, const char* value, size_t size) {
++                        return extattr_set_fd(fd, space, name, value, size) == static_cast<ssize_t>(size);
++                    }
++
++                    static bool remove(int fd, int space, const char* name) {
++                        return extattr_delete_fd(fd, space, name) == 0;
++                    }
++
++                    static std::vector<std::string> names(const std::vector<char>& list) {
++                        std::vector<std::string> result;
++
++                        for (size_t position = 0; position < list.size(); position += result.back().size() + 1)
++                            result.emplace_back(list.data() + position + 1, std::min<size_t>(static_cast<unsigned char>(list[position]), list.size() - position - 1));
++
++                        return result;
++                    }
++                };
++#else
++                // Linux puts the namespace of an extended attribute into its name and lists the names separated by NUL
++                // characters, leaving out those the caller may not read
++                struct Attributes {
++                    static std::vector<int> namespaces() {
++                        return {0};
++                    }
++
++                    static ssize_t list(const char* path, int, char* buffer, size_t size) {
++                        return listxattr(path, buffer, size);
++                    }
++
++                    static ssize_t list(int fd, int, char* buffer, size_t size) {
++                        return flistxattr(fd, buffer, size);
++                    }
++
++                    static ssize_t get(const char* path, int, const char* name, char* buffer, size_t size) {
++                        return getxattr(path, name, buffer, size);
++                    }
++
++                    static bool set(int fd, int, const char* name, const char* value, size_t size) {
++                        return fsetxattr(fd, name, value, size, 0) == 0;
++                    }
++
++                    static bool remove(int fd, int, const char* name) {
++                        return fremovexattr(fd, name) == 0;
++                    }
++
++                    static std::vector<std::string> names(const std::vector<char>& list) {
++                        std::vector<std::string> result;
++
++                        for (size_t position = 0; position < list.size(); position += result.back().size() + 1)
++                            result.emplace_back(list.data() + position, strnlen(list.data() + position, list.size() - position));
++
++                        return result;
++                    }
++                };
++#endif
++
++                // the names of a file's extended attributes in a namespace, none where its file system has no such
++                // attributes
++                template<typename File>
++                std::vector<std::string> attributeNames(File file, int space, const fs::path& path) {
++                    const auto size = Attributes::list(file, space, nullptr, 0);
++
++                    if (size < 0) {
++                        if (errno == ENOTSUP)
++                            return {};
++
++                        throw std::runtime_error("Could not list the extended attributes of " + path.string());
++                    }
++
++                    std::vector<char> buffer(static_cast<size_t>(size));
++                    const auto length = Attributes::list(file, space, buffer.data(), buffer.size());
++
++                    if (length < 0)
++                        throw std::runtime_error("Could not list the extended attributes of " + path.string());
++
++                    buffer.resize(static_cast<size_t>(length));
++                    return Attributes::names(buffer);
++                }
++
++                // ACLs, file capabilities and security labels are extended attributes, and they decide how the file may
++                // run, so the new file gets exactly the attributes the original has
++                void copyAttributes(const fs::path& path, int fd) {
++                    for (const auto space : Attributes::namespaces()) {
++                        const auto names = attributeNames(path.c_str(), space, path);
++
++                        for (const auto& name : names) {
++                            const auto size = Attributes::get(path.c_str(), space, name.c_str(), nullptr, 0);
++                            std::vector<char> value(size > 0 ? static_cast<size_t>(size) : 0);
++
++                            if (size < 0 || Attributes::get(path.c_str(), space, name.c_str(), value.data(), value.size()) != size ||
++                                !Attributes::set(fd, space, name.c_str(), value.data(), value.size()))
++                                throw std::runtime_error("Could not copy the extended attribute " + name + " of " + path.string());
++                        }
++
++                        // the new file may have inherited attributes the original does not have, such as a default ACL
++                        for (const auto& name : attributeNames(fd, space, path)) {
++                            if (std::find(names.begin(), names.end(), name) == names.end() && !Attributes::remove(fd, space, name.c_str()))
++                                throw std::runtime_error("Could not remove the extended attribute " + name + " from the new copy of " + path.string());
++                        }
++                    }
++                }
++
++                void writeFile(const fs::path& path, const std::vector<char>& data) {
++                    // the new contents go to a temporary file next to the original, which replaces it only once it is
++                    // complete, so a failed write leaves the original as it was
++                    struct stat original{};
++                    if (stat(path.c_str(), &original) != 0)
++                        throw std::runtime_error("Could not read the attributes of " + path.string());
++
++                    auto temporaryPath = (path.parent_path() / ("." + path.filename().string() + ".XXXXXX")).string();
++                    const int fd = mkstemp(temporaryPath.data());
++
++                    if (fd < 0)
++                        throw std::runtime_error("Could not create a temporary file next to " + path.string());
++
++                    try {
++                        size_t written = 0;
++
++                        while (written < data.size()) {
++                            const auto count = write(fd, data.data() + written, data.size() - written);
++
++                            if (count < 0 && errno == EINTR)
++                                continue;
++
++                            if (count <= 0)
++                                throw std::runtime_error("Could not write " + temporaryPath);
++
++                            written += static_cast<size_t>(count);
++                        }
++
++                        // the owner comes first, as changing it clears the setuid and setgid bits and file capabilities;
++                        // without the privileges to keep the original's owner and group, the original stays as it is
++                        if (fchown(fd, original.st_uid, original.st_gid) != 0)
++                            throw std::runtime_error("Could not give the new copy of " + path.string() + " the owner and group of the original");
++
++                        if (fchmod(fd, original.st_mode & 07777) != 0)
++                            throw std::runtime_error("Could not set the permissions of " + temporaryPath);
++
++                        copyAttributes(path, fd);
++
++                        if (fsync(fd) != 0)
++                            throw std::runtime_error("Could not write " + temporaryPath);
++                    } catch (...) {
++                        close(fd);
++                        unlink(temporaryPath.c_str());
++                        throw;
++                    }
++
++                    if (close(fd) != 0 || rename(temporaryPath.c_str(), path.c_str()) != 0) {
++                        unlink(temporaryPath.c_str());
++                        throw std::runtime_error("Could not replace " + path.string());
++                    }
++                }
++
++                template<typename T>
++                T load(const std::vector<char>& data, uint64_t offset) {
++                    if (offset > data.size() || data.size() - offset < sizeof(T))
++                        throw std::runtime_error("ELF file is truncated");
++
++                    T value;
++                    memcpy(&value, data.data() + offset, sizeof(T));
++                    return value;
++                }
++
++                template<typename T>
++                void store(std::vector<char>& data, uint64_t offset, const T& value) {
++                    if (offset > data.size() || data.size() - offset < sizeof(T))
++                        throw std::runtime_error("ELF file is truncated");
++
++                    memcpy(data.data() + offset, &value, sizeof(T));
++                }
++
++                uint64_t alignUp(uint64_t value, uint64_t alignment) {
++                    if (alignment <= 1)
++                        return value;
++
++                    return (value + alignment - 1) / alignment * alignment;
++                }
++
++                uint64_t alignDown(uint64_t value, uint64_t alignment) {
++                    if (alignment <= 1)
++                        return value;
++
++                    return value / alignment * alignment;
++                }
++
++                // ELF32 fields are narrower than the values computed here
++                template<typename Field>
++                void assign(Field& field, uint64_t value) {
++                    if (value > std::numeric_limits<Field>::max())
++                        throw std::runtime_error("ELF file would grow beyond what its ELF class can address");
++
++                    field = static_cast<Field>(value);
++                }
++
++                // tags whose values are addresses of the tables that may be moved out of the way of the program headers
++                bool isTableAddressTag(int64_t tag) {
++                    switch (tag) {
++                        case DT_HASH:
++                        case DT_GNU_HASH:
++                        case DT_STRTAB:
++                        case DT_SYMTAB:
++                        case DT_RELA:
++                        case DT_REL:
++                        case DT_JMPREL:
++                        case TAG_RELR:
++                        case DT_VERSYM:
++                        case DT_VERDEF:
++                        case DT_VERNEED:
++                            return true;
++                        default:
++                            return false;
++                    }
++                }
++
++                // data added behind the end of the file, which is mapped at a new address
++                struct Area {
++                    uint64_t offset = 0;
++                    uint64_t address = 0;
++                    std::vector<char> contents;
++
++                    // returns the position of the reserved space within the area
++                    uint64_t reserve(uint64_t size, uint64_t alignment) {
++                        const auto position = alignUp(contents.size(), alignment);
++                        contents.resize(position + size);
++                        return position;
++                    }
++
++                    void put(uint64_t position, const char* source, size_t size) {
++                        memcpy(contents.data() + position, source, size);
++                    }
++                };
++
++                // a part of the file that something points at: a section, or a table found through a program header
++                // or a dynamic entry
++                struct Region {
++                    uint64_t offset = 0;
++                    uint64_t size = 0;
++                    uint64_t alignment = 1;
++                    bool movable = false;
++                    std::optional<size_t> section;
++                };
++
++                // a part of the file behind the program header table that is moved into the area
++                struct Block {
++                    uint64_t offset = 0;
++                    uint64_t address = 0;
++                    uint64_t size = 0;
++                    uint64_t alignment = 1;
++                    std::vector<size_t> sections;
++                };
++
++                template<typename Types>
++                class RPathEditor {
++                    private:
++                        using Ehdr = typename Types::Ehdr;
++                        using Phdr = typename Types::Phdr;
++                        using Shdr = typename Types::Shdr;
++                        using Dyn = typename Types::Dyn;
++                        using Sym = typename Types::Sym;
++                        using Addr = typename Types::Addr;
++
++                        std::vector<char>& data;
++                        Ehdr ehdr{};
++                        std::vector<Phdr> phdrs;
++                        std::vector<Shdr> shdrs;
++                        bool hasDynamicSegment = false;
++                        std::vector<Dyn> dynamic;
++
++                    public:
++                        explicit RPathEditor(std::vector<char>& contents) : data(contents) {
++                            ehdr = load<Ehdr>(data, 0);
++
++                            if (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN)
++                                throw std::runtime_error("ELF file is neither an executable nor a shared library");
++
++                            if (ehdr.e_phnum == 0 || ehdr.e_phentsize != sizeof(Phdr))
++                                throw std::runtime_error("ELF file has no usable program header table");
++
++                            for (uint64_t i = 0; i < ehdr.e_phnum; ++i)
++                                phdrs.push_back(load<Phdr>(data, ehdr.e_phoff + i * sizeof(Phdr)));
++
++                            if (ehdr.e_shoff != 0) {
++                                if (ehdr.e_shentsize != sizeof(Shdr))
++                                    throw std::runtime_error("ELF file has an unusable section header table");
++
++                                // with too many sections for e_shnum, the first section header holds the count
++                                uint64_t count = ehdr.e_shnum;
++                                if (count == 0)
++                                    count = load<Shdr>(data, ehdr.e_shoff).sh_size;
++
++                                for (uint64_t i = 0; i < count; ++i)
++                                    shdrs.push_back(load<Shdr>(data, ehdr.e_shoff + i * sizeof(Shdr)));
++                            }
++
++                            const auto segment = std::find_if(phdrs.begin(), phdrs.end(), [](const Phdr& phdr) {
++                                return phdr.p_type == PT_DYNAMIC;
++                            });
++
++                            if (segment == phdrs.end())
++                                return;
++
++                            hasDynamicSegment = true;
++
++                            for (uint64_t position = 0; position + sizeof(Dyn) <= segment->p_filesz; position += sizeof(Dyn)) {
++                                const auto entry = load<Dyn>(data, segment->p_offset + position);
++
++                                if (entry.d_tag == DT_NULL)
++                                    break;
++
++                                dynamic.push_back(entry);
++                            }
++                        }
++
++                    private:
++                        bool isDynamic() const {
++                            return hasDynamicSegment;
++                        }
++
++                        std::optional<uint64_t> dynamicValue(int64_t tag) const {
++                            for (const auto& entry : dynamic) {
++                                if (entry.d_tag == tag)
++                                    return entry.d_un.d_val;
++                            }
++
++                            return std::nullopt;
++                        }
++
++                        bool isRPathEntry(const Dyn& entry) const {
++                            return entry.d_tag == DT_RPATH || entry.d_tag == DT_RUNPATH;
++                        }
++
++                        // file offset of size bytes at the given address, which must be backed by a loadable segment
++                        uint64_t offsetOf(uint64_t address, uint64_t size) const {
++                            for (const auto& phdr : phdrs) {
++                                if (phdr.p_type != PT_LOAD || address < phdr.p_vaddr)
++                                    continue;
++
++                                const auto position = address - phdr.p_vaddr;
++
++                                if (position <= phdr.p_filesz && size <= phdr.p_filesz - position)
++                                    return phdr.p_offset + position;
++                            }
++
++                            throw std::runtime_error("ELF file does not contain the data at address " + std::to_string(address));
++                        }
++
++                        std::vector<char> stringTable() const {
++                            const auto address = dynamicValue(DT_STRTAB);
++                            const auto size = dynamicValue(DT_STRSZ);
++
++                            if (!address.has_value() || !size.has_value())
++                                throw std::runtime_error("ELF file has no dynamic string table");
++
++                            const auto offset = offsetOf(address.value(), size.value());
++
++                            if (offset > data.size() || data.size() - offset < size.value())
++                                throw std::runtime_error("ELF file is truncated");
++
++                            return {data.begin() + static_cast<std::ptrdiff_t>(offset), data.begin() + static_cast<std::ptrdiff_t>(offset + size.value())};
++                        }
++
++                        // the string at the given offset of the dynamic string table, read where it is
++                        std::string dynamicString(uint64_t offset) const {
++                            const auto address = dynamicValue(DT_STRTAB);
++                            const auto size = dynamicValue(DT_STRSZ);
++
++                            if (!address.has_value() || !size.has_value())
++                                throw std::runtime_error("ELF file has no dynamic string table");
++
++                            const auto tableOffset = offsetOf(address.value(), size.value());
++
++                            if (offset >= size.value() || tableOffset > data.size() || data.size() - tableOffset < size.value())
++                                throw std::runtime_error("ELF file refers to a string outside its string table");
++
++                            const auto begin = data.data() + tableOffset + offset;
++                            return {begin, strnlen(begin, size.value() - offset)};
++                        }
++
++                        static std::string stringAt(const std::vector<char>& strings, uint64_t offset) {
++                            if (offset >= strings.size())
++                                throw std::runtime_error("ELF file refers to a string outside its string table");
++
++                            const auto begin = strings.data() + offset;
++                            return {begin, strnlen(begin, strings.size() - offset)};
++                        }
++
++                        size_t lastLoadSegment() const {
++                            std::optional<size_t> last;
++
++                            for (size_t i = 0; i < phdrs.size(); ++i) {
++                                if (phdrs[i].p_type == PT_LOAD && (!last.has_value() || phdrs[i].p_vaddr > phdrs[last.value()].p_vaddr))
++                                    last = i;
++                            }
++
++                            if (!last.has_value())
++                                throw std::runtime_error("ELF file has no loadable segment");
++
++                            return last.value();
++                        }
++
++                        uint64_t imageEnd() const {
++                            uint64_t end = 0;
++
++                            for (const auto& phdr : phdrs) {
++                                if (phdr.p_type == PT_LOAD)
++                                    end = std::max<uint64_t>(end, phdr.p_vaddr + phdr.p_memsz);
++                            }
++
++                            return end;
++                        }
++
++                        uint64_t largestAlignment() const {
++                            uint64_t alignment = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
++
++                            for (const auto& phdr : phdrs) {
++                                if (phdr.p_type == PT_LOAD)
++                                    alignment = std::max<uint64_t>(alignment, phdr.p_align);
++                            }
++
++                            return alignment;
++                        }
++
++                        Phdr& dynamicHeader() {
++                            return *std::find_if(phdrs.begin(), phdrs.end(), [](const Phdr& phdr) {
++                                return phdr.p_type == PT_DYNAMIC;
++                            });
++                        }
++
++                        // where the last segment can grow in the file: it must be writable, with no more zero-filled memory
++                        // than given, which then is written to the file, and with nothing loaded behind it, which is what
++                        // the segment added by an earlier call looks like, also after strip; sections that are not loaded
++                        // and the section header table may follow it, as they can move further back, but only section
++                        // headers tell where they are
++                        std::optional<uint64_t> growthPoint(uint64_t zeroFilled = 0) const {
++                            const auto& last = phdrs[lastLoadSegment()];
++                            const auto end = last.p_offset + last.p_filesz;
++
++                            if ((last.p_flags & PF_W) == 0 || last.p_memsz < last.p_filesz || last.p_memsz - last.p_filesz > zeroFilled ||
++                                ehdr.e_phoff + phdrs.size() * sizeof(Phdr) > end)
++                                return std::nullopt;
++
++                            for (const auto& phdr : phdrs) {
++                                if (phdr.p_filesz > 0 && phdr.p_offset + phdr.p_filesz > end)
++                                    return std::nullopt;
++                            }
++
++                            if (end == data.size())
++                                return end;
++
++                            if (shdrs.empty() || end > data.size() || (ehdr.e_shoff < end && ehdr.e_shoff + shdrs.size() * sizeof(Shdr) > end))
++                                return std::nullopt;
++
++                            for (const auto& shdr : shdrs) {
++                                if (shdr.sh_type == SHT_NOBITS || shdr.sh_size == 0 || shdr.sh_offset + shdr.sh_size <= end)
++                                    continue;
++
++                                if ((shdr.sh_flags & SHF_ALLOC) != 0 || shdr.sh_offset < end)
++                                    return std::nullopt;
++                            }
++
++                            return end;
++                        }
++
++                        // inserts size bytes at the given offset, moving the sections behind it and the section header
++                        // table further back by as much as keeps them aligned
++                        void makeRoom(uint64_t offset, uint64_t size) {
++                            uint64_t alignment = 16;
++
++                            for (const auto& shdr : shdrs) {
++                                if ((shdr.sh_flags & SHF_ALLOC) == 0 && shdr.sh_offset >= offset)
++                                    alignment = std::max<uint64_t>(alignment, shdr.sh_addralign);
++                            }
++
++                            const auto shift = alignUp(size, alignment);
++                            data.insert(data.begin() + static_cast<std::ptrdiff_t>(offset), shift, '\0');
++
++                            if (ehdr.e_shoff >= offset)
++                                assign(ehdr.e_shoff, ehdr.e_shoff + shift);
++
++                            for (auto& shdr : shdrs) {
++                                if (shdr.sh_type != SHT_NULL && (shdr.sh_flags & SHF_ALLOC) == 0 && shdr.sh_offset >= offset)
++                                    assign(shdr.sh_offset, shdr.sh_offset + shift);
++                            }
++                        }
++
++                        // a segment without zero-filled memory can grow into the padding behind it: bytes nothing uses in the
++                        // file, and memory no page of another segment covers
++                        std::optional<size_t> segmentWithRoom(uint64_t size, bool writable) const {
++                            const auto pageSize = largestAlignment();
++
++                            for (size_t i = 0; i < phdrs.size(); ++i) {
++                                const auto& segment = phdrs[i];
++
++                                if (segment.p_type != PT_LOAD || segment.p_filesz != segment.p_memsz || (segment.p_flags & PF_X) != 0 ||
++                                    (writable && (segment.p_flags & PF_W) == 0))
++                                    continue;
++
++                                const auto start = segment.p_offset + segment.p_filesz;
++                                const auto end = alignUp(start, 16) + size;
++                                const auto memoryEnd = segment.p_vaddr + (end - segment.p_offset);
++
++                                if (end > data.size())
++                                    continue;
++
++                                const auto first = data.begin() + static_cast<std::ptrdiff_t>(start);
++                                if (std::any_of(first, first + static_cast<std::ptrdiff_t>(end - start), [](char byte) { return byte != 0; }))
++                                    continue;
++
++                                const auto overlaps = [start, end](uint64_t offset, uint64_t length) {
++                                    return length > 0 && offset < end && offset + length > start;
++                                };
++
++                                bool used = overlaps(0, sizeof(Ehdr)) || overlaps(ehdr.e_phoff, phdrs.size() * sizeof(Phdr)) ||
++                                            overlaps(ehdr.e_shoff, shdrs.size() * sizeof(Shdr));
++
++                                for (const auto& phdr : phdrs)
++                                    used = used || overlaps(phdr.p_offset, phdr.p_filesz);
++
++                                for (const auto& shdr : shdrs)
++                                    used = used || (shdr.sh_type != SHT_NOBITS && overlaps(shdr.sh_offset, shdr.sh_size));
++
++                                for (const auto& other : phdrs) {
++                                    used = used || (&other != &segment && other.p_type == PT_LOAD && other.p_vaddr >= segment.p_vaddr &&
++                                                    alignUp(memoryEnd, pageSize) > alignDown(other.p_vaddr, pageSize));
++                                }
++
++                                if (!used)
++                                    return i;
++                            }
++
++                            return std::nullopt;
++                        }
++
++                        // only parts the dynamic loader finds through program headers or dynamic entries can move
++                        bool isMovable(const Shdr& shdr) const {
++                            switch (shdr.sh_type) {
++                                case SHT_NOTE:
++                                case SHT_HASH:
++                                case SHT_GNU_HASH:
++                                case SHT_DYNSYM:
++                                case SHT_GNU_versym:
++                                case SHT_GNU_verdef:
++                                case SHT_GNU_verneed:
++                                    return true;
++                                case SHT_STRTAB:
++                                    return dynamicValue(DT_STRTAB) == shdr.sh_addr;
++                                case SHT_REL:
++                                case SHT_RELA:
++                                case SECTION_TYPE_RELR:
++                                    return std::any_of(dynamic.begin(), dynamic.end(), [&shdr](const Dyn& entry) {
++                                        return (entry.d_tag == DT_REL || entry.d_tag == DT_RELA || entry.d_tag == DT_JMPREL ||
++                                                entry.d_tag == TAG_RELR) && entry.d_un.d_ptr == shdr.sh_addr;
++                                    });
++                                case SHT_PROGBITS:
++                                    return std::any_of(phdrs.begin(), phdrs.end(), [&shdr](const Phdr& phdr) {
++                                        return phdr.p_type == PT_INTERP && phdr.p_offset == shdr.sh_offset;
++                                    });
++                                default:
++                                    return false;
++                            }
++                        }
++
++                        template<typename T>
++                        T loadAt(uint64_t address) const {
++                            return load<T>(data, offsetOf(address, sizeof(T)));
++                        }
++
++                        // the number of entries of the dynamic symbol table, which only the hash tables tell
++                        std::optional<uint64_t> symbolCount() const {
++                            const auto hash = dynamicValue(DT_HASH);
++                            if (hash.has_value())
++                                return loadAt<uint32_t>(hash.value() + 4);
++
++                            const auto gnuHash = dynamicValue(DT_GNU_HASH);
++                            if (gnuHash.has_value())
++                                return gnuHashSymbols(gnuHash.value());
++
++                            return std::nullopt;
++                        }
++
++                        // symbols up to the last one of the longest chain the GNU hash table has, the last entry of a
++                        // chain has its lowest bit set
++                        uint64_t gnuHashSymbols(uint64_t address) const {
++                            const auto buckets = loadAt<uint32_t>(address);
++                            const auto symbolOffset = loadAt<uint32_t>(address + 4);
++                            const auto bloomSize = loadAt<uint32_t>(address + 8);
++                            const auto bucketsAddress = address + 16 + uint64_t{bloomSize} * sizeof(Addr);
++                            const auto chainsAddress = bucketsAddress + uint64_t{buckets} * 4;
++
++                            uint64_t symbols = symbolOffset;
++
++                            for (uint64_t i = 0; i < buckets; ++i) {
++                                uint64_t symbol = loadAt<uint32_t>(bucketsAddress + i * 4);
++
++                                if (symbol < symbolOffset)
++                                    continue;
++
++                                while ((loadAt<uint32_t>(chainsAddress + (symbol - symbolOffset) * 4) & 1) == 0)
++                                    ++symbol;
++
++                                symbols = std::max<uint64_t>(symbols, symbol + 1);
++                            }
++
++                            return symbols;
++                        }
++
++                        uint64_t gnuHashSize(uint64_t address) const {
++                            const auto buckets = loadAt<uint32_t>(address);
++                            const auto symbolOffset = loadAt<uint32_t>(address + 4);
++                            const auto bloomSize = loadAt<uint32_t>(address + 8);
++
++                            return 16 + uint64_t{bloomSize} * sizeof(Addr) + uint64_t{buckets} * 4 +
++                                   (gnuHashSymbols(address) - symbolOffset) * 4;
++                        }
++
++                        // where an entry of a version table finds its names and the next entry
++                        struct VersionLinks {
++                            uint64_t names;
++                            uint64_t count;
++                            uint64_t next;
++                        };
++
++                        // version needs and definitions are chained lists of entries with chained lists of names
++                        template<typename Entry, typename Name, typename EntryLinks, typename NameNext>
++                        std::optional<uint64_t> versionTableSize(int64_t tag, int64_t countTag, EntryLinks entryLinks, NameNext nameNext) const {
++                            const auto address = dynamicValue(tag);
++                            const auto count = dynamicValue(countTag);
++
++                            if (!address.has_value() || !count.has_value())
++                                return std::nullopt;
++
++                            uint64_t end = 0;
++                            uint64_t position = 0;
++
++                            for (uint64_t i = 0; i < count.value(); ++i) {
++                                const auto entry = loadAt<Entry>(address.value() + position);
++                                const VersionLinks links = entryLinks(entry);
++                                end = std::max<uint64_t>(end, position + sizeof(Entry));
++
++                                uint64_t namePosition = position + links.names;
++
++                                for (uint64_t j = 0; j < links.count; ++j) {
++                                    const auto name = loadAt<Name>(address.value() + namePosition);
++                                    end = std::max<uint64_t>(end, namePosition + sizeof(Name));
++                                    namePosition += nameNext(name);
++                                }
++
++                                if (links.next == 0)
++                                    break;
++
++                                position += links.next;
++                            }
++
++                            return end;
++                        }
++
++                        // the parts of the file the program header table could grow into: the sections, or without
++                        // section headers whatever program headers and dynamic entries point at
++                        std::vector<Region> regions() const {
++                            std::vector<Region> result;
++
++                            if (!shdrs.empty()) {
++                                for (size_t i = 1; i < shdrs.size(); ++i) {
++                                    const auto& shdr = shdrs[i];
++
++                                    if (shdr.sh_type == SHT_NOBITS || shdr.sh_size == 0)
++                                        continue;
++
++                                    result.push_back({shdr.sh_offset, shdr.sh_size, std::max<uint64_t>(shdr.sh_addralign, 1),
++                                                      (shdr.sh_flags & SHF_ALLOC) != 0 && isMovable(shdr), i});
++                                }
++
++                                return result;
++                            }
++
++                            for (const auto& phdr : phdrs) {
++                                if ((phdr.p_type == PT_INTERP || phdr.p_type == PT_NOTE || phdr.p_type == SEGMENT_TYPE_GNU_PROPERTY) && phdr.p_filesz > 0)
++                                    result.push_back({phdr.p_offset, phdr.p_filesz, std::max<uint64_t>(phdr.p_align, 1), true, std::nullopt});
++                            }
++
++                            const auto add = [&](std::optional<uint64_t> address, std::optional<uint64_t> size, uint64_t alignment) {
++                                if (address.has_value() && size.has_value() && size.value() > 0)
++                                    result.push_back({offsetOf(address.value(), size.value()), size.value(), alignment, true, std::nullopt});
++                            };
++
++                            const auto symbols = symbolCount();
++                            const auto symbolsTimes = [&symbols](uint64_t size) -> std::optional<uint64_t> {
++                                if (!symbols.has_value())
++                                    return std::nullopt;
++
++                                return symbols.value() * size;
++                            };
++
++                            const auto hash = dynamicValue(DT_HASH);
++                            const auto gnuHash = dynamicValue(DT_GNU_HASH);
++
++                            add(dynamicValue(DT_STRTAB), dynamicValue(DT_STRSZ), 1);
++                            add(dynamicValue(DT_SYMTAB), symbolsTimes(dynamicValue(DT_SYMENT).value_or(sizeof(Sym))), sizeof(Addr));
++                            add(dynamicValue(DT_VERSYM), symbolsTimes(2), 2);
++
++                            if (hash.has_value())
++                                add(hash, (2 + uint64_t{loadAt<uint32_t>(hash.value())} + loadAt<uint32_t>(hash.value() + 4)) * 4, 4);
++
++                            if (gnuHash.has_value())
++                                add(gnuHash, gnuHashSize(gnuHash.value()), sizeof(Addr));
++
++                            // the version structures have the same layout in both ELF classes
++                            add(dynamicValue(DT_VERNEED), versionTableSize<Elf64_Verneed, Elf64_Vernaux>(DT_VERNEED, DT_VERNEEDNUM,
++                                [](const Elf64_Verneed& need) {
++                                    return VersionLinks{need.vn_aux, need.vn_cnt, need.vn_next};
++                                },
++                                [](const Elf64_Vernaux& name) {
++                                    return uint64_t{name.vna_next};
++                                }), 4);
++                            add(dynamicValue(DT_VERDEF), versionTableSize<Elf64_Verdef, Elf64_Verdaux>(DT_VERDEF, DT_VERDEFNUM,
++                                [](const Elf64_Verdef& definition) {
++                                    return VersionLinks{definition.vd_aux, definition.vd_cnt, definition.vd_next};
++                                },
++                                [](const Elf64_Verdaux& name) {
++                                    return uint64_t{name.vda_next};
++                                }), 4);
++                            add(dynamicValue(DT_RELA), dynamicValue(DT_RELASZ), sizeof(Addr));
++                            add(dynamicValue(DT_REL), dynamicValue(DT_RELSZ), sizeof(Addr));
++                            add(dynamicValue(DT_JMPREL), dynamicValue(DT_PLTRELSZ), sizeof(Addr));
++                            add(dynamicValue(TAG_RELR), dynamicValue(TAG_RELRSZ), sizeof(Addr));
++
++                            return result;
++                        }
++
++                        // strip and objcopy only cope with a program header table at the start of the first segment,
++                        // so the table grows in place: whatever sits behind it moves into the area, as long as all of it
++                        // can be found again through program headers and dynamic entries
++                        std::optional<Block> blockBehindProgramHeaders() const {
++                            const auto tableEnd = ehdr.e_phoff + phdrs.size() * sizeof(Phdr);
++                            const auto grownTableEnd = tableEnd + sizeof(Phdr);
++
++                            const auto container = std::find_if(phdrs.begin(), phdrs.end(), [&](const Phdr& phdr) {
++                                return phdr.p_type == PT_LOAD && phdr.p_offset <= ehdr.e_phoff &&
++                                       grownTableEnd <= phdr.p_offset + phdr.p_filesz;
++                            });
++
++                            if (container == phdrs.end())
++                                return std::nullopt;
++
++                            std::vector<Region> parts;
++
++                            try {
++                                parts = regions();
++                            } catch (const std::runtime_error&) {
++                                return std::nullopt;
++                            }
++
++                            Block block;
++                            std::vector<bool> moved(parts.size(), false);
++                            auto begin = tableEnd;
++                            auto end = grownTableEnd;
++                            bool changed = true;
++
++                            while (changed) {
++                                changed = false;
++
++                                for (size_t i = 0; i < parts.size(); ++i) {
++                                    const auto& part = parts[i];
++
++                                    if (moved[i] || part.offset >= end || part.offset + part.size <= begin)
++                                        continue;
++
++                                    if (!part.movable)
++                                        return std::nullopt;
++
++                                    moved[i] = true;
++                                    block.alignment = std::max<uint64_t>(block.alignment, part.alignment);
++                                    begin = std::min<uint64_t>(begin, part.offset);
++                                    end = std::max<uint64_t>(end, part.offset + part.size);
++                                    changed = true;
++
++                                    if (part.section.has_value())
++                                        block.sections.push_back(part.section.value());
++                                }
++
++                                // notes sharing a segment move together
++                                for (const auto& phdr : phdrs) {
++                                    if (phdr.p_type != PT_NOTE && phdr.p_type != SEGMENT_TYPE_GNU_PROPERTY)
++                                        continue;
++
++                                    if (phdr.p_offset >= end || phdr.p_offset + phdr.p_filesz <= begin)
++                                        continue;
++
++                                    if (phdr.p_offset < begin || phdr.p_offset + phdr.p_filesz > end) {
++                                        begin = std::min<uint64_t>(begin, phdr.p_offset);
++                                        end = std::max<uint64_t>(end, phdr.p_offset + phdr.p_filesz);
++                                        block.alignment = std::max<uint64_t>(block.alignment, phdr.p_align);
++                                        changed = true;
++                                    }
++                                }
++                            }
++
++                            if (begin < tableEnd || end > container->p_offset + container->p_filesz)
++                                return std::nullopt;
++
++                            // without section headers, bytes no known part covers might still be used by something, so
++                            // the table only grows over them when they are padding
++                            if (shdrs.empty()) {
++                                for (auto offset = begin; offset < end; ++offset) {
++                                    const auto covered = std::any_of(parts.begin(), parts.end(), [&](const Region& part) {
++                                        return offset >= part.offset && offset < part.offset + part.size;
++                                    });
++
++                                    if (!covered && data[offset] != 0)
++                                        return std::nullopt;
++                                }
++                            }
++
++                            block.offset = begin;
++                            block.size = end - begin;
++                            block.address = container->p_vaddr + (begin - container->p_offset);
++                            return block;
++                        }
++
++                        // writes the dynamic array where its program header says it is, filling the rest of its space with
++                        // DT_NULL entries
++                        void writeDynamic(std::vector<Dyn> entries) {
++                            const auto& header = dynamicHeader();
++                            entries.resize(header.p_filesz / sizeof(Dyn));
++
++                            for (size_t i = 0; i < entries.size(); ++i)
++                                store(data, header.p_offset + i * sizeof(Dyn), entries[i]);
++                        }
++
++                        void writeProgramHeaders() {
++                            for (size_t i = 0; i < phdrs.size(); ++i)
++                                store(data, ehdr.e_phoff + i * sizeof(Phdr), phdrs[i]);
++                        }
++
++                        void writeSectionAndFileHeaders() {
++                            for (size_t i = 0; i < shdrs.size(); ++i)
++                                store(data, ehdr.e_shoff + i * sizeof(Shdr), shdrs[i]);
++
++                            store(data, 0, ehdr);
++                        }
++
++                        void insertLoadSegment(const Phdr& segment) {
++                            // loadable segments have to stay sorted by address, and the new one has the highest
++                            size_t position = 0;
++
++                            for (size_t i = 0; i < phdrs.size(); ++i) {
++                                if (phdrs[i].p_type == PT_LOAD)
++                                    position = i + 1;
++                            }
++
++                            phdrs.insert(phdrs.begin() + static_cast<std::ptrdiff_t>(position), segment);
++                        }
++
++                    public:
++                        std::string rpath() const {
++                            if (!isDynamic())
++                                return "";
++
++                            for (const auto tag : {DT_RUNPATH, DT_RPATH}) {
++                                const auto value = dynamicValue(tag);
++
++                                if (value.has_value())
++                                    return dynamicString(value.value());
++                            }
++
++                            return "";
++                        }
++
++                        // returns whether the file changed
++                        bool setRPath(const std::string& value) {
++                            if (!isDynamic())
++                                throw std::runtime_error("ELF file is not dynamically linked");
++
++                            if (value.find('\0') != std::string::npos)
++                                throw std::runtime_error("rpath must not contain a NUL character");
++
++                            auto strings = stringTable();
++                            const auto oldStringsAddress = dynamicValue(DT_STRTAB).value();
++                            const auto oldStringsOffset = offsetOf(oldStringsAddress, strings.size());
++
++                            const bool hasEntry = std::any_of(dynamic.begin(), dynamic.end(), [this](const Dyn& entry) {
++                                return isRPathEntry(entry);
++                            });
++
++                            const bool unchanged = std::all_of(dynamic.begin(), dynamic.end(), [&](const Dyn& entry) {
++                                return !isRPathEntry(entry) || stringAt(strings, entry.d_un.d_val) == value;
++                            });
++
++                            if (hasEntry && unchanged)
++                                return false;
++
++                            // the old value is never overwritten: the linker stores a name that ends another name only
++                            // once, so other names may share its bytes; instead, the value is added behind the end of
++                            // the string table, where every offset in use still finds the same string
++                            const auto valueOffset = strings.size();
++                            strings.insert(strings.end(), value.begin(), value.end());
++                            strings.push_back('\0');
++
++                            auto entries = dynamic;
++
++                            for (auto& entry : entries) {
++                                if (isRPathEntry(entry))
++                                    assign(entry.d_un.d_val, valueOffset);
++                                else if (entry.d_tag == DT_STRSZ)
++                                    assign(entry.d_un.d_val, strings.size());
++                            }
++
++                            if (!hasEntry) {
++                                Dyn entry{};
++                                entry.d_tag = DT_RUNPATH;
++                                assign(entry.d_un.d_val, valueOffset);
++                                entries.push_back(entry);
++                            }
++
++                            const bool dynamicFits = entries.size() + 1 <= dynamicHeader().p_filesz / sizeof(Dyn);
++
++                            // the dynamic string table's section header is found before any section moves
++                            std::optional<size_t> stringsSection;
++                            for (size_t i = 1; i < shdrs.size(); ++i) {
++                                if (shdrs[i].sh_type == SHT_STRTAB && (shdrs[i].sh_flags & SHF_ALLOC) != 0 && shdrs[i].sh_addr == oldStringsAddress)
++                                    stringsSection = i;
++                            }
++
++                            const auto last = lastLoadSegment();
++                            auto growth = growthPoint();
++
++                            Area area;
++                            std::optional<Block> block;
++                            std::optional<size_t> padded;
++                            uint64_t segmentAlignment = 0;
++
++                            // a string table that ends a segment that can grow is where an earlier call put it; the value
++                            // then simply follows it, so repeated calls only add the value itself
++                            if (dynamicFits && growth.has_value() && oldStringsOffset + valueOffset == growth.value() &&
++                                oldStringsOffset >= phdrs[last].p_offset) {
++                                area.offset = growth.value();
++                                area.address = phdrs[last].p_vaddr + (area.offset - phdrs[last].p_offset);
++                                area.put(area.reserve(value.size() + 1, 1), strings.data() + valueOffset, value.size() + 1);
++
++                                if (stringsSection.has_value())
++                                    assign(shdrs[stringsSection.value()].sh_size, strings.size());
++                            } else {
++                                // what goes into a segment that grows into its padding: the dynamic array when it does not
++                                // fit where it is, and the string table
++                                const auto dataSize = (dynamicFits ? 0 : (entries.size() + 1) * sizeof(Dyn)) + strings.size();
++
++                                if (growth.has_value()) {
++                                    area.offset = alignUp(growth.value(), 16);
++                                    area.address = phdrs[last].p_vaddr + (area.offset - phdrs[last].p_offset);
++                                } else if ((block = blockBehindProgramHeaders()).has_value()) {
++                                    segmentAlignment = largestAlignment();
++                                    area.offset = alignUp(data.size(), std::max<uint64_t>(16, block->alignment));
++                                    area.address = alignUp(imageEnd(), segmentAlignment) + area.offset % segmentAlignment;
++                                } else if ((padded = segmentWithRoom(dataSize, !dynamicFits)).has_value()) {
++                                    const auto& segment = phdrs[padded.value()];
++                                    area.offset = alignUp(segment.p_offset + segment.p_filesz, 16);
++                                    area.address = segment.p_vaddr + (area.offset - segment.p_offset);
++                                } else if ((growth = growthPoint(ZERO_FILLED_MEMORY_LIMIT)).has_value()) {
++                                    // the table cannot grow, but the last segment can once its little zero-filled memory is
++                                    // written to the file
++                                    area.offset = alignUp(phdrs[last].p_offset + phdrs[last].p_memsz, 16);
++                                    area.address = phdrs[last].p_vaddr + (area.offset - phdrs[last].p_offset);
++                                } else {
++                                    // strip and objcopy break a file whose program header table moved elsewhere, and kernels
++                                    // before 5.18 even fail to run such an executable
++                                    throw std::runtime_error("ELF file has no room for another program header");
++                                }
++
++                                std::optional<uint64_t> blockPosition;
++                                if (block.has_value() && block->size > 0)
++                                    blockPosition = area.reserve(block->size, block->alignment);
++
++                                std::optional<uint64_t> dynamicPosition;
++                                if (!dynamicFits)
++                                    dynamicPosition = area.reserve((entries.size() + 1) * sizeof(Dyn), alignof(Dyn));
++
++                                // the string table comes last, so that a later call can add its value right behind it
++                                const auto stringsPosition = area.reserve(strings.size(), 1);
++
++                                if (blockPosition.has_value()) {
++                                    const auto newOffset = area.offset + blockPosition.value();
++                                    const auto newAddress = area.address + blockPosition.value();
++
++                                    area.put(blockPosition.value(), data.data() + block->offset, block->size);
++
++                                    const auto inBlock = [&block](uint64_t address) {
++                                        return address >= block->address && address < block->address + block->size;
++                                    };
++
++                                    for (auto& entry : entries) {
++                                        if (isTableAddressTag(entry.d_tag) && inBlock(entry.d_un.d_ptr))
++                                            assign(entry.d_un.d_ptr, entry.d_un.d_ptr - block->address + newAddress);
++                                    }
++
++                                    for (auto& phdr : phdrs) {
++                                        if (phdr.p_type == PT_LOAD || phdr.p_type == PT_PHDR)
++                                            continue;
++
++                                        if (phdr.p_offset >= block->offset && phdr.p_offset + phdr.p_filesz <= block->offset + block->size && phdr.p_filesz > 0) {
++                                            assign(phdr.p_paddr, phdr.p_paddr - phdr.p_vaddr + newAddress + (phdr.p_offset - block->offset));
++                                            assign(phdr.p_vaddr, newAddress + (phdr.p_offset - block->offset));
++                                            assign(phdr.p_offset, newOffset + (phdr.p_offset - block->offset));
++                                        }
++                                    }
++
++                                    for (const auto index : block->sections) {
++                                        auto& shdr = shdrs[index];
++                                        assign(shdr.sh_addr, newAddress + (shdr.sh_offset - block->offset));
++                                        assign(shdr.sh_offset, newOffset + (shdr.sh_offset - block->offset));
++                                    }
++                                }
++
++                                for (auto& entry : entries) {
++                                    if (entry.d_tag == DT_STRTAB)
++                                        assign(entry.d_un.d_ptr, area.address + stringsPosition);
++                                }
++
++                                area.put(stringsPosition, strings.data(), strings.size());
++
++                                if (stringsSection.has_value()) {
++                                    auto& shdr = shdrs[stringsSection.value()];
++                                    assign(shdr.sh_offset, area.offset + stringsPosition);
++                                    assign(shdr.sh_addr, area.address + stringsPosition);
++                                    assign(shdr.sh_size, strings.size());
++                                }
++
++                                if (dynamicPosition.has_value()) {
++                                    auto& dynamicPhdr = dynamicHeader();
++                                    assign(dynamicPhdr.p_offset, area.offset + dynamicPosition.value());
++                                    assign(dynamicPhdr.p_vaddr, area.address + dynamicPosition.value());
++                                    assign(dynamicPhdr.p_paddr, dynamicPhdr.p_vaddr);
++                                    assign(dynamicPhdr.p_filesz, (entries.size() + 1) * sizeof(Dyn));
++                                    assign(dynamicPhdr.p_memsz, dynamicPhdr.p_filesz);
++
++                                    for (auto& shdr : shdrs) {
++                                        if (shdr.sh_type == SHT_DYNAMIC) {
++                                            assign(shdr.sh_offset, dynamicPhdr.p_offset);
++                                            assign(shdr.sh_addr, dynamicPhdr.p_vaddr);
++                                            assign(shdr.sh_size, dynamicPhdr.p_filesz);
++                                        }
++                                    }
++                                }
++
++                                if (padded.has_value()) {
++                                    auto& segment = phdrs[padded.value()];
++                                    assign(segment.p_filesz, area.offset + area.contents.size() - segment.p_offset);
++                                    assign(segment.p_memsz, segment.p_filesz);
++                                } else if (!growth.has_value()) {
++                                    Phdr segment{};
++                                    segment.p_type = PT_LOAD;
++                                    segment.p_flags = PF_R | PF_W;
++                                    assign(segment.p_offset, area.offset);
++                                    assign(segment.p_vaddr, area.address);
++                                    assign(segment.p_paddr, area.address);
++                                    assign(segment.p_filesz, area.contents.size());
++                                    assign(segment.p_memsz, area.contents.size());
++                                    assign(segment.p_align, segmentAlignment);
++
++                                    for (auto& phdr : phdrs) {
++                                        if (phdr.p_type == PT_PHDR) {
++                                            assign(phdr.p_filesz, (phdrs.size() + 1) * sizeof(Phdr));
++                                            assign(phdr.p_memsz, phdr.p_filesz);
++                                        }
++                                    }
++
++                                    insertLoadSegment(segment);
++                                    ehdr.e_phnum = static_cast<decltype(ehdr.e_phnum)>(phdrs.size());
++                                }
++                            }
++
++                            if (growth.has_value()) {
++                                auto& segment = phdrs[last];
++                                assign(segment.p_filesz, area.offset + area.contents.size() - segment.p_offset);
++                                assign(segment.p_memsz, segment.p_filesz);
++                            }
++
++                            // the area goes right behind the last segment when it grows and what follows it is not loaded,
++                            // into the padding behind a segment, or behind the end of the file
++                            if (growth.has_value() && growth.value() < data.size()) {
++                                makeRoom(growth.value(), area.offset + area.contents.size() - growth.value());
++                                std::copy(area.contents.begin(), area.contents.end(), data.begin() + static_cast<std::ptrdiff_t>(area.offset));
++                            } else if (padded.has_value()) {
++                                std::copy(area.contents.begin(), area.contents.end(), data.begin() + static_cast<std::ptrdiff_t>(area.offset));
++                            } else {
++                                data.resize(area.offset, '\0');
++                                data.insert(data.end(), area.contents.begin(), area.contents.end());
++                            }
++
++                            writeDynamic(entries);
++                            writeProgramHeaders();
++                            writeSectionAndFileHeaders();
++                            return true;
++                        }
++                };
++
++                // calls the function with an editor for the file's ELF class
++                template<typename Function>
++                auto withEditor(std::vector<char>& data, Function function) {
++                    if (data.size() < EI_NIDENT || memcmp(data.data(), ELFMAG, SELFMAG) != 0)
++                        throw std::runtime_error("Not an ELF file");
++
++                    #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++                    const auto nativeData = ELFDATA2LSB;
++                    #else
++                    const auto nativeData = ELFDATA2MSB;
++                    #endif
++
++                    if (data[EI_DATA] != nativeData)
++                        throw std::runtime_error("ELF file does not use this machine's byte order");
++
++                    switch (data[EI_CLASS]) {
++                        case ELFCLASS32: {
++                            RPathEditor<Elf32Types> editor(data);
++                            return function(editor);
++                        }
++                        case ELFCLASS64: {
++                            RPathEditor<Elf64Types> editor(data);
++                            return function(editor);
++                        }
++                        default:
++                            throw std::runtime_error("Unknown ELF class");
++                    }
++                }
++            }
++
++            std::string readRPath(const fs::path& path) {
++                auto data = readFile(path);
++
++                return withEditor(data, [](const auto& editor) {
++                    return editor.rpath();
++                });
++            }
++
++            void writeRPath(const fs::path& path, const std::string& value) {
++                auto data = readFile(path);
++
++                const auto changed = withEditor(data, [&value](auto& editor) {
++                    return editor.setRPath(value);
++                });
++
++                if (changed)
++                    writeFile(path, data);
++            }
++        }
++    }
++}
+diff --git a/src/core/elf_rpath.h b/src/core/elf_rpath.h
+new file mode 100644
+index 0000000..eb3e323
+--- /dev/null
++++ b/src/core/elf_rpath.h
+@@ -0,0 +1,21 @@
++// system headers
++#include <filesystem>
++#include <string>
++
++#pragma once
++
++namespace linuxdeploy {
++    namespace core {
++        namespace elf_file {
++            // returns the search path the dynamic loader takes from the given file: its DT_RUNPATH value, its DT_RPATH
++            // value if it has no DT_RUNPATH entry, or an empty string if it has neither
++            // throws std::runtime_error if the file is not an ELF file that can be read
++            std::string readRPath(const std::filesystem::path& path);
++
++            // replaces the value of the file's DT_RUNPATH and DT_RPATH entries, or adds a DT_RUNPATH entry if it has
++            // neither, without changing anything else the dynamic loader or the binutils make use of
++            // throws std::runtime_error if the file cannot be changed
++            void writeRPath(const std::filesystem::path& path, const std::string& value);
++        }
++    }
++}

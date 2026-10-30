@@ -1,0 +1,1514 @@
+diff --git a/recipeprefix_4ebd20/recipeprefix_86e223_test.go b/recipeprefix_4ebd20/recipeprefix_86e223_test.go
+new file mode 100644
+index 0000000..9f09b14
+--- /dev/null
++++ b/recipeprefix_4ebd20/recipeprefix_86e223_test.go
+@@ -0,0 +1,1185 @@
++// Copyright 2026 Google Inc. All rights reserved
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package recipeprefix
++
++import (
++	"bytes"
++	"context"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++)
++
++type scenario struct {
++	name  string
++	files map[string]string
++	args  []string
++	env   []string
++}
++
++var scenarios = []scenario{
++	{
++		name: "gt_starts_recipe_lines",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++> @echo hello
++> @echo world
++`},
++	},
++	{
++		name: "only_the_first_character_counts",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >x
++all:
++>@echo first-character-only
++`},
++	},
++	{
++		name: "empty_value_brings_back_the_tab",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: one two
++one:
++> @echo one
++.RECIPEPREFIX =
++two:
++	@echo two
++`},
++	},
++	{
++		name: "reset_with_a_comment",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: a
++> @echo all
++.RECIPEPREFIX = # back to the tab
++a:
++	@echo a
++`},
++	},
++	{
++		name: "reset_and_set_again",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: a b c
++a:
++> @echo a
++.RECIPEPREFIX :=
++b:
++	@echo b
++.RECIPEPREFIX = +
++c:
+++ @echo c
++`},
++	},
++	{
++		name: "recursive_value_uses_text_before_expansion",
++		files: map[string]string{"Makefile": `GT := >
++.RECIPEPREFIX = $(GT)
++all:
++$@echo dollar-starts-recipes
++`},
++	},
++	{
++		name: "recursive_value_with_empty_reference",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = $(empty)
++all:
++$@echo still-a-dollar
++`},
++	},
++	{
++		name: "dollar_prefix",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = $
++all:
++$echo dollar
++`},
++	},
++	{
++		name: "simple_value_is_expanded",
++		files: map[string]string{"Makefile": `GT := >
++.RECIPEPREFIX := $(GT)
++all:
++> @echo expanded
++`},
++	},
++	{
++		name: "define_sets_the_prefix",
++		files: map[string]string{"Makefile": `define .RECIPEPREFIX
+++
++endef
++all:
+++ @echo from-define
++`},
++	},
++	{
++		name: "override_assignment",
++		files: map[string]string{"Makefile": `override .RECIPEPREFIX = >
++all:
++> @echo override
++`},
++	},
++	{
++		name: "export_assignment",
++		files: map[string]string{"Makefile": `export .RECIPEPREFIX := +
++all:
+++ @echo export
++`},
++	},
++	{
++		name: "export_line_that_sets_the_prefix",
++		files: map[string]string{"Makefile": `export FOO := $(eval .RECIPEPREFIX = >)bar
++all:
++> @echo [$$FOO]
++`},
++	},
++	{
++		name: "command_line_sets_the_prefix",
++		files: map[string]string{"Makefile": `all:
++> @echo from-the-command-line
++`},
++		args: []string{".RECIPEPREFIX=>"},
++	},
++	{
++		name: "command_line_value_wins_over_the_makefile",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = +
++all:
++> @echo command-line-wins
++`},
++		args: []string{".RECIPEPREFIX=>"},
++	},
++	{
++		name: "override_wins_over_the_command_line",
++		files: map[string]string{"Makefile": `override .RECIPEPREFIX = +
++all:
+++ @echo override-wins
++`},
++		args: []string{".RECIPEPREFIX=>"},
++	},
++	{
++		name: "environment_value_waits_for_an_assignment",
++		files: map[string]string{"Makefile": `all: a b
++a:
++	@echo tab-from-the-start
++.RECIPEPREFIX ?= +
++b:
++> @echo after-the-conditional-assignment
++`},
++		env: []string{".RECIPEPREFIX=>"},
++	},
++	{
++		name: "hash_prefix",
++		files: map[string]string{"Makefile": `HASH := \#
++.RECIPEPREFIX := $(HASH)
++all:
++#@echo hash-starts-recipes
++`},
++	},
++	{
++		name: "space_prefix",
++		files: map[string]string{"Makefile": `SPACE := $(subst x, ,x)
++.RECIPEPREFIX := $(SPACE)
++all:
++ @echo space-starts-recipes
++  @echo two-spaces
++`},
++	},
++	{
++		name: "at_sign_prefix",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = @
++all:
++@@echo silent
++@echo echoed
++`},
++	},
++	{
++		name: "tilde_prefix",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = ~
++all:
++~@echo tilde
++`},
++	},
++	{
++		name: "letter_prefix_comes_before_assignments",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = i
++all:
++ifoo=bar; echo "$$foo"
++`},
++	},
++	{
++		name: "takes_effect_from_the_next_line",
++		files: map[string]string{"Makefile": `all: one two
++one:
++	@echo tab-recipe
++.RECIPEPREFIX = >
++two:
++> @echo gt-recipe
++`},
++	},
++	{
++		name: "assignment_ends_the_rule",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++> @echo one
++.RECIPEPREFIX = +
+++ @echo two
++`},
++	},
++	{
++		name: "set_while_reading_a_rule_line",
++		files: map[string]string{"Makefile": `all: $(eval .RECIPEPREFIX = >)
++> @echo set-by-the-rule-line
++`},
++	},
++	{
++		name: "prefix_set_in_the_target_list",
++		files: map[string]string{"Makefile": `$(eval .RECIPEPREFIX = >)all:
++> @echo a \
++> b
++`},
++	},
++	{
++		name: "continued_recipe_after_a_change_on_the_rule_line",
++		files: map[string]string{"Makefile": `all: $(eval .RECIPEPREFIX = >)
++> echo a \
++> b
++`},
++	},
++	{
++		name: "semicolon_recipe_after_a_change_in_the_target_list",
++		files: map[string]string{"Makefile": `$(eval .RECIPEPREFIX = >)all: ; @echo a \
++> b
++`},
++	},
++	{
++		name: "semicolon_recipe_after_a_change_on_the_rule_line",
++		files: map[string]string{"Makefile": `all: $(eval .RECIPEPREFIX = >) ; @echo a \
++> b
++> @echo next
++`},
++	},
++	{
++		name: "rule_from_a_call_with_a_comment",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++rule = $(1): $(2)
++$(call rule,all,dep) # note: made by a call
++> @echo all
++dep: ; @echo dep
++`},
++	},
++	{
++		name: "change_in_the_same_word_as_a_colon_from_a_variable",
++		files: map[string]string{"Makefile": `X := all:
++$(X)$(eval .RECIPEPREFIX = >) dep
++> @echo a \
++> b
++dep: ; @echo dep
++`},
++	},
++	{
++		name: "change_in_the_same_word_as_a_colon_from_a_call",
++		files: map[string]string{"Makefile": `rule = $(1):
++$(call rule,all)$(eval .RECIPEPREFIX = >) dep
++> @echo a \
++> b
++dep: ; @echo dep
++`},
++	},
++	{
++		name: "set_while_reading_a_condition",
++		files: map[string]string{"Makefile": `ifeq ($(eval .RECIPEPREFIX = >)x,x)
++all:
++> @echo set-by-the-condition
++endif
++`},
++	},
++	{
++		name: "condition_sets_the_prefix_for_the_next_line",
++		files: map[string]string{"Makefile": `ifeq ($(eval .RECIPEPREFIX = >)x,x)
++> orphan: ; @echo orphan
++endif
++all: ; @echo all
++`},
++	},
++	{
++		name: "false_condition_sets_the_prefix",
++		files: map[string]string{"Makefile": `ifeq ($(eval .RECIPEPREFIX = >)x,y)
++$(info then)
++else
++$(info else)
++endif
++all:
++> @echo all
++`},
++	},
++	{
++		name: "else_if_condition_sets_the_prefix",
++		files: map[string]string{"Makefile": `ifeq (1,2)
++$(info one)
++else ifeq ($(eval .RECIPEPREFIX = >)x,y)
++$(info two)
++else
++$(info three)
++endif
++all:
++> @echo all
++`},
++	},
++	{
++		name: "recipe_after_a_semicolon_continues",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: ; @echo first
++> @echo second
++`},
++	},
++	{
++		name: "taken_branch",
++		files: map[string]string{"Makefile": `MODE := gt
++ifeq ($(MODE),gt)
++.RECIPEPREFIX = >
++endif
++all:
++> @echo taken
++`},
++	},
++	{
++		name: "branch_not_taken",
++		files: map[string]string{"Makefile": `ifeq (1,2)
++.RECIPEPREFIX = +
++endif
++all: one two
++one:
++	@echo still-tab
++.RECIPEPREFIX = >
++two:
++> @echo then-gt
++`},
++	},
++	{
++		name: "else_branch",
++		files: map[string]string{"Makefile": `ifeq (1,2)
++X := 1
++else
++.RECIPEPREFIX = >
++endif
++all:
++> @echo from-else
++`},
++	},
++	{
++		name: "second_else_after_a_change_in_the_else_part",
++		files: map[string]string{"Makefile": `$(info before)
++ifeq (1,2)
++else
++.RECIPEPREFIX = >
++all:
++> @echo in-else
++else
++endif
++`},
++	},
++	{
++		name: "warning_after_a_change_is_given_once",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++ifeq (1,2)
++else junk
++$(info else)
++endif
++all:
++> @echo all
++`},
++	},
++	{
++		name: "line_read_again_as_a_recipe_gives_no_warning",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++> @echo all
++ifeq (1,1)
++.RECIPEPREFIX =
++unused:
++	else junk
++endif
++`},
++	},
++	{
++		name: "else_warning_when_the_else_part_is_not_taken",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++ifeq (1,1)
++else junk
++endif
++all:
++> @echo all
++`},
++	},
++	{
++		name: "nested_conditionals",
++		files: map[string]string{"Makefile": `ifeq (1,1)
++ifeq (2,2)
++.RECIPEPREFIX = >
++endif
++all:
++> @echo nested
++endif
++`},
++	},
++	{
++		name: "else_if_chain",
++		files: map[string]string{"Makefile": `ifeq (1,2)
++A := a
++else ifeq (2,2)
++.RECIPEPREFIX = >
++else
++B := b
++endif
++all:
++> @echo else-if
++`},
++	},
++	{
++		name: "other_branch_is_skipped",
++		files: map[string]string{"Makefile": `ifeq (1,1)
++.RECIPEPREFIX = >
++all:
++> @echo taken
++else
++all:
++> @echo skipped
++	@echo skipped-tab
++endif
++`},
++	},
++	{
++		name: "conditionals_between_rule_and_recipe",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++ifeq (1,1)
++> @echo in-taken
++else
++> @echo in-skipped
++endif
++> @echo after
++`},
++	},
++	{
++		name: "command_line_variable_in_condition",
++		files: map[string]string{"Makefile": `ifdef GT
++.RECIPEPREFIX = >
++endif
++all:
++> @echo after-endif
++`},
++		args: []string{"GT=1"},
++	},
++	{
++		name: "change_inside_a_branch_inside_a_rule",
++		files: map[string]string{"Makefile": `all:
++	@echo one
++ifeq (1,1)
++.RECIPEPREFIX = >
++other:
++> @echo other
++endif
++`},
++		args: []string{"all", "other"},
++	},
++	{
++		name: "include_sets_the_prefix",
++		files: map[string]string{
++			"Makefile": `include set.mk
++all:
++> @echo after-the-include
++`,
++			"set.mk": `.RECIPEPREFIX = >
++`,
++		},
++	},
++	{
++		name: "included_makefile_is_read_with_the_prefix",
++		files: map[string]string{
++			"Makefile": `.RECIPEPREFIX = >
++all: from-include
++> @echo all
++include rules.mk
++`,
++			"rules.mk": `from-include:
++> @echo from-include
++`,
++		},
++	},
++	{
++		name: "same_makefile_included_with_two_prefixes",
++		files: map[string]string{
++			"Makefile": `all: t1 t2
++include inc.mk
++.RECIPEPREFIX = >
++include inc.mk
++`,
++			"inc.mk": `ifndef SEEN
++SEEN := 1
++t1:
++	@echo t1-read-with-tab
++else
++t2:
++> @echo t2-read-with-gt
++endif
++`,
++		},
++	},
++	{
++		name: "change_inside_an_included_conditional",
++		files: map[string]string{
++			"Makefile": `all: t1 t2
++include inc.mk
++include inc.mk
++`,
++			"inc.mk": `ifndef SEEN
++SEEN := 1
++t1:
++	@echo t1
++.RECIPEPREFIX = >
++else
++t2:
++> @echo t2
++endif
++`,
++		},
++	},
++	{
++		name: "include_brings_back_the_tab",
++		files: map[string]string{
++			"Makefile": `.RECIPEPREFIX = >
++all: b c
++> @echo all
++include reset.mk
++c:
++	@echo c-after-reset
++`,
++			"reset.mk": `.RECIPEPREFIX =
++b:
++	@echo b
++`,
++		},
++	},
++	{
++		name: "include_in_a_taken_branch",
++		files: map[string]string{
++			"Makefile": `ifeq (1,1)
++include set.mk
++endif
++all:
++> @echo include-in-branch
++`,
++			"set.mk": `.RECIPEPREFIX = >
++`,
++		},
++	},
++	{
++		name: "nested_includes",
++		files: map[string]string{
++			"Makefile": `all: from-a
++include a.mk
++all:
++> @echo main
++`,
++			"a.mk": `include b.mk
++from-a:
++> @echo from-a
++`,
++			"b.mk": `.RECIPEPREFIX = >
++`,
++		},
++	},
++	{
++		name: "include_ends_the_rule",
++		files: map[string]string{
++			"Makefile": `all:
++include set.mk
++> @echo after
++`,
++			"set.mk": `.RECIPEPREFIX = >
++`,
++		},
++	},
++	{
++		name: "eval_sets_the_prefix",
++		files: map[string]string{"Makefile": `$(eval .RECIPEPREFIX = >)
++all:
++> @echo eval-set
++`},
++	},
++	{
++		name: "eval_rule_text_is_read_with_the_prefix",
++		files: map[string]string{"Makefile": `define RULE
++foo:
++> @echo foo-from-eval
++endef
++.RECIPEPREFIX = >
++all: foo
++> @echo all
++$(eval $(RULE))
++`},
++	},
++	{
++		name: "eval_text_changes_the_prefix_midway",
++		files: map[string]string{"Makefile": `all: foo
++	@echo all-with-tab
++define TEXT
++.RECIPEPREFIX = >
++foo:
++> @echo foo-after-the-change
++endef
++$(eval $(TEXT))
++`},
++	},
++	{
++		name: "eval_through_call",
++		files: map[string]string{"Makefile": `SET = $(eval .RECIPEPREFIX = $1)
++$(call SET,>)
++all:
++> @echo via-call
++`},
++	},
++	{
++		name: "eval_in_an_included_makefile",
++		files: map[string]string{
++			"Makefile": `include e.mk
++all:
++> @echo after-eval-in-include
++`,
++			"e.mk": `$(eval .RECIPEPREFIX = >)
++`,
++		},
++	},
++	{
++		name: "define_body_lines_are_not_recipes",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++define BODY
++> not a recipe line
++endef
++all:
++> @echo "$(BODY)"
++`},
++	},
++	{
++		name: "tab_indented_conditionals",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++X := 1
++all:
++	ifeq ($(X),1)
++> @echo one
++	else
++> @echo other
++	endif
++> @echo end
++`},
++	},
++	{
++		name: "tab_indented_assignment_after_a_rule",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: show
++	X := tab-indented-assignment
++show:
++> @echo $(X)
++`},
++	},
++	{
++		name: "tab_line_after_a_semicolon_recipe",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: ; @echo first
++	@echo tab-line
++`},
++	},
++	{
++		name: "tab_indented_comment_after_a_rule",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++	# $(subst a,b)
++> @echo all
++`},
++	},
++	{
++		name: "tab_indented_rule",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: other
++	other: ; @echo tab-indented-rule
++> @echo all
++`},
++	},
++	{
++		name: "tab_indented_include",
++		files: map[string]string{
++			"Makefile": `.RECIPEPREFIX = >
++all: part
++	include part.mk
++`,
++			"part.mk": `part:
++> @echo from-tab-indented-include
++`,
++		},
++	},
++	{
++		name: "tab_indented_export",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++> @echo [$$FOO]
++	export FOO := bar
++`},
++	},
++	{
++		name: "tab_indented_rule_after_an_assignment",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++X := 1
++	top: ; @echo tab-indented-rule-$(X)
++`},
++	},
++	{
++		name: "tab_indented_endif_closes_the_conditional",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++ifeq (1,1)
++all:
++> @echo one
++	endif
++`},
++	},
++	{
++		name: "several_changes_in_nested_conditionals",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: a b c d
++a:
++> @echo a
++ifeq (1,1)
++.RECIPEPREFIX = +
++b:
+++ @echo b
++ifdef MAKEFILE_LIST
++.RECIPEPREFIX = %
++c:
++% @echo c
++endif
++endif
++.RECIPEPREFIX =
++d:
++	@echo d
++`},
++	},
++	{
++		name: "included_makefile_changes_inside_an_else_if_chain",
++		files: map[string]string{
++			"Makefile": `all: t1 t2 t3
++include inc.mk
++include inc.mk
++include inc.mk
++`,
++			"inc.mk": `ifndef A
++A := 1
++t1:
++	@echo t1
++.RECIPEPREFIX = >
++else ifndef B
++B := 1
++t2:
++> @echo t2
++.RECIPEPREFIX = +
++else
++t3:
+++ @echo t3
++endif
++`,
++		},
++	},
++	{
++		name: "prefix_line_before_any_rule",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++> @echo orphan
++all: ; @echo all
++`},
++	},
++	{
++		name: "prefix_line_before_any_rule_in_a_taken_branch",
++		files: map[string]string{"Makefile": `ifeq (1,1)
++.RECIPEPREFIX = >
++> @echo orphan
++endif
++all: ; @echo all
++`},
++	},
++	{
++		name: "prefix_line_before_any_rule_in_an_else_part",
++		files: map[string]string{"Makefile": `ifeq (1,2)
++else
++.RECIPEPREFIX = >
++> @echo orphan
++endif
++all: ; @echo all
++`},
++	},
++	{
++		name: "prefix_line_before_any_rule_after_an_include",
++		files: map[string]string{
++			"Makefile": `include set.mk
++> @echo orphan
++all: ; @echo all
++`,
++			"set.mk": `.RECIPEPREFIX = >
++`,
++		},
++	},
++	{
++		name: "prefix_line_before_any_rule_in_eval_text",
++		files: map[string]string{"Makefile": `define TEXT
++.RECIPEPREFIX = >
++> @echo orphan
++endef
++$(eval $(TEXT))
++all: ; @echo all
++`},
++	},
++	{
++		name: "hash_prefix_line_before_any_rule",
++		files: map[string]string{"Makefile": `HASH := \#
++.RECIPEPREFIX := $(HASH)
++# @echo orphan
++all:
++#@echo all
++`},
++	},
++	{
++		name: "continued_recipe_line_drops_the_prefix",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++> @echo a \
++> b \
++>c
++`},
++	},
++	{
++		name: "continued_line_without_the_prefix",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++> @echo a \
++b
++`},
++	},
++	{
++		name: "echoed_continued_command",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++> echo a \
++> b
++`},
++	},
++	{
++		name: "continued_right_after_the_flags",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++>@\
++>echo hi
++`},
++	},
++	{
++		name: "continued_recipe_after_a_semicolon",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: ; echo a \
++> b
++`},
++	},
++	{
++		name: "continued_line_before_a_reset",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++> @echo a \
++> b
++.RECIPEPREFIX =
++`},
++	},
++	{
++		name: "continued_line_with_plus_prefix",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = +
++all:
+++@echo a \
+++b
++`},
++	},
++	{
++		name: "continued_line_starting_with_a_tab",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++> @echo a \
++	b
++`},
++	},
++	{
++		name: "continued_line_drops_the_tab_after_a_change_on_the_rule_line",
++		files: map[string]string{"Makefile": `all: $(eval .RECIPEPREFIX = >)
++> @echo 'a \
++	b'
++`},
++	},
++	{
++		name: "semicolon_recipe_drops_the_tab_after_a_change_on_the_rule_line",
++		files: map[string]string{"Makefile": `all: $(eval .RECIPEPREFIX = >) ; @echo 'a \
++	b'
++`},
++	},
++	{
++		name: "continued_line_drops_the_tab_after_a_reset",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++.RECIPEPREFIX =
++all:
++	@echo 'a \
++	b'
++`},
++	},
++	{
++		name: "double_colon_rules",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:: ; @echo one
++all::
++> @echo two
++`},
++	},
++	{
++		name: "pattern_rule",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: x.out
++%.out:
++> @echo pattern $@
++`},
++	},
++	{
++		name: "static_pattern_rule",
++		files: map[string]string{
++			"Makefile": `.RECIPEPREFIX = >
++all: a.out b.out
++a.out b.out: %.out: %.in
++> @echo $< to $@
++`,
++			"a.in": ``,
++			"b.in": ``,
++		},
++	},
++	{
++		name: "blank_recipe_line",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all:
++>
++> @echo after-a-blank-recipe-line
++`},
++	},
++	{
++		name: "target_specific_variable_in_a_recipe",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: X = target-specific
++all:
++> @echo $(X)
++`},
++	},
++	{
++		name: "target_specific_value_is_not_the_prefix",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: .RECIPEPREFIX = +
++all:
++> @echo target-value $(.RECIPEPREFIX)
++`},
++	},
++	{
++		name: "several_goals",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++one:
++> @echo one
++two:
++> @echo two
++`},
++		args: []string{"two", "one"},
++	},
++	{
++		name: "recipe_writes_a_file",
++		files: map[string]string{"Makefile": `.RECIPEPREFIX = >
++all: out.txt
++> @cat out.txt
++out.txt:
++> @echo written > $@
++`},
++	},
++}
++
++type normalization struct {
++	regexp  *regexp.Regexp
++	replace string
++}
++
++var normalizeQuotes = normalization{
++	regexp.MustCompile("([`'\"]|\xe2\x80\x98|\xe2\x80\x99)"), `"`,
++}
++
++var normalizeMakeLog = []normalization{
++	normalizeQuotes,
++	{regexp.MustCompile(`make(?:\[\d+\])?: (Entering|Leaving) directory[^\n]*\n`), ""},
++	{regexp.MustCompile(`make(?:\[\d+\])?: `), ""},
++	{regexp.MustCompile(" recipe for target "), " commands for target "},
++	{regexp.MustCompile(" recipe commences "), " commands commence "},
++	{regexp.MustCompile("missing rule before recipe."), "missing rule before commands."},
++	{regexp.MustCompile(" (did you mean TAB instead of 8 spaces?)"), ""},
++	{regexp.MustCompile("Extraneous text after"), "extraneous text after"},
++	{regexp.MustCompile(`\s+Stop\.`), ""},
++	{regexp.MustCompile(`Makefile:\d+: commands for target ".*?" failed\n`), ""},
++	{regexp.MustCompile(`/bin/(ba)?sh: line 1: `), ""},
++	{regexp.MustCompile(`(: \S+: No such file or directory)\n\*\*\* No rule to make target "[^"]+".`), "$1"},
++	{regexp.MustCompile(`\[\S+:\d+: `), "["},
++	{regexp.MustCompile("ninja: warning: [^\n]+"), ""},
++}
++
++var normalizeKati = []normalization{
++	normalizeQuotes,
++	{regexp.MustCompile(`\*kati\*[^\n]*`), ""},
++	{regexp.MustCompile(`c?kati: `), ""},
++	{regexp.MustCompile(`/bin/(ba)?sh: line 1: `), ""},
++	{regexp.MustCompile(`/bin/sh: `), ""},
++	{regexp.MustCompile(`.*: warning for parse error in an unevaluated line: [^\n]*`), ""},
++	{regexp.MustCompile(`([^\n ]+: )?FindEmulator: `), ""},
++	{regexp.MustCompile(` (\./+)+kati\.\S+`), ""},
++	{regexp.MustCompile(` (\./+)+test\S+.json`), ""},
++	{regexp.MustCompile(`(: )open (\S+): n(o such file or directory)\nNOTE:[^\n]*`), "${1}${2}: N${3}"},
++	{regexp.MustCompile(`Too many symbolic links encountered`), "Too many levels of symbolic links"},
++	{regexp.MustCompile(` \(os error \d+\)`), ""},
++}
++
++var circularRE = regexp.MustCompile(`(Circular .* dropped\.\n)`)
++
++func normalize(log []byte, normalizations []normalization) string {
++	ret := []byte{}
++	for _, circ := range circularRE.FindAllSubmatch(log, -1) {
++		ret = append(ret, circ[1]...)
++	}
++	ret = append(ret, circularRE.ReplaceAll(log, []byte{})...)
++	for _, n := range normalizations {
++		ret = n.regexp.ReplaceAll(ret, []byte(n.replace))
++	}
++	return string(ret)
++}
++
++func TestMain(m *testing.M) {
++	os.Unsetenv("MAKEFLAGS")
++	os.Unsetenv("MAKELEVEL")
++	os.Exit(m.Run())
++}
++
++func setUp(t *testing.T, sc scenario) string {
++	dir := t.TempDir()
++	for path, content := range sc.files {
++		full := filepath.Join(dir, path)
++		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return dir
++}
++
++var ignoredFiles = map[string]bool{
++	"Makefile": true, "build.ninja": true, "env.sh": true, "ninja.sh": true, "gmon.out": true, "submake": true,
++}
++
++func outputFiles(t *testing.T, dir string) string {
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var files []string
++	for _, e := range entries {
++		name := e.Name()
++		if ignoredFiles[name] || strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".json") ||
++			strings.HasPrefix(name, "kati") || strings.HasPrefix(name, "stdout") {
++			continue
++		}
++		files = append(files, name)
++	}
++	sort.Strings(files)
++	return strings.Join(files, "\n")
++}
++
++type result struct {
++	output string
++	ok     bool
++	files  string
++}
++
++func execute(dir string, env []string, name string, args ...string) ([]byte, bool) {
++	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, name, args...)
++	cmd.Dir = dir
++	cmd.Env = append(os.Environ(), env...)
++	out, err := cmd.CombinedOutput()
++	if ctx.Err() != nil {
++		out = append(out, []byte("\n(timed out)")...)
++	}
++	return out, err == nil
++}
++
++func runMake(t *testing.T, sc scenario) result {
++	dir := setUp(t, sc)
++	args := append(append([]string{}, sc.args...), "SHELL=/bin/bash")
++	out, ok := execute(dir, sc.env, "make", args...)
++	return result{normalize(out, normalizeMakeLog), ok, outputFiles(t, dir)}
++}
++
++func runKati(t *testing.T, sc scenario, kati string) result {
++	dir := setUp(t, sc)
++	args := append(append([]string{"--use_find_emulator"}, sc.args...), "SHELL=/bin/bash")
++	out, ok := execute(dir, sc.env, kati, args...)
++	return result{normalize(out, normalizeKati), ok, outputFiles(t, dir)}
++}
++
++func TestRecipePrefix(t *testing.T) {
++	version, err := exec.Command("make", "--version").Output()
++	if err != nil || !bytes.HasPrefix(version, []byte("GNU Make 4.2.1\n")) {
++		t.Fatalf("GNU make 4.2.1 must be installed as make: %q %v", version, err)
++	}
++	root, err := filepath.Abs("..")
++	if err != nil {
++		t.Fatal(err)
++	}
++	engines := []struct{ name, path string }{
++		{"ckati", filepath.Join(root, "ckati")},
++		{"rkati", filepath.Join(root, "target", "debug", "rkati")},
++	}
++	for _, sc := range scenarios {
++		sc := sc
++		t.Run(sc.name, func(t *testing.T) {
++			t.Parallel()
++			want := runMake(t, sc)
++			for _, e := range engines {
++				t.Run(e.name, func(t *testing.T) {
++					if _, err := os.Stat(e.path); err != nil {
++						t.Fatalf("%s is not built: %v", e.name, err)
++					}
++					got := runKati(t, sc, e.path)
++					if got.output != want.output {
++						t.Errorf("output differs from make\nmake:\n%s\n%s:\n%s", want.output, e.name, got.output)
++					}
++					if got.ok != want.ok {
++						t.Errorf("make succeeded: %v, %s succeeded: %v", want.ok, e.name, got.ok)
++					}
++					if want.ok && got.files != want.files {
++						t.Errorf("files differ from make\nmake:\n%s\n%s:\n%s", want.files, e.name, got.files)
++					}
++				})
++			}
++		})
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..c7b5b68
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,317 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++mode=""
++modes_given=0
++output_path=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      mode="$1"
++      modes_given=$((modes_given + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      if [ $# -lt 1 ] || [ -z "$1" ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      output_path="$1"
++      shift
++      ;;
++    --output_path=*)
++      output_path="${1#--output_path=}"
++      if [ -z "$output_path" ]; then
++        echo "missing value for --output_path" >&2
++        usage
++      fi
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$modes_given" -eq 1 ] || usage
++case "$output_path" in
++  ""|/*) ;;
++  *) output_path="$PWD/$output_path" ;;
++esac
++
++cd "$(dirname "$0")" || exit 2
++
++# The script may run as another uid, offline, with HOME, PATH, CARGO_HOME,
++# RUSTUP_HOME, GOPATH or other build settings unset or pointing where this uid
++# cannot build, and in a checkout it cannot write. git and cargo read their
++# configuration from HOME, so the run gets a private HOME; it prefers the
++# image's tools, and falls back to the image's toolchains when the given ones
++# cannot build offline.
++export PATH="/opt/cargo/bin:/usr/local/bin:${PATH:-}:/usr/bin:/bin"
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++export GOPROXY=off
++export CARGO_NET_OFFLINE=true
++export RUSTC_BOOTSTRAP=1
++unset CARGO_BUILD_TARGET
++if [ -n "${TMPDIR:-}" ] && ! { [ -d "$TMPDIR" ] && [ -w "$TMPDIR" ]; }; then
++  export TMPDIR=/tmp
++fi
++work="$(mktemp -d)"
++trap 'rm -rf "$work"' EXIT
++mkdir -p "$work/home"
++export HOME="$work/home"
++unset XDG_CONFIG_HOME XDG_CACHE_HOME
++notes=""
++
++# The engines, their unit tests, the repo's test runner and base mode's
++# restored files are all written inside the checkout. When this uid cannot
++# write every part of it, the run works on a copy.
++if [ -n "$(find . -path ./.git/objects -prune -o ! -writable -print -quit 2>/dev/null)" ]; then
++  notes="uid $(id -u) cannot write all of the checkout; running on a copy"
++  cp -a . "$work/repo" 2>/dev/null || notes="$notes (some files could not be copied)"
++  chmod -R u+w "$work/repo" 2>/dev/null
++  cd "$work/repo" || exit 2
++fi
++export CARGO_TARGET_DIR="$PWD/target"
++
++# Leaves the image's Rust toolchain and registry, and no other Rust settings
++# but job and thread limits.
++use_image_rust() {
++  local var
++  for var in $(compgen -e); do
++    case "$var" in
++      CARGO_BUILD_JOBS|RUST_TEST_THREADS|RUST_MIN_STACK) ;;
++      CARGO_*|RUST*) unset "$var" ;;
++    esac
++  done
++  export CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup CARGO_NET_OFFLINE=true RUSTC_BOOTSTRAP=1
++  export CARGO_TARGET_DIR="$PWD/target"
++}
++if ! cargo fetch --offline >/dev/null 2>&1; then
++  notes="${notes}${notes:+; }cargo could not build offline with CARGO_HOME=${CARGO_HOME:-} RUSTUP_HOME=${RUSTUP_HOME:-}; using /opt/cargo and /opt/rustup"
++  use_image_rust
++fi
++gocache="$(go env GOCACHE 2>/dev/null)"
++case "$gocache" in
++  /*) ;;
++  *) gocache="" ;;
++esac
++if [ -z "$gocache" ] || ! mkdir -p "$gocache" 2>/dev/null || [ ! -w "$gocache" ] ||
++  [ -n "$(find "$gocache" -mindepth 1 -maxdepth 1 -type d ! -writable -print -quit 2>/dev/null)" ]; then
++  export GOCACHE="${TMPDIR:-/tmp}/go-build-$(id -u)"
++fi
++if ! go list -m all >/dev/null 2>&1; then
++  notes="${notes}${notes:+; }go could not list modules offline with GOPATH=${GOPATH:-}; using /opt/go"
++  export GOPATH=/opt/go
++  unset GOMODCACHE
++fi
++
++base_commit=7a3ee413e1cfc230a597ac33034d2f478351e432
++build_log="$work/build.log"
++go_log="$work/go.log"
++cargo_json="$work/cargo.json"
++: >"$build_log"
++: >"$go_log"
++: >"$cargo_json"
++[ -z "$notes" ] || echo "$notes" >>"$build_log"
++status=0
++build_status=0
++go_status=0
++cargo_status=0
++
++build_engines() {
++  rm -rf out ckati find_test ninja_test strutil_test target/debug/rkati
++  if ! make -j"$(nproc)" ckati "$@" >>"$build_log" 2>&1; then
++    echo "make ckati $* failed" >>"$build_log"
++    build_status=1
++  fi
++  if ! cargo build --offline >>"$build_log" 2>&1; then
++    echo "cargo build failed" >>"$build_log"
++    build_status=1
++  fi
++}
++
++# Runs go test and appends its -v output, naming the top-level test $1.
++go_test() {
++  local name="$1"
++  shift
++  go test -v -count=1 -timeout 30m "$@" >"$work/run.log" 2>&1
++  local s=$?
++  if [ "$name" = TestKati ]; then
++    cat "$work/run.log" >>"$go_log"
++  else
++    sed "s/\bTestKati\b/$name/g" "$work/run.log" >>"$go_log"
++  fi
++  if [ "$s" -ne 0 ]; then
++    go_status=1
++    status=1
++  fi
++}
++
++if [ "$mode" = base ]; then
++  # The repo's own runner and testcases, as they are at the base commit. Some
++  # testcases are marked as expecting kati to differ from make; when a change
++  # makes one match, the runner's "Expected failure, but output is the same"
++  # is kept as a log line instead of a failure.
++  cases=""
++  if git -c safe.directory='*' cat-file -e "$base_commit^{commit}" 2>/dev/null; then
++    git -c safe.directory='*' checkout -q "$base_commit" -- run_test.go testcase/ >>"$build_log" 2>&1
++    cases="$(git -c safe.directory='*' ls-tree --name-only "$base_commit" testcase/ | sed 's#^testcase/##')"
++  fi
++  [ -n "$cases" ] || cases="$(ls testcase)"
++  sed -i 's/t\.Errorf("Expected failure, but output is the same")/t.Logf("Expected failure, but output is the same")/' run_test.go
++  pattern="$(printf '%s\n' "$cases" | grep -E '\.(mk|sh)$' | sed 's/\./\\./g' | paste -sd '|' -)"
++  build_engines ckati_tests
++  go_test TestKati -run "^TestKati\$/^($pattern)\$" .
++  go_test TestKati_ninja -run "^TestKati\$/^($pattern)\$" . --ninja
++  go_test TestKati_rkati -run "^TestKati\$/^($pattern)\$" . --rkati
++  go_test TestKati_rkati_ninja -run "^TestKati\$/^($pattern)\$" . --rkati --ninja
++
++  unit_status=0
++  for t in find_test ninja_test strutil_test; do
++    echo "=== RUN   TestCkatiUnit/$t"
++    if [ -x "./$t" ] && "./$t" >"$work/unit.log" 2>&1; then
++      echo "--- PASS: TestCkatiUnit/$t (0.00s)"
++    else
++      [ -x "./$t" ] || echo "$t was not built" >"$work/unit.log"
++      sed 's/^/    /' "$work/unit.log"
++      echo "--- FAIL: TestCkatiUnit/$t (0.00s)"
++      unit_status=1
++    fi
++  done >>"$go_log"
++  if [ "$unit_status" -eq 0 ]; then
++    printf 'ok  \tgithub.com/google/kati/ckati_unit\t0.000s\n' >>"$go_log"
++  else
++    printf 'FAIL\tgithub.com/google/kati/ckati_unit\t0.000s\n' >>"$go_log"
++    go_status=1
++    status=1
++  fi
++
++  cargo test --offline -- -Z unstable-options --format json --report-time >"$cargo_json" 2>"$work/cargo.err"
++  cargo_status=$?
++  cat "$work/cargo.err" >>"$build_log"
++  [ "$cargo_status" -eq 0 ] || status=1
++else
++  build_engines
++  go_test TestRecipePrefix ./recipeprefix_4ebd20/
++fi
++
++[ "$build_status" -eq 0 ] || status=1
++if ! grep -qE '^ *--- (PASS|FAIL|SKIP):' "$go_log"; then
++  echo "no test results were produced in $mode mode" >>"$go_log"
++  status=1
++fi
++
++cat "$build_log" "$go_log"
++
++if [ -n "$output_path" ]; then
++  mkdir -p "$(dirname "$output_path")"
++  : >"$work/convert.err"
++  go-junit-report <"$go_log" >"$work/go.xml" 2>>"$work/convert.err"
++  go_convert=$?
++  cargo_convert=0
++  if [ -s "$cargo_json" ]; then
++    grep '^{' "$cargo_json" | cargo2junit >"$work/cargo.xml" 2>>"$work/convert.err"
++    cargo_convert=$?
++  fi
++  if ! python3 - "$output_path" "$work" "$build_status" "$go_status" "$go_convert" \
++      "$cargo_status" "$cargo_convert" <<'PY'
++import os
++import re
++import sys
++import xml.etree.ElementTree as ET
++
++out, work = sys.argv[1], sys.argv[2]
++build_status, go_status, go_convert, cargo_status, cargo_convert = (int(a) for a in sys.argv[3:8])
++bad_chars = re.compile("\x1b\\[[0-9;]*[A-Za-z]|[\x00-\x08\x0b\x0c\x0e-\x1f]")
++
++
++def read(name, lines=150):
++    try:
++        with open(os.path.join(work, name), errors="replace") as f:
++            return bad_chars.sub("", "".join(f.readlines()[-lines:]))
++    except OSError:
++        return ""
++
++
++def suites(name):
++    try:
++        top = ET.parse(os.path.join(work, name)).getroot()
++    except (OSError, ET.ParseError):
++        return []
++    return [top] if top.tag == "testsuite" else list(top.iter("testsuite"))
++
++
++def failing_case(suite_name, case_name, message, text):
++    suite = ET.Element("testsuite", name=suite_name)
++    case = ET.SubElement(suite, "testcase", classname=suite_name, name=case_name)
++    ET.SubElement(case, "failure", message=message).text = text
++    return suite
++
++
++def has_failure(found):
++    return any(c.find("failure") is not None or c.find("error") is not None
++               for s in found for c in s.iter("testcase"))
++
++
++root = ET.Element("testsuites")
++if build_status:
++    root.append(failing_case("kati_build", "build", "ckati or rkati did not build", read("build.log")))
++
++go_suites = suites("go.xml")
++if go_convert:
++    root.append(failing_case("go_test", "junit_conversion", "go-junit-report failed",
++                             read("convert.err") + read("go.log")))
++if not any(True for s in go_suites for _ in s.iter("testcase")):
++    root.append(failing_case("go_test", "results", "no go test results could be read",
++                             read("convert.err") + read("go.log")))
++else:
++    if go_status and not has_failure(go_suites):
++        root.append(failing_case("go_test", "exit_status", "go test failed without a failing test",
++                                 read("go.log")))
++    root.extend(go_suites)
++
++if os.path.getsize(os.path.join(work, "cargo.json")) or cargo_status:
++    if cargo_convert:
++        root.append(failing_case("rkati_unit", "junit_conversion", "cargo2junit failed",
++                                 read("convert.err") + read("cargo.json")))
++    cargo_suites = suites("cargo.xml")
++    if not any(True for s in cargo_suites for _ in s.iter("testcase")):
++        root.append(failing_case("rkati_unit", "results", "no cargo test results could be read",
++                                 read("convert.err") + read("cargo.err") + read("cargo.json")))
++    else:
++        if cargo_status and not has_failure(cargo_suites):
++            root.append(failing_case("rkati_unit", "exit_status",
++                                     "cargo test failed without a failing test", read("cargo.err")))
++        root.extend(cargo_suites)
++
++for element in root.iter():
++    for key, value in list(element.attrib.items()):
++        element.set(key, bad_chars.sub("", value))
++    if element.text:
++        element.text = bad_chars.sub("", element.text)
++for suite in root.iter("testsuite"):
++    cases = suite.findall("testcase")
++    suite.set("tests", str(len(cases)))
++    suite.set("failures", str(sum(c.find("failure") is not None for c in cases)))
++    suite.set("errors", str(sum(c.find("error") is not None for c in cases)))
++ET.ElementTree(root).write(out, encoding="UTF-8", xml_declaration=True)
++PY
++  then
++    echo "could not write $output_path" >&2
++    status=1
++  fi
++  if [ "$go_convert" -ne 0 ] || [ "$cargo_convert" -ne 0 ]; then
++    echo "a JUnit converter failed" >&2
++    status=1
++  fi
++fi
++
++exit "$status"

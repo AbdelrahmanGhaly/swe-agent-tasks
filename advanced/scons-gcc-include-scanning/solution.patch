@@ -1,0 +1,2450 @@
+diff --git a/SCons/Scanner/C.py b/SCons/Scanner/C.py
+index 2efc67895..627be9625 100644
+--- a/SCons/Scanner/C.py
++++ b/SCons/Scanner/C.py
+@@ -28,6 +28,7 @@ CConditionalScanner, which must be explicitly selected by calling
+ add_scanner() for each affected suffix.
+ """
+ 
++import shlex
+ from typing import Dict
+ 
+ import SCons.Node.FS
+@@ -43,6 +44,7 @@ class SConsCPPScanner(SCons.cpp.PreProcessor):
+     by Nodes, not strings; 2) we can keep track of the files that are
+     missing.
+     """
++
+     def __init__(self, *args, **kwargs) -> None:
+         super().__init__(*args, **kwargs)
+         self.missing = []
+@@ -67,6 +69,7 @@ class SConsCPPScanner(SCons.cpp.PreProcessor):
+             self.missing.append((file, self.current_file))
+             return ''
+ 
++
+ def dictify_CPPDEFINES(env, replace: bool = False) -> dict:
+     """Return CPPDEFINES converted to a dict for preprocessor emulation.
+ 
+@@ -92,6 +95,7 @@ def dictify_CPPDEFINES(env, replace: bool = False) -> dict:
+     .. versionchanged:: 4.9.0
+        Simple macro replacement added, and *replace* arg to enable it.
+     """
++
+     def _replace(mapping: Dict) -> Dict:
+         """Simplistic macro replacer for dictify_CPPDEFINES.
+ 
+@@ -164,7 +168,7 @@ def dictify_CPPDEFINES(env, replace: bool = False) -> dict:
+                 result[c] = None
+         if replace:
+             return _replace(result)
+-        return(result)
++        return result
+ 
+     if SCons.Util.is_String(cppdefines):
+         # single macro define in a string
+@@ -182,6 +186,7 @@ def dictify_CPPDEFINES(env, replace: bool = False) -> dict:
+ 
+     return {cppdefines: None}
+ 
++
+ class SConsCPPScannerWrapper:
+     """The SCons wrapper around a cpp.py scanner.
+ 
+@@ -216,6 +221,7 @@ class SConsCPPScannerWrapper:
+     def select(self, node):
+         return self
+ 
++
+ def CScanner():
+     """Return a prototype Scanner instance for scanning source files
+     that use the C pre-processor"""
+@@ -251,25 +257,24 @@ class SConsCPPConditionalScanner(SCons.cpp.PreProcessor):
+     def __init__(self, *args, **kwargs) -> None:
+         super().__init__(*args, **kwargs)
+         self.missing = []
+-        self._known_paths = []
+ 
+     def initialize_result(self, fname) -> None:
+         self.result = SCons.Util.UniqueList([fname])
+ 
++    def includer_dir(self):
++        if self.current_file is None:
++            return self.current
++        return self.current_file.dir
++
++    def file_in_dir(self, directory, fname):
++        if directory is None:
++            directory = self.current
++        return SCons.Node.FS.find_file(fname, (directory,))
++
+     def find_include_file(self, t):
+-        keyword, quote, fname = t
+-        paths = tuple(self._known_paths) + self.searchpath[quote]
+-        if quote == '"':
+-            paths = (self.current_file.dir,) + paths
+-        result = SCons.Node.FS.find_file(fname, paths)
+-        if result:
+-            result_path = result.get_abspath()
+-            for p in self.searchpath[quote]:
+-                if result_path.startswith(p.get_abspath()):
+-                    self._known_paths.append(p)
+-                    break
+-        else:
+-            self.missing.append((fname, self.current_file))
++        result = super().find_include_file(t)
++        if not result:
++            self.missing.append((t[2], self.current_file))
+         return result
+ 
+     def read_file(self, file) -> str:
+@@ -280,6 +285,42 @@ class SConsCPPConditionalScanner(SCons.cpp.PreProcessor):
+             return ""
+ 
+ 
++def cppdefines_macros(env) -> dict:
++    """Return CPPDEFINES as the macros a compiler would be given.
++
++    Each entry is converted and substituted the way the ``-D`` options
++    for the command line are (see :func:`~SCons.Defaults._defines`), then
++    read the way the shell passes it on.  The result maps every macro
++    name, in order, to its value text, or to None for a name defined
++    without a value; a name may carry a parameter list, as in ``F(x)``.
++    """
++    from SCons.Defaults import processDefines
++
++    macros = {}
++    defines = processDefines(env.get('CPPDEFINES') or [])
++    if defines:
++        for define in SCons.Util.flatten(env.subst_list(defines)):
++            name, eq, value = _shell_word(str(define)).partition('=')
++            macros[name] = value if eq else None
++    return macros
++
++
++def _shell_word(arg) -> str:
++    """Return a command-line argument as the shell hands it to a program.
++
++    SCons puts double quotes around an argument holding white space, and
++    the shell then removes quotes and backslash escapes.  An argument the
++    shell would reject is returned unchanged.
++    """
++    if ' ' in arg or '\t' in arg:
++        arg = f'"{arg}"'
++    try:
++        words = shlex.split(arg)
++    except ValueError:
++        return arg
++    return words[0] if words else ''
++
++
+ class SConsCPPConditionalScannerWrapper:
+     """
+     The SCons wrapper around a cpp.py scanner.
+@@ -298,7 +339,7 @@ class SConsCPPConditionalScannerWrapper:
+         cpp = SConsCPPConditionalScanner(
+             current=node.get_dir(),
+             cpppath=path,
+-            dict=dictify_CPPDEFINES(env),
++            dict=cppdefines_macros(env),
+             depth=depth,
+         )
+         result = cpp(node)
+diff --git a/SCons/cpp.py b/SCons/cpp.py
+index bdd70189f..4e0b480c3 100644
+--- a/SCons/cpp.py
++++ b/SCons/cpp.py
+@@ -23,249 +23,1323 @@
+ 
+ """SCons C Pre-Processor module"""
+ 
++import bisect
++import collections
+ import os
+ import re
+ 
+ import SCons.Util
+ 
+-# First "subsystem" of regular expressions that we set up:
+-#
+-# Stuff to turn the C preprocessor directives in a file's contents into
+-# a list of tuples that we can process easily.
+-#
+-# A table of regular expressions that fetch the arguments from the rest of
+-# a C preprocessor line.  Different directives have different arguments
+-# that we want to fetch, using the regular expressions to which the lists
+-# of preprocessor directives map.
+-cpp_lines_dict = {
+-    # Fetch the rest of a #if/#elif as one argument,
+-    # with white space optional.
+-    ('if', 'elif')      : r'\s*(.+)',
+-
+-    # Fetch the rest of a #ifdef/#ifndef as one argument,
+-    # separated from the keyword by white space.
+-    ('ifdef', 'ifndef',): r'\s+(.+)',
+-
+-    # Fetch the rest of a #import/#include/#include_next line as one
+-    # argument, with white space optional.
+-    ('import', 'include', 'include_next',)
+-                        : r'\s*(.+)',
+-
+-    # We don't care what comes after a #else or #endif line.
+-    ('else', 'endif',)  : '',
+-
+-    # Fetch three arguments from a #define line:
+-    #   1) The #defined keyword.
+-    #   2) The optional parentheses and arguments (if it's a function-like
+-    #      macro, '' if it's not).
+-    #   3) The expansion value.
+-    ('define',)         : r'\s+([_A-Za-z][_A-Za-z0-9_]*)(\([^)]*\))?\s*(.*)',
+-
+-    # Fetch the #undefed keyword from a #undef line.
+-    ('undef',)          : r'\s+([_A-Za-z][A-Za-z0-9_]*)',
+-}
+-
+-# Create a table that maps each individual C preprocessor directive to
+-# the corresponding compiled regular expression that fetches the arguments
+-# we care about.
+-Table = {}
+-for op_list, expr in cpp_lines_dict.items():
+-    e = re.compile(expr)
+-    for op in op_list:
+-        Table[op] = e
+-del e
+-del op
+-del op_list
+-
+-# Create a list of the expressions we'll use to match all of the
+-# preprocessor directives.  These are the same as the directives
+-# themselves *except* that we must use a negative lookahead assertion
+-# when matching "if" so it doesn't match the "if" in "ifdef" or "ifndef".
+-override = {
+-    'if'                        : 'if(?!n?def)',
+-}
+-l = [override.get(x, x) for x in Table.keys()]
+-
+-
+-# Turn the list of expressions into one big honkin' regular expression
+-# that will match all the preprocessor lines at once.  This will return
+-# a list of tuples, one for each preprocessor line.  The preprocessor
+-# directive will be the first element in each tuple, and the rest of
+-# the line will be the second element.
+-e = r'^\s*#\s*(' + '|'.join(l) + ')(.*)$'
+-
+-# And last but not least, compile the expression.
+-CPP_Expression = re.compile(e, re.M)
++# The preprocessing directives the PreProcessor dispatches on.  Each one
++# is handled by the method named ``do_<directive>``.
++DIRECTIVES = (
++    'if',
++    'ifdef',
++    'ifndef',
++    'elif',
++    'elifdef',
++    'elifndef',
++    'else',
++    'endif',
++    'define',
++    'undef',
++    'include',
++    'include_next',
++    'import',
++    'line',
++    'pragma',
++)
++
++CONDITIONALS = frozenset(
++    ('if', 'ifdef', 'ifndef', 'elif', 'elifdef', 'elifndef', 'else', 'endif')
++)
++
++# Include nesting at which GCC gives up (its -fmax-include-depth default):
++# a header at include level 199 is still read, and an #include from it is
++# an error.
++MAX_INCLUDE_DEPTH = 200
++
++PREV_WHITE = 1
++NO_EXPAND = 2
++PASTE_LEFT = 4
++STRINGIFY = 8
++
++DIGRAPHS = {'%:': '#', '%:%:': '##', '<:': '[', ':>': ']', '<%': '{', '%>': '}'}
++
++
++class Token:
++    """A C preprocessing token.
++
++    *kind* is one of ``name``, ``number``, ``char``, ``string``,
++    ``header``, ``punct``, ``other``, ``padding``, ``arg`` (a macro
++    parameter in a replacement list) or ``eof``.  A name written with
++    universal character names keeps that *spelling*, while its *text* is
++    the name they stand for.
++    """
+ 
+-# A list with RE to cleanup CPP Expressions (tuples)
+-# We should remove all comments and carriage returns (\r) before evaluating
+-CPP_Expression_Cleaner_List = [
+-    r"/\*.*\*/",
+-    r"/\*.*",
+-    r"//.*",
+-    r"\r"
+-]
+-CPP_Expression_Cleaner_RE = re.compile(
+-    r"\s*(" + "|".join(CPP_Expression_Cleaner_List) + ")")
++    __slots__ = ('arg', 'flags', 'kind', 'line', 'source', 'spelling', 'text')
++
++    def __init__(self, kind, text, flags: int = 0, line: int = 0) -> None:
++        self.kind = kind
++        self.text = text
++        self.spelling = text
++        self.flags = flags
++        self.line = line
++        self.arg = None
++        self.source = None
++
++    def copy(self, flags=None):
++        t = Token(
++            self.kind, self.text, self.flags if flags is None else flags, self.line
++        )
++        t.spelling = self.spelling
++        t.arg = self.arg
++        t.source = self.source
++        return t
++
++    def op(self):
++        """Returns the punctuator a ``punct`` token spells, digraphs mapped."""
++        if self.kind != 'punct':
++            return None
++        return DIGRAPHS.get(self.text, self.text)
++
++    def __repr__(self) -> str:
++        return f"Token({self.kind!r}, {self.text!r})"
++
++
++def _padding(source):
++    t = Token('padding', '')
++    t.source = source
++    return t
++
++
++_AVOID_PASTE = _padding(None)
++
++
++class PreprocessorError(Exception):
++    """Raised for input that the C pre-processor would reject."""
++
++
++# Translation phases 1-3: line splicing and the lexical grammar.
++
++_splice_re = re.compile(r'\\[ \t\f\v]*\n')
++
++_token_re = re.compile(
++    r"""
++    (?P<ws>(?:[ \t\f\v\r]+|/\*.*?\*/|/\*.*\Z|//[^\n]*)+)
++  | (?P<raw>(?:u8|[uUL])?R"(?P<delim>[^\s()\\"]{0,16})\()
++  | (?P<string>(?:u8|[uUL])?"(?:\\.|[^"\\\n])*")
++  | (?P<char>[uUL]?'(?:\\.|[^'\\\n])*')
++  | (?P<number>\.?[0-9](?:[eEpP][+-]|[\w$.])*)
++  | (?P<name>(?:[^\W\d]|\$|\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8})
++      (?:[\w$]|\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8})*)
++  | (?P<punct>%:%:|\.\.\.|<<=|>>=|->|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||
++       [*/%+&^|-]=|\#\#|<:|:>|<%|%>|%:|::|[][(){}.&*+~!/%<>^|?:;=,\#-])
++  | (?P<other>.)
++""",
++    re.VERBOSE | re.DOTALL,
++)
++
++# Recognizes the start of a preprocessing directive at the start of a line:
++# optional white space and comments (which may span lines), then ``#`` (or
++# ``%:``) that is not part of ``##``.
++_directive_start_re = re.compile(
++    r'(?:[ \t\f\v\r]+|/\*.*?\*/|/\*.*\Z)*(?:#|%:)(?!#|%:)', re.DOTALL
++)
++
++# Skips ordinary source text up to the end of a logical line, honoring
++# comments, character constants and string literals (raw ones included).
++_skip_re = re.compile(
++    r"""
++    [^\n"'/A-Za-z_$]+
++  | //[^\n]*
++  | /\*.*?\*/ | /\*.*\Z
++  | (?P<rawprefix>(?:u8|[uUL])?R)"(?P<delim>[^\s()\\"]{0,16})\(
++  | [A-Za-z_$][\w$]*
++  | "(?:\\.|[^"\\\n])*"?
++  | '(?:\\.|[^'\\\n])*'?
++  | /
++  | (?P<newline>\n)
++""",
++    re.VERBOSE | re.DOTALL,
++)
++
++
++class _Source:
++    """The spliced text of one file, with a map back to physical lines."""
++
++    def __init__(self, contents) -> None:
++        contents = contents.replace('\r\n', '\n')
++        pieces = []
++        self.splices = []
++        pos = 0
++        removed = 0
++        for m in _splice_re.finditer(contents):
++            pieces.append(contents[pos : m.start()])
++            removed += m.end() - m.start()
++            self.splices.append(m.end() - removed)
++            pos = m.end()
++        pieces.append(contents[pos:])
++        self.text = ''.join(pieces)
++        self.newlines = [m.start() for m in re.finditer('\n', self.text)]
++
++    def line_of(self, offset) -> int:
++        return (
++            1
++            + bisect.bisect_left(self.newlines, offset)
++            + bisect.bisect_right(self.splices, offset)
++        )
++
++
++_ucn_re = re.compile(r'\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})')
++
++
++class Lexer:
++    """Lexes the preprocessing tokens of one directive line."""
++
++    def __init__(self, text, source=None, offset: int = 0) -> None:
++        self.text = text
++        self.pos = 0
++        self.source = source
++        self.offset = offset
++
++    def _line(self, pos) -> int:
++        if self.source is None:
++            return 0
++        return self.source.line_of(self.offset + pos)
+ 
+-def Cleanup_CPP_Expressions(ts):
+-    return [(t[0], CPP_Expression_Cleaner_RE.sub("", t[1])) for t in ts]
++    def at_end(self) -> bool:
++        m = _token_re.match(self.text, self.pos)
++        return m is None or (m.lastgroup == 'ws' and m.end() == len(self.text))
+ 
+-#
+-# Second "subsystem" of regular expressions that we set up:
+-#
+-# Stuff to translate a C preprocessor expression (as found on a #if or
+-# #elif line) into an equivalent Python expression that we can eval().
+-#
++    def rest(self) -> str:
++        return self.text[self.pos :]
+ 
+-# A dictionary that maps the C representation of Boolean operators
+-# to their Python equivalents.
+-CPP_to_Python_Ops_Dict = {
+-    '!'         : ' not ',
+-    '!='        : ' != ',
+-    '&&'        : ' and ',
+-    '||'        : ' or ',
+-    '?'         : ' and ',
+-    ':'         : ' or ',
+-}
++    def next(self, angled: bool = False):
++        """Returns the next token, or an ``eof`` token at the end of the line.
+ 
+-CPP_to_Python_Ops_Sub = lambda m: CPP_to_Python_Ops_Dict[m.group(0)]
+-
+-# We have to sort the keys by length so that longer expressions
+-# come *before* shorter expressions--in particular, "!=" must
+-# come before "!" in the alternation.  Without this, the Python
+-# re module, as late as version 2.2.2, empirically matches the
+-# "!" in "!=" first, instead of finding the longest match.
+-# What's up with that?
+-l = sorted(list(CPP_to_Python_Ops_Dict.keys()), key=lambda a: len(a), reverse=True)
+-
+-# Turn the list of keys into one regular expression that will allow us
+-# to substitute all of the operators at once.
+-expr = '|'.join(map(re.escape, l))
+-
+-# ...and compile the expression.
+-CPP_to_Python_Ops_Expression = re.compile(expr)
+-
+-# integer specifications
+-int_suffix_opt = r'(?:[uU](?:l{1,2}|L{1,2}|[zZ]|wb|WB)?|(?:l{1,2}|L{1,2}|[zZ]|wb|WB)[uU]?)?'
+-
+-hex_integer = fr'(0[xX][0-9A-Fa-f]+){int_suffix_opt}'
+-bin_integer = fr'(0[bB][01]+){int_suffix_opt}'
+-oct_integer = fr'(0[0-7]*){int_suffix_opt}'
+-dec_integer = fr'([1-9][0-9]*){int_suffix_opt}'
+-
+-int_boundary = r'[a-zA-Z0-9_]'
+-int_neg_lookbehind = fr'(?<!{int_boundary})'
+-int_neg_lookahead = fr'(?!{int_boundary})'
+-
+-# A separate list of expressions to be evaluated and substituted
+-# sequentially, not all at once.
+-CPP_to_Python_Eval_List = [
+-    [r'defined\s+(\w+)', '"\\1" in __dict__'],
+-    [r'defined\s*\((\w+)\)', '"\\1" in __dict__'],
+-    [fr'{int_neg_lookbehind}{hex_integer}{int_neg_lookahead}', '\\1'],
+-    [fr'{int_neg_lookbehind}{bin_integer}{int_neg_lookahead}', '\\1'],
+-    [fr'{int_neg_lookbehind}{oct_integer}{int_neg_lookahead}', '0o\\1'],
+-    [fr'{int_neg_lookbehind}{dec_integer}{int_neg_lookahead}', '\\1'],
+-]
+-
+-# Replace the string representations of the regular expressions in the
+-# list with compiled versions.
+-for l in CPP_to_Python_Eval_List:
+-    l[0] = re.compile(l[0])
+-
+-# Wrap up all of the above into a handy function.
+-def CPP_to_Python(s):
++        With *angled* true, a header name in angle brackets or double
++        quotes is returned as one token, as at the start of an
++        ``#include`` operand.
++        """
++        flags = 0
++        m = _token_re.match(self.text, self.pos)
++        if m and m.lastgroup == 'ws':
++            flags = PREV_WHITE
++            self.pos = m.end()
++            m = _token_re.match(self.text, self.pos)
++        if m is None:
++            return Token('eof', '', flags, self._line(self.pos))
++        start = self.pos
++        line = self._line(start)
++        if angled and self.text[start] in '<"':
++            close = '>' if self.text[start] == '<' else '"'
++            end = self.text.find(close, start + 1)
++            if end != -1:
++                self.pos = end + 1
++                kind = 'header' if close == '>' else 'string'
++                return Token(kind, self.text[start : end + 1], flags, line)
++        kind = m.lastgroup
++        if kind == 'raw':
++            close = ')' + m.group('delim') + '"'
++            end = self.text.find(close, m.end())
++            if end == -1:
++                self.pos = len(self.text)
++                return Token('other', self.text[start:], flags, line)
++            self.pos = end + len(close)
++            return Token('string', self.text[start : self.pos], flags, line)
++        self.pos = m.end()
++        t = Token(kind, m.group(0), flags, line)
++        if kind == 'name' and '\\' in t.text:
++            t.text = _ucn_re.sub(
++                lambda u: chr(int(u.group(1) or u.group(2), 16)), t.text
++            )
++        return t
++
++    def tokens(self):
++        result = []
++        while True:
++            t = self.next()
++            if t.kind == 'eof':
++                return result
++            result.append(t)
++
++
++def tokenize(text):
++    """Returns the preprocessing tokens of *text* as one line."""
++    return Lexer(text).tokens()
++
++
++def spell(tokens) -> str:
++    """Spells *tokens*, with a space wherever one preceded a token."""
++    out = []
++    for t in tokens:
++        if t.kind == 'padding':
++            continue
++        if out and t.flags & PREV_WHITE:
++            out.append(' ')
++        out.append(t.spelling)
++    return ''.join(out)
++
++
++def _directive_lines(contents):
++    """Yields ``(name, lexer, end_line)`` for each directive in *contents*.
++
++    *lexer* covers the rest of the directive after its name.  *end_line*
++    is the physical line on which the directive ends.  A comment counts as
++    one space, so a comment that spans lines does not start a new line: a
++    ``#`` that follows other text and such a comment is ordinary text, as
++    it is to GCC.
+     """
+-    Converts a C pre-processor expression into an equivalent
+-    Python expression that can be evaluated.
++    src = _Source(contents)
++    text = src.text
++    n = len(text)
++    pos = 0
++    while pos < n:
++        m = _directive_start_re.match(text, pos)
++        if m:
++            pos = m.end()
++        end = pos
++        while end < n:
++            s = _skip_re.match(text, end)
++            if s.lastgroup == 'newline':
++                break
++            if s.group('rawprefix'):
++                close = ')' + s.group('delim') + '"'
++                found = text.find(close, s.end())
++                end = n if found == -1 else found + len(close)
++            else:
++                end = s.end()
++        if m:
++            lexer = Lexer(text[pos:end], src, pos)
++            name = lexer.next()
++            if name.kind == 'number':
++                yield 'line', Lexer(text[pos:end], src, pos), src.line_of(end)
++            elif name.kind == 'name':
++                yield (
++                    name.text,
++                    Lexer(lexer.rest(), src, pos + lexer.pos),
++                    src.line_of(end),
++                )
++        pos = end + 1
++
++
++def _parse_define(lexer):
++    """Parses the operand of a ``#define`` into its parts.
++
++    Returns ``(name, params, body)``; *params* is None for an object-like
++    macro, otherwise a list of parameter names in which ``...`` stands
++    for an unnamed variable argument and ``name...`` for a named one.
+     """
+-    s = CPP_to_Python_Ops_Expression.sub(CPP_to_Python_Ops_Sub, s)
+-    for expr, repl in CPP_to_Python_Eval_List:
+-        s = re.sub(expr, repl, s)
+-    return s
++    name = lexer.next()
++    if name.kind != 'name' or name.text == 'defined':
++        return None
++    params = None
++    if lexer.text.startswith('(', lexer.pos):
++        lexer.next()
++        params = []
++        while True:
++            t = lexer.next()
++            if t.op() == ')' and not params:
++                break
++            if t.op() == '...':
++                params.append('...')
++                t = lexer.next()
++            elif t.kind == 'name':
++                t2 = lexer.next()
++                if t2.op() == '...':
++                    params.append(t.text + '...')
++                    t = lexer.next()
++                else:
++                    params.append(t.text)
++                    t = t2
++            else:
++                return None
++            if t.op() == ')':
++                break
++            if t.op() != ',' or params[-1].endswith('...'):
++                return None
++    body = lexer.tokens()
++    if body:
++        body[0] = body[0].copy(flags=body[0].flags & ~PREV_WHITE)
++    return name.text, params, body
+ 
+ 
++class Macro:
++    """A macro definition.
+ 
+-del expr
+-del l
+-del override
++    *params* is None for an object-like macro, otherwise the list of
++    parameter names (the variable argument, if any, last).  *builtin*
++    names the dynamic value of a built-in macro.
++    """
+ 
++    __slots__ = ('body', 'builtin', 'name', 'params', 'variadic')
+ 
++    def __init__(
++        self, name, params=None, variadic: bool = False, body=(), builtin=None
++    ) -> None:
++        self.name = name
++        self.params = params
++        self.variadic = variadic
++        self.body = list(body)
++        self.builtin = builtin
++
++    @classmethod
++    def from_definition(cls, name, params, body):
++        """Builds a macro from a parsed ``#define``; None if it is invalid."""
++        variadic = False
++        names = None
++        if params is not None:
++            names = []
++            for i, p in enumerate(params):
++                if p.endswith('...'):
++                    if i != len(params) - 1:
++                        return None
++                    variadic = True
++                    p = p[:-3] or '__VA_ARGS__'
++                names.append(p)
++            if len(set(names)) != len(names):
++                return None
++        tokens = []
++        stringify = False
++        for t in body:
++            op = t.op()
++            if op == '##':
++                if not tokens:
++                    return None
++                last = tokens[-1]
++                tokens[-1] = last.copy(flags=last.flags | PASTE_LEFT)
++                continue
++            if op == '#' and names is not None:
++                stringify = True
++                continue
++            t = t.copy()
++            if t.kind == 'name' and names is not None and t.text in names:
++                t.kind = 'arg'
++                t.arg = names.index(t.text)
++            if stringify:
++                if t.kind != 'arg' and not (variadic and t.text == '__VA_OPT__'):
++                    return None
++                t.flags |= STRINGIFY
++                stringify = False
++            tokens.append(t)
++        if stringify or (tokens and tokens[-1].flags & PASTE_LEFT):
++            return None
++        return cls(name, names, variadic, tokens)
++
++
++def object_macro(name, value):
++    """Returns an object-like macro whose replacement is the text *value*."""
++    body = tokenize(value)
++    if body:
++        body[0] = body[0].copy(flags=body[0].flags & ~PREV_WHITE)
++    return Macro(name, body=body)
++
++
++# Macros GCC defines for C when run with -undef.
++STANDARD_MACROS = (
++    ('__STDC__', '1'),
++    ('__STDC_VERSION__', '201710L'),
++    ('__STDC_HOSTED__', '1'),
++    ('__STDC_UTF_16__', '1'),
++    ('__STDC_UTF_32__', '1'),
++)
++
++BUILTIN_MACROS = (
++    '__LINE__',
++    '__INCLUDE_LEVEL__',
++    '__has_include',
++    '__has_include_next',
++)
++
++
++class _Context:
++    __slots__ = ('line', 'lines', 'macro', 'pos', 'tokens')
++
++    def __init__(self, tokens, macro=None, line: int = 0, lines=None) -> None:
++        self.tokens = tokens
++        self.pos = 0
++        self.macro = macro
++        self.line = line
++        self.lines = lines
++
++    def line_of(self, pos) -> int:
++        return self.line if self.lines is None else self.lines[pos]
++
++
++class _Arg:
++    __slots__ = ('expanded', 'lines', 'omitted', 'stringified', 'tokens')
++
++    def __init__(self, tokens, lines=()) -> None:
++        self.tokens = tokens
++        self.lines = list(lines)
++        self.omitted = False
++        self.expanded = None
++        self.stringified = None
++
++
++class Expander:
++    """Macro-expands the rest of one directive line.
++
++    The expansion follows GCC's algorithm: replacement lists are rescanned
++    in contexts, a macro is disabled while its own replacement is being
++    read, and a name met while its macro is disabled is never expanded
++    again.  Each token counts as being on its own line if it was read from
++    the directive, and otherwise on the line of the macro name whose
++    expansion produced it; ``__LINE__`` reports that line, unless the
++    outermost macro being expanded is object-like.
++    """
+ 
+-class FunctionEvaluator:
+-    """Handles delayed evaluation of a #define function call."""
++    def __init__(self, pp, lexer, include: bool = False) -> None:
++        self.pp = pp
++        self.macros = pp.cpp_namespace
++        self.lexer = lexer
++        self.include = include
++        self.contexts = []
++        self.disabled = set()
++        self.lookahead = []
++        self.prevent_expansion = 0
++        self.skip_eval = 0
++        self.angled = False
++        self.invocation_line = 0
++        self.top_function_like = False
++        self.line = 0
++        self.from_context = None
++
++    def base_token(self):
++        if self.lookahead:
++            return self.lookahead.pop()
++        t = self.lexer.next(self.angled)
++        self.angled = False
++        return t
++
++    def backup(self, token) -> None:
++        if self.from_context is not None:
++            self.from_context.pos -= 1
++        else:
++            self.lookahead.append(token)
++
++    def push(self, tokens, macro=None, line: int = 0, lines=None) -> None:
++        self.contexts.append(_Context(tokens, macro, line, lines))
++
++    def pop(self) -> None:
++        ctx = self.contexts.pop()
++        if ctx.macro is not None and (
++            not self.contexts or self.contexts[-1].macro != ctx.macro
++        ):
++            self.disabled.discard(ctx.macro)
++
++    def get(self):
++        while True:
++            if not self.contexts:
++                self.from_context = None
++                t = self.base_token()
++                self.line = t.line
++            else:
++                ctx = self.contexts[-1]
++                if ctx.pos == len(ctx.tokens):
++                    self.pop()
++                    continue
++                t = ctx.tokens[ctx.pos]
++                self.line = ctx.line_of(ctx.pos)
++                ctx.pos += 1
++                self.from_context = ctx
++                if t.flags & PASTE_LEFT:
++                    self.paste_all(t)
++                    continue
++            if t.kind != 'name' or t.flags & NO_EXPAND:
++                return t
++            macro = self.macros.get(t.text)
++            if macro is None:
++                return t
++            if t.text in self.disabled:
++                return t.copy(flags=t.flags | NO_EXPAND)
++            if self.prevent_expansion:
++                return t
++            if not self.contexts:
++                self.invocation_line = t.line
++                self.top_function_like = macro.params is not None
++            if self.enter(macro):
++                continue
++            return t
++
++    def get_no_padding(self):
++        while True:
++            t = self.get()
++            if t.kind != 'padding':
++                return t
++
++    def enter(self, macro) -> bool:
++        line = self.line
++        if macro.builtin:
++            self.push([self.builtin(macro, line)])
++            return True
++        tokens = macro.body
++        if macro.params is not None:
++            self.prevent_expansion += 1
++            try:
++                args = self.invocation_args(macro)
++            finally:
++                self.prevent_expansion -= 1
++            if args is None:
++                return False
++            if macro.params:
++                tokens = self.replace_args(macro, args)
++        self.disabled.add(macro.name)
++        self.push(tokens, macro.name, line)
++        return True
++
++    def invocation_args(self, macro):
++        padding = None
++        while True:
++            t = self.get()
++            if t.kind != 'padding':
++                break
++            if (
++                padding is None
++                or padding.source is None
++                or (not padding.source.flags & PREV_WHITE and t.source is None)
++            ):
++                padding = t
++        if t.op() == '(':
++            return self.collect_args(macro)
++        if t.kind != 'eof' or self.from_context is not None:
++            self.backup(t)
++            if padding is not None:
++                self.push([padding])
++        return None
+ 
+-    def __init__(self, name, args, expansion) -> None:
+-        """
+-        Squirrels away the arguments and expansion value of a #define
+-        macro function for later evaluation when we must actually expand
+-        a value that uses it.
+-        """
+-        self.name = name
+-        self.args = function_arg_separator.split(args)
+-        try:
+-            expansion = expansion.split('##')
+-        except AttributeError:
+-            pass
+-        self.expansion = expansion
++    def collect_args(self, macro):
++        paramc = len(macro.params)
++        args = []
++        while True:
++            depth = 0
++            tokens = []
++            lines = []
++            while True:
++                t = self.get()
++                op = t.op()
++                if t.kind == 'padding':
++                    if not tokens:
++                        continue
++                elif op == '(':
++                    depth += 1
++                elif op == ')':
++                    if depth == 0:
++                        break
++                    depth -= 1
++                elif op == ',':
++                    if depth == 0 and not (macro.variadic and len(args) + 1 == paramc):
++                        break
++                elif t.kind == 'eof':
++                    if self.from_context is not None:
++                        self.backup(t)
++                    raise PreprocessorError(
++                        f"unterminated argument list invoking macro {macro.name}"
++                    )
++                tokens.append(t)
++                lines.append(self.line)
++            while tokens and tokens[-1].kind == 'padding':
++                tokens.pop()
++                lines.pop()
++            args.append(_Arg(tokens, lines))
++            if t.op() == ')':
++                break
++        argc = len(args)
++        if argc == 1 and paramc == 0 and not args[0].tokens:
++            argc = 0
++        if argc != paramc:
++            if not (macro.variadic and argc == paramc - 1):
++                raise PreprocessorError(
++                    f"macro {macro.name} passed {argc} arguments, takes {paramc}"
++                )
++            args.append(_Arg([]))
++        if macro.variadic and (argc < paramc or (argc == 1 and not args[0].tokens)):
++            args[paramc - 1].omitted = True
++        return args
++
++    def expand_arg(self, arg) -> None:
++        if arg.expanded is not None:
++            return
++        arg.expanded = []
++        if not arg.tokens:
++            return
++        self.push(arg.tokens + [Token('eof', '')], lines=arg.lines + [0])
++        while True:
++            t = self.get()
++            if t.kind == 'eof':
++                break
++            arg.expanded.append(t)
++        self.pop()
++
++    def stringify(self, tokens):
++        out = ['"']
++        source = None
++        backslashes = 0
++        for t in tokens:
++            if t.kind == 'padding':
++                if source is None or (
++                    not source.flags & PREV_WHITE and t.source is None
++                ):
++                    source = t.source
++                continue
++            if len(out) > 1:
++                if source is None:
++                    source = t
++                if source.flags & PREV_WHITE:
++                    out.append(' ')
++            source = None
++            if t.kind in ('string', 'char'):
++                out.append(
++                    t.text.replace('\\', '\\\\')
++                    .replace('"', '\\"')
++                    .replace('\n', '\\n')
++                )
++            else:
++                out.append(t.spelling)
++            backslashes = backslashes + 1 if t.kind == 'other' and t.text == '\\' else 0
++        if backslashes & 1:
++            out.pop()
++        out.append('"')
++        return Token('string', ''.join(out))
++
++    def replace_args(self, macro, args):
++        out = []
++        body = macro.body
++        vaopt = _VaOpt(self, macro, args[-1])
++        # Where the __VA_OPT__ being substituted starts in *out*, and
++        # whether a token precedes it there (GCC anchors on that token).
++        vaopt_start = None
++        vaopt_anchored = False
++        for i, src in enumerate(body):
++            state = vaopt.update(src)
++            if state != 'include':
++                if state == 'begin':
++                    if i and not body[i - 1].flags & PASTE_LEFT:
++                        out.append(_padding(src))
++                    vaopt_start = len(out)
++                    vaopt_anchored = bool(out)
++                elif state == 'end':
++                    start = vaopt_start
++                    vaopt_start = None
++                    if vaopt.stringify:
++                        pasted = self.paste_list(out[start:])
++                        del out[start:]
++                        t = self.stringify(pasted)
++                        if src.flags & PASTE_LEFT:
++                            t.flags |= PASTE_LEFT
++                        out.append(t)
++                        continue
++                    if (
++                        vaopt_anchored
++                        and len(out) == start
++                        and out[-1].flags & PASTE_LEFT
++                    ):
++                        out[-1] = out[-1].copy(flags=out[-1].flags & ~PASTE_LEFT)
++                    if src.flags & PASTE_LEFT:
++                        while len(out) > start and out[-1] is _AVOID_PASTE:
++                            out.pop()
++                        if out and out[-1].kind != 'padding':
++                            out[-1] = out[-1].copy(flags=out[-1].flags | PASTE_LEFT)
++                    else:
++                        out.append(_AVOID_PASTE)
++                continue
++            if src.kind != 'arg':
++                out.append(src)
++                continue
++            arg = args[src.arg]
++            paste_flag = None
++            at_vaopt_start = (
++                vaopt_start is not None and vaopt_anchored and len(out) == vaopt_start
++            )
++            if src.flags & STRINGIFY:
++                if arg.stringified is None:
++                    arg.stringified = self.stringify(arg.tokens)
++                tokens = [arg.stringified]
++            elif src.flags & PASTE_LEFT:
++                tokens = arg.tokens
++            elif i and body[i - 1].flags & PASTE_LEFT:
++                tokens = arg.tokens
++                if out:
++                    prev = out[-1]
++                    if (
++                        prev.op() == ','
++                        and macro.variadic
++                        and src.arg == len(macro.params) - 1
++                    ):
++                        if arg.omitted:
++                            out.pop()
++                        else:
++                            paste_flag = len(out) - 1
++                    elif not tokens:
++                        paste_flag = len(out) - 1
++            else:
++                self.expand_arg(arg)
++                tokens = arg.expanded
++                if at_vaopt_start:
++                    while tokens and tokens[0].kind == 'padding':
++                        tokens = tokens[1:]
++            if (
++                self.include
++                and i
++                and not body[i - 1].flags & PASTE_LEFT
++                and not at_vaopt_start
++            ):
++                out.append(_padding(src))
++            if tokens:
++                out.extend(tokens)
++                if src.flags & PASTE_LEFT:
++                    paste_flag = len(out) - 1
++            if paste_flag is not None:
++                t = out[paste_flag]
++                out[paste_flag] = t.copy(
++                    flags=(t.flags & ~PASTE_LEFT) | (src.flags & PASTE_LEFT)
++                )
++        return out
++
++    def paste_list(self, tokens):
++        result = []
++        i = 0
++        while i < len(tokens):
++            t = tokens[i]
++            while t.flags & PASTE_LEFT and i + 1 < len(tokens):
++                i += 1
++                rhs = tokens[i]
++                t = self.paste(t, rhs)
++                if not rhs.flags & PASTE_LEFT:
++                    break
++            result.append(t)
++            i += 1
++        return result
+ 
+-    def __call__(self, *values):
+-        """
+-        Evaluates the expansion of a #define macro function called
+-        with the specified values.
+-        """
+-        if len(self.args) != len(values):
+-            raise ValueError("Incorrect number of arguments to `%s'" % self.name)
+-        # Create a dictionary that maps the macro arguments to the
+-        # corresponding values in this "call."  We'll use this when we
+-        # eval() the expansion so that arguments will get expanded to
+-        # the right values.
+-        args = self.args
+-        localvars = {k: v for k, v in zip(args, values)}
+-        parts = [s if s in args else repr(s) for s in self.expansion]
+-        statement = ' + '.join(parts)
++    def paste(self, lhs, rhs):
++        text = lhs.spelling
++        if lhs.op() == '/' and rhs.op() != '=':
++            text += ' '
++        if rhs.kind != 'padding':
++            text += rhs.spelling
++        lexer = Lexer(text)
++        t = lexer.next()
++        flags = lhs.flags & PREV_WHITE
++        if t.kind == 'eof' or t.flags & PREV_WHITE or not lexer.at_end():
++            return Token('other', lhs.spelling + rhs.spelling, flags)
++        t.flags = flags
++        return t
++
++    def paste_all(self, lhs) -> None:
++        ctx = self.contexts[-1]
++        line = self.line
++        while True:
++            rhs = ctx.tokens[ctx.pos]
++            ctx.pos += 1
++            lhs = self.paste(lhs, rhs)
++            if not rhs.flags & PASTE_LEFT:
++                break
++        self.push([lhs], line=line)
++
++    def builtin(self, macro, line):
++        name = macro.builtin
++        if name in ('__has_include', '__has_include_next'):
++            value = self.has_include(name == '__has_include_next')
++            return Token('number', str(value))
++        if name == '__LINE__':
++            if not self.top_function_like:
++                line = self.invocation_line
++            return Token('number', str(line + self.pp.line_delta()))
++        return Token('number', str(self.pp.include_level()))
++
++    def has_include(self, include_next: bool) -> int:
++        self.angled = True
++        t = self.get_no_padding()
++        paren = t.op() == '('
++        if paren:
++            self.angled = True
++            t = self.get_no_padding()
++        self.angled = False
++        bracket = t.kind != 'string'
++        if t.kind in ('string', 'header'):
++            name = t.text[1:-1]
++        elif t.op() == '<':
++            name = self.glue_header_name()
++        else:
++            raise PreprocessorError("operator __has_include requires a header-name")
++        if paren and self.get_no_padding().op() != ')':
++            raise PreprocessorError("missing ')' after __has_include operand")
++        if self.skip_eval:
++            return 0
++        return 1 if self.pp.has_header(name, bracket, include_next) else 0
++
++    def glue_header_name(self) -> str:
++        out = []
++        while True:
++            t = self.get_no_padding()
++            if t.op() == '>':
++                return ''.join(out)
++            if t.kind == 'eof':
++                raise PreprocessorError("missing terminating > character")
++            if t.flags & PREV_WHITE:
++                out.append(' ')
++            out.append(t.spelling)
++
++    def rest(self):
++        """Returns the remaining tokens of the line, fully expanded."""
++        result = []
++        while True:
++            t = self.get()
++            if t.kind == 'eof':
++                return result
++            result.append(t)
++
++
++class _VaOpt:
++    """Tracks ``__VA_OPT__`` while a replacement list is substituted."""
++
++    def __init__(self, expander, macro, arg) -> None:
++        self.expander = expander
++        self.variadic = macro.variadic
++        self.arg = arg
++        self.state = 0
++        self.stringify = False
++        self.update_kind = None
++
++    def update(self, token) -> str:
++        if not self.variadic:
++            return 'include'
++        if token.kind == 'name' and token.text == '__VA_OPT__':
++            if self.state:
++                raise PreprocessorError("__VA_OPT__ may not appear in a __VA_OPT__")
++            self.state = 1
++            self.stringify = bool(token.flags & STRINGIFY)
++            return 'begin'
++        if self.state == 1:
++            if token.op() != '(':
++                raise PreprocessorError(
++                    "__VA_OPT__ must be followed by an open parenthesis"
++                )
++            self.state = 2
++            if self.update_kind is None:
++                self.expander.expand_arg(self.arg)
++                self.update_kind = 'drop'
++                if any(t.kind != 'padding' for t in self.arg.expanded):
++                    self.update_kind = 'include'
++            return 'drop'
++        if self.state >= 2:
++            if self.state == 2:
++                self.state = 3
++            op = token.op()
++            if op == '(':
++                self.state += 1
++            elif op == ')':
++                self.state -= 1
++                if self.state == 2:
++                    self.state = 0
++                    return 'end'
++            return self.update_kind
++        return 'include'
++
++
++_number_re = re.compile(
++    r"""
++    (?:0[xX](?P<hex>[0-9A-Fa-f]+) | 0[bB](?P<bin>[01]+) | (?P<dec>[1-9][0-9]*) | (?P<oct>0[0-7]*))
++    (?P<suffix>[uU](?:ll|LL|[lL])? | (?:ll|LL|[lL])[uU]?)?\Z
++""",
++    re.VERBOSE,
++)
++
++_SIMPLE_ESCAPES = {
++    'n': 10,
++    't': 9,
++    'v': 11,
++    'b': 8,
++    'r': 13,
++    'f': 12,
++    'a': 7,
++    '\\': 92,
++    "'": 39,
++    '"': 34,
++    '?': 63,
++    'e': 27,
++    'E': 27,
++}
+ 
+-        return eval(statement, globals(), localvars)
++INTMAX_BITS = 64
++_MASK = (1 << INTMAX_BITS) - 1
++_SIGN = 1 << (INTMAX_BITS - 1)
++
++
++def _to_signed(v) -> int:
++    v &= _MASK
++    return v - (1 << INTMAX_BITS) if v & _SIGN else v
++
++
++class _Value:
++    __slots__ = ('unsigned', 'value')
++
++    def __init__(self, value, unsigned: bool = False) -> None:
++        self.value = (value & _MASK) if unsigned else _to_signed(value)
++        self.unsigned = unsigned
++
++
++def interpret_number(text):
++    """Returns the value of an integer constant in a ``#if`` expression."""
++    m = _number_re.match(text)
++    if not m:
++        raise PreprocessorError(f"invalid integer constant {text!r} in #if")
++    if m.group('hex'):
++        value = int(m.group('hex'), 16)
++    elif m.group('bin'):
++        value = int(m.group('bin'), 2)
++    elif m.group('dec'):
++        value = int(m.group('dec'))
++    else:
++        value = int(m.group('oct') or '0', 8)
++    suffix = m.group('suffix') or ''
++    # A constant too big for intmax_t is unsigned.
++    unsigned = 'u' in suffix.lower() or value >= _SIGN
++    return _Value(value & _MASK, unsigned)
++
++
++def interpret_char(text):
++    """Returns the value of a character constant in a ``#if`` expression."""
++    prefix = text[: text.index("'")]
++    body = text[len(prefix) + 1 : -1]
++    chars = []
++
++    def add(code) -> None:
++        # One character, encoded the way the constant's type holds it:
++        # UTF-8 for char, UTF-16 for char16_t, the code point otherwise.
++        if not prefix:
++            chars.extend(chr(code).encode('utf-8'))
++        elif prefix == 'u':
++            units = chr(code).encode('utf-16-be')
++            chars.extend(
++                int.from_bytes(units[k : k + 2], 'big') for k in range(0, len(units), 2)
++            )
++        else:
++            chars.append(code)
++
++    i = 0
++    while i < len(body):
++        c = body[i]
++        if c != '\\':
++            add(ord(c))
++            i += 1
++            continue
++        i += 1
++        c = body[i] if i < len(body) else ''
++        if c in _SIMPLE_ESCAPES:
++            chars.append(_SIMPLE_ESCAPES[c])
++            i += 1
++        elif c in '01234567' and c:
++            j = i
++            while j < len(body) and j - i < 3 and body[j] in '01234567':
++                j += 1
++            chars.append(int(body[i:j], 8))
++            i = j
++        elif c == 'x':
++            j = i + 1
++            while j < len(body) and body[j] in '0123456789abcdefABCDEF':
++                j += 1
++            if j == i + 1:
++                raise PreprocessorError("\\x used with no following hex digits")
++            chars.append(int(body[i + 1 : j], 16))
++            i = j
++        elif c in 'uU':
++            digits = body[i + 1 : i + (5 if c == 'u' else 9)]
++            if len(digits) != (4 if c == 'u' else 8) or not all(
++                d in '0123456789abcdefABCDEF' for d in digits
++            ):
++                raise PreprocessorError("incomplete universal character name")
++            code = int(digits, 16)
++            if (
++                code > 0x10FFFF
++                or 0xD800 <= code <= 0xDFFF
++                or (code < 0xA0 and code not in (0x24, 0x40, 0x60))
++            ):
++                raise PreprocessorError(
++                    f"\\{c}{digits} is not a valid universal character"
++                )
++            add(code)
++            i += 1 + len(digits)
++        else:
++            chars.append(ord(c) if c else 92)
++            i += 1
++    if not chars:
++        raise PreprocessorError("empty character constant")
++    if prefix in ('u', 'U'):
++        width = 16 if prefix == 'u' else 32
++        return _Value(chars[-1] & ((1 << width) - 1), True)
++    if prefix == 'L':
++        v = chars[-1] & 0xFFFFFFFF
++        return _Value(v - (1 << 32) if v & 0x80000000 else v)
++    if len(chars) == 1:
++        v = chars[0] & 0xFF
++        return _Value(v - 256 if v & 0x80 else v)
++    v = 0
++    for c in chars:
++        v = ((v << 8) | (c & 0xFF)) & 0xFFFFFFFF
++    return _Value(v - (1 << 32) if v & 0x80000000 else v)
++
++
++_BINARY_PRECEDENCE = {
++    '*': 10,
++    '/': 10,
++    '%': 10,
++    '+': 9,
++    '-': 9,
++    '<<': 8,
++    '>>': 8,
++    '<': 7,
++    '>': 7,
++    '<=': 7,
++    '>=': 7,
++    '==': 6,
++    '!=': 6,
++    '&': 5,
++    '^': 4,
++    '|': 3,
++    '&&': 2,
++    '||': 1,
++}
+ 
+ 
+-# Find line continuations.
+-line_continuations = re.compile('\\\\\r?\n')
++class ExpressionEvaluator:
++    """Evaluates a ``#if`` expression with C pre-processor arithmetic.
+ 
+-# Search for a "function call" macro on an expansion.  Returns the
+-# two-tuple of the "function" name itself, and a string containing the
+-# arguments within the call parentheses.
+-function_name = re.compile(r'(\S+)\(([^)]*)\)')
++    Values are ``intmax_t`` or ``uintmax_t``; the usual arithmetic
++    conversions apply, ``defined`` is honored also when a macro
++    expansion produces it, and identifiers left after expansion are 0.
++    """
+ 
+-# Split a string containing comma-separated function call arguments into
+-# the separate arguments.
+-function_arg_separator = re.compile(r',\s*')
++    def __init__(self, expander) -> None:
++        self.x = expander
++        self.token = None
++        self.advance()
++
++    def advance(self) -> None:
++        x = self.x
++        while True:
++            t = x.get()
++            if t.kind == 'padding':
++                continue
++            if t.kind == 'name' and t.text == 'defined':
++                self.token = self.defined_value()
++            else:
++                self.token = t
++            return
+ 
++    def defined_value(self):
++        x = self.x
++        x.prevent_expansion += 1
++        try:
++            t = x.get_no_padding()
++            paren = t.op() == '('
++            if paren:
++                t = x.get_no_padding()
++            if t.kind != 'name':
++                raise PreprocessorError('operator "defined" requires an identifier')
++            if paren and x.get_no_padding().op() != ')':
++                raise PreprocessorError('missing \')\' after "defined"')
++        finally:
++            x.prevent_expansion -= 1
++        return Token('number', '1' if t.text in x.macros else '0')
++
++    def value(self) -> int:
++        """Returns the value of the whole expression."""
++        if self.token.kind == 'eof':
++            raise PreprocessorError("#if with no expression")
++        v = self.comma()
++        if self.token.kind != 'eof':
++            raise PreprocessorError(
++                f"missing binary operator before token {self.token.text!r}"
++            )
++        return v.value
++
++    def evaluate(self) -> bool:
++        return self.value() != 0
++
++    def comma(self):
++        v = self.conditional()
++        while self.token.op() == ',':
++            self.advance()
++            v = self.conditional()
++        return v
++
++    def conditional(self):
++        cond = self.binary(1)
++        if self.token.op() != '?':
++            return cond
++        self.advance()
++        taken = cond.value != 0
++        if not taken:
++            self.x.skip_eval += 1
++        a = self.comma()
++        if not taken:
++            self.x.skip_eval -= 1
++        if self.token.op() != ':':
++            raise PreprocessorError("'?' without following ':'")
++        self.advance()
++        if taken:
++            self.x.skip_eval += 1
++        b = self.conditional()
++        if taken:
++            self.x.skip_eval -= 1
++        unsigned = a.unsigned or b.unsigned
++        return _Value((a if taken else b).value, unsigned)
++
++    def binary(self, min_prec):
++        lhs = self.unary()
++        while True:
++            op = self.token.op()
++            prec = _BINARY_PRECEDENCE.get(op)
++            if prec is None or prec < min_prec:
++                return lhs
++            self.advance()
++            if op in ('&&', '||'):
++                short = (lhs.value == 0) if op == '&&' else (lhs.value != 0)
++                if short:
++                    self.x.skip_eval += 1
++                rhs = self.binary(prec + 1)
++                if short:
++                    self.x.skip_eval -= 1
++                if op == '&&':
++                    lhs = _Value(int(lhs.value != 0 and rhs.value != 0))
++                else:
++                    lhs = _Value(int(lhs.value != 0 or rhs.value != 0))
++                continue
++            rhs = self.binary(prec + 1)
++            lhs = self.apply(op, lhs, rhs)
++
++    def apply(self, op, a, b):
++        if op in ('<<', '>>'):
++            return self.shift(op, a, b)
++        unsigned = a.unsigned or b.unsigned
++        av = a.value & _MASK if unsigned else a.value
++        bv = b.value & _MASK if unsigned else b.value
++        if op == '*':
++            return _Value(av * bv, unsigned)
++        if op in ('/', '%'):
++            if bv == 0:
++                if self.x.skip_eval:
++                    return _Value(0, unsigned)
++                raise PreprocessorError("division by zero in #if")
++            q = abs(av) // abs(bv)
++            if (av < 0) != (bv < 0):
++                q = -q
++            return _Value(q if op == '/' else av - q * bv, unsigned)
++        if op == '+':
++            return _Value(av + bv, unsigned)
++        if op == '-':
++            return _Value(av - bv, unsigned)
++        if op == '&':
++            return _Value(av & bv, unsigned)
++        if op == '^':
++            return _Value(av ^ bv, unsigned)
++        if op == '|':
++            return _Value(av | bv, unsigned)
++        result = {
++            '<': av < bv,
++            '>': av > bv,
++            '<=': av <= bv,
++            '>=': av >= bv,
++            '==': av == bv,
++            '!=': av != bv,
++        }[op]
++        return _Value(int(result))
++
++    def shift(self, op, a, b):
++        n = b.value & _MASK if b.unsigned else b.value
++        if n < 0 and not b.unsigned:
++            op = '>>' if op == '<<' else '<<'
++            n = -n
++        av = a.value
++        if op == '<<':
++            if n >= INTMAX_BITS:
++                return _Value(0, a.unsigned)
++            return _Value(av << n, a.unsigned)
++        if n >= INTMAX_BITS:
++            return _Value(-1 if (av < 0 and not a.unsigned) else 0, a.unsigned)
++        if a.unsigned:
++            return _Value((av & _MASK) >> n, True)
++        return _Value(av >> n)
++
++    def unary(self):
++        t = self.token
++        op = t.op()
++        if op in ('+', '-', '~', '!'):
++            self.advance()
++            v = self.unary()
++            if op == '+':
++                return v
++            if op == '-':
++                return _Value(-v.value, v.unsigned)
++            if op == '~':
++                return _Value(~v.value, v.unsigned)
++            return _Value(int(v.value == 0))
++        if op == '(':
++            self.advance()
++            v = self.comma()
++            if self.token.op() != ')':
++                raise PreprocessorError("missing ')' in expression")
++            self.advance()
++            return v
++        if t.kind == 'number':
++            self.advance()
++            return interpret_number(t.text)
++        if t.kind == 'char':
++            self.advance()
++            return interpret_char(t.text)
++        if t.kind == 'name':
++            self.advance()
++            return _Value(0)
++        raise PreprocessorError(
++            f"token {t.text!r} is not valid in preprocessor expressions"
++        )
++
++
++class _Frame:
++    """The state of one file being pre-processed."""
++
++    __slots__ = ('conditions', 'file', 'found_index', 'line_delta')
++
++    def __init__(self, file, found_index=None) -> None:
++        self.file = file
++        self.found_index = found_index
++        self.conditions = []
++        self.line_delta = 0
+ 
+ 
+ class PreProcessor:
+-    """The main workhorse class for handling C pre-processing."""
++    """The main workhorse class for handling C pre-processing.
+ 
+-    def __init__(self, current=os.curdir, cpppath=(), dict={}, all: int=0, depth=-1) -> None:
+-        global Table
++    The pre-processor follows the files a source includes the way GCC
++    does: macros are expanded and ``#if`` expressions evaluated with the
++    C rules, every ``#include`` reads its header again unless the header
++    used ``#pragma once`` or was ``#import``-ed, and ``#include_next``
++    resumes the search after the directory its file was found in.
++    """
+ 
++    def __init__(
++        self, current=os.curdir, cpppath=(), dict={}, all: int = 0, depth=-1
++    ) -> None:
+         cpppath = tuple(cpppath)
+ 
+         self.searchpath = {
+             '"': (current,) + cpppath,
+             '<': cpppath + (current,),
+         }
+-
+-        # Initialize our C preprocessor namespace for tracking the
+-        # values of #defined keywords.  We use this namespace to look
+-        # for keywords on #ifdef/#ifndef lines, and to eval() the
+-        # expressions on #if/#elif lines (after massaging them from C to
+-        # Python).
+-        self.cpp_namespace = dict.copy()
+-        self.cpp_namespace['__dict__'] = self.cpp_namespace
+-
+-        # Namespace for constant expression evaluation (literals only)
+-        self.constant_expression_namespace = {}
++        self.current = current
++        self.cpppath = self._unique_dirs(cpppath)
++
++        # The macro table: name -> Macro.  Standard and built-in macros
++        # come first; definitions passed in *dict* may replace them.
++        self.cpp_namespace = {}
++        for name, value in STANDARD_MACROS:
++            self.cpp_namespace[name] = object_macro(name, value)
++        for name in BUILTIN_MACROS:
++            self.cpp_namespace[name] = Macro(name, builtin=name)
++        for name, value in dict.items():
++            self._predefine(name, value)
+ 
+         # Return all includes without resolving
+         if all:
+@@ -277,18 +1351,56 @@ class PreProcessor:
+         # >0 - number of allowed nested includes
+         self.depth = depth
+ 
+-        # For efficiency, a dispatch table maps each C preprocessor
+-        # directive (#if, #define, etc.) to the method that should be
+-        # called when we see it.  We accomodate state changes (#if,
+-        # #ifdef, #ifndef) by pushing the current dispatch table on a
+-        # stack and changing what method gets called for each relevant
+-        # directive we might see next at this level (#else, #elif).
+-        # #endif will simply pop the stack.
++        # A dispatch table maps each C preprocessor directive (#if,
++        # #define, etc.) to the method that should be called when we
++        # see it.
+         d = {'scons_current_file': self.scons_current_file}
+-        for op in Table.keys():
++        for op in DIRECTIVES:
+             d[op] = getattr(self, 'do_' + op)
+         self.default_table = d
+ 
++        self._tuple_cache = {}
++        self._frames = [_Frame(None)]
++        self._found_index = None
++
++    def _predefine(self, name, value) -> None:
++        """Defines a macro the way a ``-D`` option does.
++
++        *name* may carry a parameter list, as in ``F(x)``, to define a
++        function-like macro.
++        """
++        definition = _parse_define(Lexer(f'{name} {self._define_value(value)}'))
++        macro = Macro.from_definition(*definition) if definition else None
++        if macro is not None:
++            self.cpp_namespace[macro.name] = macro
++
++    @staticmethod
++    def _define_value(value) -> str:
++        """Returns the replacement text for a predefined macro value.
++
++        A value of None defines the macro as 1, as a bare ``-DNAME``
++        option does.  Backslash-escaped quotes and angle brackets stand
++        for themselves, as they do after the shell has read them.
++        """
++        if value is None:
++            return '1'
++        value = str(value)
++        for c in '<">':
++            value = value.replace(f"\\{c}", c)
++        return value
++
++    @staticmethod
++    def _unique_dirs(dirs):
++        result = []
++        seen = set()
++        for d in dirs:
++            path = d.get_abspath() if hasattr(d, 'get_abspath') else os.path.abspath(d)
++            key = os.path.normcase(path)
++            if key not in seen:
++                seen.add(key)
++                result.append(d)
++        return tuple(result)
++
+     def __call__(self, file):
+         """
+         Pre-processes a file.
+@@ -315,18 +1427,33 @@ class PreProcessor:
+         return self._process_tuples(self.tupleize(contents))
+ 
+     def _process_tuples(self, tuples, file=None):
+-        self.stack = []
+         self.dispatch_table = self.default_table.copy()
+         self.current_file = file
+-        self.tuples = tuples
++        self.tuples = collections.deque(tuples)
++        self._frames = [_Frame(file)]
++        self.stack = self._frames[0].conditions
++        self._skipping = False
++        self._once = set()
++        self._entered = {file}
++        self._overflow = False
++        self._pushed_macros = {}
+ 
+         self.initialize_result(file)
+         while self.tuples:
+-            t = self.tuples.pop(0)
+-            # Uncomment to see the list of tuples being processed (e.g.,
+-            # to validate the CPP lines are being translated correctly).
+-            # print(t)
+-            self.dispatch_table[t[0]](t)
++            t = self.tuples.popleft()
++            op = t[0]
++            if op == 'scons_enter_file':
++                self._frames.append(t[1])
++                self.stack = t[1].conditions
++                continue
++            if op == 'scons_leave_file':
++                self._frames.pop()
++                self.stack = self._frames[-1].conditions
++                self._skipping = bool(self.stack) and self.stack[-1][1]
++                continue
++            if self._skipping and op not in CONDITIONALS:
++                continue
++            self.dispatch_table[op](t)
+         return self.finalize_result(file)
+ 
+     def tupleize(self, contents):
+@@ -336,43 +1463,45 @@ class PreProcessor:
+ 
+         The first element of each tuple is the line's preprocessor
+         directive (#if, #include, #define, etc., minus the initial '#').
+-        The remaining elements are specific to the type of directive, as
+-        pulled apart by the regular expression.
++        The remaining elements are specific to the type of directive:
++        a :class:`Lexer` over the rest of the line for most of them, the
++        macro name for ``#ifdef``-like directives and ``#undef``, and
++        ``(name, params, body)`` for ``#define``.
+         """
+-        return self._match_tuples(self._parse_tuples(contents))
+-
+-    def _parse_tuples(self, contents):
+-        global CPP_Expression
+-        contents = line_continuations.sub('', contents)
+-        tuples = CPP_Expression.findall(contents)
+-        return Cleanup_CPP_Expressions(tuples)
+-
+-    def _match_tuples(self, tuples):
+-        global Table
+         result = []
+-        for t in tuples:
+-            m = Table[t[0]].match(t[1])
+-            if m:
+-                result.append((t[0],) + m.groups())
++        for name, lexer, end_line in _directive_lines(contents):
++            if name in ('ifdef', 'ifndef', 'elifdef', 'elifndef', 'undef'):
++                t = lexer.next()
++                result.append((name, t.text if t.kind == 'name' else None))
++            elif name in ('else', 'endif'):
++                result.append((name,))
++            elif name == 'define':
++                definition = _parse_define(lexer)
++                if definition:
++                    result.append((name,) + definition)
++            elif name == 'line':
++                result.append((name, lexer, end_line))
++            elif name in DIRECTIVES:
++                result.append((name, lexer))
+         return result
+ 
+     # Dispatch table stack manipulation methods.
+ 
+     def save(self) -> None:
+         """
+-        Pushes the current dispatch table on the stack and re-initializes
+-        the current dispatch table to the default.
++        Opens a new conditional group, remembering whether the enclosing
++        group is being skipped.
+         """
+-        self.stack.append(self.dispatch_table)
+-        self.dispatch_table = self.default_table.copy()
++        self.stack.append([self._skipping, self._skipping, False])
+ 
+     def restore(self) -> None:
+         """
+-        Pops the previous dispatch table off the stack and makes it the
+-        current one.
++        Closes the innermost conditional group.
+         """
+-        try: self.dispatch_table = self.stack.pop()
+-        except IndexError: pass
++        try:
++            self._skipping = self.stack.pop()[0]
++        except IndexError:
++            pass
+ 
+     # Utility methods.
+ 
+@@ -386,97 +1515,147 @@ class PreProcessor:
+     def scons_current_file(self, t) -> None:
+         self.current_file = t[1]
+ 
+-    def eval_constant_expression(self, s):
+-        """
+-        Evaluates a C preprocessor expression.
++    def line_delta(self) -> int:
++        return self._frames[-1].line_delta
+ 
+-        This is done by converting it to a Python equivalent and
+-        eval()ing it in the C preprocessor namespace we use to
+-        track #define values.
++    def include_level(self) -> int:
++        return len(self._frames) - 1
+ 
+-        Returns None if the eval() result is not an integer.
+-        """
+-        s = CPP_to_Python(s)
+-        try:
+-            rval = eval(s, self.constant_expression_namespace)
+-        except (NameError, TypeError, SyntaxError) as e:
+-            rval = None
+-        if not isinstance(rval, int):
+-            rval = None
+-        return rval
++    def _lexer(self, t):
++        """Returns a fresh lexer over the operand of tuple *t*."""
++        operand = t[1]
++        if isinstance(operand, Lexer):
++            return Lexer(operand.text, operand.source, operand.offset)
++        return Lexer(' '.join(str(x) for x in t[1:]))
+ 
+     def eval_expression(self, t):
+         """
+-        Evaluates a C preprocessor expression.
++        Evaluates the C preprocessor expression on a #if or #elif line.
+ 
+-        This is done by converting it to a Python equivalent and
+-        eval()ing it in the C preprocessor namespace we use to
+-        track #define values.
++        The expression is macro-expanded and evaluated with the integer
++        arithmetic of the C preprocessor.  An expression the
++        preprocessor would reject counts as false.
+         """
+-        t = CPP_to_Python(' '.join(t[1:]))
++        expander = Expander(self, self._lexer(t))
+         try:
+-            return eval(t, self.cpp_namespace)
+-        except (NameError, TypeError, SyntaxError):
++            return 1 if ExpressionEvaluator(expander).evaluate() else 0
++        except (PreprocessorError, RecursionError):
+             return 0
+ 
++    def eval_constant_expression(self, s):
++        """
++        Evaluates a C preprocessor expression made of constants only.
++
++        Returns the value of *s*, or None if it names an identifier or
++        is not a valid expression.
++        """
++        if any(t.kind == 'name' for t in tokenize(s)):
++            return None
++        try:
++            return ExpressionEvaluator(Expander(self, Lexer(s))).value()
++        except (PreprocessorError, RecursionError):
++            return None
++
+     def initialize_result(self, fname) -> None:
+         self.result = [fname]
+ 
+     def finalize_result(self, fname):
+         return self.result[1:]
+ 
++    def search_order(self, keyword, quote, fallback: bool = True):
++        """Returns the ``(index, directory)`` pairs to search, in order.
++
++        A quoted name is looked for first in the directory of the file
++        containing the directive (index -1), then along the include
++        path.  ``#include_next`` resumes after the directory in which the
++        current file was found.  A file found in the directory of its
++        includer was not found on the include path, even when that
++        directory is also on it, so ``#include_next`` from it searches the
++        whole include path again, as GCC does.  With *fallback*, the
++        directory of the source being scanned is tried last (index None),
++        so that headers the compiler would not find are still noticed.
++        """
++        frame = self._frames[-1]
++        if keyword == 'include_next' and frame.found_index is not None:
++            return list(enumerate(self.cpppath))[frame.found_index + 1 :]
++        order = list(enumerate(self.cpppath))
++        if quote == '"':
++            order.insert(0, (-1, self.includer_dir()))
++        if fallback:
++            order.append((None, self.current))
++        return order
++
++    def includer_dir(self):
++        """Returns the directory of the file currently being processed."""
++        if self.current_file is None:
++            return self.current
++        return os.path.dirname(self.current_file) or os.curdir
++
++    def file_in_dir(self, directory, fname):
++        """Returns the path of *fname* in *directory* if it is a file."""
++        if os.path.isabs(fname) or directory == os.curdir:
++            f = fname
++        else:
++            f = os.path.join(directory, fname)
++        return f if os.path.isfile(f) else None
++
++    def search_include_file(self, keyword, quote, fname, fallback: bool = True):
++        """Returns ``(file, index)`` for a header, or ``(None, None)``."""
++        if os.path.isabs(fname):
++            return self.file_in_dir(None, fname), None
++        for index, directory in self.search_order(keyword, quote, fallback):
++            f = self.file_in_dir(directory, fname)
++            if f:
++                return f, index
++        return None, None
++
++    def has_header(self, fname, bracket, include_next) -> bool:
++        """Answers ``__has_include`` and ``__has_include_next``."""
++        keyword = (
++            'include_next' if include_next and len(self._frames) > 1 else 'include'
++        )
++        f, _ = self.search_include_file(
++            keyword, '<' if bracket else '"', fname, fallback=False
++        )
++        return bool(f)
++
+     def find_include_file(self, t):
+         """
+         Finds the #include file for a given preprocessor tuple.
+         """
+-        fname = t[2]
+-        for d in self.searchpath[t[1]]:
+-            if d == os.curdir:
+-                f = fname
+-            else:
+-                f = os.path.join(d, fname)
+-            if os.path.isfile(f):
+-                return f
+-        return None
++        keyword, quote, fname = t
++        f, self._found_index = self.search_include_file(keyword, quote, fname)
++        return f
+ 
+     def read_file(self, file) -> str:
+         with open(file, 'rb') as f:
+             return SCons.Util.to_Text(f.read())
+ 
++    def _file_tuples(self, file):
++        try:
++            return self._tuple_cache[file]
++        except KeyError:
++            pass
++        tuples = self.tupleize(self.read_file(file))
++        self._tuple_cache[file] = tuples
++        return tuples
++
+     # Start and stop processing include lines.
+ 
+     def start_handling_includes(self, t=None) -> None:
+         """
+-        Causes the PreProcessor object to start processing #import,
+-        #include and #include_next lines.
+-
+-        This method will be called when a #if, #ifdef, #ifndef or #elif
+-        evaluates True, or when we reach the #else in a #if, #ifdef,
+-        #ifndef or #elif block where a condition already evaluated
+-        False.
++        Makes the directives of the current conditional group take effect.
+ 
++        Called when a #if, #ifdef, #ifndef or #elif evaluates True, or
++        when a #else is reached and no earlier branch was taken.
+         """
+-        d = self.dispatch_table
+-        p = self.stack[-1] if self.stack else self.default_table
+-
+-        for k in ('import', 'include', 'include_next', 'define', 'undef'):
+-            d[k] = p[k]
++        self._skipping = bool(self.stack) and self.stack[-1][0]
+ 
+     def stop_handling_includes(self, t=None) -> None:
+         """
+-        Causes the PreProcessor object to stop processing #import,
+-        #include and #include_next lines.
+-
+-        This method will be called when a #if, #ifdef, #ifndef or #elif
+-        evaluates False, or when we reach the #else in a #if, #ifdef,
+-        #ifndef or #elif block where a condition already evaluated True.
++        Makes the directives of the current conditional group be skipped.
+         """
+-        d = self.dispatch_table
+-        d['import'] = self.do_nothing
+-        d['include'] =  self.do_nothing
+-        d['include_next'] =  self.do_nothing
+-        d['define'] =  self.do_nothing
+-        d['undef'] =  self.do_nothing
++        self._skipping = True
+ 
+     # Default methods for handling all of the preprocessor directives.
+     # (Note that what actually gets called for a given directive at any
+@@ -488,15 +1667,15 @@ class PreProcessor:
+         #ifndef lines.
+         """
+         self.save()
+-        d = self.dispatch_table
++        group = self.stack[-1]
++        if group[0]:
++            return
+         if condition:
++            group[2] = True
+             self.start_handling_includes()
+-            d['elif'] = self.stop_handling_includes
+-            d['else'] = self.stop_handling_includes
+         else:
+             self.stop_handling_includes()
+-            d['elif'] = self.do_elif
+-            d['else'] = self.start_handling_includes
++        group[1] = self._skipping
+ 
+     def do_ifdef(self, t) -> None:
+         """
+@@ -508,29 +1687,52 @@ class PreProcessor:
+         """
+         Default handling of a #ifndef line.
+         """
+-        self._do_if_else_condition(t[1] not in self.cpp_namespace)
++        self._do_if_else_condition(t[1] is not None and t[1] not in self.cpp_namespace)
+ 
+     def do_if(self, t) -> None:
+         """
+         Default handling of a #if line.
+         """
+-        self._do_if_else_condition(self.eval_expression(t))
++        self._do_if_else_condition(not self._skipping and self.eval_expression(t))
++
++    def _do_elif_condition(self, evaluate) -> None:
++        if not self.stack:
++            return
++        group = self.stack[-1]
++        if group[0] or group[2]:
++            self.stop_handling_includes()
++        elif evaluate():
++            group[2] = True
++            self.start_handling_includes()
++        else:
++            self.stop_handling_includes()
++        group[1] = self._skipping
+ 
+     def do_elif(self, t) -> None:
+         """
+         Default handling of a #elif line.
+         """
+-        d = self.dispatch_table
+-        if self.eval_expression(t):
+-            self.start_handling_includes()
+-            d['elif'] = self.stop_handling_includes
+-            d['else'] = self.stop_handling_includes
++        self._do_elif_condition(lambda: self.eval_expression(t))
++
++    def do_elifdef(self, t) -> None:
++        """
++        Default handling of a #elifdef line.
++        """
++        self._do_elif_condition(lambda: t[1] in self.cpp_namespace)
++
++    def do_elifndef(self, t) -> None:
++        """
++        Default handling of a #elifndef line.
++        """
++        self._do_elif_condition(
++            lambda: t[1] is not None and t[1] not in self.cpp_namespace
++        )
+ 
+     def do_else(self, t) -> None:
+         """
+         Default handling of a #else line.
+         """
+-        pass
++        self._do_elif_condition(lambda: True)
+ 
+     def do_endif(self, t) -> None:
+         """
+@@ -542,125 +1744,190 @@ class PreProcessor:
+         """
+         Default handling of a #define line.
+         """
+-        _, name, args, expansion = t
+-
+-        rval = self.eval_constant_expression(expansion)
+-        if rval is not None:
+-            expansion = rval
+-        else:
+-            # handle "defined" chain "! (defined (A) || defined (B)" ...
+-            if "defined " in expansion:
+-                self.cpp_namespace[name] = self.eval_expression(t[2:])
+-                return
+-
+-        if args:
+-            evaluator = FunctionEvaluator(name, args[1:-1], expansion)
+-            self.cpp_namespace[name] = evaluator
+-        else:
+-            self.cpp_namespace[name] = expansion
++        _, name, params, body = t
++        macro = Macro.from_definition(name, params, body)
++        if macro is not None:
++            self.cpp_namespace[name] = macro
+ 
+     def do_undef(self, t) -> None:
+         """
+         Default handling of a #undef line.
+         """
+-        try: del self.cpp_namespace[t[1]]
+-        except KeyError: pass
++        self.cpp_namespace.pop(t[1], None)
++
++    def do_line(self, t) -> None:
++        """
++        Default handling of a #line line (and of GCC line markers).
++        """
++        expander = Expander(self, self._lexer(t))
++        try:
++            tokens = [x for x in expander.rest() if x.kind != 'padding']
++        except PreprocessorError:
++            return
++        if not tokens or tokens[0].kind != 'number' or not tokens[0].text.isdigit():
++            return
++        self._frames[-1].line_delta = int(tokens[0].text) - (t[2] + 1)
++
++    def do_pragma(self, t) -> None:
++        """
++        Default handling of a #pragma line.
++
++        ``once``, ``push_macro`` and ``pop_macro`` matter to which files
++        are read; other pragmas are ignored.
++        """
++        lexer = self._lexer(t)
++        word = lexer.next()
++        if word.kind != 'name':
++            return
++        if word.text == 'once':
++            self._once.add(self._frames[-1].file)
++            return
++        if word.text not in ('push_macro', 'pop_macro'):
++            return
++        if lexer.next().op() != '(':
++            return
++        arg = lexer.next()
++        if arg.kind != 'string' or arg.text[0] != '"' or lexer.next().op() != ')':
++            return
++        name = arg.text[1:-1]
++        pushed = self._pushed_macros
++        if word.text == 'push_macro':
++            pushed.setdefault(name, []).append(self.cpp_namespace.get(name))
++        elif pushed.get(name):
++            macro = pushed[name].pop()
++            if macro is None:
++                self.cpp_namespace.pop(name, None)
++            else:
++                self.cpp_namespace[name] = macro
+ 
+     def do_import(self, t) -> None:
+         """
+         Default handling of a #import line.
++
++        Like #include, but a file is read only if it has not been read
++        before, and never again afterwards.
+         """
+-        # XXX finish this -- maybe borrow/share logic from do_include()...?
+-        pass
++        self.do_include(t)
+ 
+     def do_include(self, t) -> None:
+         """
+         Default handling of a #include line.
+         """
+-        t = self.resolve_include(t)
+-        if not t:
+-            return
++        keyword = t[0]
++        if keyword == 'include_next' and len(self._frames) == 1:
++            t = ('include',) + tuple(t[1:])
++        resolved = self.resolve_include(t)
++        if resolved:
++            self._include(keyword, resolved)
++
++    def _include(self, keyword, t) -> None:
++        """Reads the header *t* names next, unless it is left unread."""
++        self._found_index = None
+         include_file = self.find_include_file(t)
+-        # avoid infinite recursion
+-        if not include_file or include_file in self.result:
++        if not include_file:
+             return
+-        self.result.append(include_file)
+-        # print include_file, len(self.tuples)
++        found_index = self._found_index
++        if include_file not in self.result:
++            self.result.append(include_file)
+ 
+         # Handle maximum depth of nested includes
+-        if self.depth != -1:
+-            current_depth = 0
+-            for t in self.tuples:
+-                if t[0] == "scons_current_file":
+-                    current_depth += 1
+-            if current_depth >= self.depth:
++        level = len(self._frames) - 1
++        if self.depth != -1 and level >= self.depth:
++            return
++        if level + 1 >= MAX_INCLUDE_DEPTH:
++            # The compiler gives up here.  From now on read each file at
++            # most once, so that a recursive tangle cannot run away.
++            self._overflow = True
++            return
++        if self._overflow and include_file in self._entered:
++            return
++
++        if include_file in self._once:
++            return
++        if keyword == 'import':
++            self._once.add(include_file)
++            if include_file in self._entered:
+                 return
++        tuples = self._file_tuples(include_file)
++        if self.guarded(include_file, tuples):
++            return
++        self._entered.add(include_file)
++        frame = _Frame(include_file, found_index)
++        new_tuples = (
++            [('scons_enter_file', frame), ('scons_current_file', include_file)]
++            + list(tuples)
++            + [('scons_leave_file', frame), ('scons_current_file', self.current_file)]
++        )
++        self.tuples.extendleft(reversed(new_tuples))
++
++    def guarded(self, file, tuples) -> bool:
++        """
++        Tells whether the include guard of a header keeps its contents out.
++        """
++        guard = _include_guard(tuples)
++        return guard is not None and guard in self.cpp_namespace
+ 
+-        new_tuples = [('scons_current_file', include_file)] + \
+-                      self.tupleize(self.read_file(include_file)) + \
+-                     [('scons_current_file', self.current_file)]
+-        self.tuples[:] = new_tuples + self.tuples
+-
+-    # From: Stefan Seefeld <seefeld@sympatico.ca> (22 Nov 2005)
+-    #
+-    # By the way, #include_next is not the same as #include. The difference
+-    # being that #include_next starts its search in the path following the
+-    # path that let to the including file. In other words, if your system
+-    # include paths are ['/foo', '/bar'], and you are looking at a header
+-    # '/foo/baz.h', it might issue an '#include_next <baz.h>' which would
+-    # correctly resolve to '/bar/baz.h' (if that exists), but *not* see
+-    # '/foo/baz.h' again. See
+-    # https://gcc.gnu.org/onlinedocs/cpp/Wrapper-Headers.html for more notes.
+-    #
+-    # I have no idea in what context #import might be used.
+-    # Update: possibly these notes?
+-    # https://github.com/MicrosoftDocs/cpp-docs/blob/main/docs/preprocessor/hash-import-directive-cpp.md
+-
+-    # XXX is #include_next really the same as #include ?
+-    do_include_next = do_include
++    def do_include_next(self, t) -> None:
++        """
++        Default handling of a #include_next line.
++        """
++        self.do_include(t)
+ 
+     # Utility methods for handling resolution of include files.
+ 
+     def resolve_include(self, t):
+         """Resolve a tuple-ized #include line.
+ 
+-        This handles recursive expansion of values without "" or <>
+-        surrounding the name until an initial " or < is found, to handle
+-        #include FILE where FILE is a #define somewhere else.
++        The operand is a header name, or else it is macro-expanded and
++        must then produce a string literal or a ``<``...``>`` sequence.
++        Returns ``(keyword, quote, name)``, or None if there is no file
++        name to look for.
+         """
+-        s = t[1].strip()
+-        while not s[0] in '<"':
+-            try:
+-                s = self.cpp_namespace[s]
+-                # strip backslashes from the computed include (-DFOO_H=\"foo.h\")
+-                for c in '<">':
+-                    s = s.replace(f"\\{c}", c)
+-            except KeyError:
+-                m = function_name.search(s)
+-
+-                # Date: Mon, 28 Nov 2016 17:47:13 UTC
+-                # From: Ivan Kravets <ikravets@platformio.org>
+-                #
+-                # Ignore `#include` directive that depends on dynamic macro
+-                # which is not located in state TABLE
+-                # For example, `#include MYCONFIG_FILE`
+-                if not m:
+-                    return None
+-
+-                s = self.cpp_namespace[m.group(1)]
+-                if callable(s):
+-                    args = function_arg_separator.split(m.group(2))
+-                    s = s(*args)
+-            if not s:
+-                return None
+-        return (t[0], s[0], s[1:-1])
++        expander = Expander(self, self._lexer(t), include=True)
++        expander.angled = True
++        try:
++            first = expander.get_no_padding()
++            if first.kind == 'header' or (
++                first.kind == 'string' and first.text[0] == '"'
++            ):
++                name = first.text
++            elif first.op() == '<':
++                name = '<' + expander.glue_header_name() + '>'
++            else:
++                name = spell([first] + expander.rest()).strip()
++        except (PreprocessorError, RecursionError):
++            return None
++        if len(name) < 3 or (name[0], name[-1]) not in (('"', '"'), ('<', '>')):
++            return None
++        return (t[0], name[0], name[1:-1])
+ 
+     def all_include(self, t) -> None:
+-        """
+-        """
++        """ """
+         self.result.append(self.resolve_include(t))
+ 
+ 
++def _include_guard(tuples):
++    """Returns the include-guard macro of a header, or None.
++
++    A header whose directives all sit inside ``#ifndef X`` ... ``#endif``,
++    with no ``#else`` or ``#elif`` of its own, does nothing once X is
++    defined, so it need not be processed again.
++    """
++    if len(tuples) < 2 or tuples[0][0] != 'ifndef' or tuples[-1][0] != 'endif':
++        return None
++    depth = 0
++    for t in tuples[:-1]:
++        if t[0] in ('if', 'ifdef', 'ifndef'):
++            depth += 1
++        elif t[0] == 'endif':
++            depth -= 1
++            if depth == 0:
++                return None
++        elif depth == 1 and t[0] in ('else', 'elif', 'elifdef', 'elifndef'):
++            return None
++    return tuples[0][1]
++
++
+ class DumbPreProcessor(PreProcessor):
+     """A preprocessor that ignores all #if/#elif/#else/#endif directives
+     and just reports back *all* of the #include files (like the classic
+@@ -670,9 +1937,22 @@ class DumbPreProcessor(PreProcessor):
+     find all of the #include lines, only slower.  It exists mainly as
+     an example of how the main PreProcessor class can be sub-classed
+     to tailor its behavior.
++
++    The branches of each conditional are taken one after the other, so a
++    macro has the definition read last before it is used.
+     """
++
+     def __init__(self, *args, **kw) -> None:
+         PreProcessor.__init__(self, *args, **kw)
+         d = self.default_table
+-        for func in ['if', 'elif', 'else', 'endif', 'ifdef', 'ifndef']:
+-            d[func] = d[func] = self.do_nothing
++        for func in CONDITIONALS:
++            d[func] = self.do_nothing
++
++    def guarded(self, file, tuples) -> bool:
++        """
++        Tells whether the include guard of a header keeps its contents out.
++
++        Every branch is taken here, so a header is read at least once; its
++        guard only keeps it from being read again.
++        """
++        return file in self._entered and super().guarded(file, tuples)

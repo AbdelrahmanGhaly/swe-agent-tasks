@@ -1,0 +1,1192 @@
+diff --git a/quorumweights_3964f9/voter_weights_3964f9_test.go b/quorumweights_3964f9/voter_weights_3964f9_test.go
+new file mode 100644
+index 0000000..d9fdefd
+--- /dev/null
++++ b/quorumweights_3964f9/voter_weights_3964f9_test.go
+@@ -0,0 +1,1035 @@
++package quorumweights
++
++import (
++	"fmt"
++	"io"
++	"log"
++	"math"
++	"math/rand"
++	"slices"
++	"testing"
++
++	"google.golang.org/protobuf/proto"
++
++	"go.etcd.io/raft/v3"
++	pb "go.etcd.io/raft/v3/raftpb"
++)
++
++var quietLogger = &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)}
++
++type peer struct {
++	rn           *raft.RawNode
++	storage      *raft.MemoryStorage
++	confState    *pb.ConfState
++	appliedIndex uint64
++	applied      []string
++	reads        []string
++}
++
++type cluster struct {
++	t        *testing.T
++	weights  map[uint64]uint64
++	tweak    func(*raft.Config)
++	peers    map[uint64]*peer
++	isolated map[uint64]bool
++	drop     func(*pb.Message) bool
++}
++
++func newCluster(t *testing.T, voters, learners []uint64, weights map[uint64]uint64, tweak func(*raft.Config)) *cluster {
++	t.Helper()
++	c := &cluster{
++		t:        t,
++		weights:  weights,
++		tweak:    tweak,
++		peers:    map[uint64]*peer{},
++		isolated: map[uint64]bool{},
++	}
++	cs := &pb.ConfState{Voters: voters, Learners: learners}
++	for _, id := range append(slices.Clone(voters), learners...) {
++		c.start(id, cs)
++	}
++	return c
++}
++
++func (c *cluster) config(id uint64, storage raft.Storage) *raft.Config {
++	cfg := &raft.Config{
++		ID:              id,
++		ElectionTick:    10,
++		HeartbeatTick:   1,
++		Storage:         storage,
++		MaxSizePerMsg:   1 << 20,
++		MaxInflightMsgs: 256,
++		VoterWeights:    c.weights,
++		Logger:          quietLogger,
++	}
++	if c.tweak != nil {
++		c.tweak(cfg)
++	}
++	return cfg
++}
++
++func (c *cluster) start(id uint64, cs *pb.ConfState) {
++	c.t.Helper()
++	storage := raft.NewMemoryStorage()
++	p := &peer{storage: storage}
++	if cs != nil {
++		snap := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{
++			Index:     proto.Uint64(1),
++			Term:      proto.Uint64(1),
++			ConfState: cs,
++		}}
++		if err := storage.ApplySnapshot(snap); err != nil {
++			c.t.Fatal(err)
++		}
++		if err := storage.SetHardState(&pb.HardState{Term: proto.Uint64(1), Commit: proto.Uint64(1)}); err != nil {
++			c.t.Fatal(err)
++		}
++		p.confState = cs
++		p.appliedIndex = 1
++	}
++	rn, err := raft.NewRawNode(c.config(id, storage))
++	if err != nil {
++		c.t.Fatal(err)
++	}
++	p.rn = rn
++	c.peers[id] = p
++}
++
++func (c *cluster) ids() []uint64 {
++	ids := make([]uint64, 0, len(c.peers))
++	for id := range c.peers {
++		ids = append(ids, id)
++	}
++	slices.Sort(ids)
++	return ids
++}
++
++func (c *cluster) handleReady(p *peer) []*pb.Message {
++	c.t.Helper()
++	rd := p.rn.Ready()
++	if !raft.IsEmptySnap(rd.Snapshot) {
++		if err := p.storage.ApplySnapshot(rd.Snapshot); err != nil {
++			c.t.Fatal(err)
++		}
++		p.confState = rd.Snapshot.GetMetadata().GetConfState()
++		p.appliedIndex = rd.Snapshot.GetMetadata().GetIndex()
++	}
++	if err := p.storage.Append(rd.Entries); err != nil {
++		c.t.Fatal(err)
++	}
++	if !raft.IsEmptyHardState(rd.HardState) {
++		if err := p.storage.SetHardState(rd.HardState); err != nil {
++			c.t.Fatal(err)
++		}
++	}
++	for _, rs := range rd.ReadStates {
++		p.reads = append(p.reads, fmt.Sprintf("%s@%d", rs.RequestCtx, rs.Index))
++	}
++	for _, e := range rd.CommittedEntries {
++		switch e.GetType() {
++		case pb.EntryNormal:
++			if len(e.GetData()) > 0 {
++				p.applied = append(p.applied, string(e.GetData()))
++			}
++		case pb.EntryConfChange:
++			var cc pb.ConfChange
++			if err := proto.Unmarshal(e.GetData(), &cc); err != nil {
++				c.t.Fatal(err)
++			}
++			p.confState = p.rn.ApplyConfChange(&cc)
++		case pb.EntryConfChangeV2:
++			var cc pb.ConfChangeV2
++			if err := proto.Unmarshal(e.GetData(), &cc); err != nil {
++				c.t.Fatal(err)
++			}
++			p.confState = p.rn.ApplyConfChange(&cc)
++		}
++		p.appliedIndex = e.GetIndex()
++	}
++	msgs := rd.Messages
++	p.rn.Advance(rd)
++	return msgs
++}
++
++func (c *cluster) blocked(m *pb.Message) bool {
++	if c.isolated[m.GetFrom()] || c.isolated[m.GetTo()] {
++		return true
++	}
++	return c.drop != nil && c.drop(m)
++}
++
++func (c *cluster) stabilize() {
++	c.t.Helper()
++	for range 10000 {
++		var msgs []*pb.Message
++		for _, id := range c.ids() {
++			p := c.peers[id]
++			for p.rn.HasReady() {
++				msgs = append(msgs, c.handleReady(p)...)
++			}
++		}
++		if len(msgs) == 0 {
++			return
++		}
++		for _, m := range msgs {
++			to, ok := c.peers[m.GetTo()]
++			if !ok || c.blocked(m) {
++				continue
++			}
++			_ = to.rn.Step(m)
++			if m.GetType() == pb.MsgSnap {
++				c.peers[m.GetFrom()].rn.ReportSnapshot(m.GetTo(), raft.SnapshotFinish)
++			}
++		}
++	}
++	c.t.Fatal("cluster did not settle")
++}
++
++func (c *cluster) isolate(ids ...uint64) {
++	for _, id := range ids {
++		c.isolated[id] = true
++	}
++}
++
++func (c *cluster) heal(ids ...uint64) {
++	for _, id := range ids {
++		delete(c.isolated, id)
++	}
++}
++
++func (c *cluster) campaign(id uint64) {
++	c.t.Helper()
++	if err := c.peers[id].rn.Campaign(); err != nil {
++		c.t.Fatal(err)
++	}
++	c.stabilize()
++}
++
++func (c *cluster) electWithoutSaving(id uint64) {
++	c.t.Helper()
++	if err := c.peers[id].rn.Campaign(); err != nil {
++		c.t.Fatal(err)
++	}
++	for range 100 {
++		if c.state(id) == raft.StateLeader {
++			return
++		}
++		var msgs []*pb.Message
++		for _, pid := range c.ids() {
++			p := c.peers[pid]
++			for p.rn.HasReady() {
++				msgs = append(msgs, c.handleReady(p)...)
++			}
++		}
++		for _, m := range msgs {
++			if to, ok := c.peers[m.GetTo()]; ok && !c.blocked(m) {
++				_ = to.rn.Step(m)
++			}
++		}
++	}
++	c.t.Fatalf("node %d did not become leader", id)
++}
++
++func (c *cluster) propose(id uint64, data string) {
++	c.t.Helper()
++	if err := c.peers[id].rn.Propose([]byte(data)); err != nil {
++		c.t.Fatal(err)
++	}
++	c.stabilize()
++}
++
++func (c *cluster) proposeConfChange(id uint64, cc pb.ConfChangeI) {
++	c.t.Helper()
++	if err := c.peers[id].rn.ProposeConfChange(cc); err != nil {
++		c.t.Fatal(err)
++	}
++	c.stabilize()
++}
++
++func (c *cluster) readIndex(id uint64, ctx string) {
++	c.peers[id].rn.ReadIndex([]byte(ctx))
++	c.stabilize()
++}
++
++func (c *cluster) tick(id uint64, n int) {
++	c.t.Helper()
++	for range n {
++		c.peers[id].rn.Tick()
++		c.stabilize()
++	}
++}
++
++func (c *cluster) setWeights(weights map[uint64]uint64, ids ...uint64) {
++	c.t.Helper()
++	for _, id := range ids {
++		if err := c.peers[id].rn.SetVoterWeights(weights); err != nil {
++			c.t.Fatalf("SetVoterWeights on %d: %v", id, err)
++		}
++	}
++	c.stabilize()
++}
++
++func (c *cluster) compact(id uint64) {
++	c.t.Helper()
++	p := c.peers[id]
++	if _, err := p.storage.CreateSnapshot(p.appliedIndex, p.confState, nil); err != nil {
++		c.t.Fatal(err)
++	}
++	if err := p.storage.Compact(p.appliedIndex); err != nil {
++		c.t.Fatal(err)
++	}
++}
++
++func (c *cluster) state(id uint64) raft.StateType {
++	return c.peers[id].rn.Status().RaftState
++}
++
++func (c *cluster) term(id uint64) uint64 {
++	return c.peers[id].rn.Status().GetTerm()
++}
++
++func (c *cluster) commit(id uint64) uint64 {
++	return c.peers[id].rn.Status().GetCommit()
++}
++
++func (c *cluster) requireState(id uint64, want raft.StateType) {
++	c.t.Helper()
++	if got := c.state(id); got != want {
++		c.t.Fatalf("node %d is %s, want %s", id, got, want)
++	}
++}
++
++func (c *cluster) requireApplied(id uint64, want ...string) {
++	c.t.Helper()
++	got := c.peers[id].applied
++	if want == nil {
++		want = []string{}
++	}
++	if got == nil {
++		got = []string{}
++	}
++	if !slices.Equal(got, want) {
++		c.t.Fatalf("node %d applied %q, want %q", id, got, want)
++	}
++}
++
++func (c *cluster) requireReads(id uint64, want ...string) {
++	c.t.Helper()
++	got := c.peers[id].reads
++	if want == nil {
++		want = []string{}
++	}
++	if got == nil {
++		got = []string{}
++	}
++	if !slices.Equal(got, want) {
++		c.t.Fatalf("node %d read states %q, want %q", id, got, want)
++	}
++}
++
++func preVote(cfg *raft.Config) {
++	cfg.PreVote = true
++}
++
++func checkQuorum(cfg *raft.Config) {
++	cfg.CheckQuorum = true
++}
++
++func addNode(id uint64) *pb.ConfChange {
++	return &pb.ConfChange{Type: pb.ConfChangeAddNode.Enum(), NodeId: proto.Uint64(id)}
++}
++
++func TestHeavyVoterWinsElectionAlone(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 3}, nil)
++	c.isolate(1)
++	c.campaign(1)
++	c.requireState(1, raft.StateLeader)
++	c.propose(1, "x")
++	c.requireApplied(1, "x")
++}
++
++func TestLightVotersCannotElectWithoutHeavyVoter(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 3}, nil)
++	c.isolate(1)
++	c.campaign(2)
++	c.requireState(2, raft.StateCandidate)
++	c.requireState(3, raft.StateFollower)
++}
++
++func TestElectionLostOnceWeightedQuorumIsOutOfReach(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 3}, nil)
++	c.isolate(1)
++	c.campaign(1)
++	c.propose(1, "x")
++	c.heal(1)
++	c.campaign(2)
++	c.requireState(2, raft.StateFollower)
++	c.requireState(1, raft.StateLeader)
++}
++
++func TestExactlyHalfTheWeightIsNotAQuorum(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 2}, nil)
++	c.isolate(2, 3)
++	c.campaign(1)
++	c.requireState(1, raft.StateCandidate)
++
++	c.heal(2)
++	c.campaign(1)
++	c.requireState(1, raft.StateLeader)
++
++	c.isolate(2)
++	c.propose(1, "half")
++	c.requireApplied(1)
++
++	c.heal(2)
++	c.tick(1, 1)
++	c.requireApplied(1, "half")
++}
++
++func TestElectionLostAtExactlyHalf(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 2}, nil)
++	c.isolate(1)
++	c.campaign(1)
++	c.requireState(1, raft.StateCandidate)
++	c.heal(1)
++	c.campaign(2)
++	c.requireState(2, raft.StateFollower)
++	c.requireState(1, raft.StateCandidate)
++}
++
++func TestPreVoteUsesWeights(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 3}, preVote)
++	start := c.term(2)
++	c.isolate(1)
++	c.campaign(2)
++	c.requireState(2, raft.StatePreCandidate)
++	if got := c.term(2); got != start {
++		t.Fatalf("pre-candidate moved from term %d to %d", start, got)
++	}
++
++	c.campaign(1)
++	c.requireState(1, raft.StateLeader)
++	if got := c.term(1); got != start+1 {
++		t.Fatalf("leader term is %d, want %d", got, start+1)
++	}
++}
++
++func TestCommitWaitsForWeightedQuorum(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{3: 3}, nil)
++	c.campaign(1)
++	c.requireState(1, raft.StateLeader)
++	committed := c.commit(1)
++
++	c.isolate(3)
++	c.propose(1, "a")
++	c.requireApplied(1)
++	c.requireApplied(2)
++	if got := c.commit(1); got != committed {
++		t.Fatalf("commit moved from %d to %d without the heavy voter", committed, got)
++	}
++
++	c.heal(3)
++	c.tick(1, 1)
++	c.requireApplied(1, "a")
++	c.requireApplied(2, "a")
++	c.requireApplied(3, "a")
++}
++
++func TestCheckQuorumCountsWeight(t *testing.T) {
++	heavy := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 3}, checkQuorum)
++	heavy.campaign(1)
++	heavy.isolate(1)
++	heavy.tick(1, 25)
++	heavy.requireState(1, raft.StateLeader)
++
++	half := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 2}, checkQuorum)
++	half.campaign(1)
++	half.isolate(3)
++	half.tick(1, 25)
++	half.requireState(1, raft.StateLeader)
++	half.isolate(2)
++	half.tick(1, 25)
++	if half.state(1) == raft.StateLeader {
++		t.Fatal("leader with half the weight kept leading without a quorum")
++	}
++}
++
++func TestReadIndexNeedsWeightedAcks(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{3: 3}, nil)
++	c.campaign(1)
++	commit := c.commit(1)
++
++	c.isolate(3)
++	c.readIndex(1, "r")
++	c.requireReads(1)
++
++	c.heal(3)
++	c.tick(1, 1)
++	c.requireReads(1, fmt.Sprintf("r@%d", commit))
++}
++
++func TestHeavyLeaderAnswersReadIndexAlone(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 3}, nil)
++	c.campaign(1)
++	commit := c.commit(1)
++
++	c.isolate(2, 3)
++	c.readIndex(1, "solo")
++	c.requireReads(1, fmt.Sprintf("solo@%d", commit))
++
++	c.heal(2)
++	c.readIndex(2, "fwd")
++	c.requireReads(2, fmt.Sprintf("fwd@%d", commit))
++}
++
++func TestJointConfigurationWeighsEachHalf(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 3, 4: 3}, nil)
++	c.campaign(1)
++
++	c.proposeConfChange(1, &pb.ConfChangeV2{
++		Transition: pb.ConfChangeTransitionJointExplicit.Enum(),
++		Changes: []*pb.ConfChangeSingle{
++			{Type: pb.ConfChangeAddNode.Enum(), NodeId: proto.Uint64(4)},
++			{Type: pb.ConfChangeAddNode.Enum(), NodeId: proto.Uint64(5)},
++			{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: proto.Uint64(2)},
++			{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: proto.Uint64(3)},
++		},
++	})
++	cs := c.peers[1].confState
++	if !slices.Equal(cs.GetVotersOutgoing(), []uint64{1, 2, 3}) || !slices.Equal(cs.GetVoters(), []uint64{1, 4, 5}) {
++		t.Fatalf("leader did not enter the joint configuration: %v", cs)
++	}
++	c.compact(1)
++	c.start(4, nil)
++	c.start(5, nil)
++	c.tick(1, 1)
++
++	c.isolate(2, 3, 4, 5)
++	c.propose(1, "j")
++	c.requireApplied(1)
++
++	c.heal(5)
++	c.tick(1, 1)
++	c.requireApplied(1, "j")
++	c.requireApplied(5, "j")
++}
++
++func TestJointConfigurationNeedsBothHalves(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{2: 3, 4: 3}, nil)
++	c.campaign(1)
++	c.requireState(1, raft.StateLeader)
++
++	c.proposeConfChange(1, &pb.ConfChangeV2{
++		Transition: pb.ConfChangeTransitionJointExplicit.Enum(),
++		Changes: []*pb.ConfChangeSingle{
++			{Type: pb.ConfChangeAddNode.Enum(), NodeId: proto.Uint64(4)},
++			{Type: pb.ConfChangeAddNode.Enum(), NodeId: proto.Uint64(5)},
++			{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: proto.Uint64(2)},
++			{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: proto.Uint64(3)},
++		},
++	})
++	cs := c.peers[1].confState
++	if !slices.Equal(cs.GetVotersOutgoing(), []uint64{1, 2, 3}) || !slices.Equal(cs.GetVoters(), []uint64{1, 4, 5}) {
++		t.Fatalf("leader did not enter the joint configuration: %v", cs)
++	}
++	c.compact(1)
++	c.start(4, nil)
++	c.start(5, nil)
++	c.tick(1, 1)
++	commit := c.commit(1)
++
++	c.isolate(2)
++	c.propose(1, "both")
++	c.requireApplied(1)
++	c.readIndex(1, "jr")
++	c.requireReads(1)
++
++	c.heal(2)
++	c.tick(1, 1)
++	c.requireApplied(1, "both")
++	c.requireReads(1, fmt.Sprintf("jr@%d", commit))
++
++	c.isolate(2)
++	c.campaign(4)
++	c.requireState(4, raft.StateCandidate)
++
++	c.heal(2)
++	c.isolate(4)
++	c.campaign(3)
++	c.requireState(3, raft.StateCandidate)
++
++	c.heal(4)
++	c.campaign(3)
++	c.requireState(3, raft.StateLeader)
++}
++
++func TestWeightAppliesAgainAfterReAdding(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{3: 3}, nil)
++	c.campaign(1)
++	c.requireState(1, raft.StateLeader)
++
++	c.proposeConfChange(1, &pb.ConfChange{Type: pb.ConfChangeRemoveNode.Enum(), NodeId: proto.Uint64(3)})
++	if slices.Contains(c.peers[1].confState.GetVoters(), 3) {
++		t.Fatalf("node 3 was not removed: %v", c.peers[1].confState)
++	}
++	c.proposeConfChange(1, addNode(3))
++	if !slices.Contains(c.peers[1].confState.GetVoters(), 3) {
++		t.Fatalf("node 3 was not added back: %v", c.peers[1].confState)
++	}
++	c.tick(1, 1)
++
++	c.isolate(3)
++	c.propose(1, "again")
++	c.requireApplied(1)
++	c.requireApplied(2)
++
++	c.heal(3)
++	c.tick(1, 1)
++	c.requireApplied(1, "again")
++	c.requireApplied(3, "again")
++}
++
++func TestLearnersCarryNoWeight(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, []uint64{4}, map[uint64]uint64{4: 10}, nil)
++	c.campaign(1)
++	c.requireState(1, raft.StateLeader)
++
++	c.isolate(2, 3)
++	c.propose(1, "l")
++	c.requireApplied(1)
++	c.requireApplied(4)
++
++	c.heal(2)
++	c.tick(1, 1)
++	c.requireApplied(1, "l")
++
++	c.heal(3)
++	c.proposeConfChange(1, addNode(4))
++	if !slices.Contains(c.peers[1].confState.GetVoters(), 4) {
++		t.Fatalf("node 4 was not promoted: %v", c.peers[1].confState)
++	}
++
++	c.isolate(4)
++	c.propose(1, "m")
++	c.requireApplied(1, "l")
++
++	c.heal(4)
++	c.tick(1, 1)
++	c.requireApplied(1, "l", "m")
++}
++
++func TestWeightsApplyToVotersAddedLater(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{4: 3}, nil)
++	c.campaign(1)
++	c.proposeConfChange(1, addNode(4))
++	c.compact(1)
++	c.start(4, nil)
++	c.tick(1, 1)
++	if !slices.Contains(c.peers[4].confState.GetVoters(), 4) {
++		t.Fatalf("node 4 did not catch up to its own addition: %v", c.peers[4].confState)
++	}
++
++	c.isolate(4)
++	c.propose(1, "n")
++	c.requireApplied(1)
++	c.requireApplied(2)
++
++	c.heal(4)
++	c.tick(1, 1)
++	c.requireApplied(1, "n")
++	c.requireApplied(4, "n")
++}
++
++func TestSetVoterWeightsKeepsWeightsForFutureVoters(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, nil, nil)
++	c.campaign(1)
++	c.setWeights(map[uint64]uint64{4: 3}, 3, 2, 1)
++
++	c.proposeConfChange(1, addNode(4))
++	c.compact(1)
++	c.start(4, nil)
++	c.tick(1, 1)
++	if !slices.Contains(c.peers[4].confState.GetVoters(), 4) {
++		t.Fatalf("node 4 did not catch up to its own addition: %v", c.peers[4].confState)
++	}
++
++	c.isolate(4)
++	c.propose(1, "f")
++	c.requireApplied(1)
++	c.requireApplied(2)
++
++	c.heal(4)
++	c.tick(1, 1)
++	c.requireApplied(1, "f")
++	c.requireApplied(4, "f")
++}
++
++func TestWeightsSurviveSnapshotRestore(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{2: 3}, nil)
++	c.campaign(1)
++	c.requireState(1, raft.StateLeader)
++
++	c.isolate(3)
++	c.propose(1, "a")
++	c.propose(1, "b")
++	c.requireApplied(1, "a", "b")
++	c.compact(1)
++
++	c.heal(3)
++	c.tick(1, 1)
++	c.requireApplied(3)
++	if got, want := c.commit(3), c.commit(1); got != want {
++		t.Fatalf("node 3 commit %d, want %d after the snapshot", got, want)
++	}
++
++	c.isolate(2)
++	c.campaign(3)
++	c.requireState(3, raft.StateCandidate)
++
++	c.heal(2)
++	c.campaign(3)
++	c.requireState(3, raft.StateLeader)
++
++	c.isolate(2)
++	c.propose(3, "c")
++	c.requireApplied(3)
++	c.requireApplied(1, "a", "b")
++}
++
++func rejectsConfig(cfg *raft.Config) (rejected bool) {
++	defer func() {
++		if recover() != nil {
++			rejected = true
++		}
++	}()
++	_, err := raft.NewRawNode(cfg)
++	return err != nil
++}
++
++func TestZeroWeightIsRejected(t *testing.T) {
++	storage := raft.NewMemoryStorage()
++	snap := &pb.Snapshot{Metadata: &pb.SnapshotMetadata{
++		Index:     proto.Uint64(1),
++		Term:      proto.Uint64(1),
++		ConfState: &pb.ConfState{Voters: []uint64{1, 2, 3}},
++	}}
++	if err := storage.ApplySnapshot(snap); err != nil {
++		t.Fatal(err)
++	}
++	cfg := &raft.Config{
++		ID:              1,
++		ElectionTick:    10,
++		HeartbeatTick:   1,
++		Storage:         storage,
++		MaxSizePerMsg:   1 << 20,
++		MaxInflightMsgs: 256,
++		VoterWeights:    map[uint64]uint64{2: 0},
++		Logger:          quietLogger,
++	}
++	if !rejectsConfig(cfg) {
++		t.Fatal("NewRawNode accepted a zero weight")
++	}
++
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 3}, nil)
++	if err := c.peers[1].rn.SetVoterWeights(map[uint64]uint64{1: 0}); err == nil {
++		t.Fatal("SetVoterWeights accepted a zero weight")
++	}
++	if err := c.peers[1].rn.SetVoterWeights(map[uint64]uint64{2: 1, 3: 0}); err == nil {
++		t.Fatal("SetVoterWeights accepted a zero weight")
++	}
++	if err := c.peers[1].rn.SetVoterWeights(map[uint64]uint64{9: 0}); err == nil {
++		t.Fatal("SetVoterWeights accepted a zero weight for a node that is not a voter")
++	}
++	c.isolate(1)
++	c.campaign(1)
++	c.requireState(1, raft.StateLeader)
++
++	cfg.VoterWeights = map[uint64]uint64{9: 0}
++	if !rejectsConfig(cfg) {
++		t.Fatal("NewRawNode accepted a zero weight for a node that is not a voter")
++	}
++
++	withLearner := newCluster(t, []uint64{1, 2, 3}, []uint64{4}, nil, nil)
++	if err := withLearner.peers[1].rn.SetVoterWeights(map[uint64]uint64{4: 0}); err == nil {
++		t.Fatal("SetVoterWeights accepted a zero weight for a learner")
++	}
++}
++
++func TestHugeWeightsDoNotOverflow(t *testing.T) {
++	lopsided := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: math.MaxUint64, 2: 2}, nil)
++	lopsided.isolate(1, 3)
++	lopsided.campaign(2)
++	lopsided.requireState(2, raft.StateCandidate)
++	lopsided.campaign(1)
++	lopsided.requireState(1, raft.StateLeader)
++
++	twins := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: math.MaxUint64, 2: math.MaxUint64}, nil)
++	twins.isolate(1)
++	twins.campaign(1)
++	twins.requireState(1, raft.StateCandidate)
++
++	twins.heal(1)
++	twins.isolate(2)
++	twins.campaign(1)
++	twins.requireState(1, raft.StateLeader)
++
++	twins.isolate(3)
++	twins.propose(1, "big")
++	twins.requireApplied(1)
++
++	twins.heal(3)
++	twins.tick(1, 1)
++	twins.requireApplied(1, "big")
++}
++
++func TestMissingWeightsDefaultToOne(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3, 4}, nil, map[uint64]uint64{1: 1, 2: 2}, nil)
++	c.isolate(3, 4)
++	c.campaign(1)
++	c.requireState(1, raft.StateLeader)
++
++	plain := newCluster(t, []uint64{1, 2, 3, 4}, nil, nil, nil)
++	plain.isolate(3, 4)
++	plain.campaign(1)
++	plain.requireState(1, raft.StateCandidate)
++}
++
++func TestSetVoterWeightsCommitsPendingEntries(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{3: 3}, nil)
++	c.campaign(1)
++	c.isolate(3)
++	c.propose(1, "p")
++	c.requireApplied(1)
++	c.requireApplied(2)
++
++	c.setWeights(map[uint64]uint64{1: 3, 3: 3}, 2, 1)
++	c.requireApplied(1, "p")
++	c.requireApplied(2, "p")
++}
++
++func TestSetVoterWeightsConfirmsPendingReads(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{3: 3}, nil)
++	c.campaign(1)
++	commit := c.commit(1)
++	c.isolate(3)
++	c.readIndex(1, "q")
++	c.requireReads(1)
++
++	c.setWeights(map[uint64]uint64{1: 3, 3: 3}, 2, 1)
++	c.requireReads(1, fmt.Sprintf("q@%d", commit))
++}
++
++func TestSetVoterWeightsReleasesPostponedReads(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, nil, nil)
++	c.drop = func(m *pb.Message) bool {
++		return m.GetFrom() == 1 && m.GetType() == pb.MsgApp
++	}
++	c.campaign(1)
++	c.requireState(1, raft.StateLeader)
++	elected := c.commit(1)
++	c.readIndex(1, "w")
++	c.requireReads(1)
++
++	c.setWeights(map[uint64]uint64{1: 3}, 1)
++	c.requireReads(1, fmt.Sprintf("w@%d", elected+1))
++
++	majority := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{3: 3}, nil)
++	majority.drop = func(m *pb.Message) bool {
++		return m.GetTo() == 3 && m.GetType() == pb.MsgApp
++	}
++	majority.campaign(1)
++	majority.requireState(1, raft.StateLeader)
++	start := majority.commit(1)
++	majority.readIndex(1, "m")
++	majority.requireReads(1)
++
++	majority.setWeights(nil, 3, 2, 1)
++	majority.requireReads(1, fmt.Sprintf("m@%d", start+1))
++}
++
++func TestSetVoterWeightsAnswersReadsPostponedBeforeTheLeaderSavedItsEntry(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, nil, nil)
++	c.electWithoutSaving(1)
++	before := c.commit(1)
++	c.peers[1].rn.ReadIndex([]byte("u"))
++	c.isolate(2, 3)
++
++	c.setWeights(map[uint64]uint64{1: 3}, 3, 2, 1)
++	got := c.peers[1].reads
++	if len(got) != 1 || (got[0] != fmt.Sprintf("u@%d", before) && got[0] != fmt.Sprintf("u@%d", before+1)) {
++		t.Fatalf("node 1 read states %q, want the read answered without the followers", got)
++	}
++}
++
++func TestSetVoterWeightsDecidesOngoingElection(t *testing.T) {
++	won := newCluster(t, []uint64{1, 2, 3}, nil, nil, nil)
++	won.isolate(2, 3)
++	won.campaign(1)
++	won.requireState(1, raft.StateCandidate)
++	won.setWeights(map[uint64]uint64{1: 3}, 1)
++	won.requireState(1, raft.StateLeader)
++	won.propose(1, "won")
++	won.requireApplied(1, "won")
++
++	pre := newCluster(t, []uint64{1, 2, 3}, nil, nil, preVote)
++	start := pre.term(1)
++	pre.isolate(2, 3)
++	pre.campaign(1)
++	pre.requireState(1, raft.StatePreCandidate)
++	pre.setWeights(map[uint64]uint64{1: 3}, 1)
++	pre.requireState(1, raft.StateLeader)
++	if got := pre.term(1); got != start+1 {
++		t.Fatalf("leader term is %d, want %d", got, start+1)
++	}
++
++	lost := newCluster(t, []uint64{1, 2, 3}, nil, nil, nil)
++	lost.campaign(1)
++	lost.isolate(2)
++	lost.propose(1, "x")
++	lost.heal(2)
++	lost.isolate(3)
++	lost.campaign(2)
++	lost.requireState(2, raft.StateCandidate)
++	lost.setWeights(map[uint64]uint64{1: 3}, 2)
++	lost.requireState(2, raft.StateFollower)
++}
++
++func TestSetVoterWeightsStepsDownLeaderWithoutActiveQuorum(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 3}, checkQuorum)
++	c.campaign(1)
++	c.isolate(2, 3)
++	c.tick(1, 25)
++	c.requireState(1, raft.StateLeader)
++
++	c.setWeights(nil, 1)
++	c.requireState(1, raft.StateFollower)
++}
++
++func TestStepDownCountsVotersActiveAtLastCheck(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 3}, checkQuorum)
++	c.campaign(1)
++	c.tick(1, 9)
++	c.isolate(2, 3)
++	c.tick(1, 5)
++
++	c.setWeights(nil, 1)
++	c.requireState(1, raft.StateLeader)
++
++	c.tick(1, 10)
++	if c.state(1) == raft.StateLeader {
++		t.Fatal("leader kept leading after a check that found no quorum")
++	}
++}
++
++func TestVotersAddedAfterLastCheckAreNotCountedActive(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, nil, checkQuorum)
++	c.campaign(1)
++	c.tick(1, 10)
++	c.requireState(1, raft.StateLeader)
++
++	c.proposeConfChange(1, addNode(4))
++	if !slices.Contains(c.peers[1].confState.GetVoters(), 4) {
++		t.Fatalf("node 4 was not added: %v", c.peers[1].confState)
++	}
++
++	c.setWeights(map[uint64]uint64{4: 10}, 3, 2, 1)
++	c.requireState(1, raft.StateFollower)
++}
++
++func TestFollowerKeepsWeightsForLaterElections(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, nil, nil)
++	c.campaign(1)
++	c.requireState(2, raft.StateFollower)
++
++	c.setWeights(map[uint64]uint64{2: 3}, 3, 2, 1)
++	c.isolate(1, 3)
++	c.campaign(2)
++	c.requireState(2, raft.StateLeader)
++}
++
++func TestLoweringWeightsKeepsCommittedEntries(t *testing.T) {
++	c := newCluster(t, []uint64{1, 2, 3}, nil, map[uint64]uint64{1: 3}, nil)
++	c.campaign(1)
++	c.isolate(2, 3)
++	c.propose(1, "kept")
++	c.requireApplied(1, "kept")
++	committed := c.commit(1)
++
++	c.setWeights(nil, 1)
++	if got := c.commit(1); got != committed {
++		t.Fatalf("commit went from %d to %d", committed, got)
++	}
++	c.propose(1, "waits")
++	c.requireApplied(1, "kept")
++
++	c.heal(2)
++	c.tick(1, 1)
++	c.requireApplied(1, "kept", "waits")
++}
++
++func weightOf(weights map[uint64]uint64, id uint64) uint64 {
++	if w, ok := weights[id]; ok {
++		return w
++	}
++	return 1
++}
++
++func TestElectionsAndCommitsFollowWeightedMajorities(t *testing.T) {
++	rng := rand.New(rand.NewSource(3964))
++	voters := []uint64{1, 2, 3, 4, 5}
++	for round := range 6 {
++		weights := map[uint64]uint64{}
++		var total uint64
++		for _, id := range voters {
++			if w := uint64(rng.Intn(5)); w > 0 {
++				weights[id] = w
++			}
++			total += weightOf(weights, id)
++		}
++		for _, candidate := range voters {
++			for mask := range 1 << 4 {
++				var reachable []uint64
++				support := weightOf(weights, candidate)
++				bit := 0
++				for _, id := range voters {
++					if id == candidate {
++						continue
++					}
++					if mask&(1<<bit) != 0 {
++						reachable = append(reachable, id)
++						support += weightOf(weights, id)
++					}
++					bit++
++				}
++				quorum := support > total-support
++				name := fmt.Sprintf("round%d/candidate%d/reach%v", round, candidate, reachable)
++
++				c := newCluster(t, voters, nil, weights, nil)
++				for _, id := range voters {
++					if id != candidate && !slices.Contains(reachable, id) {
++						c.isolate(id)
++					}
++				}
++				c.campaign(candidate)
++				if got := c.state(candidate) == raft.StateLeader; got != quorum {
++					t.Fatalf("%s: leader=%v, want %v (weights %v)", name, got, quorum, weights)
++				}
++
++				full := newCluster(t, voters, nil, weights, nil)
++				full.campaign(candidate)
++				if full.state(candidate) != raft.StateLeader {
++					continue
++				}
++				for _, id := range voters {
++					if id != candidate && !slices.Contains(reachable, id) {
++						full.isolate(id)
++					}
++				}
++				full.propose(candidate, "e")
++				if got := slices.Contains(full.peers[candidate].applied, "e"); got != quorum {
++					t.Fatalf("%s: committed=%v, want %v (weights %v)", name, got, quorum, weights)
++				}
++			}
++		}
++	}
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..c677d19
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,145 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++usage() {
++  echo "usage: $0 [--output_path <path>] base|new" >&2
++  exit 2
++}
++
++MODE=""
++MODE_COUNT=0
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    base|new)
++      MODE="$1"
++      MODE_COUNT=$((MODE_COUNT + 1))
++      shift
++      ;;
++    --output_path)
++      shift
++      [ $# -lt 1 ] && { echo "missing value for --output_path" >&2; usage; }
++      OUTPUT_PATH="$1"
++      shift
++      ;;
++    --output_path=*)
++      OUTPUT_PATH="${1#--output_path=}"
++      [ -n "$OUTPUT_PATH" ] || { echo "missing value for --output_path" >&2; usage; }
++      shift
++      ;;
++    *)
++      echo "unknown argument: $1" >&2
++      usage
++      ;;
++  esac
++done
++[ "$MODE_COUNT" -eq 1 ] || usage
++
++cd "$(dirname "$0")" || exit 2
++
++export GOFLAGS=-buildvcs=false
++export GOTOOLCHAIN=local
++if [ -n "${GOCACHE:-}" ] && [ ! -w "$GOCACHE" ]; then
++  export GOCACHE="/tmp/go-build-$(id -u)"
++fi
++
++NEW_DIR="quorumweights_3964f9"
++NEW_PKG="go.etcd.io/raft/v3/$NEW_DIR"
++LOG="$(mktemp)"
++trap 'rm -f "$LOG"' EXIT
++
++if [ "$MODE" = "base" ]; then
++  PKGS="$(go list ./... 2>>"$LOG" | grep -v "/$NEW_DIR\$")"
++  go test -v -count=1 -timeout 20m $PKGS >>"$LOG" 2>&1
++  STATUS=$?
++else
++  go test -v -count=1 -timeout 20m "./$NEW_DIR/" >>"$LOG" 2>&1
++  STATUS=$?
++fi
++
++if ! grep -qE '^ *--- (PASS|FAIL|SKIP):' "$LOG"; then
++  echo "no tests were collected in mode $MODE" >>"$LOG"
++  [ "$STATUS" -eq 0 ] && STATUS=1
++fi
++
++cat "$LOG"
++
++expected_tests() {
++  grep -ho '^func Test[A-Za-z0-9_]*' "$NEW_DIR"/*_test.go | sed 's/^func //'
++}
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  go-junit-report <"$LOG" >"$OUTPUT_PATH" 2>/dev/null || true
++  PANICKED="$(awk '/^--- FAIL: /{name=$3} /^panic: /{print name; exit}' "$LOG")"
++  if [ -n "$PANICKED" ] && grep -q "<testcase name=\"$PANICKED\"" "$OUTPUT_PATH" 2>/dev/null; then
++    PANIC_TEXT="$(mktemp)"
++    PATCHED="$(mktemp)"
++    sed -n '/^panic: /,$p' "$LOG" | head -n 40 | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' >"$PANIC_TEXT"
++    awk -v name="$PANICKED" -v text="$PANIC_TEXT" '
++      index($0, "<testcase name=\"" name "\"") { inside = 1 }
++      inside && /<failure message="Failed"><\/failure>/ {
++        sub(/<failure message="Failed"><\/failure>/, "<failure message=\"panic\">")
++        printf "%s", $0
++        while ((getline line < text) > 0) print line
++        print "</failure>"
++        inside = 0
++        next
++      }
++      /<\/testcase>/ { inside = 0 }
++      { print }
++    ' "$OUTPUT_PATH" >"$PATCHED" && cat "$PATCHED" >"$OUTPUT_PATH"
++    rm -f "$PANIC_TEXT" "$PATCHED"
++  fi
++  RAN=0
++  NAMES=""
++  if [ "$MODE" = "new" ]; then
++    SUITE="$NEW_PKG"
++    for name in $(expected_tests); do
++      if grep -q "<testcase name=\"$name\"" "$OUTPUT_PATH" 2>/dev/null; then
++        RAN=1
++      else
++        NAMES="$NAMES $name"
++      fi
++    done
++  else
++    SUITE="go.etcd.io/raft/v3"
++    if grep -q '<testcase ' "$OUTPUT_PATH" 2>/dev/null; then
++      RAN=1
++    else
++      NAMES="build"
++    fi
++  fi
++  if [ -n "$NAMES" ]; then
++    [ "$STATUS" -eq 0 ] && STATUS=1
++    DETAIL="$(grep -E '^# |\.go:[0-9]+:[0-9]+: |\[(build|setup) failed\]|^panic' "$LOG" | head -n 40)"
++    [ -n "$DETAIL" ] || DETAIL="$(tail -n 40 "$LOG")"
++    DETAIL="$(printf '%s\n' "$DETAIL" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
++    if [ "$RAN" -eq 1 ] && [ -n "$PANICKED" ]; then
++      MESSAGE="not run: the test binary exited after $PANICKED panicked"
++    elif [ "$RAN" -eq 1 ]; then
++      MESSAGE="not run: the test binary exited before reaching this test"
++    else
++      MESSAGE="the test package failed to build or run"
++      printf '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n</testsuites>\n' >"$OUTPUT_PATH"
++    fi
++    COUNT="$(printf '%s\n' $NAMES | grep -c .)"
++    EXTRA="$(mktemp)"
++    MERGED="$(mktemp)"
++    {
++      echo "<testsuite name=\"$SUITE\" tests=\"$COUNT\" failures=\"$COUNT\" errors=\"0\">"
++      for name in $NAMES; do
++        echo "<testcase name=\"$name\" classname=\"$SUITE\"><failure message=\"$MESSAGE\">$DETAIL</failure></testcase>"
++      done
++      echo '</testsuite>'
++    } >"$EXTRA"
++    awk -v extra="$EXTRA" '/<\/testsuites>/ { while ((getline line < extra) > 0) print line } { print }' "$OUTPUT_PATH" >"$MERGED"
++    TESTS="$(grep -c '<testcase ' "$MERGED")"
++    FAILURES="$(grep -c '<failure' "$MERGED")"
++    ERRORS="$(grep -c '<error' "$MERGED")"
++    sed -E "1,/<testsuites/ s#<testsuites[^>]*>#<testsuites tests=\"$TESTS\" failures=\"$FAILURES\" errors=\"$ERRORS\">#" "$MERGED" >"$OUTPUT_PATH"
++    rm -f "$EXTRA" "$MERGED"
++  fi
++fi
++
++exit "$STATUS"

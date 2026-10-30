@@ -1,0 +1,2525 @@
+diff --git a/internal/maincmd/clientmaincmd.go b/internal/maincmd/clientmaincmd.go
+index bc01295..dc6cc2f 100644
+--- a/internal/maincmd/clientmaincmd.go
++++ b/internal/maincmd/clientmaincmd.go
+@@ -105,8 +105,17 @@ func rsyncMain(ctx context.Context, osenv *rsyncos.Env, opts *rsyncopts.Options,
+ 		}
+ 	}
+ 
++	if ff := opts.FilesFrom(); ff != "" && ff != "-" {
++		roDirs = append(roDirs, ff)
++	}
++	var linkDirs []string
++	if (!opts.Sender() || opts.LocalServer()) && other != "" {
++		// The destination is local.
++		linkDirs = linkDestDirs(other, opts.LinkDest())
++	}
++
+ 	if daemonConnection < 0 {
+-		stats, err := socketClient(ctx, osenv, opts, host, path, port, paths, roDirs, rwDirs)
++		stats, err := socketClient(ctx, osenv, opts, host, path, port, paths, roDirs, rwDirs, linkDirs)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -128,10 +137,14 @@ func rsyncMain(ctx context.Context, osenv *rsyncos.Env, opts *rsyncopts.Options,
+ 	conn := &readWriteCloser{
+ 		r: rc,
+ 		w: wc,
++		c: &rsync.BothCloser{
++			ReadCloser:  rc,
++			WriteCloser: wc,
++		},
+ 	}
+ 
+ 	if osenv.Restrict() {
+-		if err := restrict.MaybeFileSystem(roDirs, rwDirs); err != nil {
++		if err := restrict.MaybeFileSystem(roDirs, rwDirs, linkDirs...); err != nil {
+ 			return nil, err
+ 		}
+ 	}
+@@ -154,6 +167,39 @@ func rsyncMain(ctx context.Context, osenv *rsyncos.Env, opts *rsyncopts.Options,
+ 	return stats, nil
+ }
+ 
++// readLocalFilesFrom reads the --files-from list on the sending side.
++func readLocalFilesFrom(osenv *rsyncos.Env, opts *rsyncopts.Options) ([]string, error) {
++	list, closeList, err := sender.OpenFilesFrom(opts.FilesFrom(), osenv.Stdin)
++	if err != nil {
++		return nil, err
++	}
++	defer closeList()
++	return sender.ReadFilesFrom(list, opts.FromNulls(), true)
++}
++
++// readForwardedFilesFrom reads the --files-from list that the receiving
++// client passes on to a remote sender.
++func readForwardedFilesFrom(osenv *rsyncos.Env, opts *rsyncopts.Options) ([]string, error) {
++	list, closeList, err := sender.OpenFilesFrom(opts.FilesFrom(), osenv.Stdin)
++	if err != nil {
++		return nil, err
++	}
++	defer closeList()
++	return sender.ForwardedFilesFrom(list, opts.FromNulls())
++}
++
++// linkDestDirs returns the --link-dest directory (relative to the
++// destination unless it is absolute), if any.
++func linkDestDirs(dest, linkDest string) []string {
++	if linkDest == "" {
++		return nil
++	}
++	if !filepath.IsAbs(linkDest) {
++		linkDest = filepath.Join(dest, linkDest)
++	}
++	return []string{linkDest}
++}
++
+ // rsync/main.c:do_cmd
+ func doCmd(osenv *rsyncos.Env, opts *rsyncopts.Options, machine, user, path string, daemonConnection int) (io.ReadCloser, io.WriteCloser, error) {
+ 	if opts.Verbose() {
+@@ -322,10 +368,42 @@ func ClientRun(osenv *rsyncos.Env, opts *rsyncopts.Options, conn io.ReadWriteClo
+ 			osenv.Logf("sender(paths=%q)", paths)
+ 		}
+ 
++		if opts.FilesFrom() != "" {
++			if len(paths) != 1 {
++				return nil, fmt.Errorf("--files-from requires exactly one source directory, got %q", paths)
++			}
++			names, err := readLocalFilesFrom(osenv, opts)
++			if err != nil {
++				return nil, err
++			}
++			paths = sender.FilesFromPaths(paths[0], names, opts.RelativePaths())
++		}
++
+ 		// Turn relative paths like ./gcexportdata or bin/gcexportdata
+ 		// into absolute paths so that we can call Transfer.Do()
+ 		// with modPath="/" below.
+ 		for idx, path := range paths {
++			if opts.RelativePaths() {
++				// With --relative, the path of a relative argument
++				// is transmitted as given: mark where it starts with
++				// /./ (unless it already has a /./). A path with a
++				// volume name (C: on Windows) or a leading separator
++				// does not start at the working directory.
++				slashed := filepath.ToSlash(path)
++				if filepath.VolumeName(path) != "" || strings.HasPrefix(slashed, "/") {
++					continue
++				}
++				wd, err := os.Getwd()
++				if err != nil {
++					return nil, err
++				}
++				if strings.Contains(slashed, "/./") {
++					paths[idx] = wd + "/" + path
++				} else {
++					paths[idx] = wd + "/./" + path
++				}
++				continue
++			}
+ 			// Trailing slashes are meaningful to rsync,
+ 			// so preserve a trailing slash across filepath.Abs.
+ 			hasTrailingSlash := strings.HasSuffix(path, "/")
+@@ -350,6 +428,18 @@ func ClientRun(osenv *rsyncos.Env, opts *rsyncopts.Options, conn io.ReadWriteClo
+ 		return nil, fmt.Errorf("BUG: expected exactly one path, got %q", paths)
+ 	}
+ 
++	var filesFrom []string
++	if opts.FilesFrom() != "" {
++		// The sender on the other side reads the names from the
++		// connection (rsync/main.c:client_run). The list is a file on
++		// this side, read before access is restricted to the destination.
++		names, err := readForwardedFilesFrom(osenv, opts)
++		if err != nil {
++			return nil, err
++		}
++		filesFrom = names
++	}
++
+ 	rt := &receiver.Transfer{
+ 		Logger: osenv.Logger(),
+ 		Opts: &receiver.TransferOpts{
+@@ -371,6 +461,7 @@ func ClientRun(osenv *rsyncos.Env, opts *rsyncopts.Options, conn io.ReadWriteClo
+ 			DoFsync:           opts.DoFsync(),
+ 			KeepPartial:       opts.KeepPartial(),
+ 			SparseFiles:       opts.SparseFiles(),
++			LinkDest:          opts.LinkDest(),
+ 
+ 			InfoGTE:  opts.InfoGTE,
+ 			DebugGTE: opts.DebugGTE,
+@@ -396,7 +487,7 @@ func ClientRun(osenv *rsyncos.Env, opts *rsyncopts.Options, conn io.ReadWriteClo
+ 		}
+ 		defer rt.DestRoot.Close()
+ 		if osenv.Restrict() {
+-			if err := restrict.MaybeFileSystem(nil, []string{rt.Dest}); err != nil {
++			if err := restrict.MaybeFileSystem(nil, []string{rt.Dest}, linkDestDirs(rt.Dest, opts.LinkDest())...); err != nil {
+ 				return nil, fmt.Errorf("landlock: %v", err)
+ 			}
+ 		}
+@@ -415,11 +506,31 @@ func ClientRun(osenv *rsyncos.Env, opts *rsyncopts.Options, conn io.ReadWriteClo
+ 		osenv.Logf("exclusion list sent")
+ 	}
+ 
++	// The sender sends file list entries while it reads the --files-from
++	// names, so the names are forwarded while the file list is received
++	// (rsync/io.c:forward_filesfrom_data runs in the loop that reads).
++	var forwarded chan error
++	if opts.FilesFrom() != "" {
++		forwarded = make(chan error, 1)
++		go func() {
++			forwarded <- sender.ForwardFilesFrom(c.Writer, filesFrom)
++		}()
++	}
++
+ 	// receive file list
+ 	if opts.DebugGTE(rsyncopts.DEBUG_FLIST, 1) {
+ 		osenv.Logf("receiving file list")
+ 	}
+ 	fileList, err := rt.ReceiveFileList()
++	if forwarded != nil {
++		if err != nil {
++			// Unblock a forwarding write that the sender no longer reads.
++			c.Close()
++			<-forwarded
++		} else {
++			err = <-forwarded
++		}
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/internal/maincmd/clientserver.go b/internal/maincmd/clientserver.go
+index d5bd1d8..6037651 100644
+--- a/internal/maincmd/clientserver.go
++++ b/internal/maincmd/clientserver.go
+@@ -18,7 +18,7 @@ import (
+ )
+ 
+ // rsync/clientserver.c:start_socket_client
+-func socketClient(ctx context.Context, osenv *rsyncos.Env, opts *rsyncopts.Options, host string, remotePath string, port int, paths []string, roDirs, rwDirs []string) (*rsyncstats.TransferStats, error) {
++func socketClient(ctx context.Context, osenv *rsyncos.Env, opts *rsyncopts.Options, host string, remotePath string, port int, paths []string, roDirs, rwDirs, linkDirs []string) (*rsyncstats.TransferStats, error) {
+ 	if port < 0 {
+ 		if port := opts.RsyncPort(); port > 0 {
+ 			host += ":" + strconv.Itoa(port)
+@@ -55,7 +55,7 @@ func socketClient(ctx context.Context, osenv *rsyncos.Env, opts *rsyncopts.Optio
+ 	defer conn.Close()
+ 
+ 	if osenv.Restrict() {
+-		if err := restrict.MaybeFileSystem(roDirs, rwDirs); err != nil {
++		if err := restrict.MaybeFileSystem(roDirs, rwDirs, linkDirs...); err != nil {
+ 			return nil, err
+ 		}
+ 	}
+diff --git a/internal/maincmd/maincmd.go b/internal/maincmd/maincmd.go
+index fa01ab8..cd44ace 100644
+--- a/internal/maincmd/maincmd.go
++++ b/internal/maincmd/maincmd.go
+@@ -99,7 +99,7 @@ func Main(ctx context.Context, osenv *rsyncos.Env, args []string, cfg *rsyncdcon
+ 		if opts.Verbose() {
+ 			osenv.Logf("paths: %q", paths)
+ 		}
+-		var roDirs, rwDirs []string
++		var roDirs, rwDirs, linkDirs []string
+ 		if opts.Sender() {
+ 			roDirs = append(roDirs, paths...)
+ 		} else {
+@@ -109,9 +109,10 @@ func Main(ctx context.Context, osenv *rsyncos.Env, args []string, cfg *rsyncdcon
+ 				}
+ 			}
+ 			rwDirs = append(rwDirs, paths...)
++			linkDirs = linkDestDirs(paths[0], opts.LinkDest())
+ 		}
+ 		if osenv.Restrict() {
+-			if err := restrict.MaybeFileSystem(roDirs, rwDirs); err != nil {
++			if err := restrict.MaybeFileSystem(roDirs, rwDirs, linkDirs...); err != nil {
+ 				return nil, err
+ 			}
+ 		}
+diff --git a/internal/receiver/do.go b/internal/receiver/do.go
+index c5b6b2e..6e47fef 100644
+--- a/internal/receiver/do.go
++++ b/internal/receiver/do.go
+@@ -72,6 +72,12 @@ func (rt *Transfer) deleteFiles(fileList []*File) error {
+ // rsync/main.c:do_recv
+ func (rt *Transfer) Do(c *rsyncwire.Conn, fileList []*File, noReport bool) (*rsyncstats.TransferStats, error) {
+ 	rt.defaultPerms = defaultPerms()
++	if rt.LinkDestRoot == nil && rt.Opts.LinkDest != "" {
++		rt.openLinkDest()
++		if rt.LinkDestRoot != nil {
++			defer rt.LinkDestRoot.Close()
++		}
++	}
+ 
+ 	if rt.Opts.DeleteMode {
+ 		if err := rt.deleteFiles(fileList); err != nil {
+@@ -98,10 +104,11 @@ func (rt *Transfer) Do(c *rsyncwire.Conn, fileList []*File, noReport bool) (*rsy
+ 	if err := eg.Wait(); err != nil {
+ 		return nil, err
+ 	}
+-	if len(rt.retouchDirs) > 0 /* || rt.retouchDirTimes */ {
+-		if err := rt.touchUpDirs(); err != nil {
+-			return nil, err
+-		}
++	if err := rt.finishTransferredHardLinks(); err != nil {
++		return nil, err
++	}
++	if err := rt.touchUpDirs(fileList); err != nil {
++		return nil, err
+ 	}
+ 
+ 	var stats *rsyncstats.TransferStats
+diff --git a/internal/receiver/flist.go b/internal/receiver/flist.go
+index 1aca7ae..9671219 100644
+--- a/internal/receiver/flist.go
++++ b/internal/receiver/flist.go
+@@ -4,7 +4,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"io/fs"
+-	"path/filepath"
++	"path"
+ 	"sort"
+ 	"time"
+ 
+@@ -15,9 +15,26 @@ import (
+ 
+ // rsync/flist.c:flist_sort_and_clean
+ func sortFileList(fileList []*File) {
+-	sort.Slice(fileList, func(i, j int) bool {
++	sort.SliceStable(fileList, func(i, j int) bool {
+ 		return fileList[i].Name < fileList[j].Name
+ 	})
++	// Duplicate names (as --relative produces for overlapping source
++	// arguments) keep their place, so that the indices still match the
++	// sender's, but only one of them is used: the first one, unless a
++	// later one is a directory and the first is not.
++	used := -1
++	for i, f := range fileList {
++		if used < 0 || f.Name != fileList[used].Name {
++			used = i
++			continue
++		}
++		if f.isDir() && !fileList[used].isDir() {
++			fileList[used].duplicate = true
++			used = i
++		} else {
++			f.duplicate = true
++		}
++	}
+ }
+ 
+ // rsync/receiver.c:delete_files
+@@ -38,8 +55,15 @@ type File struct {
+ 	LinkTarget string
+ 	Rdev       int32
+ 	Checksum   [rsyncchecksum.Size]byte
++
++	idev      *idev
++	duplicate bool
++	hlink     *hlinkGroup
++	hlinkLast bool
+ }
+ 
++func (f *File) isDir() bool { return f.Mode&rsync.S_IFMT == rsync.S_IFDIR }
++
+ // FileMode converts from the Linux permission bits to Go’s permission bits.
+ func (f *File) FileMode() fs.FileMode {
+ 	ret := fs.FileMode(f.Mode) & fs.ModePerm
+@@ -108,7 +132,11 @@ func (rt *Transfer) receiveFileEntry(flags uint16, last *File) (*File, error) {
+ 	}
+ 	// TODO: does rsync’s clean_fname() and sanitize_path() combination do
+ 	// anything more than Go’s filepath.Clean()?
+-	f.Name = filepath.Clean(string(b))
++	//
++	// path.Clean keeps the slashes the name has on the wire (filepath.Clean
++	// turns them into backslashes on Windows), so that the file list sorts
++	// like the sender's and the indices match on every platform.
++	f.Name = path.Clean(string(b))
+ 
+ 	length, err := rt.Conn.ReadInt64()
+ 	if err != nil {
+@@ -190,6 +218,18 @@ func (rt *Transfer) receiveFileEntry(flags uint16, last *File) (*File, error) {
+ 		f.LinkTarget = string(b)
+ 	}
+ 
++	if rt.Opts.PreserveHardlinks && mode == rsync.S_IFREG {
++		dev, err := rt.Conn.ReadInt64()
++		if err != nil {
++			return nil, err
++		}
++		ino, err := rt.Conn.ReadInt64()
++		if err != nil {
++			return nil, err
++		}
++		f.idev = &idev{dev: uint64(dev), ino: uint64(ino)}
++	}
++
+ 	if rt.Opts.AlwaysChecksum {
+ 		if _, err := io.ReadFull(rt.Conn.Reader, f.Checksum[:]); err != nil {
+ 			return nil, err
+@@ -244,6 +284,9 @@ func (rt *Transfer) ReceiveFileList() ([]*File, error) {
+ 	}
+ 
+ 	sortFileList(fileList)
++	if rt.Opts.PreserveHardlinks {
++		rt.matchHardLinks(fileList)
++	}
+ 
+ 	if rt.Opts.PreserveUid || rt.Opts.PreserveGid {
+ 		// receive the uid/gid list
+diff --git a/internal/receiver/generator.go b/internal/receiver/generator.go
+index 0daca21..40985bc 100644
+--- a/internal/receiver/generator.go
++++ b/internal/receiver/generator.go
+@@ -51,7 +51,8 @@ func (rt *Transfer) GenerateFiles(fileList []*File) error {
+ 	return nil
+ }
+ 
+-func (rt *Transfer) touchUpDirs() error {
++// rsync/generator.c:touch_up_dirs
++func (rt *Transfer) touchUpDirs(fileList []*File) error {
+ 	for _, d := range rt.retouchDirs {
+ 		if rt.Opts.DebugGTE(rsyncopts.DEBUG_TIME, 2) {
+ 			rt.Logger.Printf("touchUpDirs: %s (%v)", d.f.Name, d.perm)
+@@ -60,6 +61,25 @@ func (rt *Transfer) touchUpDirs() error {
+ 			return err
+ 		}
+ 	}
++	if !rt.Opts.PreserveTimes || rt.Opts.DryRun || rt.listOnly() {
++		return nil
++	}
++	// Creating, renaming and linking files inside the directories changed
++	// their modification time after it was set.
++	for _, f := range fileList {
++		if !f.isDir() || f.duplicate {
++			continue
++		}
++		st, err := rt.DestRoot.Lstat(f.Name)
++		if err != nil || !st.IsDir() {
++			continue
++		}
++		if !modTimeEqual(st.ModTime(), f.ModTime) {
++			if err := rt.DestRoot.Chtimes(f.Name, f.ModTime, f.ModTime); err != nil {
++				return err
++			}
++		}
++	}
+ 	return nil
+ }
+ 
+@@ -104,21 +124,26 @@ func (rt *Transfer) setPerms(f *File, perm fs.FileMode) error {
+ 	}
+ 
+ 	isLink := f.Mode&rsync.S_IFMT == rsync.S_IFLNK
+-	if rt.Opts.PreserveTimes &&
+-		!isLink &&
+-		!modTimeEqual(st.ModTime(), f.ModTime) {
+-		if err := rt.DestRoot.Chtimes(f.Name, f.ModTime, f.ModTime); err != nil {
++	if rt.Opts.PreserveTimes && !modTimeEqual(st.ModTime(), f.ModTime) {
++		if isLink {
++			err = lchtimes(rt.DestRoot, f.Name, f.ModTime)
++		} else {
++			err = rt.DestRoot.Chtimes(f.Name, f.ModTime, f.ModTime)
++		}
++		if err != nil {
+ 			return err
+ 		}
+ 	}
+ 
+-	_, err = rt.setUid(f, st)
++	// Changing the owner clears the setuid and setgid bits, so the mode is
++	// compared after it (rsync/rsync.c:set_file_attrs stats again).
++	st, err = rt.setUid(f, st)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+ 	if !isLink {
+-		if st.Mode().Perm() != perm { // only call Chmod if the permissions actually differ
++		if st.Mode()&modePermBits != perm { // only call Chmod if the permissions actually differ
+ 			if err := rt.DestRoot.Chmod(f.Name, perm); err != nil {
+ 				return err
+ 			}
+@@ -141,6 +166,9 @@ func (rt *Transfer) recvGenerator(idx int, f *File) error {
+ 	if rt.Opts.DebugGTE(rsyncopts.DEBUG_GENR, 1) {
+ 		rt.Logger.Printf("recv_generator(f=%+v)", f)
+ 	}
++	if f.duplicate {
++		return nil
++	}
+ 
+ 	local := filepath.Join(rt.Dest, f.Name)
+ 	st, err := rt.DestRoot.Lstat(f.Name)
+@@ -167,7 +195,9 @@ func (rt *Transfer) recvGenerator(idx int, f *File) error {
+ 			if rt.Opts.DebugGTE(rsyncopts.DEBUG_GENR, 1) {
+ 				rt.Logger.Printf("MkdirAll(%s, %v)", f.Name, perm)
+ 			}
+-			if err := rt.DestRoot.MkdirAll(f.Name, perm); err != nil {
++			// os.Root only creates directories with permission bits;
++			// setPerms adds the setuid, setgid and sticky bits.
++			if err := rt.DestRoot.MkdirAll(f.Name, perm.Perm()); err != nil {
+ 				// TODO: EEXIST is okay
+ 				return err
+ 			}
+@@ -198,6 +228,18 @@ func (rt *Transfer) recvGenerator(idx int, f *File) error {
+ 
+ 	if rt.Opts.PreserveLinks && mode == rsync.S_IFLNK {
+ 		// TODO: safe_symlinks option
++		// Like rsync (try_dests_non), only a missing destination is linked
++		// from the --link-dest directory; an existing one is kept if it
++		// matches and replaced otherwise.
++		if err != nil && rt.LinkDestRoot != nil {
++			linked, err := rt.tryLinkDestNonReg(f)
++			if err != nil {
++				return err
++			}
++			if linked {
++				return nil
++			}
++		}
+ 		if err == nil {
+ 			// local file exists, verify target matches
+ 			if target, err := rt.DestRoot.Readlink(f.Name); err == nil {
+@@ -230,14 +272,24 @@ func (rt *Transfer) recvGenerator(idx int, f *File) error {
+ 		mode == rsync.S_IFBLK ||
+ 		mode == rsync.S_IFSOCK ||
+ 		mode == rsync.S_IFIFO) {
+-		if err := rt.createDevice(f, st, perm); err != nil {
++		if !canCreateDevices {
++			return nil
++		}
++		// As for symlinks, only a missing destination is linked from the
++		// --link-dest directory.
++		if err != nil && rt.LinkDestRoot != nil {
++			linked, err := rt.tryLinkDestNonReg(f)
++			if err != nil {
++				return err
++			}
++			if linked {
++				return nil
++			}
++		}
++		if err := rt.createDevice(f, st, perm.Perm()); err != nil {
+ 			return err
+ 		}
+-		return nil
+-	}
+-
+-	if rt.Opts.PreserveHardlinks {
+-		// TODO: hard link check
++		return rt.setPerms(f, perm)
+ 	}
+ 
+ 	if !f.FileMode().IsRegular() {
+@@ -246,11 +298,23 @@ func (rt *Transfer) recvGenerator(idx int, f *File) error {
+ 		return nil
+ 	}
+ 
++	// rsync/hlink.c:hard_link_check: once a member of the group is done,
++	// the others are linked to it; while it is transferred, they wait.
++	if f.hlink != nil {
++		switch f.hlink.state {
++		case hlinkDone:
++			return rt.maybeHardLink(f, f.hlink.leader)
++		case hlinkSent:
++			f.hlink.waiting = append(f.hlink.waiting, f)
++			return nil
++		}
++	}
++
+ 	requestFullFile := func() error {
+ 		if rt.Opts.DebugGTE(rsyncopts.DEBUG_GENR, 1) {
+ 			rt.Logger.Printf("requesting: %s", f.Name)
+ 		}
+-		if err := rt.Conn.WriteInt32(int32(idx)); err != nil {
++		if err := rt.requestFile(idx, f); err != nil {
+ 			return err
+ 		}
+ 		if rt.Opts.DryRun {
+@@ -274,19 +338,56 @@ func (rt *Transfer) recvGenerator(idx int, f *File) error {
+ 		// no partial file? fall through.
+ 	}
+ 
+-	if os.IsNotExist(err) {
+-		return requestFullFile()
+-	}
+-	if err != nil {
++	if err != nil && !os.IsNotExist(err) {
+ 		return err
+ 	}
+-
+-	if !st.Mode().IsRegular() {
++	if err == nil && !st.Mode().IsRegular() {
+ 		// A non-regular file with this name exists. Delete it so that we can
+ 		// create our file instead.
+ 		if err := rt.DestRoot.Remove(f.Name); err != nil {
+ 			return fmt.Errorf("unlinking to make room for regular file: %v", err)
+ 		}
++		st = nil
++	}
++	if os.IsNotExist(err) {
++		st = nil
++	}
++
++	if rt.LinkDestRoot != nil {
++		done, basis, err := rt.tryLinkDestReg(f, st)
++		if err != nil {
++			return err
++		}
++		if done {
++			return nil
++		}
++		if basis {
++			in, err := rt.LinkDestRoot.Open(f.Name)
++			if err != nil {
++				return requestFullFile()
++			}
++			defer in.Close()
++			info, err := in.Stat()
++			if err != nil {
++				return err
++			}
++			if err := rt.requestFile(idx, f); err != nil {
++				return err
++			}
++			if rt.Opts.DryRun {
++				return nil
++			}
++			return rt.generateAndSendSums(in, info.Size())
++		}
++	}
++
++	if st == nil {
++		// Members of a group that are missing wait for a member that
++		// exists, or for the last one, which gets transferred.
++		if f.hlink != nil && !f.hlinkLast {
++			f.hlink.waiting = append(f.hlink.waiting, f)
++			return nil
++		}
+ 		return requestFullFile()
+ 	}
+ 
+@@ -303,15 +404,14 @@ func (rt *Transfer) recvGenerator(idx int, f *File) error {
+ 		if err := rt.setPerms(f, perm); err != nil {
+ 			return err
+ 		}
++		if f.hlink != nil {
++			return rt.finishHardLink(f)
++		}
+ 		return nil
+ 	}
+ 
+ 	if rt.Opts.DryRun {
+-		if err := rt.Conn.WriteInt32(int32(idx)); err != nil {
+-			return err
+-		}
+-
+-		return nil
++		return rt.requestFile(idx, f)
+ 	}
+ 
+ 	// TODO: if deltas are disabled, request the file in full
+@@ -326,13 +426,23 @@ func (rt *Transfer) recvGenerator(idx int, f *File) error {
+ 	if rt.Opts.DebugGTE(rsyncopts.DEBUG_GENR, 1) {
+ 		rt.Logger.Printf("sending sums for: %s", f.Name)
+ 	}
+-	if err := rt.Conn.WriteInt32(int32(idx)); err != nil {
++	if err := rt.requestFile(idx, f); err != nil {
+ 		return err
+ 	}
+ 
+ 	return rt.generateAndSendSums(in, st.Size())
+ }
+ 
++// requestFile asks the sender for the file with index idx. A hard-linked file
++// that gets transferred becomes the leader of its group.
++func (rt *Transfer) requestFile(idx int, f *File) error {
++	if f.hlink != nil {
++		f.hlink.state = hlinkSent
++		f.hlink.leader = f
++	}
++	return rt.Conn.WriteInt32(int32(idx))
++}
++
+ func (rt *Transfer) recvGeneratorPartial(idx int, f *File) (bool, error) {
+ 	// See if there is a partial file we can resume from.
+ 	partialName := rt.partialName(f.Name)
+@@ -353,7 +463,7 @@ func (rt *Transfer) recvGeneratorPartial(idx int, f *File) (bool, error) {
+ 	}
+ 
+ 	if rt.Opts.DryRun {
+-		if err := rt.Conn.WriteInt32(int32(idx)); err != nil {
++		if err := rt.requestFile(idx, f); err != nil {
+ 			return true, err
+ 		}
+ 
+@@ -365,7 +475,7 @@ func (rt *Transfer) recvGeneratorPartial(idx int, f *File) (bool, error) {
+ 	if rt.Opts.DebugGTE(rsyncopts.DEBUG_GENR, 1) {
+ 		rt.Logger.Printf("sending sums for: %s", f.Name)
+ 	}
+-	if err := rt.Conn.WriteInt32(int32(idx)); err != nil {
++	if err := rt.requestFile(idx, f); err != nil {
+ 		return true, err
+ 	}
+ 
+diff --git a/internal/receiver/generatormknod_darwin.go b/internal/receiver/generatormknod_darwin.go
+index 01820f2..2a67160 100644
+--- a/internal/receiver/generatormknod_darwin.go
++++ b/internal/receiver/generatormknod_darwin.go
+@@ -2,7 +2,6 @@ package receiver
+ 
+ import (
+ 	"io/fs"
+-	"os"
+ 	"path/filepath"
+ 	"syscall"
+ 
+@@ -10,29 +9,32 @@ import (
+ 	"golang.org/x/sys/unix"
+ )
+ 
++const canCreateDevices = true
++
+ func (rt *Transfer) createDevice(f *File, st fs.FileInfo, perm fs.FileMode) error {
+ 	local := filepath.Join(rt.Dest, f.Name)
+ 	mode := f.Mode & rsync.S_IFMT
++	if st != nil {
++		// Like rsync (recv_generator), an existing device or special file
++		// that passes the quick check (for a device, the same device
++		// number) is kept, and anything else is replaced.
++		if fileType(st.Mode()) == fileType(f.FileMode()) {
++			if same, err := rt.quickCheck(f, rt.DestRoot, st); err != nil || same {
++				return err
++			}
++		}
++		if err := rt.DestRoot.Remove(f.Name); err != nil {
++			return err
++		}
++	}
+ 	switch mode {
+ 	case rsync.S_IFCHR:
+-		if st != nil && st.Mode().Type()&os.ModeCharDevice != 0 {
+-			return nil // file of correct type exists
+-		}
+ 		return unix.Mknod(local, uint32(perm)|syscall.S_IFCHR, int(f.Rdev))
+ 
+ 	case rsync.S_IFBLK:
+-		if st != nil && (st.Mode().Type()&os.ModeDevice != 0 ||
+-			st.Mode().Type()&os.ModeCharDevice != 0) {
+-			return nil // file of correct type exists
+-		}
+-
+ 		return unix.Mknod(local, uint32(perm)|syscall.S_IFBLK, int(f.Rdev))
+ 
+ 	case rsync.S_IFSOCK:
+-		if st != nil && st.Mode().Type()&os.ModeSocket != 0 {
+-			return nil // file of correct type exists
+-		}
+-
+ 		fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+ 		if err != nil {
+ 			return err
+@@ -48,11 +50,13 @@ func (rt *Transfer) createDevice(f *File, st fs.FileInfo, perm fs.FileMode) erro
+ 		return nil
+ 
+ 	case rsync.S_IFIFO:
+-		if st != nil && st.Mode().Type()&os.ModeNamedPipe != 0 {
+-			return nil // file of correct type exists
+-		}
+-
+ 		return unix.Mkfifo(local, uint32(perm))
+ 	}
+ 	return nil
+ }
++
++// sameDevice reports whether st is the device that f describes.
++func sameDevice(f *File, st fs.FileInfo) bool {
++	stt, ok := st.Sys().(*syscall.Stat_t)
++	return ok && uint64(stt.Rdev) == uint64(uint32(f.Rdev))
++}
+diff --git a/internal/receiver/generatormknod_linux.go b/internal/receiver/generatormknod_linux.go
+index ded5712..876d246 100644
+--- a/internal/receiver/generatormknod_linux.go
++++ b/internal/receiver/generatormknod_linux.go
+@@ -3,7 +3,6 @@ package receiver
+ import (
+ 	"fmt"
+ 	"io/fs"
+-	"os"
+ 	"path/filepath"
+ 	"strconv"
+ 	"syscall"
+@@ -12,34 +11,37 @@ import (
+ 	"golang.org/x/sys/unix"
+ )
+ 
++const canCreateDevices = true
++
+ func (rt *Transfer) createDevice(f *File, st fs.FileInfo, perm fs.FileMode) error {
++	mode := f.Mode & rsync.S_IFMT
++	if st != nil {
++		// Like rsync (recv_generator), an existing device or special file
++		// that passes the quick check (for a device, the same device
++		// number) is kept, and anything else is replaced.
++		if fileType(st.Mode()) == fileType(f.FileMode()) {
++			if same, err := rt.quickCheck(f, rt.DestRoot, st); err != nil || same {
++				return err
++			}
++		}
++		if err := rt.DestRoot.Remove(f.Name); err != nil {
++			return err
++		}
++	}
+ 	base := filepath.Base(f.Name)
+ 	parentDir, err := rt.DestRoot.OpenFile(filepath.Dir(f.Name), 0, 0)
+ 	if err != nil {
+ 		return fmt.Errorf("Open(parent(%s)): %v", f.Name, err)
+ 	}
+ 	defer parentDir.Close()
+-	mode := f.Mode & rsync.S_IFMT
+ 	switch mode {
+ 	case rsync.S_IFCHR:
+-		if st != nil && st.Mode().Type()&os.ModeCharDevice != 0 {
+-			return nil // file of correct type exists
+-		}
+ 		return unix.Mknodat(int(parentDir.Fd()), base, uint32(perm)|syscall.S_IFCHR, int(f.Rdev))
+ 
+ 	case rsync.S_IFBLK:
+-		if st != nil && (st.Mode().Type()&os.ModeDevice != 0 ||
+-			st.Mode().Type()&os.ModeCharDevice != 0) {
+-			return nil // file of correct type exists
+-		}
+-
+ 		return unix.Mknodat(int(parentDir.Fd()), base, uint32(perm)|syscall.S_IFBLK, int(f.Rdev))
+ 
+ 	case rsync.S_IFSOCK:
+-		if st != nil && st.Mode().Type()&os.ModeSocket != 0 {
+-			return nil // file of correct type exists
+-		}
+-
+ 		fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+ 		if err != nil {
+ 			return err
+@@ -60,11 +62,13 @@ func (rt *Transfer) createDevice(f *File, st fs.FileInfo, perm fs.FileMode) erro
+ 		return nil
+ 
+ 	case rsync.S_IFIFO:
+-		if st != nil && st.Mode().Type()&os.ModeNamedPipe != 0 {
+-			return nil // file of correct type exists
+-		}
+-
+ 		return unix.Mkfifoat(int(parentDir.Fd()), base, uint32(perm))
+ 	}
+ 	return nil
+ }
++
++// sameDevice reports whether st is the device that f describes.
++func sameDevice(f *File, st fs.FileInfo) bool {
++	stt, ok := st.Sys().(*syscall.Stat_t)
++	return ok && uint64(stt.Rdev) == uint64(uint32(f.Rdev))
++}
+diff --git a/internal/receiver/generatormknodstub.go b/internal/receiver/generatormknodstub.go
+index 0916de0..9af47af 100644
+--- a/internal/receiver/generatormknodstub.go
++++ b/internal/receiver/generatormknodstub.go
+@@ -4,6 +4,14 @@ package receiver
+ 
+ import "io/fs"
+ 
++// canCreateDevices reports whether createDevice creates devices and special
++// files on this platform.
++const canCreateDevices = false
++
+ func (rt *Transfer) createDevice(*File, fs.FileInfo, fs.FileMode) error {
+ 	return nil
+ }
++
++func sameDevice(*File, fs.FileInfo) bool {
++	return false
++}
+diff --git a/internal/receiver/generatorsymlink.go b/internal/receiver/generatorsymlink.go
+index 81b0ed2..debfebb 100644
+--- a/internal/receiver/generatorsymlink.go
++++ b/internal/receiver/generatorsymlink.go
+@@ -4,10 +4,25 @@ package receiver
+ 
+ import (
+ 	"os"
++	"path/filepath"
++	"time"
+ 
+ 	"github.com/google/renameio/v2"
++	"golang.org/x/sys/unix"
+ )
+ 
+ func symlink(root *os.Root, oldname, newname string) error {
+ 	return renameio.SymlinkRoot(root, oldname, newname)
+ }
++
++// lchtimes sets the modification time of the symlink name itself, not of
++// its target.
++func lchtimes(root *os.Root, name string, mtime time.Time) error {
++	dir, err := root.Open(filepath.Dir(name))
++	if err != nil {
++		return err
++	}
++	defer dir.Close()
++	ts := []unix.Timespec{unix.NsecToTimespec(mtime.UnixNano()), unix.NsecToTimespec(mtime.UnixNano())}
++	return unix.UtimesNanoAt(int(dir.Fd()), filepath.Base(name), ts, unix.AT_SYMLINK_NOFOLLOW)
++}
+diff --git a/internal/receiver/generatorsymlink_windows.go b/internal/receiver/generatorsymlink_windows.go
+index ba97dd4..587c8b7 100644
+--- a/internal/receiver/generatorsymlink_windows.go
++++ b/internal/receiver/generatorsymlink_windows.go
+@@ -2,7 +2,13 @@
+ 
+ package receiver
+ 
+-import "os"
++import (
++	"os"
++	"path/filepath"
++	"time"
++
++	"golang.org/x/sys/windows"
++)
+ 
+ func symlink(destroot *os.Root, oldname, newname string) error {
+ 	if err := destroot.Remove(newname); err != nil && !os.IsNotExist(err) {
+@@ -10,3 +16,21 @@ func symlink(destroot *os.Root, oldname, newname string) error {
+ 	}
+ 	return destroot.Symlink(oldname, newname)
+ }
++
++// lchtimes sets the modification time of the symlink name itself, not of
++// its target: the link is opened relative to a handle of its parent
++// directory without following it, as in linkAt.
++func lchtimes(root *os.Root, name string, mtime time.Time) error {
++	dir, err := root.Open(filepath.Dir(name))
++	if err != nil {
++		return err
++	}
++	defer dir.Close()
++	h, err := openNoFollow(windows.Handle(dir.Fd()), filepath.Base(name), windows.SYNCHRONIZE|windows.FILE_WRITE_ATTRIBUTES)
++	if err != nil {
++		return err
++	}
++	defer windows.CloseHandle(h)
++	ft := windows.NsecToFiletime(mtime.UnixNano())
++	return windows.SetFileTime(h, nil, &ft, &ft)
++}
+diff --git a/internal/receiver/generatoruid.go b/internal/receiver/generatoruid.go
+index 55df596..23b9078 100644
+--- a/internal/receiver/generatoruid.go
++++ b/internal/receiver/generatoruid.go
+@@ -60,3 +60,15 @@ func (rt *Transfer) setUid(f *File, st fs.FileInfo) (fs.FileInfo, error) {
+ 	}
+ 	return rt.DestRoot.Lstat(f.Name)
+ }
++
++// rsync/generator.c:ownership_differs
++func (rt *Transfer) ownershipDiffers(f *File, st fs.FileInfo) bool {
++	stt, ok := st.Sys().(*syscall.Stat_t)
++	if !ok {
++		return false
++	}
++	if rt.Opts.PreserveUid && amRoot && stt.Uid != uint32(f.Uid) {
++		return true
++	}
++	return rt.Opts.PreserveGid && (amRoot || inGroup[uint32(f.Gid)]) && stt.Gid != uint32(f.Gid)
++}
+diff --git a/internal/receiver/generatoruidstub.go b/internal/receiver/generatoruidstub.go
+index 61cd632..d01af15 100644
+--- a/internal/receiver/generatoruidstub.go
++++ b/internal/receiver/generatoruidstub.go
+@@ -7,3 +7,7 @@ import "io/fs"
+ func (rt *Transfer) setUid(_ *File, st fs.FileInfo) (fs.FileInfo, error) {
+ 	return st, nil
+ }
++
++func (rt *Transfer) ownershipDiffers(*File, fs.FileInfo) bool {
++	return false
++}
+diff --git a/internal/receiver/hlink.go b/internal/receiver/hlink.go
+new file mode 100644
+index 0000000..1c7e6da
+--- /dev/null
++++ b/internal/receiver/hlink.go
+@@ -0,0 +1,103 @@
++package receiver
++
++import (
++	"os"
++)
++
++// idev is the sender's device and inode number of a regular file, which
++// protocols before 28 transmit for every regular file with -H.
++type idev struct {
++	dev, ino uint64
++}
++
++const (
++	hlinkPending = iota // no member is done or being transferred
++	hlinkSent           // the leader is being transferred
++	hlinkDone           // the leader is complete
++)
++
++// hlinkGroup tracks the files of the file list that are hard links of each
++// other on the sending side.
++type hlinkGroup struct {
++	state  int
++	leader *File
++	// waiting are members that get linked to the leader once it is
++	// complete: members missing at the destination that were seen before
++	// a leader was found, and members seen while it was transferred.
++	waiting []*File
++}
++
++// rsync/hlink.c:match_hard_links
++func (rt *Transfer) matchHardLinks(fileList []*File) {
++	members := make(map[idev][]*File)
++	var order []idev
++	for _, f := range fileList {
++		if f.duplicate || f.idev == nil {
++			continue
++		}
++		if _, ok := members[*f.idev]; !ok {
++			order = append(order, *f.idev)
++		}
++		members[*f.idev] = append(members[*f.idev], f)
++	}
++	for _, key := range order {
++		group := members[key]
++		if len(group) < 2 {
++			continue
++		}
++		g := &hlinkGroup{state: hlinkPending}
++		for _, f := range group {
++			f.hlink = g
++		}
++		group[len(group)-1].hlinkLast = true
++		rt.hlinkGroups = append(rt.hlinkGroups, g)
++	}
++}
++
++// finishHardLink makes f the leader of its group and links the waiting
++// members to it, see rsync/hlink.c:finish_hard_link.
++func (rt *Transfer) finishHardLink(f *File) error {
++	g := f.hlink
++	g.state = hlinkDone
++	g.leader = f
++	waiting := g.waiting
++	g.waiting = nil
++	for _, w := range waiting {
++		if err := rt.maybeHardLink(w, f); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// finishTransferredHardLinks links the members of each group whose leader
++// was transferred, once all transfers are complete.
++func (rt *Transfer) finishTransferredHardLinks() error {
++	for _, g := range rt.hlinkGroups {
++		if g.state == hlinkSent {
++			if err := rt.finishHardLink(g.leader); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++// maybeHardLink makes f a hard link of leader, unless it already is one, see
++// rsync/hlink.c:maybe_hard_link.
++func (rt *Transfer) maybeHardLink(f, leader *File) error {
++	if rt.Opts.DryRun {
++		return nil
++	}
++	leaderSt, err := rt.DestRoot.Lstat(leader.Name)
++	if err != nil {
++		return err
++	}
++	if st, err := rt.DestRoot.Lstat(f.Name); err == nil && os.SameFile(st, leaderSt) {
++		return nil
++	}
++	if rt.Opts.Verbose {
++		rt.Logger.Printf("%s => %s", f.Name, leader.Name)
++	}
++	return replaceWithLink(rt.DestRoot, leader.Name, rt.DestRoot, f.Name)
++}
+diff --git a/internal/receiver/link.go b/internal/receiver/link.go
+new file mode 100644
+index 0000000..315783b
+--- /dev/null
++++ b/internal/receiver/link.go
+@@ -0,0 +1,33 @@
++//go:build linux || darwin
++
++package receiver
++
++import (
++	"os"
++	"path/filepath"
++
++	"golang.org/x/sys/unix"
++)
++
++// linkAt creates newname in newRoot as a hard link of oldname in oldRoot,
++// without following a symlink. The parent directories are opened through
++// their os.Root, so neither name can escape its root.
++func linkAt(oldRoot *os.Root, oldname string, newRoot *os.Root, newname string) error {
++	if oldRoot == newRoot {
++		return newRoot.Link(oldname, newname)
++	}
++	oldDir, err := oldRoot.Open(filepath.Dir(oldname))
++	if err != nil {
++		return err
++	}
++	defer oldDir.Close()
++	newDir, err := newRoot.Open(filepath.Dir(newname))
++	if err != nil {
++		return err
++	}
++	defer newDir.Close()
++	if err := unix.Linkat(int(oldDir.Fd()), filepath.Base(oldname), int(newDir.Fd()), filepath.Base(newname), 0); err != nil {
++		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: err}
++	}
++	return nil
++}
+diff --git a/internal/receiver/link_windows.go b/internal/receiver/link_windows.go
+new file mode 100644
+index 0000000..40e23c2
+--- /dev/null
++++ b/internal/receiver/link_windows.go
+@@ -0,0 +1,117 @@
++//go:build windows
++
++package receiver
++
++import (
++	"os"
++	"path/filepath"
++	"syscall"
++	"unsafe"
++
++	"golang.org/x/sys/windows"
++)
++
++// fileLinkInformation is FILE_LINK_INFORMATION, the argument of
++// NtSetInformationFile with the FileLinkInformation class.
++type fileLinkInformation struct {
++	ReplaceIfExists bool
++	RootDirectory   windows.Handle
++	FileNameLength  uint32
++	FileName        [windows.MAX_PATH]uint16
++}
++
++// fileLinkInformationClass is FileLinkInformation (windows.FileLinkInformation
++// is the value of FileLinkInformationEx).
++const fileLinkInformationClass = 11
++
++// linkAt creates newname in newRoot as a hard link of oldname in oldRoot,
++// without following a symlink. Like os.Root.Link within one root, both parent
++// directories are opened through their roots and the file and its new name
++// are given relative to those directory handles, so neither name can escape
++// its root.
++func linkAt(oldRoot *os.Root, oldname string, newRoot *os.Root, newname string) error {
++	if oldRoot == newRoot {
++		return newRoot.Link(oldname, newname)
++	}
++	oldDir, err := oldRoot.Open(filepath.Dir(oldname))
++	if err != nil {
++		return err
++	}
++	defer oldDir.Close()
++	newDir, err := newRoot.Open(filepath.Dir(newname))
++	if err != nil {
++		return err
++	}
++	defer newDir.Close()
++	if err := linkHandles(windows.Handle(oldDir.Fd()), filepath.Base(oldname), windows.Handle(newDir.Fd()), filepath.Base(newname)); err != nil {
++		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: err}
++	}
++	return nil
++}
++
++// linkHandles links oldname in the directory olddir as newname in the
++// directory newdir, like Linkat in the Go standard library's
++// internal/syscall/windows, which os.Root.Link uses. FileLinkInformation is
++// set on a handle that has DELETE access besides FILE_WRITE_ATTRIBUTES.
++func linkHandles(olddir windows.Handle, oldname string, newdir windows.Handle, newname string) error {
++	h, err := openNoFollow(olddir, oldname, windows.SYNCHRONIZE|windows.FILE_WRITE_ATTRIBUTES|windows.DELETE)
++	if err != nil {
++		return err
++	}
++	defer windows.CloseHandle(h)
++
++	info := fileLinkInformation{RootDirectory: newdir}
++	p16, err := windows.UTF16FromString(newname)
++	if err != nil {
++		return err
++	}
++	if len(p16) > len(info.FileName) {
++		return syscall.EINVAL
++	}
++	copy(info.FileName[:], p16)
++	info.FileNameLength = uint32((len(p16) - 1) * 2)
++	err = windows.NtSetInformationFile(
++		h,
++		&windows.IO_STATUS_BLOCK{},
++		(*byte)(unsafe.Pointer(&info)),
++		uint32(unsafe.Sizeof(info)),
++		fileLinkInformationClass,
++	)
++	return ntError(err)
++}
++
++// openNoFollow opens name in the directory dir with the given access,
++// without following a symlink.
++func openNoFollow(dir windows.Handle, name string, access uint32) (windows.Handle, error) {
++	objectName, err := windows.NewNTUnicodeString(name)
++	if err != nil {
++		return 0, err
++	}
++	attrs := windows.OBJECT_ATTRIBUTES{RootDirectory: dir, ObjectName: objectName}
++	attrs.Length = uint32(unsafe.Sizeof(attrs))
++	var h windows.Handle
++	err = windows.NtCreateFile(
++		&h,
++		access,
++		&attrs,
++		&windows.IO_STATUS_BLOCK{},
++		nil,
++		0,
++		windows.FILE_SHARE_DELETE|windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
++		windows.FILE_OPEN,
++		windows.FILE_OPEN_REPARSE_POINT|windows.FILE_OPEN_FOR_BACKUP_INTENT|windows.FILE_SYNCHRONOUS_IO_NONALERT,
++		0,
++		0,
++	)
++	if err != nil {
++		return 0, ntError(err)
++	}
++	return h, nil
++}
++
++func ntError(err error) error {
++	if st, ok := err.(windows.NTStatus); ok {
++		return st.Errno()
++	}
++	return err
++}
+diff --git a/internal/receiver/linkdest.go b/internal/receiver/linkdest.go
+new file mode 100644
+index 0000000..7d01b39
+--- /dev/null
++++ b/internal/receiver/linkdest.go
+@@ -0,0 +1,256 @@
++package receiver
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"io/fs"
++	"math/rand/v2"
++	"os"
++	"path/filepath"
++
++	"github.com/gokrazy/rsync"
++	"github.com/gokrazy/rsync/internal/rsyncchecksum"
++)
++
++// openLinkDest opens the --link-dest directory, unless the caller already
++// did. Like rsync, which changes into the destination before using it, a
++// relative directory is relative to the destination.
++func (rt *Transfer) openLinkDest() {
++	if rt.LinkDestRoot != nil || rt.Opts.LinkDest == "" {
++		return
++	}
++	dir := rt.Opts.LinkDest
++	if !filepath.IsAbs(dir) {
++		dir = filepath.Join(rt.Dest, dir)
++	}
++	root, err := os.OpenRoot(dir)
++	if err != nil {
++		rt.Logger.Printf("--link-dest arg does not exist: %s", rt.Opts.LinkDest)
++		return
++	}
++	rt.LinkDestRoot = root
++}
++
++// replaceWithLink makes name in root a hard link of oldname in oldRoot. Like
++// rsync/generator.c:atomic_create, an existing name is replaced by renaming
++// the new link over it, and a directory in the way is removed first.
++func replaceWithLink(oldRoot *os.Root, oldname string, root *os.Root, name string) error {
++	st, err := root.Lstat(name)
++	if os.IsNotExist(err) {
++		return linkAt(oldRoot, oldname, root, name)
++	}
++	if err == nil && st.IsDir() {
++		if err := root.Remove(name); err != nil {
++			return err
++		}
++		return linkAt(oldRoot, oldname, root, name)
++	}
++	tmp := filepath.Join(filepath.Dir(name), fmt.Sprintf(".%s.%d", filepath.Base(name), rand.Int64()))
++	if err := linkAt(oldRoot, oldname, root, tmp); err != nil {
++		return err
++	}
++	if err := root.Rename(tmp, name); err != nil {
++		root.Remove(tmp)
++		return err
++	}
++	return nil
++}
++
++// quickCheck reports whether the file st in root has the size and the
++// modification time (or with -c, the checksum) that f has, see
++// rsync/generator.c:quick_check_ok.
++func (rt *Transfer) quickCheck(f *File, root *os.Root, st os.FileInfo) (bool, error) {
++	switch {
++	case st.Mode().IsRegular():
++		if st.Size() != f.Length {
++			return false, nil
++		}
++		if rt.Opts.AlwaysChecksum {
++			sum, err := rsyncchecksum.RootChecksum(root, f.Name)
++			if err != nil {
++				return false, err
++			}
++			return bytes.Equal(sum, f.Checksum[:]), nil
++		}
++		if rt.Opts.IgnoreTimes {
++			return false, nil
++		}
++		return modTimeEqual(st.ModTime(), f.ModTime), nil
++	case st.Mode()&fs.ModeSymlink != 0:
++		target, err := root.Readlink(f.Name)
++		if err != nil {
++			return false, nil
++		}
++		return target == f.LinkTarget, nil
++	case st.Mode()&(fs.ModeDevice|fs.ModeCharDevice) != 0:
++		// Only the device number counts, as in rsync: get_file_type makes
++		// character and block devices one type, so a node of the other
++		// kind with the same number matches and is kept.
++		return sameDevice(f, st), nil
++	case st.Mode()&(fs.ModeNamedPipe|fs.ModeSocket) != 0:
++		return st.Mode().Type() == f.FileMode().Type(), nil
++	}
++	return true, nil
++}
++
++// unchangedAttrs reports whether st already has the attributes that f would
++// get, see rsync/generator.c:unchanged_attrs.
++func (rt *Transfer) unchangedAttrs(f *File, st os.FileInfo) bool {
++	if rt.Opts.PreserveTimes && !modTimeEqual(st.ModTime(), f.ModTime) {
++		return false
++	}
++	isLink := f.Mode&rsync.S_IFMT == rsync.S_IFLNK
++	if !isLink && rt.Opts.PreservePerms && st.Mode()&modePermBits != senderPerm(f.Mode) {
++		return false
++	}
++	return !rt.ownershipDiffers(f, st)
++}
++
++// fileType classifies m like rsync/generator.c:get_file_type: character and
++// block devices are one type, and so are FIFOs and sockets.
++func fileType(m fs.FileMode) fs.FileMode {
++	switch {
++	case m&(fs.ModeDevice|fs.ModeCharDevice) != 0:
++		return fs.ModeDevice
++	case m&(fs.ModeNamedPipe|fs.ModeSocket) != 0:
++		return fs.ModeNamedPipe
++	}
++	return m.Type()
++}
++
++// linkDestMatch compares f with the file of the same name in the --link-dest
++// directory: 0 means there is none (of the same type), 1 that it exists, 2 that
++// it passes the quick check, and 3 that its attributes are unchanged, too.
++func (rt *Transfer) linkDestMatch(f *File) (int, os.FileInfo, error) {
++	st, err := rt.LinkDestRoot.Lstat(f.Name)
++	if err != nil || fileType(st.Mode()) != fileType(f.FileMode()) {
++		return 0, nil, nil
++	}
++	ok, err := rt.quickCheck(f, rt.LinkDestRoot, st)
++	if err != nil || !ok {
++		return 1, st, err
++	}
++	if !rt.unchangedAttrs(f, st) {
++		return 2, st, nil
++	}
++	return 3, st, nil
++}
++
++// tryLinkDestReg handles a regular file with --link-dest, like
++// rsync/generator.c:try_dests_reg does with one basis directory. It returns
++// done if f needs nothing more, or basis if the file in the --link-dest
++// directory is to be the basis of the transfer. destSt is the existing
++// destination file, if any: like rsync (find_exact_for_existing), which tries
++// the --link-dest directory before its quick check, it is replaced by a link
++// to an identical file there even when it is up to date, and is otherwise
++// left to the normal checks, which update its attributes in place. If it is a
++// hard link of the file in the --link-dest directory, that file changes with
++// it, as with rsync (rsync(1): "existing files may get their attributes
++// tweaked, and that can affect alternate destination files via hard-links").
++func (rt *Transfer) tryLinkDestReg(f *File, destSt os.FileInfo) (done, basis bool, _ error) {
++	level, st, err := rt.linkDestMatch(f)
++	if err != nil || level == 0 {
++		return false, false, err
++	}
++	if level == 3 {
++		if destSt != nil && os.SameFile(destSt, st) {
++			return false, false, nil
++		}
++		if !rt.Opts.DryRun {
++			if err := replaceWithLink(rt.LinkDestRoot, f.Name, rt.DestRoot, f.Name); err != nil {
++				// Like rsync (try_a_copy), copy the file when it cannot
++				// be linked, e.g. from another file system.
++				if rt.Opts.Verbose {
++					rt.Logger.Printf("%v, copying instead", err)
++				}
++				if err := rt.copyFromLinkDest(f); err != nil {
++					return false, false, err
++				}
++			}
++		}
++		if f.hlink != nil {
++			if err := rt.finishHardLink(f); err != nil {
++				return false, false, err
++			}
++		}
++		return true, false, nil
++	}
++	if destSt != nil {
++		return false, false, nil
++	}
++	if level == 2 {
++		if !rt.Opts.DryRun {
++			if err := rt.copyFromLinkDest(f); err != nil {
++				return false, false, err
++			}
++		}
++		if f.hlink != nil {
++			if err := rt.finishHardLink(f); err != nil {
++				return false, false, err
++			}
++		}
++		return true, false, nil
++	}
++	return false, true, nil
++}
++
++// tryLinkDestNonReg hard-links a symlink, device or special file from the
++// --link-dest directory if it is identical, like rsync/generator.c:try_dests_non.
++func (rt *Transfer) tryLinkDestNonReg(f *File) (bool, error) {
++	if f.FileMode().IsDir() {
++		return false, nil
++	}
++	level, _, err := rt.linkDestMatch(f)
++	if err != nil || level < 3 {
++		return false, err
++	}
++	if !rt.Opts.DryRun {
++		if err := replaceWithLink(rt.LinkDestRoot, f.Name, rt.DestRoot, f.Name); err != nil {
++			// Like rsync (try_dests_non), create the entry instead.
++			if rt.Opts.Verbose {
++				rt.Logger.Printf("%v, creating it instead", err)
++			}
++			return false, nil
++		}
++	}
++	return true, nil
++}
++
++// openLinkDestBasis opens the file name in the --link-dest directory as the
++// basis of a transfer. Only a regular file can be one (the generator requests
++// the whole file otherwise), and opening anything else, such as a FIFO, could
++// block, so anything else counts as missing.
++func (rt *Transfer) openLinkDestBasis(name string) (*os.File, error) {
++	st, err := rt.LinkDestRoot.Lstat(name)
++	if err != nil {
++		return nil, err
++	}
++	if !st.Mode().IsRegular() {
++		return nil, os.ErrNotExist
++	}
++	return rt.LinkDestRoot.Open(name)
++}
++
++// copyFromLinkDest copies the file of the same name from the --link-dest
++// directory instead of transferring it, see
++// rsync/generator.c:copy_altdest_file.
++func (rt *Transfer) copyFromLinkDest(f *File) error {
++	in, err := rt.LinkDestRoot.Open(f.Name)
++	if err != nil {
++		return err
++	}
++	defer in.Close()
++	out, err := newPendingFile(rt.DestRoot, f.Name, rt.Opts.DoFsync, rt.Opts.SparseFiles)
++	if err != nil {
++		return err
++	}
++	defer out.Cleanup()
++	if _, err := io.Copy(out, in); err != nil {
++		return err
++	}
++	if err := out.CloseAtomicallyReplace(); err != nil {
++		return err
++	}
++	return rt.setPerms(f, rt.destPerm(f, nil))
++}
+diff --git a/internal/receiver/linkstub.go b/internal/receiver/linkstub.go
+new file mode 100644
+index 0000000..11fa725
+--- /dev/null
++++ b/internal/receiver/linkstub.go
+@@ -0,0 +1,19 @@
++//go:build !linux && !darwin && !windows
++
++package receiver
++
++import (
++	"errors"
++	"os"
++)
++
++// linkAt creates newname in newRoot as a hard link of oldname in oldRoot.
++// Without linkat(2), a link from one root into another cannot be kept inside
++// both roots, so it is refused and the caller copies or recreates the file
++// instead, as rsync does when a hard link fails.
++func linkAt(oldRoot *os.Root, oldname string, newRoot *os.Root, newname string) error {
++	if oldRoot == newRoot {
++		return newRoot.Link(oldname, newname)
++	}
++	return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: errors.ErrUnsupported}
++}
+diff --git a/internal/receiver/permissions.go b/internal/receiver/permissions.go
+index 896563d..ec40a44 100644
+--- a/internal/receiver/permissions.go
++++ b/internal/receiver/permissions.go
+@@ -5,13 +5,32 @@ import (
+ 	"os"
+ )
+ 
++// modePermBits are the bits of a fs.FileMode that rsync's --perms preserves
++// (rsync.h:CHMOD_BITS).
++const modePermBits = fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
++
++// senderPerm converts the permission bits of the sender's mode, including the
++// setuid, setgid and sticky bits, to Go's permission bits.
++func senderPerm(mode int32) fs.FileMode {
++	perm := fs.FileMode(mode).Perm()
++	if mode&0o4000 != 0 {
++		perm |= fs.ModeSetuid
++	}
++	if mode&0o2000 != 0 {
++		perm |= fs.ModeSetgid
++	}
++	if mode&0o1000 != 0 {
++		perm |= fs.ModeSticky
++	}
++	return perm
++}
++
+ func (rt *Transfer) destPerm(f *File, st os.FileInfo) fs.FileMode {
+-	senderPerm := fs.FileMode(f.Mode).Perm()
+ 	if rt.Opts.PreservePerms {
+-		return senderPerm // --perms means apply the sender permissions
++		return senderPerm(f.Mode) // --perms means apply the sender permissions
+ 	}
+ 	if st != nil {
+-		return st.Mode().Perm() // keep existing permissions
++		return st.Mode() & modePermBits // keep existing permissions
+ 	}
+-	return senderPerm & rt.defaultPerms
++	return fs.FileMode(f.Mode).Perm() & rt.defaultPerms
+ }
+diff --git a/internal/receiver/receiver.go b/internal/receiver/receiver.go
+index 02c9eda..979e7ca 100644
+--- a/internal/receiver/receiver.go
++++ b/internal/receiver/receiver.go
+@@ -98,6 +98,12 @@ func (rt *Transfer) recvFile1(f *File) error {
+ 	}
+ 
+ 	localFile, err := rt.openLocalFile(f)
++	if os.IsNotExist(err) && rt.LinkDestRoot != nil {
++		// Before protocol 29, the generator does not say which basis file
++		// it used: a missing file is looked for in the --link-dest
++		// directory (rsync/receiver.c:recv_files).
++		localFile, err = rt.openLinkDestBasis(f.Name)
++	}
+ 	if err != nil && !os.IsNotExist(err) {
+ 		rt.Logger.Printf("opening local file failed, continuing: %v", err)
+ 	}
+diff --git a/internal/receiver/transfer.go b/internal/receiver/transfer.go
+index 8fb9d9e..3953dc8 100644
+--- a/internal/receiver/transfer.go
++++ b/internal/receiver/transfer.go
+@@ -32,6 +32,9 @@ type TransferOpts struct {
+ 	DoFsync           bool
+ 	KeepPartial       bool
+ 	SparseFiles       bool
++	// LinkDest is the --link-dest directory, relative to Dest unless it
++	// is absolute.
++	LinkDest string
+ 
+ 	InfoGTE  func(rsyncopts.InfoLevel, uint16) bool
+ 	DebugGTE func(rsyncopts.DebugLevel, uint16) bool
+@@ -45,6 +48,9 @@ type Transfer struct {
+ 	DestRoot *os.Root
+ 	Env      *rsyncos.Env
+ 	Progress progress.Printer
++	// LinkDestRoot is the --link-dest directory. If it is nil, Do opens
++	// Opts.LinkDest.
++	LinkDestRoot *os.Root
+ 
+ 	// state
+ 	Conn         *rsyncwire.Conn
+@@ -54,6 +60,7 @@ type Transfer struct {
+ 	Groups       map[int32]mapping
+ 	defaultPerms fs.FileMode
+ 	retouchDirs  []retouchDir
++	hlinkGroups  []*hlinkGroup
+ }
+ 
+ type retouchDir struct {
+diff --git a/internal/restrict/restrict_linux.go b/internal/restrict/restrict_linux.go
+index 950aee1..01df196 100644
+--- a/internal/restrict/restrict_linux.go
++++ b/internal/restrict/restrict_linux.go
+@@ -13,7 +13,13 @@ import (
+ // ExtraHook is set when testing to make the landlock rule set more permissive.
+ var ExtraHook func() []landlock.Rule
+ 
+-func MaybeFileSystem(roDirsOrFiles []string, rwDirs []string) error {
++// MaybeFileSystem restricts file system access to reading roDirsOrFiles and
++// reading and writing rwDirs. Files in linkDirs can be hard-linked into
++// rwDirs: Landlock refuses a link through which a file would gain access
++// rights (EXDEV), so the files in linkDirs get the file rights that rwDirs
++// give, while the directories in linkDirs are only readable (no entries can
++// be created, removed or renamed in them).
++func MaybeFileSystem(roDirsOrFiles []string, rwDirs []string, linkDirs ...string) error {
+ 	re := ExtraHook
+ 	if re == nil {
+ 		re = func() []landlock.Rule {
+@@ -32,13 +38,15 @@ func MaybeFileSystem(roDirsOrFiles []string, rwDirs []string) error {
+ 			roFiles = append(roFiles, fn)
+ 		}
+ 	}
+-	log.Printf("setting up landlock ACL (paths ro: %q, paths rw: %q)", roDirs, rwDirs)
++	log.Printf("setting up landlock ACL (paths ro: %q, paths rw: %q, paths link: %q)", roDirs, rwDirs, linkDirs)
+ 	err := landlock.V3.BestEffort().RestrictPaths(
+ 		append(re(), []landlock.Rule{
+ 			landlock.RODirs(defaultRoDirs...).IgnoreIfMissing(),
+ 			landlock.RODirs(roDirs...).IgnoreIfMissing(),
+ 			landlock.ROFiles(roFiles...).IgnoreIfMissing(),
+ 			landlock.RWDirs(rwDirs...).WithRefer(),
++			landlock.RODirs(linkDirs...).IgnoreIfMissing(),
++			landlock.RWFiles(linkDirs...).WithRefer().IgnoreIfMissing(),
+ 		}...)...)
+ 	if err != nil {
+ 		return fmt.Errorf("landlock: %v", err)
+diff --git a/internal/restrict/restrict_other.go b/internal/restrict/restrict_other.go
+index d60a51c..11aa983 100644
+--- a/internal/restrict/restrict_other.go
++++ b/internal/restrict/restrict_other.go
+@@ -8,4 +8,4 @@ import "github.com/landlock-lsm/go-landlock/landlock"
+ 
+ var ExtraHook func() []landlock.Rule
+ 
+-func MaybeFileSystem(_, _ []string) error { return nil }
++func MaybeFileSystem(_, _ []string, _ ...string) error { return nil }
+diff --git a/internal/rsyncopts/rsyncopts.go b/internal/rsyncopts/rsyncopts.go
+index ef4d533..98fbae0 100644
+--- a/internal/rsyncopts/rsyncopts.go
++++ b/internal/rsyncopts/rsyncopts.go
+@@ -305,6 +305,7 @@ type Options struct {
+ 	bwlimit_arg          string
+ 	bwlimit              int
+ 	make_backups         int
++	link_dest            string
+ 	backup_dir           string
+ 	backup_suffix        string
+ 	list_only            int
+@@ -714,6 +715,10 @@ func (o *Options) PreserveMTimes() bool       { return o.preserve_mtimes != 0 }
+ func (o *Options) PreservePerms() bool        { return o.preserve_perms != 0 }
+ func (o *Options) PreserveSpecials() bool     { return o.preserve_specials != 0 }
+ func (o *Options) PreserveHardLinks() bool    { return o.preserve_hard_links != 0 }
++func (o *Options) RelativePaths() bool        { return o.relative_paths != 0 }
++func (o *Options) LinkDest() string           { return o.link_dest }
++func (o *Options) FilesFrom() string          { return o.files_from }
++func (o *Options) FromNulls() bool            { return o.eol_nulls != 0 }
+ func (o *Options) DoFsync() bool              { return o.do_fsync != 0 }
+ func (o *Options) Recurse() bool              { return o.recurse != 0 }
+ func (o *Options) Verbose() bool              { return o.verbose != 0 }
+@@ -873,9 +878,9 @@ func (o *Options) gokrazyTable() []poptOption {
+ 		{"hard-links", "H", POPT_ARG_NONE, nil, 'H'},
+ 		{"no-hard-links", "", POPT_ARG_VAL, &o.preserve_hard_links, 0},
+ 		{"no-H", "", POPT_ARG_VAL, &o.preserve_hard_links, 0},
+-		//{"relative", "R", POPT_ARG_VAL, &o.relative_paths, 1},
+-		//{"no-relative", "", POPT_ARG_VAL, &o.relative_paths, 0},
+-		//{"no-R", "", POPT_ARG_VAL, &o.relative_paths, 0},
++		{"relative", "R", POPT_ARG_VAL, &o.relative_paths, 1},
++		{"no-relative", "", POPT_ARG_VAL, &o.relative_paths, 0},
++		{"no-R", "", POPT_ARG_VAL, &o.relative_paths, 0},
+ 		//{"implied-dirs", "", POPT_ARG_VAL, &o.implied_dirs, 1},
+ 		//{"no-implied-dirs", "", POPT_ARG_VAL, &o.implied_dirs, 0},
+ 		//{"i-d", "", POPT_ARG_VAL, &o.implied_dirs, 1},
+@@ -936,7 +941,7 @@ func (o *Options) gokrazyTable() []poptOption {
+ 		//{"block-size", "B", POPT_ARG_STRING, nil, OPT_BLOCK_SIZE},
+ 		//{"compare-dest", "", POPT_ARG_STRING, nil, OPT_COMPARE_DEST},
+ 		//{"copy-dest", "", POPT_ARG_STRING, nil, OPT_COPY_DEST},
+-		//{"link-dest", "", POPT_ARG_STRING, nil, OPT_LINK_DEST},
++		{"link-dest", "", POPT_ARG_STRING, nil, OPT_LINK_DEST},
+ 		//{"fuzzy", "y", POPT_ARG_NONE, nil, 'y'},
+ 		//{"no-fuzzy", "", POPT_ARG_VAL, &o.fuzzy_basis, 0},
+ 		//{"no-y", "", POPT_ARG_VAL, &o.fuzzy_basis, 0},
+@@ -983,9 +988,9 @@ func (o *Options) gokrazyTable() []poptOption {
+ 		//{"read-batch", "", POPT_ARG_STRING, &o.batch_name, OPT_READ_BATCH},
+ 		//{"write-batch", "", POPT_ARG_STRING, &o.batch_name, OPT_WRITE_BATCH},
+ 		//{"only-write-batch", "", POPT_ARG_STRING, &o.batch_name, OPT_ONLY_WRITE_BATCH},
+-		//{"files-from", "", POPT_ARG_STRING, &o.files_from, 0},
+-		//{"from0", "0", POPT_ARG_VAL, &o.eol_nulls, 1},
+-		//{"no-from0", "", POPT_ARG_VAL, &o.eol_nulls, 0},
++		{"files-from", "", POPT_ARG_STRING, &o.files_from, 0},
++		{"from0", "0", POPT_ARG_VAL, &o.eol_nulls, 1},
++		{"no-from0", "", POPT_ARG_VAL, &o.eol_nulls, 0},
+ 		//{"old-args", "", POPT_ARG_NONE, nil, OPT_OLD_ARGS},
+ 		//{"no-old-args", "", POPT_ARG_VAL, &o.old_style_args, 0},
+ 		//{"secluded-args", "s", POPT_ARG_VAL, &o.protect_args, 1},
+@@ -1485,8 +1490,15 @@ func (pc *Context) ParseArguments(osenv *rsyncos.Env, args []string) error {
+ 		case OPT_APPEND:
+ 			return errNotYetImplemented
+ 
+-		case OPT_LINK_DEST,
+-			OPT_COPY_DEST,
++		case OPT_LINK_DEST:
++			// Protocol 27 allows only one alternate destination
++			// directory (rsync/compat.c:setup_protocol).
++			if opts.link_dest != "" {
++				return fmt.Errorf("using more than one --link-dest option requires protocol 29 or higher (negotiated 27)")
++			}
++			opts.link_dest = pc.poptGetOptArg()
++
++		case OPT_COPY_DEST,
+ 			OPT_COMPARE_DEST:
+ 			return errNotYetImplemented
+ 
+@@ -1543,6 +1555,18 @@ func (pc *Context) ParseArguments(osenv *rsyncos.Env, args []string) error {
+ 		os.Exit(1)
+ 	}
+ 
++	if opts.files_from != "" {
++		// The listed directories are not recursed into, unless -r was
++		// given explicitly: -r sets recurse to 2, while -a only sets it to
++		// 1 when it is still 0 (rsync/options.c, recurse == 1).
++		if opts.recurse == 1 {
++			opts.recurse = 0
++		}
++		if opts.xfer_dirs < 0 {
++			opts.xfer_dirs = 1
++		}
++	}
++
+ 	if opts.recurse != 0 {
+ 		opts.xfer_dirs = 1
+ 	}
+diff --git a/internal/rsyncopts/serveroptions.go b/internal/rsyncopts/serveroptions.go
+index d904db6..1a7e9cf 100644
+--- a/internal/rsyncopts/serveroptions.go
++++ b/internal/rsyncopts/serveroptions.go
+@@ -52,8 +52,9 @@ func (o *Options) ServerOptions() []string {
+ 	//  * default for remote transfers, and in any case old versions
+ 	//  * of rsync will not understand it. */
+ 
+-	// if (preserve_hard_links)
+-	// 	argstr[x++] = 'H';
++	if o.PreserveHardLinks() {
++		argstr += "H"
++	}
+ 	if o.PreserveUid() {
+ 		argstr += "o"
+ 	}
+@@ -80,8 +81,9 @@ func (o *Options) ServerOptions() []string {
+ 	if o.IgnoreTimes() {
+ 		argstr += "I"
+ 	}
+-	// if (relative_paths)
+-	// 	argstr[x++] = 'R';
++	if o.RelativePaths() {
++		argstr += "R"
++	}
+ 	// if (one_file_system)
+ 	// 	argstr[x++] = 'x';
+ 	if o.SparseFiles() {
+@@ -198,14 +200,19 @@ func (o *Options) ServerOptions() []string {
+ 	// 	args[ac++] = tmpdir;
+ 	// }
+ 
+-	// if (compare_dest && am_sender) {
+-	// 	/* the server only needs this option if it is not the sender,
+-	// 	 *   and it may be an older version that doesn't know this
+-	// 	 *   option, so don't send it if client is the sender.
+-	// 	 */
+-	// 	args[ac++] = link_dest ? "--link-dest" : "--compare-dest";
+-	// 	args[ac++] = compare_dest;
+-	// }
++	// The server only needs this option if it is not the sender.
++	if o.LinkDest() != "" && o.Sender() {
++		sargv = append(sargv, "--link-dest", o.LinkDest())
++	}
++
++	// A remote sender reads the names from the connection. --files-from
++	// implies -R there, so --no-R has to be passed on.
++	if o.FilesFrom() != "" && !o.Sender() {
++		sargv = append(sargv, "--files-from=-", "--from0")
++		if !o.RelativePaths() {
++			sargv = append(sargv, "--no-relative")
++		}
++	}
+ 
+ 	// if (files_from && (!am_sender || remote_filesfrom_file)) {
+ 	// 	if (remote_filesfrom_file) {
+diff --git a/internal/sender/do.go b/internal/sender/do.go
+index 52343af..bd34670 100644
+--- a/internal/sender/do.go
++++ b/internal/sender/do.go
+@@ -55,7 +55,7 @@ func (st *Transfer) Do(crd *rsyncwire.CountingReader, cwr *rsyncwire.CountingWri
+ 	// Sort the file list. The client sorts, so we need to sort, too (in the
+ 	// same way!), otherwise our indices do not match what the client will
+ 	// request.
+-	sort.Slice(fileList.Files, func(i, j int) bool {
++	sort.SliceStable(fileList.Files, func(i, j int) bool {
+ 		return fileList.Files[i].Wpath < fileList.Files[j].Wpath
+ 	})
+ 
+diff --git a/internal/sender/filesfrom.go b/internal/sender/filesfrom.go
+new file mode 100644
+index 0000000..abf7ef5
+--- /dev/null
++++ b/internal/sender/filesfrom.go
+@@ -0,0 +1,175 @@
++package sender
++
++import (
++	"bufio"
++	"io"
++	"os"
++	"path"
++	"path/filepath"
++	"strings"
++)
++
++// ReadFilesFrom reads the names of a --files-from list, separated by NUL
++// bytes if nulls is set and by line endings otherwise, see
++// rsync/io.c:read_line. A list read from a local file skips empty names and
++// comments (names starting with # or ;); a list read from the connection
++// ends with an empty name.
++func ReadFilesFrom(r io.ByteReader, nulls, local bool) ([]string, error) {
++	names, err := readNames(r, nulls, local)
++	if err != nil {
++		return nil, err
++	}
++	return filterNames(names, local), nil
++}
++
++// ForwardedFilesFrom reads a local --files-from list the way a client passes
++// it on to a remote sender, see rsync/io.c:forward_filesfrom_data: empty
++// names are dropped, but comment lines are kept, and the sender reads them
++// as names.
++func ForwardedFilesFrom(r io.ByteReader, nulls bool) ([]string, error) {
++	names, err := readNames(r, nulls, true)
++	if err != nil {
++		return nil, err
++	}
++	var out []string
++	for _, name := range names {
++		if name != "" {
++			out = append(out, name)
++		}
++	}
++	return out, nil
++}
++
++func readNames(r io.ByteReader, nulls, local bool) ([]string, error) {
++	var names []string
++	var name strings.Builder
++	for {
++		ch, err := r.ReadByte()
++		if err == io.EOF {
++			if name.Len() > 0 {
++				names = append(names, name.String())
++			}
++			return names, nil
++		}
++		if err != nil {
++			return nil, err
++		}
++		end := ch == 0
++		if !nulls {
++			end = ch == '\n' || ch == '\r'
++		}
++		if !end {
++			name.WriteByte(ch)
++			continue
++		}
++		if name.Len() == 0 && !local {
++			return names, nil
++		}
++		names = append(names, name.String())
++		name.Reset()
++	}
++}
++
++func filterNames(names []string, local bool) []string {
++	if !local {
++		return names
++	}
++	var out []string
++	for _, name := range names {
++		if name == "" || strings.HasPrefix(name, "#") || strings.HasPrefix(name, ";") {
++			continue
++		}
++		out = append(out, name)
++	}
++	return out
++}
++
++// sanitizeName keeps a --files-from name inside the source directory, like
++// rsync/util1.c:sanitize_path: leading slashes are removed, and a .. element
++// removes the element before it instead of leaving the directory. The .
++// elements (SP_KEEP_DOT_DIRS) and a trailing slash stay: a /./ marks where
++// the path starts, and a trailing slash asks for the contents of a directory.
++func sanitizeName(name string) string {
++	var elems []string
++	for _, elem := range strings.Split(name, "/") {
++		switch elem {
++		case "":
++			continue
++		case "..":
++			if len(elems) > 0 {
++				elems = elems[:len(elems)-1]
++			}
++			continue
++		}
++		elems = append(elems, elem)
++	}
++	clean := strings.Join(elems, "/")
++	if clean != "" && (strings.HasSuffix(name, "/") || strings.HasSuffix(name, "/..")) {
++		clean += "/"
++	}
++	return clean
++}
++
++// contentsName reports whether a source name asks for the contents of a
++// directory, which are sent even without -r: it ends in a slash or is a dot
++// directory (rsync/flist.c:send_file_list, a name that is not a NORMAL_NAME).
++func contentsName(name string) bool {
++	return name == "" || name == "." || strings.HasSuffix(name, "/") || strings.HasSuffix(name, "/.")
++}
++
++// FilesFromPaths turns the names of a --files-from list into the source
++// arguments they stand for (relative paths below dir, the source directory),
++// see rsync/flist.c:send_file_list. With relative (-R), a /./ in a name marks
++// where the path that is recreated starts, so a/b/./c/f is sent as c/f;
++// without it, only the last element of a name is sent.
++func FilesFromPaths(dir string, names []string, relative bool) []string {
++	// The names start below the source directory, so a /./ in the
++	// directory itself must not mark where they start.
++	volume := filepath.VolumeName(dir)
++	dir = volume + path.Clean(filepath.ToSlash(dir[len(volume):]))
++	var paths []string
++	for _, name := range names {
++		name = sanitizeName(name)
++		if !relative {
++			p := path.Join(dir, name)
++			if contentsName(name) {
++				p += "/"
++			}
++			paths = append(paths, p)
++			continue
++		}
++		if strings.Contains(name, "/./") {
++			paths = append(paths, dir+"/"+name)
++		} else {
++			paths = append(paths, dir+"/./"+name)
++		}
++	}
++	return paths
++}
++
++// ForwardFilesFrom sends the names of a --files-from list to a sender on the
++// other side of the connection, NUL-terminated and followed by an empty name,
++// like rsync/io.c:forward_filesfrom_data.
++func ForwardFilesFrom(w io.Writer, names []string) error {
++	var buf strings.Builder
++	for _, name := range names {
++		buf.WriteString(name)
++		buf.WriteByte(0)
++	}
++	buf.WriteByte(0)
++	_, err := io.WriteString(w, buf.String())
++	return err
++}
++
++// OpenFilesFrom opens the local --files-from list: stdin for -, the named
++// file otherwise.
++func OpenFilesFrom(name string, stdin io.Reader) (*bufio.Reader, func() error, error) {
++	if name == "-" {
++		return bufio.NewReader(stdin), func() error { return nil }, nil
++	}
++	f, err := os.Open(name)
++	if err != nil {
++		return nil, nil, err
++	}
++	return bufio.NewReader(f), f.Close, nil
++}
+diff --git a/internal/sender/flist.go b/internal/sender/flist.go
+index a43352d..9eaeeb8 100644
+--- a/internal/sender/flist.go
++++ b/internal/sender/flist.go
+@@ -90,11 +90,29 @@ type scopedWalker struct {
+ 	strip     string
+ 	subdir    string
+ 	prefix    string
++	// sent records the names already in the file list (with --relative)
++	// and whether each is a directory, so that names shared by several
++	// source arguments are sent only once. A directory is still sent after a
++	// non-directory of the same name: the receiver keeps the directory, as
++	// in rsync/flist.c:flist_sort_and_clean.
++	sent map[string]bool
++	// fakeIno numbers the files whose inode number is unknown (-H).
++	fakeIno *int64
++	// contents sends the entries of the top directory even without -r,
++	// because its name asks for them (see contentsName).
++	contents bool
++	walkRoot string
+ }
+ 
+ func (s *scopedWalker) walk() error {
+ 	if s.source == nil {
+-		fi, err := os.Lstat(s.localDir)
++		// A name that asks for the contents of a directory follows a
++		// symlink, like rsync's link_stat in send_file_list.
++		stat := os.Lstat
++		if s.contents {
++			stat = os.Stat
++		}
++		fi, err := stat(s.localDir)
+ 		if err != nil {
+ 			s.st.Logger.Printf("  Lstat(localDir=%q): %v", s.localDir, err)
+ 			return fmt.Errorf("i/o error: requested module path is not accessible")
+@@ -126,12 +144,27 @@ func (s *scopedWalker) walk() error {
+ 	if strings.HasPrefix(rootname, "/") {
+ 		rootname = "." + rootname
+ 	}
+-	if err := fs.WalkDir(s.source.FS(), path.Clean(rootname), s.walkFn); err != nil {
++	s.walkRoot = path.Clean(rootname)
++	if !s.contents {
++		// fs.WalkDir follows a symlink at its root: send the link
++		// itself, as rsync does for a source argument.
++		if info, err := fs.Lstat(s.source.FS(), s.walkRoot); err == nil && info.Mode()&fs.ModeSymlink != 0 {
++			return s.walkFn(s.walkRoot, fs.FileInfoToDirEntry(info), nil)
++		}
++	}
++	if err := fs.WalkDir(s.source.FS(), s.walkRoot, s.walkFn); err != nil {
+ 		return err
+ 	}
+ 	return nil
+ }
+ 
++// skipDir reports whether the walk stays out of the directory path: without
++// -r, it only enters the top directory of a name that asks for its contents,
++// see rsync/flist.c:send_if_directory.
++func (s *scopedWalker) skipDir(path string, info fs.FileInfo) bool {
++	return info.Mode().IsDir() && !s.st.Opts.Recurse() && !(s.contents && path == s.walkRoot)
++}
++
+ func (s *scopedWalker) walkFn(path string, d fs.DirEntry, err error) error {
+ 	logger := s.st.Logger // for convenience
+ 	opts := s.st.Opts     // for convenience
+@@ -187,6 +220,32 @@ func (s *scopedWalker) walkFn(path string, d fs.DirEntry, err error) error {
+ 		return filepath.SkipDir
+ 	}
+ 
++	if s.sent != nil {
++		if dir, ok := s.sent[name]; ok && (dir || !info.IsDir()) {
++			if s.skipDir(path, info) {
++				return filepath.SkipDir
++			}
++			return nil
++		}
++		s.sent[name] = info.IsDir()
++	}
++
++	if err := s.sendEntry(path, name, info, flags); err != nil {
++		return err
++	}
++
++	if s.skipDir(path, info) {
++		return filepath.SkipDir
++	}
++
++	return nil
++}
++
++// sendEntry adds one entry to the file list and transmits it.
++func (s *scopedWalker) sendEntry(path, name string, info fs.FileInfo, flags byte) error {
++	logger := s.st.Logger // for convenience
++	opts := s.st.Opts     // for convenience
++
+ 	s.fileList.Files = append(s.fileList.Files, file{
+ 		source:  s.source,
+ 		path:    path,
+@@ -225,6 +284,15 @@ func (s *scopedWalker) walkFn(path string, d fs.DirEntry, err error) error {
+ 
+ 	// 7.   file mode (optional, mode_t, integer)
+ 	mode := int32(info.Mode() & os.ModePerm)
++	if info.Mode()&os.ModeSetuid != 0 {
++		mode |= 0o4000
++	}
++	if info.Mode()&os.ModeSetgid != 0 {
++		mode |= 0o2000
++	}
++	if info.Mode()&os.ModeSticky != 0 {
++		mode |= 0o1000
++	}
+ 	isDev := false
+ 	isSpecial := false
+ 	if info.Mode().IsDir() {
+@@ -311,6 +379,19 @@ func (s *scopedWalker) walkFn(path string, d fs.DirEntry, err error) error {
+ 		s.fec.WriteString(target)
+ 	}
+ 
++	if opts.PreserveHardLinks() && info.Mode().IsRegular() {
++		// Protocols before 28 transmit the device and inode number of
++		// every regular file, the device incremented so that it is never
++		// zero (rsync/flist.c:send_file_entry).
++		dev, ino, ok := devIno(s.source, path, info)
++		if !ok {
++			*s.fakeIno++
++			dev, ino = 0, uint64(*s.fakeIno)
++		}
++		s.fec.WriteInt64(int64(dev + 1))
++		s.fec.WriteInt64(int64(ino))
++	}
++
+ 	if opts.AlwaysChecksum() {
+ 		var emptyChecksum [rsyncchecksum.Size]byte
+ 		checksum := emptyChecksum[:]
+@@ -330,7 +411,9 @@ func (s *scopedWalker) walkFn(path string, d fs.DirEntry, err error) error {
+ 		s.fec.WriteString(string(checksum))
+ 	}
+ 
+-	s.conn.WriteString(s.fec.String())
++	if err := s.conn.WriteString(s.fec.String()); err != nil {
++		return err
++	}
+ 
+ 	// The status byte may consist of the following bits and determines which of the optional fields are transmitted.
+ 
+@@ -344,11 +427,135 @@ func (s *scopedWalker) walkFn(path string, d fs.DirEntry, err error) error {
+ 
+ 	// If the status byte is zero, the file-list has terminated.
+ 
+-	if info.Mode().IsDir() && !opts.Recurse() {
+-		return filepath.SkipDir
++	return nil
++}
++
++// splitRelative splits a source argument into the directory its name is
++// relative to and that name (--relative): a /./ in the path marks where the
++// name starts, otherwise the whole path is the name, relative to the current
++// directory (or to /, without the leading slash).
++func splitRelative(requested string) (dir, name string) {
++	if idx := strings.Index(requested, "/./"); idx > -1 {
++		dir = requested[:idx]
++		if dir == "" {
++			dir = "/"
++		}
++		return dir, requested[idx+3:]
++	}
++	if strings.HasPrefix(requested, "/") {
++		return "/", requested
+ 	}
++	return ".", requested
++}
+ 
+-	return nil
++// cleanRelative removes empty and . elements from a relative name, like
++// rsync/util1.c:clean_fname, and rejects .. elements.
++func cleanRelative(name string) (string, error) {
++	var elems []string
++	for _, elem := range strings.Split(name, "/") {
++		switch elem {
++		case "", ".":
++			continue
++		case "..":
++			return "", fmt.Errorf("found \"..\" dir in relative path: %s", name)
++		}
++		elems = append(elems, elem)
++	}
++	return strings.Join(elems, "/"), nil
++}
++
++// walkRelative sends a source argument under its full name, preceded by the
++// directories leading to it (--relative), see rsync/flist.c:send_file_list
++// and send_implied_dirs. The implied directories are only stat(2)ed: the
++// sender may not be allowed to open them. Like rsync ("Don't filter implied
++// dirs."), the filter rules do not apply to them; a receiving client refuses
++// a file list with a name that its own rules exclude.
++func (s *scopedWalker) walkRelative(localDir, requested string) error {
++	opts := s.st.Opts
++	isModule := localDir != rsync.FileSystemRoot
++	volume := ""
++	if !isModule && s.source == nil {
++		// A local argument is a native path: its volume name (C: on
++		// Windows) stays out of the name, like a leading slash, and its
++		// separators become slashes.
++		volume = filepath.VolumeName(requested)
++		requested = filepath.ToSlash(requested[len(volume):])
++	}
++	dir, name := splitRelative(requested)
++	s.contents = contentsName(name)
++	name, err := cleanRelative(name)
++	if err != nil {
++		return err
++	}
++	if isModule {
++		// Module paths are relative to the module.
++		if dir, err = cleanRelative(dir); err != nil {
++			return err
++		}
++	}
++
++	stat := func(rel string, follow bool) (fs.FileInfo, error) {
++		if s.source != nil {
++			name := path.Join(".", dir, rel)
++			if follow {
++				return fs.Stat(s.source.FS(), name)
++			}
++			return fs.Lstat(s.source.FS(), name)
++		}
++		full := filepath.Join(localDir, dir, rel)
++		if !isModule {
++			full = filepath.Join(volume+dir, rel)
++		}
++		if follow {
++			return os.Stat(full)
++		}
++		return os.Lstat(full)
++	}
++
++	info, err := stat(name, s.contents)
++	if err != nil {
++		s.ioError(err)
++		return nil
++	}
++	if info.IsDir() && opts.XferDirs() == 0 {
++		s.st.Logger.Printf("skipping directory %s", requested)
++		return nil
++	}
++
++	if name != "" {
++		elems := strings.Split(name, "/")
++		for i := 1; i < len(elems); i++ {
++			implied := strings.Join(elems[:i], "/")
++			if s.sent[implied] {
++				continue
++			}
++			info, err := stat(implied, true)
++			if err != nil {
++				s.ioError(err)
++				return nil
++			}
++			s.sent[implied] = true
++			if err := s.sendEntry("", implied, info, rsync.XMIT_LONG_NAME); err != nil {
++				return err
++			}
++		}
++	}
++
++	if s.source != nil {
++		s.requested = path.Join(".", dir, name)
++		if base := path.Join(".", dir); base != "." {
++			s.strip = base + "/"
++		}
++	} else {
++		s.localDir = filepath.Join(localDir, dir, name)
++		if !isModule {
++			s.localDir = filepath.Join(volume+dir, name)
++		}
++		s.requested = "."
++		s.prefix = name
++	}
++	s.subdir = "."
++	return s.walk()
+ }
+ 
+ // rsync/flist.c:send_file_list
+@@ -379,10 +586,37 @@ func (st *Transfer) SendFileList(localDir string, paths []string, excl *filterRu
+ 		ioErrors = 1
+ 	}
+ 
++	var sent map[string]bool
++	if st.Opts.RelativePaths() {
++		sent = make(map[string]bool)
++	}
++	var fakeIno int64
++
+ 	for _, requested := range paths {
++		if st.Opts.RelativePaths() {
++			sw := &scopedWalker{
++				st:       st,
++				conn:     st.Conn,
++				fec:      fec,
++				excl:     excl,
++				uidMap:   uidMap,
++				gidMap:   gidMap,
++				fileList: &fileList,
++				source:   st.Source,
++				ioError:  ioError,
++				sent:     sent,
++				fakeIno:  &fakeIno,
++			}
++			if err := sw.walkRelative(localDir, requested); err != nil {
++				return nil, err
++			}
++			continue
++		}
++
+ 		subdir := "."
+ 		prefix := ""
+ 		local := localDir
++		contents := strings.HasSuffix(requested, "/")
+ 		if local == rsync.FileSystemRoot {
+ 			// Implicit module (/) and absolute requested path (/tmp/foo/),
+ 			// turn the path into the local directory and request /.
+@@ -426,6 +660,8 @@ func (st *Transfer) SendFileList(localDir string, paths []string, excl *filterRu
+ 			strip:     strip,
+ 			subdir:    subdir,
+ 			prefix:    prefix,
++			fakeIno:   &fakeIno,
++			contents:  contents,
+ 		}
+ 		if err := sw.walk(); err != nil {
+ 			return nil, err
+diff --git a/internal/sender/stat_noino.go b/internal/sender/stat_noino.go
+new file mode 100644
+index 0000000..ea0d6c8
+--- /dev/null
++++ b/internal/sender/stat_noino.go
+@@ -0,0 +1,11 @@
++//go:build !linux && !darwin && !windows
++
++package sender
++
++import "io/fs"
++
++// devIno reports that this platform does not identify files, so -H cannot
++// find the hard links among them.
++func devIno(FileSource, string, fs.FileInfo) (dev, ino uint64, ok bool) {
++	return 0, 0, false
++}
+diff --git a/internal/sender/stat_unix.go b/internal/sender/stat_unix.go
+index c16a548..a0d16e8 100644
+--- a/internal/sender/stat_unix.go
++++ b/internal/sender/stat_unix.go
+@@ -30,3 +30,12 @@ func rdevFromFileInfo(info fs.FileInfo) (int32, bool) {
+ 	}
+ 	return int32(st.Rdev), true
+ }
++
++// devIno returns the device and inode number of the regular file path.
++func devIno(_ FileSource, _ string, info fs.FileInfo) (dev, ino uint64, ok bool) {
++	st, ok := info.Sys().(*syscall.Stat_t)
++	if !ok {
++		return 0, 0, false
++	}
++	return uint64(st.Dev), uint64(st.Ino), true
++}
+diff --git a/internal/sender/stat_windows.go b/internal/sender/stat_windows.go
+new file mode 100644
+index 0000000..10cebef
+--- /dev/null
++++ b/internal/sender/stat_windows.go
+@@ -0,0 +1,28 @@
++//go:build windows
++
++package sender
++
++import (
++	"io/fs"
++	"os"
++	"syscall"
++)
++
++// devIno returns the volume serial number and file index of the regular file
++// path, which identify it like a device and inode number do elsewhere.
++func devIno(source FileSource, path string, _ fs.FileInfo) (dev, ino uint64, ok bool) {
++	f, err := source.Open(path)
++	if err != nil {
++		return 0, 0, false
++	}
++	defer f.Close()
++	osf, isOS := f.(*os.File)
++	if !isOS {
++		return 0, 0, false
++	}
++	var d syscall.ByHandleFileInformation
++	if err := syscall.GetFileInformationByHandle(syscall.Handle(osf.Fd()), &d); err != nil {
++		return 0, 0, false
++	}
++	return uint64(d.VolumeSerialNumber), uint64(d.FileIndexHigh)<<32 | uint64(d.FileIndexLow), true
++}
+diff --git a/rsyncd/rsyncd.go b/rsyncd/rsyncd.go
+index 055b907..05c79a0 100644
+--- a/rsyncd/rsyncd.go
++++ b/rsyncd/rsyncd.go
+@@ -444,20 +444,21 @@ func (s *Server) handleConnReceiver(module *Module, crd *rsyncwire.CountingReade
+ 			Verbose:  opts.Verbose(),
+ 			Progress: opts.Progress(),
+ 
+-			DeleteMode:       opts.DeleteMode(),
+-			PreserveGid:      opts.PreserveGid(),
+-			PreserveUid:      opts.PreserveUid(),
+-			PreserveLinks:    opts.PreserveLinks(),
+-			PreservePerms:    opts.PreservePerms(),
+-			PreserveDevices:  opts.PreserveDevices(),
+-			PreserveSpecials: opts.PreserveSpecials(),
+-			PreserveTimes:    opts.PreserveMTimes(),
+-			// TODO: PreserveHardlinks: opts.PreserveHardlinks,
+-			IgnoreTimes:    opts.IgnoreTimes(),
+-			AlwaysChecksum: opts.AlwaysChecksum(),
+-			DoFsync:        opts.DoFsync(),
+-			KeepPartial:    opts.KeepPartial(),
+-			SparseFiles:    opts.SparseFiles(),
++			DeleteMode:        opts.DeleteMode(),
++			PreserveGid:       opts.PreserveGid(),
++			PreserveUid:       opts.PreserveUid(),
++			PreserveLinks:     opts.PreserveLinks(),
++			PreservePerms:     opts.PreservePerms(),
++			PreserveDevices:   opts.PreserveDevices(),
++			PreserveSpecials:  opts.PreserveSpecials(),
++			PreserveTimes:     opts.PreserveMTimes(),
++			PreserveHardlinks: opts.PreserveHardLinks(),
++			IgnoreTimes:       opts.IgnoreTimes(),
++			AlwaysChecksum:    opts.AlwaysChecksum(),
++			DoFsync:           opts.DoFsync(),
++			KeepPartial:       opts.KeepPartial(),
++			SparseFiles:       opts.SparseFiles(),
++			LinkDest:          opts.LinkDest(),
+ 
+ 			InfoGTE:  opts.InfoGTE,
+ 			DebugGTE: opts.DebugGTE,
+@@ -483,6 +484,8 @@ func (s *Server) handleConnReceiver(module *Module, crd *rsyncwire.CountingReade
+ 		if len(paths) > 1 {
+ 			return fmt.Errorf("module is available, and at most one destination path is allowed, got %q", paths)
+ 		}
++		moduleRoot := rt.DestRoot
++		destDir := "."
+ 		// Descend into subdirectory (if requested),
+ 		// using the os.OpenRoot traversal-safe API.
+ 		if len(paths) == 1 && paths[0] != "/" {
+@@ -511,14 +514,36 @@ func (s *Server) handleConnReceiver(module *Module, crd *rsyncwire.CountingReade
+ 				rt.Dest = filepath.Join(rt.Dest, name)
+ 			}
+ 			rt.DestRoot = subRoot
++			destDir = subdir
+ 			if opts.Verbose() {
+ 				s.logger.Printf("opened subdirectory %q", rt.Dest)
+ 			}
+ 		}
+-	}
+-
+-	if opts.PreserveHardLinks() {
+-		return fmt.Errorf("support for hard links not yet implemented")
++		if linkDest := opts.LinkDest(); linkDest != "" {
++			// Like rsync's daemon, keep the --link-dest directory inside
++			// the module: a path that starts with a slash is relative to
++			// the module root, and others are relative to the destination,
++			// with .. elements that climb at most to the module root (rsync
++			// sanitizes them with the depth of the destination,
++			// main.c:do_server_recv). If it is not there, the transfer goes
++			// without one; the receiver must not look for it elsewhere.
++			rt.Opts.LinkDest = ""
++			name := sanitizePath(linkDest, 0)
++			if !strings.HasPrefix(linkDest, "/") {
++				dir, depth := sanitizePath(destDir, 0), 0
++				if dir != "." {
++					depth = strings.Count(dir, "/") + 1
++				}
++				name = sanitizePath(dir+"/"+sanitizePath(linkDest, depth), 0)
++			}
++			linkDestRoot, err := moduleRoot.OpenRoot(filepath.FromSlash(name))
++			if err != nil {
++				s.logger.Printf("--link-dest arg does not exist: %s", opts.LinkDest())
++			} else {
++				defer linkDestRoot.Close()
++				rt.LinkDestRoot = linkDestRoot
++			}
++		}
+ 	}
+ 
+ 	if opts.DeleteMode() {
+@@ -551,6 +576,35 @@ func (s *Server) handleConnReceiver(module *Module, crd *rsyncwire.CountingReade
+ 	return nil
+ }
+ 
++// sanitizePath is rsync/util1.c:sanitize_path for a path that a client sent,
++// whatever the operating system: slashes separate the elements, a leading
++// slash and . elements are dropped, and a .. element removes the element
++// before it. Up to depth .. elements at the start stay (they climb above the
++// current directory); further ones are dropped.
++func sanitizePath(p string, depth int) string {
++	var elems []string
++	kept := 0
++	for _, elem := range strings.Split(p, "/") {
++		switch {
++		case elem == "" || elem == ".":
++		case elem == ".." && len(elems) > kept:
++			elems = elems[:len(elems)-1]
++		case elem == "..":
++			if depth > 0 {
++				depth--
++				kept++
++				elems = append(elems, elem)
++			}
++		default:
++			elems = append(elems, elem)
++		}
++	}
++	if len(elems) == 0 {
++		return "."
++	}
++	return strings.Join(elems, "/")
++}
++
+ // handleConnSender is equivalent to rsync/main.c:do_server_sender
+ func (s *Server) handleConnSender(module *Module, crd *rsyncwire.CountingReader, cwr *rsyncwire.CountingWriter, paths []string, opts *rsyncopts.Options, negotiate bool, c *rsyncwire.Conn, sessionChecksumSeed int32) (err error) {
+ 	if module == nil {
+@@ -582,6 +636,19 @@ func (s *Server) handleConnSender(module *Module, crd *rsyncwire.CountingReader,
+ 	}
+ 	st.Logger.Printf("exclusion list read (entries: %d)", len(exclusionList.Filters))
+ 
++	if filesFrom := opts.FilesFrom(); filesFrom != "" && len(paths) > 0 {
++		// With --files-from=-, the client sends the names after the
++		// filter list (rsync/flist.c:send_file_list).
++		if filesFrom != "-" {
++			return fmt.Errorf("--files-from=%s: only --files-from=- is supported on the sending server", filesFrom)
++		}
++		names, err := sender.ReadFilesFrom(st.Conn, true, false)
++		if err != nil {
++			return err
++		}
++		paths = sender.FilesFromPaths(paths[0], names, opts.RelativePaths())
++	}
++
+ 	stats, err := st.Do(crd, cwr, module.Path, paths, exclusionList)
+ 	if err != nil {
+ 		return err

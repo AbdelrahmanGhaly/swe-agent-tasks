@@ -1,0 +1,449 @@
+diff --git a/README.md b/README.md
+index 5244068..7f66434 100644
+--- a/README.md
++++ b/README.md
+@@ -24,6 +24,7 @@ This raft implementation is a full feature implementation of Raft protocol. Feat
+ - Log replication
+ - Log compaction
+ - Membership changes
++- Weighted voting, where voters carry different weights in every quorum decision
+ - Leadership transfer extension
+ - Efficient linearizable read-only queries served by both the leader and followers
+   - leader checks with quorum and bypasses Raft log before processing read-only queries
+diff --git a/quorum/joint.go b/quorum/joint.go
+index e3741e0..feb04fd 100644
+--- a/quorum/joint.go
++++ b/quorum/joint.go
+@@ -47,8 +47,14 @@ func (c JointConfig) Describe(l AckedIndexer) string {
+ // quorum. An index is jointly committed if it is committed in both constituent
+ // majorities.
+ func (c JointConfig) CommittedIndex(l AckedIndexer) Index {
+-	idx0 := c[0].CommittedIndex(l)
+-	idx1 := c[1].CommittedIndex(l)
++	return c.WeightedCommittedIndex(l, nil)
++}
++
++// WeightedCommittedIndex is like CommittedIndex, but each constituent majority
++// commits by weight (see MajorityConfig.WeightedCommittedIndex).
++func (c JointConfig) WeightedCommittedIndex(l AckedIndexer, w Weights) Index {
++	idx0 := c[0].WeightedCommittedIndex(l, w)
++	idx1 := c[1].WeightedCommittedIndex(l, w)
+ 	if idx0 < idx1 {
+ 		return idx0
+ 	}
+@@ -59,8 +65,14 @@ func (c JointConfig) CommittedIndex(l AckedIndexer) Index {
+ // a result indicating whether the vote is pending, lost, or won. A joint quorum
+ // requires both majority quorums to vote in favor.
+ func (c JointConfig) VoteResult(votes map[uint64]bool) VoteResult {
+-	r1 := c[0].VoteResult(votes)
+-	r2 := c[1].VoteResult(votes)
++	return c.WeightedVoteResult(votes, nil)
++}
++
++// WeightedVoteResult is like VoteResult, but each constituent majority decides
++// by weight (see MajorityConfig.WeightedVoteResult).
++func (c JointConfig) WeightedVoteResult(votes map[uint64]bool, w Weights) VoteResult {
++	r1 := c[0].WeightedVoteResult(votes, w)
++	r2 := c[1].WeightedVoteResult(votes, w)
+ 
+ 	if r1 == r2 {
+ 		// If they agree, return the agreed state.
+diff --git a/quorum/majority.go b/quorum/majority.go
+index 2d656b5..9c7e192 100644
+--- a/quorum/majority.go
++++ b/quorum/majority.go
+@@ -162,6 +162,44 @@ func (c MajorityConfig) CommittedIndex(l AckedIndexer) Index {
+ 	return Index(srt[pos])
+ }
+ 
++// WeightedCommittedIndex is like CommittedIndex, but an index is committed
++// once the voters that acked it hold more than half of the configuration's total
++// weight.
++func (c MajorityConfig) WeightedCommittedIndex(l AckedIndexer, w Weights) Index {
++	if len(w) == 0 || len(c) == 0 {
++		return c.CommittedIndex(l)
++	}
++
++	type ack struct {
++		idx    Index
++		weight uint64
++	}
++	acks := make([]ack, 0, len(c))
++	var total weightSum
++	for id := range c {
++		weight := w.Of(id)
++		total.add(weight)
++		// Voters that haven't reported in count as having acked index zero.
++		idx, ok := l.AckedIndex(id)
++		if !ok {
++			idx = 0
++		}
++		acks = append(acks, ack{idx: idx, weight: weight})
++	}
++	slices.SortFunc(acks, func(a, b ack) int {
++		return cmp.Compare(b.idx, a.idx)
++	})
++
++	var acked weightSum
++	for _, a := range acks {
++		acked.add(a.weight)
++		if acked.moreThanHalfOf(total) {
++			return a.idx
++		}
++	}
++	return 0
++}
++
+ // VoteResult takes a mapping of voters to yes/no (true/false) votes and returns
+ // a result indicating whether the vote is pending (i.e. neither a quorum of
+ // yes/no has been reached), won (a quorum of yes has been reached), or lost (a
+@@ -196,3 +234,32 @@ func (c MajorityConfig) VoteResult(votes map[uint64]bool) VoteResult {
+ 	}
+ 	return VoteLost
+ }
++
++// WeightedVoteResult is like VoteResult, but the vote is won once the voters in
++// favor hold more than half of the configuration's total weight, and lost once
++// that is out of reach.
++func (c MajorityConfig) WeightedVoteResult(votes map[uint64]bool, w Weights) VoteResult {
++	if len(w) == 0 || len(c) == 0 {
++		return c.VoteResult(votes)
++	}
++
++	var total, yes, possible weightSum
++	for id := range c {
++		weight := w.Of(id)
++		total.add(weight)
++		if v, ok := votes[id]; !ok || v {
++			possible.add(weight)
++			if ok {
++				yes.add(weight)
++			}
++		}
++	}
++
++	if yes.moreThanHalfOf(total) {
++		return VoteWon
++	}
++	if possible.moreThanHalfOf(total) {
++		return VotePending
++	}
++	return VoteLost
++}
+diff --git a/quorum/quorum.go b/quorum/quorum.go
+index 2899e46..99364e5 100644
+--- a/quorum/quorum.go
++++ b/quorum/quorum.go
+@@ -16,6 +16,7 @@ package quorum
+ 
+ import (
+ 	"math"
++	"math/bits"
+ 	"strconv"
+ )
+ 
+@@ -37,6 +38,38 @@ type AckedIndexer interface {
+ 
+ type mapAckIndexer map[uint64]Index
+ 
++// Weights assigns voting weights to voters. A voter without an entry has
++// weight one, so empty Weights describe plain majorities.
++type Weights map[uint64]uint64
++
++// Of returns the voting weight of the given voter.
++func (w Weights) Of(id uint64) uint64 {
++	if weight, ok := w[id]; ok {
++		return weight
++	}
++	return 1
++}
++
++// weightSum adds up voter weights in 128 bits, so that no set of uint64
++// weights can overflow it.
++type weightSum struct {
++	hi, lo uint64
++}
++
++func (s *weightSum) add(weight uint64) {
++	var carry uint64
++	s.lo, carry = bits.Add64(s.lo, weight, 0)
++	s.hi += carry
++}
++
++// moreThanHalfOf reports whether s is more than half of total, which must not
++// be smaller than s.
++func (s weightSum) moreThanHalfOf(total weightSum) bool {
++	restLo, borrow := bits.Sub64(total.lo, s.lo, 0)
++	restHi, _ := bits.Sub64(total.hi, s.hi, borrow)
++	return s.hi > restHi || (s.hi == restHi && s.lo > restLo)
++}
++
+ func (m mapAckIndexer) AckedIndex(id uint64) (Index, bool) {
+ 	idx, ok := m[id]
+ 	return idx, ok
+diff --git a/raft.go b/raft.go
+index 5d92f7b..7853952 100644
+--- a/raft.go
++++ b/raft.go
+@@ -19,6 +19,7 @@ import (
+ 	"crypto/rand"
+ 	"errors"
+ 	"fmt"
++	"maps"
+ 	"math"
+ 	"math/big"
+ 	"slices"
+@@ -286,6 +287,12 @@ type Config struct {
+ 	// https://github.com/etcd-io/raft/issues/83
+ 	StepDownOnRemoval bool
+ 
++	// VoterWeights assigns voting weights to voters by ID. Voters without an
++	// entry have weight one. A set of voters forms a quorum when their weights
++	// add up to more than half of the total weight of the voters in the
++	// configuration. Every member of the group must use the same weights.
++	VoterWeights map[uint64]uint64
++
+ 	// raft state tracer
+ 	TraceLogger TraceLogger
+ }
+@@ -337,6 +344,15 @@ func (c *Config) validate() error {
+ 		return errors.New("CheckQuorum must be enabled when ReadOnlyOption is ReadOnlyLeaseBased")
+ 	}
+ 
++	return validateVoterWeights(c.VoterWeights)
++}
++
++func validateVoterWeights(weights map[uint64]uint64) error {
++	for id, weight := range weights {
++		if weight == 0 {
++			return fmt.Errorf("voter weight of %x must be greater than 0", id)
++		}
++	}
+ 	return nil
+ }
+ 
+@@ -421,6 +437,11 @@ type raft struct {
+ 	randomizedElectionTimeout int
+ 	disableProposalForwarding bool
+ 	stepDownOnRemoval         bool
++	voterWeights              quorum.Weights
++
++	// activeAtLastCheck lists the nodes that the leader's last CheckQuorum
++	// found active. It is nil until the first such check in the term.
++	activeAtLastCheck []uint64
+ 
+ 	tick func()
+ 	step stepFunc
+@@ -463,8 +484,10 @@ func newRaft(c *Config) *raft {
+ 		disableProposalForwarding:   c.DisableProposalForwarding,
+ 		disableConfChangeValidation: c.DisableConfChangeValidation,
+ 		stepDownOnRemoval:           c.StepDownOnRemoval,
++		voterWeights:                maps.Clone(c.VoterWeights),
+ 		traceLogger:                 c.TraceLogger,
+ 	}
++	r.trk.Weights = r.voterWeights
+ 
+ 	traceInitState(r)
+ 
+@@ -807,6 +830,7 @@ func (r *raft) reset(term uint64) {
+ 	r.pendingConfIndex = 0
+ 	r.uncommittedSize = 0
+ 	r.readOnly = newReadOnly(r.readOnly.option)
++	r.activeAtLastCheck = nil
+ }
+ 
+ func (r *raft) appendEntry(es ...*pb.Entry) (accepted bool) {
+@@ -1279,6 +1303,12 @@ func stepLeader(r *raft, m *pb.Message) error {
+ 		r.bcastHeartbeat()
+ 		return nil
+ 	case pb.MsgCheckQuorum:
++		r.activeAtLastCheck = nil
++		r.trk.Visit(func(id uint64, pr *tracker.Progress) {
++			if pr.RecentActive {
++				r.activeAtLastCheck = append(r.activeAtLastCheck, id)
++			}
++		})
+ 		if !r.trk.QuorumActive() {
+ 			r.logger.Warningf("%x stepped down to follower since quorum is not active", r.id)
+ 			r.becomeFollower(r.Term, None)
+@@ -1352,8 +1382,8 @@ func stepLeader(r *raft, m *pb.Message) error {
+ 		r.bcastAppend()
+ 		return nil
+ 	case pb.MsgReadIndex:
+-		// only one voting member (the leader) in the cluster
+-		if r.trk.IsSingleton() {
++		// the leader's own vote is a quorum
++		if r.trk.HasQuorum(r.id) {
+ 			if resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.GetTo() != None {
+ 				r.send(resp)
+ 			}
+@@ -1602,7 +1632,7 @@ func stepLeader(r *raft, m *pb.Message) error {
+ 		}
+ 
+ 		r.readOnly.recvAck(m.GetFrom(), m.GetContext())
+-		rss := r.readOnly.maybeAdvance(r.trk.Voters)
++		rss := r.readOnly.maybeAdvance(r.trk.Voters, r.trk.Weights)
+ 		for _, rs := range rss {
+ 			if resp := r.responseToReadIndexReq(rs.req, rs.index); resp.GetTo() != None {
+ 				r.send(resp)
+@@ -1922,6 +1952,7 @@ func (r *raft) restore(s *pb.Snapshot) bool {
+ 
+ 	// Reset the configuration and add the (potentially updated) peers in anew.
+ 	r.trk = tracker.MakeProgressTracker(r.trk.MaxInflight, r.trk.MaxInflightBytes)
++	r.trk.Weights = r.voterWeights
+ 	cfg, trk, err := confchange.Restore(confchange.Changer{
+ 		Tracker:   r.trk,
+ 		LastIndex: r.raftLog.lastIndex(),
+@@ -1941,6 +1972,58 @@ func (r *raft) restore(s *pb.Snapshot) bool {
+ 	return true
+ }
+ 
++// setVoterWeights replaces the voting weights and acts on every quorum decision
++// that the new weights settle.
++func (r *raft) setVoterWeights(weights map[uint64]uint64) error {
++	if err := validateVoterWeights(weights); err != nil {
++		return err
++	}
++	r.voterWeights = maps.Clone(weights)
++	r.trk.Weights = r.voterWeights
++
++	switch r.state {
++	case StateLeader:
++		if r.activeAtLastCheck != nil && !r.trk.HasQuorum(r.activeAtLastCheck...) {
++			r.logger.Warningf("%x stepped down to follower since the voters active at its last quorum check are no longer a quorum", r.id)
++			r.becomeFollower(r.Term, None)
++			return nil
++		}
++		if r.maybeCommit() {
++			releasePendingReadIndexMessages(r)
++			r.bcastAppend()
++		}
++		if r.trk.HasQuorum(r.id) {
++			msgs := r.pendingReadIndexMessages
++			r.pendingReadIndexMessages = nil
++			for _, m := range msgs {
++				if resp := r.responseToReadIndexReq(m, r.raftLog.committed); resp.GetTo() != None {
++					r.send(resp)
++				}
++			}
++		}
++		if r.readOnly.option == ReadOnlySafe {
++			for _, rs := range r.readOnly.maybeAdvance(r.trk.Voters, r.trk.Weights) {
++				if resp := r.responseToReadIndexReq(rs.req, rs.index); resp.GetTo() != None {
++					r.send(resp)
++				}
++			}
++		}
++	case StateCandidate, StatePreCandidate:
++		switch _, _, res := r.trk.TallyVotes(); res {
++		case quorum.VoteWon:
++			if r.state == StatePreCandidate {
++				r.campaign(campaignElection)
++			} else {
++				r.becomeLeader()
++				r.bcastAppend()
++			}
++		case quorum.VoteLost:
++			r.becomeFollower(r.Term, None)
++		}
++	}
++	return nil
++}
++
+ // promotable indicates whether state machine can be promoted to leader,
+ // which is true when its own id is in progress list.
+ func (r *raft) promotable() bool {
+diff --git a/rawnode.go b/rawnode.go
+index dddb798..b5b67cd 100644
+--- a/rawnode.go
++++ b/rawnode.go
+@@ -548,6 +548,16 @@ func (rn *RawNode) ForgetLeader() error {
+ 	return rn.raft.Step(&pb.Message{Type: pb.MsgForgetLeader.Enum()})
+ }
+ 
++// SetVoterWeights replaces the voting weights given in Config.VoterWeights. The
++// new weights take effect immediately: a leader using CheckQuorum steps down if
++// the voters that its last check found active are no longer a quorum, a leader
++// that stays commits the entries and confirms the reads they allow, and a
++// candidate whose votes they decide wins or loses. A weight of zero is an error,
++// in which case nothing changes.
++func (rn *RawNode) SetVoterWeights(weights map[uint64]uint64) error {
++	return rn.raft.setVoterWeights(weights)
++}
++
+ // ReadIndex requests a read state. The read state will be set in ready.
+ // Read State has a read index. Once the application advances further than the read
+ // index, any linearizable read requests issued before the read request can be
+diff --git a/read_only.go b/read_only.go
+index 23fc9d3..31e0cef 100644
+--- a/read_only.go
++++ b/read_only.go
+@@ -76,9 +76,9 @@ func (ro *readOnly) AckedIndex(voterID uint64) (quorum.Index, bool) {
+ 
+ // maybeAdvance uses the existing acknowledgements and current raft
+ // configuration to confirm and return as many unconfirmed reads as possible.
+-func (ro *readOnly) maybeAdvance(c quorum.JointConfig) []*readIndexRequest {
++func (ro *readOnly) maybeAdvance(c quorum.JointConfig, w quorum.Weights) []*readIndexRequest {
+ 	// Use `CommittedIndex` to figure out how many reads are now confirmed.
+-	newConfirmedReads := uint64(c.CommittedIndex(ro))
++	newConfirmedReads := uint64(c.WeightedCommittedIndex(ro, w))
+ 	if newConfirmedReads <= ro.confirmedReads {
+ 		return nil
+ 	}
+diff --git a/tracker/tracker.go b/tracker/tracker.go
+index ddf15ba..2057c02 100644
+--- a/tracker/tracker.go
++++ b/tracker/tracker.go
+@@ -121,6 +121,10 @@ type ProgressTracker struct {
+ 
+ 	Votes map[uint64]bool
+ 
++	// Weights are the voting weights that quorum decisions use. Voters
++	// without an entry have weight one.
++	Weights quorum.Weights
++
+ 	MaxInflight      int
+ 	MaxInflightBytes uint64
+ }
+@@ -161,6 +165,15 @@ func (p *ProgressTracker) IsSingleton() bool {
+ 	return len(p.Voters[0]) == 1 && len(p.Voters[1]) == 0
+ }
+ 
++// HasQuorum returns true if the given voters form a quorum on their own.
++func (p *ProgressTracker) HasQuorum(ids ...uint64) bool {
++	votes := make(map[uint64]bool, len(ids))
++	for _, id := range ids {
++		votes[id] = true
++	}
++	return p.Voters.WeightedVoteResult(votes, p.Weights) == quorum.VoteWon
++}
++
+ type matchAckIndexer map[uint64]*Progress
+ 
+ var _ quorum.AckedIndexer = matchAckIndexer(nil)
+@@ -177,7 +190,7 @@ func (l matchAckIndexer) AckedIndex(id uint64) (quorum.Index, bool) {
+ // Committed returns the largest log index known to be committed based on what
+ // the voting members of the group have acknowledged.
+ func (p *ProgressTracker) Committed() uint64 {
+-	return uint64(p.Voters.CommittedIndex(matchAckIndexer(p.Progress)))
++	return uint64(p.Voters.WeightedCommittedIndex(matchAckIndexer(p.Progress), p.Weights))
+ }
+ 
+ // Visit invokes the supplied closure for all tracked progresses in stable order.
+@@ -214,7 +227,7 @@ func (p *ProgressTracker) QuorumActive() bool {
+ 		votes[id] = pr.RecentActive
+ 	})
+ 
+-	return p.Voters.VoteResult(votes) == quorum.VoteWon
++	return p.Voters.WeightedVoteResult(votes, p.Weights) == quorum.VoteWon
+ }
+ 
+ // VoterNodes returns a sorted slice of voters.
+@@ -276,6 +289,6 @@ func (p *ProgressTracker) TallyVotes() (granted int, rejected int, _ quorum.Vote
+ 			rejected++
+ 		}
+ 	}
+-	result := p.Voters.VoteResult(p.Votes)
++	result := p.Voters.WeightedVoteResult(p.Votes, p.Weights)
+ 	return granted, rejected, result
+ }

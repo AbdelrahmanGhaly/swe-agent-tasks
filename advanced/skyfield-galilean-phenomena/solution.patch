@@ -1,0 +1,365 @@
+diff --git a/skyfield/almanac.py b/skyfield/almanac.py
+index b509048..01def36 100644
+--- a/skyfield/almanac.py
++++ b/skyfield/almanac.py
+@@ -7,6 +7,7 @@ import numpy as np
+ from numpy import cos, sin, sqrt, zeros_like
+ from .constants import pi, tau
+ from .framelib import ecliptic_frame
++from .jovianlib import _galilean_states
+ from .searchlib import find_discrete
+ from .nutationlib import iau2000b_radians
+ from .units import Angle
+@@ -184,6 +185,25 @@ def oppositions_conjunctions(ephemeris, target):
+ 
+ MERIDIAN_TRANSITS = ['Antimeridian transit', 'Meridian transit']
+ 
++def galilean_phenomena(ephemeris, observer):
++    """Build a function of time that tells what Jupiter's four big moons
++    are doing, as seen by an observer.
++
++    The function that this returns will expect a single argument that is
++    a :class:`~skyfield.timelib.Time` and will return an integer whose
++    bit ``4 * i + k`` is set while moon ``i`` is in state ``k``.  The
++    moons Io, Europa, Ganymede, and Callisto are numbered from 0, and so
++    are the states: occulted, in transit, eclipsed, and shadow in
++    transit.
++
++    """
++    def galilean_phenomena_at(t):
++        """Return the states of Jupiter's four big moons at time `t`."""
++        return _galilean_states(ephemeris, observer, t)
++
++    galilean_phenomena_at.step_days = 0.005  # catch stays of 8 minutes or more
++    return galilean_phenomena_at
++
+ def meridian_transits(ephemeris, target, topos):
+     """Build a function of time for finding when a body transits the meridian.
+ 
+diff --git a/skyfield/jovianlib.py b/skyfield/jovianlib.py
+new file mode 100644
+index 0000000..e7767dc
+--- /dev/null
++++ b/skyfield/jovianlib.py
+@@ -0,0 +1,321 @@
++# -*- coding: utf-8 -*-
++"""Jupiter's four Galilean moons: their light, Jupiter's disk and shadow."""
++
++from __future__ import division
++
++from numpy import (abs, arccos, arcsin, arctan2, array, clip, cos, cross,
++                   int64, isfinite, maximum, minimum, pi, sin, sqrt, where,
++                   zeros)
++from numpy.polynomial.legendre import leggauss
++from .constants import AU_KM, C_AUDAY, DEG2RAD, tau
++from .functions import dots, length_of, sqrt_nan
++
++_MOON_NAMES = ('io', 'europa', 'ganymede', 'callisto')
++_MOON_RADII_KM = (1821.6, 1560.8, 2631.2, 2410.3)
++_EQUATORIAL_RADIUS_KM = 71492.0
++_POLAR_RADIUS_KM = 66854.0
++_POLE_RA = 268.057 * DEG2RAD
++_POLE_DEC = 64.495 * DEG2RAD
++_POLE = array([cos(_POLE_DEC) * cos(_POLE_RA),
++               cos(_POLE_DEC) * sin(_POLE_RA),
++               sin(_POLE_DEC)])
++_KM_PER_DAY = C_AUDAY * AU_KM
++
++_x, _w = leggauss(1024)
++_CHORD_OFFSETS = sin(_x * pi / 2.0)[:, None]
++_CHORD_HALVES = cos(_x * pi / 2.0)[:, None]
++_CHORD_WEIGHTS = (_w * pi / 2.0)[:, None] * _CHORD_HALVES
++
++def _pole_like(xyz):
++    return _POLE.reshape((3,) + (1,) * (len(xyz.shape) - 1))
++
++def _to_unit_sphere(xyz_km):
++    """Rescale vectors from Jupiter's center so Jupiter is the unit sphere."""
++    pole = _pole_like(xyz_km)
++    along_pole = dots(pole, xyz_km) * pole
++    return ((xyz_km - along_pole) / _EQUATORIAL_RADIUS_KM
++            + along_pole / _POLAR_RADIUS_KM)
++
++def _first_contact(start, end):
++    """Where does the line from `start` toward `end` enter the unit sphere?
++
++    Returns the fraction of the way from `start` to `end` at which the
++    line first meets the sphere, or ``nan`` if it never meets it.
++
++    """
++    direction = end - start
++    a = dots(direction, direction)
++    along = dots(start, direction) / a
++    closest = start - along * direction
++    return -along - sqrt_nan((1.0 - dots(closest, closest)) / a)
++
++def _unit(xyz):
++    return xyz / length_of(xyz)
++
++def _across(center, toward):
++    """Unit vector perpendicular to `center`, pointing toward `toward`, or
++    any perpendicular if `toward` lies straight along `center`."""
++    spare = (abs(center) == abs(center).min(axis=0)) * 1.0
++    spare = spare - dots(spare, center) * center
++    across = toward - dots(toward, center) * center
++    across = where(length_of(across) > 0.0, across, spare)
++    return across / length_of(across)
++
++def _lit_arcs(a, b, g):
++    """Return the sunlit arcs of the chords of a moon's face.
++
++    The face is the half of the moon turned to a viewer, drawn as the unit
++    disk of the directions of its surface: a point `x` along `across` and
++    `y` along `along` stands for the surface whose outward direction has
++    those two components.  Its chords run along `across` at the offsets
++    `_CHORD_OFFSETS` and reach `_CHORD_HALVES` each way, and a point of a
++    chord is named by the angle whose cosine and sine give `x` and the
++    component toward the viewer as fractions of the chord's half-length.
++    So a stretch of a chord is an arc, the pair of angles between 0 and pi
++    where it begins and ends, and an arc that ends where it begins is
++    empty.  `a`, `b` and `g` are the components of the direction of the
++    Sun along `across`, along `along` and toward the viewer.
++
++    """
++    middle = arctan2(g, a)
++    level = -b * _CHORD_OFFSETS / (_CHORD_HALVES * sqrt(a * a + g * g))
++    reach = arccos(clip(level, -1.0, 1.0))
++    return ((clip(middle - reach, 0.0, pi), clip(middle + reach, 0.0, pi)),
++            (clip(middle - reach + tau, 0.0, pi), pi + 0.0 * reach))
++
++def _arcs_above(height, turn):
++    """Find the arcs of each chord on which `height(angle)` is above zero,
++    given that along a chord it crosses zero at most once on each side of
++    the angle `turn`."""
++    arcs = []
++    ends = 0.0 * turn, turn, pi + 0.0 * turn
++    heights = [height(angle) for angle in ends]
++    for k in 0, 1:
++        low, high = ends[k], ends[k + 1]
++        h_low, h_high = heights[k], heights[k + 1]
++        for _ in range(10):
++            middle = (low + high) / 2.0
++            h = height(middle)
++            move_low = (h > 0.0) == (heights[k] > 0.0)
++            low = where(move_low, middle, low)
++            high = where(move_low, high, middle)
++            h_low = where(move_low, h, h_low)
++            h_high = where(move_low, h_high, h)
++        rise = where(h_high == h_low, 1.0, h_high - h_low)
++        edge = clip(low - h_low / rise * (high - low), low, high)
++        arcs.append((where(heights[k] > 0.0, ends[k], edge),
++                     where(heights[k + 1] > 0.0, ends[k + 1], edge)))
++    return arcs
++
++def _shared_light(lit, arcs, size):
++    """What share of the light of a face, whose sunlit arcs are `lit`,
++    comes from the `arcs` of its chords?  A viewer for whom the moon has
++    the angular radius `size` sees a little less than half of it, and
++    sees the rest of it a little out of proportion."""
++    rim = arcsin(minimum(sin(size) / _CHORD_HALVES, 1.0))
++    wide = 3.0 * sin(size) * _CHORD_HALVES * _CHORD_HALVES
++
++    def seen(angle):
++        return (-_CHORD_HALVES * cos(angle) - sin(size) * angle
++                + wide * (angle / 2.0 - sin(2.0 * angle) / 4.0))
++
++    def area(others):
++        total = 0.0
++        for a, b in lit:
++            for c, d in others:
++                low = clip(maximum(a, c), rim, pi - rim)
++                high = maximum(clip(minimum(b, d), rim, pi - rim), low)
++                total = total + seen(high) - seen(low)
++        return total
++
++    whole = (0.0, pi),
++    return ((_CHORD_WEIGHTS * area(arcs)).sum(axis=0)
++            / (_CHORD_WEIGHTS * area(whole)).sum(axis=0))
++
++def _light_behind_jupiter(apex_s, moon_s, viewer, sunward, size, radius_km):
++    """What share of the light that a moon sends a viewer comes from
++    surface that Jupiter hides from an apex?
++
++    With the viewer as the apex this is the light that Jupiter hides or
++    stands behind; with the Sun as the apex it is the light that comes
++    from surface in Jupiter's shadow.  `apex_s` and `moon_s` are the apex
++    and the moon's center, rescaled like `_to_unit_sphere`; `viewer` and
++    `sunward` point from the moon to the viewer and to the Sun, and the
++    moon shows the viewer a disk of angular radius `size`.  Also returns
++    how far along the way from the apex to the moon Jupiter stands, as a
++    fraction.
++
++    """
++    # A point is hidden from the apex if the line through them passes
++    # within one radius of Jupiter's center: `depth` is positive there.
++    toward = moon_s - apex_s
++    turned = cross(apex_s, moon_s, axis=0)
++    span = dots(apex_s, apex_s)
++    depth = dots(toward, toward) - dots(turned, turned)
++    slope = 2.0 * (toward - span * moon_s + dots(apex_s, moon_s) * apex_s)
++    slope = radius_km * _to_unit_sphere(slope)
++    where_jupiter = -dots(apex_s, toward) / dots(toward, toward)
++
++    across = _across(viewer, slope)
++    along = cross(viewer, across, axis=0)
++    steep = length_of(slope)
++    share = where(depth > 0.0, 1.0, 0.0)
++    near = abs(depth) < 1.5 * steep
++    if not near.any():
++        return share, where_jupiter
++
++    def pick(vector):
++        return vector[..., near]
++
++    apex_s, viewer, across, along = map(pick, (apex_s, viewer, across, along))
++    slope, sunward, span = pick(slope), pick(sunward), span[near]
++    axes = [radius_km * _to_unit_sphere(axis)
++            for axis in (across, along, viewer)]
++
++    def bend(u, v):
++        return (1.0 - span) * dots(u, v) + dots(apex_s, u) * dots(apex_s, v)
++
++    a, b, v = axes
++    s = _CHORD_OFFSETS
++    base = depth[near] + s * dots(slope, along) + s * s * bend(b, b)
++    k_cos = _CHORD_HALVES * (dots(slope, across) + 2.0 * s * bend(a, b))
++    k_sin = _CHORD_HALVES * (dots(slope, viewer) + 2.0 * s * bend(b, v))
++    square = _CHORD_HALVES * _CHORD_HALVES
++    k_cc, k_ss, k_cs = (square * bend(a, a), square * bend(v, v),
++                        2.0 * square * bend(a, v))
++
++    def depth_at(angle):
++        c = cos(angle)
++        z = sin(angle)
++        return (base + k_cos * c + k_sin * z
++                + k_cc * c * c + k_ss * z * z + k_cs * c * z)
++
++    hidden = _arcs_above(depth_at, arctan2(k_sin, k_cos) % pi)
++    lit = _lit_arcs(dots(across, sunward), dots(along, sunward),
++                    dots(viewer, sunward))
++    share[near] = _shared_light(lit, hidden, pick(size))
++    return share, where_jupiter
++
++def _retarded(t, light_time):
++    return t.ts.tdb_jd(t.whole, t.tdb_fraction - light_time)
++
++class _View(object):
++    """What an observer sees of Jupiter and its four big moons at `t`.
++
++    Each body is placed where it was when the light involved passed it.
++
++    """
++    def __init__(self, ephemeris, observer, t):
++        self.t = t
++        self.sun = ephemeris['sun']
++        self.jupiter = ephemeris['jupiter']
++        self.moons = [ephemeris[name] for name in _MOON_NAMES]
++        o = observer.at(t)
++        self.observer_km = o.position.km
++        self.to_jupiter = o.observe(self.jupiter)
++        self.to_moons = [o.observe(moon) for moon in self.moons]
++        self.sight = {}
++        self.sunlight = {}
++
++    def jupiter_km_at(self, t):
++        return self.jupiter.at(t).position.km
++
++    def sight_geometry(self, i):
++        """Return the observer and moon `i` rescaled about Jupiter, the
++        direction from the moon to the observer and the angular radius of
++        the moon, for the light of the moon that reaches or would reach
++        the observer."""
++        if i not in self.sight:
++            moon_km = self.to_moons[i].position.km
++            distance = length_of(moon_km)
++            center = moon_km / distance
++            # The moon's light passes the edge of Jupiter when it is as
++            # far from us as the point of our line of sight nearest Jupiter.
++            lag = dots(self.to_jupiter.position.km, center) / _KM_PER_DAY
++            jupiter_km = (self.jupiter_km_at(_retarded(self.t, lag))
++                          - self.observer_km)
++            self.sight[i] = (_to_unit_sphere(-jupiter_km),
++                             _to_unit_sphere(moon_km - jupiter_km), -center,
++                             arcsin(_MOON_RADII_KM[i] / distance))
++        return self.sight[i]
++
++    def sunlight_geometry(self, i):
++        """Return the Sun and moon `i` rescaled about Jupiter, and the
++        direction from the moon to the Sun, for the sunlight that reaches
++        the moon as it sends us its light."""
++        if i not in self.sunlight:
++            m = self.moons[i].at(_retarded(self.t,
++                                           self.to_moons[i].light_time))
++            sun_km = m.observe(self.sun).position.km
++            sunward = _unit(sun_km)
++            # That sunlight passes the edge of Jupiter when it is as far
++            # from the moon as the point of its path nearest Jupiter.
++            jupiter_km = m.observe(self.jupiter).position.km
++            lag = dots(jupiter_km, sunward) / _KM_PER_DAY
++            jupiter_km = (self.jupiter_km_at(_retarded(m.t, lag))
++                          - m.position.km)
++            self.sunlight[i] = (_to_unit_sphere(sun_km - jupiter_km),
++                                _to_unit_sphere(-jupiter_km), sunward)
++        return self.sunlight[i]
++
++    def occulted_and_transiting(self, i):
++        viewer_s, moon_s, viewer, size = self.sight_geometry(i)
++        _, _, sunward = self.sunlight_geometry(i)
++        light, where_jupiter = _light_behind_jupiter(
++            viewer_s, moon_s, viewer, sunward, size, _MOON_RADII_KM[i])
++        inside = light > 0.5
++        return (inside & (where_jupiter > 0.0) & (where_jupiter < 1.0),
++                inside & (where_jupiter > 1.0))
++
++    def eclipsed(self, i):
++        sun_s, moon_s, sunward = self.sunlight_geometry(i)
++        _, _, viewer, size = self.sight_geometry(i)
++        light, where_jupiter = _light_behind_jupiter(
++            sun_s, moon_s, viewer, sunward, size, _MOON_RADII_KM[i])
++        return (light > 0.5) & (where_jupiter > 0.0) & (where_jupiter < 1.0)
++
++    def shadow_transiting(self, i):
++        # The shadow that we see fell on the clouds when they sent us
++        # their light, and left the moon earlier still.  While it misses
++        # Jupiter, time the light from where it would first touch.
++        moon = self.moons[i]
++        seen = self.to_jupiter.light_time
++        for _ in range(2):
++            j = self.jupiter.at(_retarded(self.t, seen))
++            cast = j.observe(moon).light_time
++            for _ in range(2):
++                m = moon.at(_retarded(j.t, cast))
++                moon_km = m.position.km - j.position.km
++                sun_km = moon_km + m.observe(self.sun).position.km
++                sun_s = _to_unit_sphere(sun_km)
++                line_s = _to_unit_sphere(moon_km) - sun_s
++                f = _first_contact(sun_s, sun_s + line_s)
++                hit = isfinite(f)
++                nearest = -dots(sun_s, line_s) / dots(line_s, line_s)
++                point_km = sun_km + where(hit, f, nearest) * (moon_km - sun_km)
++                cast = length_of(point_km - moon_km) / _KM_PER_DAY
++            observer_km = self.observer_km - j.position.km
++            seen = length_of(observer_km - point_km) / _KM_PER_DAY
++        point_s = _to_unit_sphere(point_km)
++        observer_s = _to_unit_sphere(observer_km)
++        faces_observer = dots(point_s, observer_s - point_s) > 0.0
++        return hit & (f > 1.0) & faces_observer
++
++    def states(self, i):
++        occulted, transiting = self.occulted_and_transiting(i)
++        return (occulted, transiting, self.eclipsed(i),
++                self.shadow_transiting(i))
++
++def _galilean_states(ephemeris, observer, t):
++    """Pack the four states of every moon into an integer per time: bit
++    ``4 * i + k`` is set while moon ``i`` is in state ``k``, counting
++    occulted, in transit, eclipsed, and shadow in transit from zero."""
++    shape = t.shape
++    if len(shape) != 1:
++        t = t.ts.tt_jd(t.whole.reshape(-1), t.tt_fraction.reshape(-1))
++    view = _View(ephemeris, observer, t)
++    code = zeros(t.shape, int64)
++    for i in range(4):
++        for k, state in enumerate(view.states(i)):
++            code += state.astype(int64) << (4 * i + k)
++    return code.reshape(shape)

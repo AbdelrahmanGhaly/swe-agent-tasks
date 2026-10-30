@@ -1,0 +1,2284 @@
+diff --git a/src-rs/command.rs b/src-rs/command.rs
+index 270d8b6..17f672c 100644
+--- a/src-rs/command.rs
++++ b/src-rs/command.rs
+@@ -115,7 +115,9 @@ impl AutoCommandVar {
+                 }
+             }
+             AutoCommand::Star => {
+-                if let Some(output_pattern) = &current_dep_node.output_pattern {
++                if let Some(stem) = &current_dep_node.stem {
++                    out.put_slice(&stem.as_bytes())
++                } else if let Some(output_pattern) = &current_dep_node.output_pattern {
+                     let pat = Pattern::new(output_pattern.as_bytes());
+                     out.put_slice(pat.stem(&current_dep_node.output.as_bytes()))
+                 }
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 3f32205..9d90fba 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -16,7 +16,7 @@ limitations under the License.
+ 
+ use anyhow::Result;
+ use bytes::{Buf, BufMut, Bytes, BytesMut};
+-use memchr::memchr;
++use memchr::{memchr, memrchr};
+ use parking_lot::Mutex;
+ use std::{
+     collections::{HashMap, HashSet},
+@@ -43,7 +43,7 @@ use crate::{
+ 
+ pub type NamedDepNode = (Symbol, Arc<Mutex<DepNode>>);
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct DepNode {
+     pub output: Symbol,
+     pub cmds: Vec<Arc<Value>>,
+@@ -54,7 +54,17 @@ pub struct DepNode {
+     pub is_default_target: bool,
+     pub is_phony: bool,
+     pub is_restat: bool,
++    pub is_intermediate: bool,
++    pub is_implicit_intermediate: bool,
++    pub is_secondary: bool,
++    pub is_precious: bool,
++    pub delete_on_error: bool,
+     pub implicit_outputs: Vec<Symbol>,
++    pub also_made: Vec<Symbol>,
++    pub intermediate_also_made: HashSet<Symbol>,
++    pub secondary_also_made: HashSet<Symbol>,
++    pub precious_also_made: HashSet<Symbol>,
++    pub phony_also_made: HashSet<Symbol>,
+     pub actual_inputs: Vec<Symbol>,
+     pub actual_order_only_inputs: Vec<Symbol>,
+     pub actual_validations: Vec<Symbol>,
+@@ -63,6 +73,7 @@ pub struct DepNode {
+     pub ninja_pool_var: Option<Var>,
+     pub tags_var: Option<Var>,
+     pub output_pattern: Option<Symbol>,
++    pub stem: Option<Symbol>,
+     pub loc: Option<Loc>,
+ }
+ 
+@@ -78,7 +89,17 @@ impl DepNode {
+             is_default_target: false,
+             is_phony,
+             is_restat,
++            is_intermediate: false,
++            is_implicit_intermediate: false,
++            is_secondary: false,
++            is_precious: false,
++            delete_on_error: false,
+             implicit_outputs: Vec::new(),
++            also_made: Vec::new(),
++            intermediate_also_made: HashSet::new(),
++            secondary_also_made: HashSet::new(),
++            precious_also_made: HashSet::new(),
++            phony_also_made: HashSet::new(),
+             actual_inputs: Vec::new(),
+             actual_order_only_inputs: Vec::new(),
+             actual_validations: Vec::new(),
+@@ -87,6 +108,7 @@ impl DepNode {
+             ninja_pool_var: None,
+             tags_var: None,
+             output_pattern: None,
++            stem: None,
+             loc: None,
+         }))
+     }
+@@ -396,6 +418,19 @@ struct DepBuilder<'a> {
+ 
+     implicit_rules: RuleTrie,
+     suffix_rules: SuffixRuleMap,
++    implicit_rule_list: Vec<Arc<Rule>>,
++    implicit_rule_order: HashMap<*const Rule, usize>,
++    replaced_implicit_rules: HashSet<*const Rule>,
++    in_use_rules: HashSet<*const Rule>,
++    pending_matches: HashMap<Symbol, Arc<ImplicitMatch>>,
++    mentioned: HashSet<Symbol>,
++    impossible: HashSet<Symbol>,
++    no_implicit_search: HashSet<Symbol>,
++    precious: HashSet<Symbol>,
++    intermediate: HashSet<Symbol>,
++    secondary: HashSet<Symbol>,
++    all_secondary: bool,
++    delete_on_error: bool,
+ 
+     first_rule: Option<Symbol>,
+     done: HashMap<Symbol, Arc<Mutex<DepNode>>>,
+@@ -412,9 +447,27 @@ struct DepBuilder<'a> {
+ struct PickedRuleInfo {
+     merger: Option<Arc<Mutex<RuleMerger>>>,
+     pattern_rule: Option<Arc<Rule>>,
++    implicit_match: Option<Arc<ImplicitMatch>>,
+     vars: Option<Arc<Vars>>,
+ }
+ 
++#[derive(Debug)]
++struct ImplicitMatch {
++    rule: Arc<Rule>,
++    output_pattern: Symbol,
++    stem: Bytes,
++    resolved: Arc<Rule>,
++    intermediates: Vec<(Symbol, Arc<ImplicitMatch>)>,
++}
++
++struct ImplicitCandidate {
++    rule: Arc<Rule>,
++    output_pattern: Symbol,
++    dir: Bytes,
++    stem: Bytes,
++    stem_len: usize,
++}
++
+ impl<'a> DepBuilder<'a> {
+     fn new(ev: &'a mut Evaluator) -> Result<Self> {
+         let rule_vars = std::mem::take(&mut ev.rule_vars);
+@@ -426,6 +479,19 @@ impl<'a> DepBuilder<'a> {
+ 
+             implicit_rules: RuleTrie::new(),
+             suffix_rules: HashMap::new(),
++            implicit_rule_list: Vec::new(),
++            implicit_rule_order: HashMap::new(),
++            replaced_implicit_rules: HashSet::new(),
++            in_use_rules: HashSet::new(),
++            pending_matches: HashMap::new(),
++            mentioned: HashSet::new(),
++            impossible: HashSet::new(),
++            no_implicit_search: HashSet::new(),
++            precious: HashSet::new(),
++            intermediate: HashSet::new(),
++            secondary: HashSet::new(),
++            all_secondary: false,
++            delete_on_error: false,
+ 
+             first_rule: None,
+             done: HashMap::new(),
+@@ -471,12 +537,22 @@ impl<'a> DepBuilder<'a> {
+                 );
+             }
+         }
++        if let Some(targets) = self.get_special_target_inputs(intern(".PRECIOUS")) {
++            self.precious.extend(targets);
++        }
++        if let Some(targets) = self.get_special_target_inputs(intern(".INTERMEDIATE")) {
++            self.intermediate.extend(targets);
++        }
++        if let Some(targets) = self.get_special_target_inputs(intern(".SECONDARY")) {
++            if targets.is_empty() {
++                self.all_secondary = true;
++            }
++            self.secondary.extend(targets);
++        }
++        self.delete_on_error = self.rules.contains_key(&intern(".DELETE_ON_ERROR"));
+ 
+         let unsupported_builtin_targets = vec![
+             ".DEFAULT",
+-            ".PRECIOUS",
+-            ".INTERMEDIATE",
+-            ".SECONDARY",
+             ".SECONDEXPANSION",
+             ".IGNORE",
+             ".LOW_RESOLUTION_TIME",
+@@ -493,11 +569,15 @@ impl<'a> DepBuilder<'a> {
+     }
+ 
+     fn build(&mut self, mut targets: Vec<Symbol>) -> Result<Vec<NamedDepNode>> {
+-        let Some(first_rule) = self.first_rule else {
++        // Like GNU make, goals given on the command line need no default target.
++        if self.first_rule.is_none() && (targets.is_empty() || FLAGS.gen_all_targets) {
+             error!("*** No targets.");
+-        };
++        }
+ 
+-        if !FLAGS.gen_all_targets && targets.is_empty() {
++        if !FLAGS.gen_all_targets
++            && targets.is_empty()
++            && let Some(first_rule) = self.first_rule
++        {
+             targets.push(first_rule);
+         }
+         if FLAGS.gen_all_targets {
+@@ -528,6 +608,10 @@ impl<'a> DepBuilder<'a> {
+         // TODO: LogStats?
+ 
+         let mut nodes = Vec::new();
++        // GNU make enters the goals before reading the makefile, so a goal
++        // "ought to exist" when a pattern rule names it as a prerequisite.
++        self.mentioned.extend(targets.iter().cloned());
++
+         for target in targets {
+             let v = Arc::new(Vars::new());
+             self.cur_rule_vars = Some(v.clone());
+@@ -560,6 +644,15 @@ impl<'a> DepBuilder<'a> {
+         Some((ret, merger.rules[0].loc.clone()))
+     }
+ 
++    // GNU make also counts the prerequisites after "|" of these special targets.
++    fn get_special_target_inputs(&self, s: Symbol) -> Option<Vec<Symbol>> {
++        let (mut targets, _) = self.get_rule_inputs(s)?;
++        for r in &self.rules.get(&s)?.lock().rules {
++            targets.extend(r.order_only_inputs.iter().cloned());
++        }
++        Some(targets)
++    }
++
+     fn populate_rules(&mut self) -> Result<()> {
+         // TODO: Is this take necessary, or can we refactor how we pass around ev?
+         for rule in std::mem::take(&mut self.ev.rules) {
+@@ -573,6 +666,7 @@ impl<'a> DepBuilder<'a> {
+         for rules in self.suffix_rules.values_mut() {
+             rules.reverse();
+         }
++        self.mentioned.extend(self.rule_vars.keys().cloned());
+         // TODO: This clone likely isn't necessary with some refactoring
+         for (symbol, merger) in self.rules.clone() {
+             let Some(vars) = self.lookup_rule_vars(symbol) else {
+@@ -648,6 +742,16 @@ impl<'a> DepBuilder<'a> {
+                 .lock()
+                 .add_rule(*output, rule.clone())?;
+             self.populate_suffix_rule(&rule, *output)?;
++
++            // Like GNU make, only explicit rules mention their prerequisites; make does not
++            // enter a pattern rule's prerequisites as files.
++            self.mentioned
++                .extend(apply_output_pattern(&rule, *output, &rule.inputs));
++            self.mentioned.extend(apply_output_pattern(
++                &rule,
++                *output,
++                &rule.order_only_inputs,
++            ));
+         }
+         Ok(())
+     }
+@@ -669,7 +773,41 @@ impl<'a> DepBuilder<'a> {
+         i == b"RCS/%,v" || i == b"RCS/%" || i == b"%,v" || i == b"s.%" || i == b"SCCS/s.%"
+     }
+ 
++    // As in GNU make, an earlier rule with several target patterns is never the
++    // same rule: after "%.c %.h: %.src", a later "%.c: %.src" is a rule of its
++    // own, and the earlier one, tried first, still makes foo.c.
++    fn is_same_implicit_rule(old_rule: &Rule, rule: &Rule) -> bool {
++        let pattern = old_rule.output_patterns[0];
++        old_rule.output_patterns.iter().all(|p| *p == pattern)
++            && rule.output_patterns.contains(&pattern)
++            && old_rule
++                .inputs
++                .iter()
++                .chain(&old_rule.order_only_inputs)
++                .eq(rule.inputs.iter().chain(&rule.order_only_inputs))
++    }
++
+     fn populate_implicit_rule(&mut self, rule: Arc<Rule>) -> Result<()> {
++        // An empty static pattern rule has no target pattern and matches nothing.
++        if rule.output_patterns.is_empty() {
++            return Ok(());
++        }
++        // Like GNU make, a pattern rule replaces an earlier one only when the
++        // earlier rule has a single target pattern, which is one of its own, and
++        // the prerequisites have the same names in the same order, wherever "|"
++        // falls. It is then tried as if it were defined last.
++        if let Some(old_rule) = self.implicit_rule_list.iter().find(|old_rule| {
++            !self
++                .replaced_implicit_rules
++                .contains(&Arc::as_ptr(old_rule))
++                && Self::is_same_implicit_rule(old_rule, &rule)
++        }) {
++            self.replaced_implicit_rules.insert(Arc::as_ptr(old_rule));
++        }
++        self.implicit_rule_order
++            .insert(Arc::as_ptr(&rule), self.implicit_rule_list.len());
++        self.implicit_rule_list.push(rule.clone());
++
+         for output_pattern in &rule.output_patterns {
+             let op = output_pattern.as_bytes();
+             if op.as_ref() != b"%" || !Self::is_ignorable_implicit_rule(&rule) {
+@@ -699,49 +837,251 @@ impl<'a> DepBuilder<'a> {
+         self.rule_vars.get(&o).cloned()
+     }
+ 
+-    fn can_pick_implicit_rule(
+-        &mut self,
+-        rule: &Rule,
++    fn is_mentioned(&self, target: Symbol) -> bool {
++        self.mentioned.contains(&target)
++            || self.rules.contains_key(&target)
++            || self.phony.contains(&target)
++    }
++
++    fn collect_implicit_candidates(
++        &self,
+         output: Symbol,
+-        n: Arc<Mutex<DepNode>>,
+-    ) -> Option<Arc<Rule>> {
+-        let output_str = output.as_bytes();
+-        let mut matched = None;
+-        for output_pattern in &rule.output_patterns {
+-            let pat = Pattern::new(output_pattern.as_bytes());
+-            if pat.matches(&output_str) {
+-                let mut ok = true;
+-                for input in &rule.inputs {
+-                    let buf = pat.append_subst(&output_str, &input.as_bytes());
+-                    if !self.exists(intern(buf)) {
+-                        ok = false;
+-                        break;
+-                    }
++        recursing: bool,
++    ) -> Vec<ImplicitCandidate> {
++        let name = output.as_bytes();
++        let (dir, base) = match memrchr(b'/', &name) {
++            Some(slash) if slash + 1 < name.len() => {
++                (name.slice(..slash + 1), name.slice(slash + 1..))
++            }
++            _ => (Bytes::new(), name.clone()),
++        };
++
++        let mut rules = self.implicit_rules.get(&name);
++        if !dir.is_empty() {
++            rules.extend(self.implicit_rules.get(&base));
++        }
++        rules.sort_by_key(|r| self.implicit_rule_order[&Arc::as_ptr(r)]);
++        rules.dedup_by(|a, b| Arc::ptr_eq(a, b));
++
++        let mut candidates = Vec::new();
++        let mut specific_rule_matched = false;
++        for rule in rules {
++            let ptr = Arc::as_ptr(&rule);
++            if self.replaced_implicit_rules.contains(&ptr) || self.in_use_rules.contains(&ptr) {
++                continue;
++            }
++            let has_inputs = !rule.inputs.is_empty() || !rule.order_only_inputs.is_empty();
++            if has_inputs && rule.cmds.is_empty() {
++                continue;
++            }
++            for output_pattern in &rule.output_patterns {
++                let pat = output_pattern.as_bytes();
++                if recursing && pat.as_ref() == b"%" && !rule.is_double_colon {
++                    continue;
++                }
++                let strip_dir = !dir.is_empty() && !pat.contains(&b'/');
++                let target = if strip_dir { &base } else { &name };
++                let Some(percent) = memchr(b'%', &pat) else {
++                    continue;
++                };
++                if pat.len() - 1 > target.len()
++                    || !target.starts_with(&pat[..percent])
++                    || !target.ends_with(&pat[percent + 1..])
++                {
++                    continue;
++                }
++                if pat.as_ref() != b"%" {
++                    specific_rule_matched = true;
++                }
++                if !has_inputs && rule.cmds.is_empty() {
++                    continue;
+                 }
++                let stem = target.slice(percent..percent + target.len() - (pat.len() - 1));
++                let dir = if strip_dir { dir.clone() } else { Bytes::new() };
++                candidates.push(ImplicitCandidate {
++                    rule: rule.clone(),
++                    output_pattern: *output_pattern,
++                    stem_len: stem.len() + dir.len(),
++                    dir,
++                    stem,
++                });
++            }
++        }
+ 
+-                if ok {
+-                    matched = Some(*output_pattern);
+-                    break;
++        candidates.sort_by_key(|c| c.stem_len);
++        // Like GNU make, a non-terminal rule with a match-anything target is
++        // dropped as a whole, the arms of its other targets included.
++        if specific_rule_matched {
++            candidates.retain(|c| {
++                c.rule.is_double_colon
++                    || !c
++                        .rule
++                        .output_patterns
++                        .iter()
++                        .any(|p| p.as_bytes().as_ref() == b"%")
++            });
++        }
++        candidates
++    }
++
++    fn subst_stem(input: Symbol, c: &ImplicitCandidate) -> Symbol {
++        let s = input.as_bytes();
++        let Some(percent) = memchr(b'%', &s) else {
++            return input;
++        };
++        let mut buf = BytesMut::with_capacity(s.len() + c.dir.len() + c.stem.len());
++        buf.put_slice(&c.dir);
++        buf.put_slice(&s[..percent]);
++        buf.put_slice(&c.stem);
++        buf.put_slice(&s[percent + 1..]);
++        intern(buf.freeze())
++    }
++
++    fn try_implicit_candidate(
++        &mut self,
++        c: &ImplicitCandidate,
++        intermediate_ok: bool,
++        listed: &[Symbol],
++        rejected: &mut bool,
++    ) -> Option<Arc<ImplicitMatch>> {
++        let mut resolved = (*c.rule).clone();
++        resolved.output_patterns.clear();
++        resolved.inputs = c
++            .rule
++            .inputs
++            .iter()
++            .map(|i| Self::subst_stem(*i, c))
++            .collect();
++        resolved.order_only_inputs = c
++            .rule
++            .order_only_inputs
++            .iter()
++            .map(|i| Self::subst_stem(*i, c))
++            .collect();
++
++        let mut prereqs = resolved.inputs.clone();
++        prereqs.extend(resolved.order_only_inputs.iter().cloned());
++
++        let ptr = Arc::as_ptr(&c.rule);
++        self.in_use_rules.insert(ptr);
++        let mut intermediates = Vec::new();
++        let mut ok = true;
++        for prereq in prereqs {
++            if self.impossible.contains(&prereq) {
++                *rejected = true;
++                ok = false;
++                break;
++            }
++            // A file the makefile mentions "ought to exist" for GNU make, even when
++            // nothing can make it. Like make, which reads a directory only once, this
++            // sees only files that exist before any recipe runs.
++            if listed.contains(&prereq)
++                || self.is_mentioned(prereq)
++                || std::fs::exists(OsStr::from_bytes(&prereq.as_bytes())).is_ok_and(|v| v)
++            {
++                continue;
++            }
++            if intermediate_ok {
++                if let Some(sub) = self.find_implicit_rule(prereq, true, &[]) {
++                    intermediates.push((prereq, sub));
++                    continue;
+                 }
++                // Like GNU make, a name whose search failed stays impossible for the
++                // rest of the run, even when a rule in use caused the failure.
++                self.impossible.insert(prereq);
+             }
++            ok = false;
++            break;
++        }
++        self.in_use_rules.remove(&ptr);
++        if !ok {
++            return None;
+         }
+-        let matched = matched?;
+ 
+-        let mut rule = rule.clone();
+-        if rule.output_patterns.len() > 1 {
+-            // We should mark all other output patterns as used.
+-            let pat = Pattern::new(matched.as_bytes());
+-            for output_pattern in &rule.output_patterns {
+-                if *output_pattern == matched {
++        // As in GNU make, $* keeps the directory a slash-less pattern set aside.
++        let mut stem = BytesMut::with_capacity(c.dir.len() + c.stem.len());
++        stem.put_slice(&c.dir);
++        stem.put_slice(&c.stem);
++        Some(Arc::new(ImplicitMatch {
++            rule: c.rule.clone(),
++            output_pattern: c.output_pattern,
++            stem: stem.freeze(),
++            resolved: Arc::new(resolved),
++            intermediates,
++        }))
++    }
++
++    fn find_implicit_rule(
++        &mut self,
++        output: Symbol,
++        recursing: bool,
++        listed: &[Symbol],
++    ) -> Option<Arc<ImplicitMatch>> {
++        let candidates = self.collect_implicit_candidates(output, recursing);
++        let mut rejected = vec![false; candidates.len()];
++        for pass in 0..2 {
++            for (i, c) in candidates.iter().enumerate() {
++                if rejected[i] || (pass == 1 && c.rule.is_double_colon) {
+                     continue;
+                 }
+-                let buf = pat.append_subst(&output_str, &output_pattern.as_bytes());
+-                self.done.insert(intern(buf), n.clone());
++                let mut reject = false;
++                let found = self.try_implicit_candidate(c, pass == 1, listed, &mut reject);
++                if reject {
++                    rejected[i] = true;
++                }
++                if found.is_some() {
++                    return found;
++                }
++            }
++        }
++        None
++    }
++
++    fn mark_also_made_outputs(
++        &mut self,
++        output: Symbol,
++        found: &ImplicitMatch,
++        n: &Arc<Mutex<DepNode>>,
++    ) {
++        for output_pattern in &found.rule.output_patterns {
++            if *output_pattern == found.output_pattern {
++                continue;
++            }
++            // Like GNU make, this names the other targets with the stem and its
++            // directory, so p%.h for lib/pfoo.out names plib/foo.h.
++            let pat = output_pattern.as_bytes();
++            let percent = memchr(b'%', &pat).unwrap();
++            let mut buf = BytesMut::with_capacity(pat.len() + found.stem.len());
++            buf.put_slice(&pat[..percent]);
++            buf.put_slice(&found.stem);
++            buf.put_slice(&pat[percent + 1..]);
++            let also_made = intern(buf.freeze());
++            if also_made != output {
++                // A phony name stays a target of its own, as GNU make never searches
++                // implicit rules for it.
++                if !self.phony.contains(&also_made) {
++                    self.done.insert(also_made, n.clone());
++                }
++                let mut n = n.lock();
++                n.also_made.push(also_made);
++                // GNU make keeps the special targets of each file the rule makes.
++                if self.intermediate.contains(&also_made)
++                    || self.secondary.contains(&also_made)
++                    || (self.all_secondary && self.is_mentioned(also_made))
++                {
++                    n.intermediate_also_made.insert(also_made);
++                }
++                if self.all_secondary || self.secondary.contains(&also_made) {
++                    n.secondary_also_made.insert(also_made);
++                }
++                if self.precious.contains(&also_made) || self.precious.contains(output_pattern) {
++                    n.precious_also_made.insert(also_made);
++                }
++                if self.phony.contains(&also_made) {
++                    n.phony_also_made.insert(also_made);
++                }
+             }
+-            rule.output_patterns.clear();
+-            rule.output_patterns.push(matched);
+         }
+-        Some(Arc::new(rule))
+     }
+ 
+     fn merge_implicit_rule_vars(
+@@ -773,27 +1113,52 @@ impl<'a> DepBuilder<'a> {
+             return Some(PickedRuleInfo {
+                 merger: Some(rule_merger.clone()),
+                 pattern_rule: None,
++                implicit_match: None,
+                 vars,
+             });
+         }
+ 
+-        let irules = self.implicit_rules.get(&output.as_bytes());
+-        for rule in irules.into_iter().rev() {
+-            let Some(pattern_rule) = self.can_pick_implicit_rule(&rule, output, n.clone()) else {
+-                continue;
+-            };
++        let found = match self.pending_matches.remove(&output) {
++            Some(found) => Some(found),
++            None => {
++                let mut listed = Vec::new();
++                if let Some(merger) = &rule_merger {
++                    for r in &merger.lock().rules {
++                        listed.extend(apply_output_pattern(r, output, &r.inputs));
++                        listed.extend(apply_output_pattern(r, output, &r.order_only_inputs));
++                    }
++                }
++                if self.phony.contains(&output) || self.no_implicit_search.contains(&output) {
++                    None
++                } else {
++                    self.find_implicit_rule(output, false, &listed)
++                }
++            }
++        };
++        if let Some(found) = found {
++            self.mark_also_made_outputs(output, &found, n);
++            // GNU make chains no further past a terminal rule: it marks what the rule
++            // found as searched, so that file gets no implicit rule later, even as a
++            // goal.
++            if found.rule.is_double_colon {
++                let resolved = &found.resolved;
++                for input in resolved.inputs.iter().chain(&resolved.order_only_inputs) {
++                    self.no_implicit_search.insert(*input);
++                }
++            }
+             if rule_merger.is_some() {
+                 return Some(PickedRuleInfo {
+                     merger: rule_merger,
+-                    pattern_rule: Some(pattern_rule),
++                    pattern_rule: Some(found.resolved.clone()),
++                    implicit_match: Some(found),
+                     vars,
+                 });
+             }
+-            assert!(pattern_rule.output_patterns.len() == 1);
+-            let vars = self.merge_implicit_rule_vars(pattern_rule.output_patterns[0], vars);
++            let vars = self.merge_implicit_rule_vars(found.output_pattern, vars);
+             return Some(PickedRuleInfo {
+                 merger: None,
+-                pattern_rule: Some(pattern_rule),
++                pattern_rule: Some(found.resolved.clone()),
++                implicit_match: Some(found),
+                 vars,
+             });
+         }
+@@ -804,6 +1169,7 @@ impl<'a> DepBuilder<'a> {
+                 return Some(PickedRuleInfo {
+                     merger: rule_merger,
+                     pattern_rule: None,
++                    implicit_match: None,
+                     vars,
+                 });
+             } else {
+@@ -815,6 +1181,7 @@ impl<'a> DepBuilder<'a> {
+                 return Some(PickedRuleInfo {
+                     merger: rule_merger,
+                     pattern_rule: None,
++                    implicit_match: None,
+                     vars,
+                 });
+             } else {
+@@ -828,6 +1195,7 @@ impl<'a> DepBuilder<'a> {
+                 return Some(PickedRuleInfo {
+                     merger: rule_merger,
+                     pattern_rule: None,
++                    implicit_match: None,
+                     vars,
+                 });
+             } else {
+@@ -846,6 +1214,7 @@ impl<'a> DepBuilder<'a> {
+                 return Some(PickedRuleInfo {
+                     merger: rule_merger,
+                     pattern_rule: Some(irule.clone()),
++                    implicit_match: None,
+                     vars,
+                 });
+             }
+@@ -857,6 +1226,7 @@ impl<'a> DepBuilder<'a> {
+             return Some(PickedRuleInfo {
+                 merger: rule_merger,
+                 pattern_rule: Some(irule.clone()),
++                implicit_match: None,
+                 vars,
+             });
+         }
+@@ -865,6 +1235,7 @@ impl<'a> DepBuilder<'a> {
+             Some(PickedRuleInfo {
+                 merger: rule_merger,
+                 pattern_rule: None,
++                implicit_match: None,
+                 vars,
+             })
+         } else {
+@@ -890,6 +1261,23 @@ impl<'a> DepBuilder<'a> {
+         );
+         self.done.insert(output, n.clone());
+ 
++        let chained = self.pending_matches.contains_key(&output);
++        {
++            let is_intermediate = chained
++                || self.intermediate.contains(&output)
++                || self.secondary.contains(&output)
++                || (self.all_secondary && self.is_mentioned(output));
++            let mut n = n.lock();
++            n.is_implicit_intermediate = chained;
++            n.is_intermediate = is_intermediate;
++            n.is_secondary = self.all_secondary || self.secondary.contains(&output);
++            n.is_precious = self.precious.contains(&output);
++            n.delete_on_error = self.delete_on_error;
++        }
++        if chained {
++            self.mentioned.insert(output);
++        }
++
+         let Some(mut picked_rule_info) = self.pick_rule(output, &n) else {
+             return Ok(n);
+         };
+@@ -913,6 +1301,21 @@ impl<'a> DepBuilder<'a> {
+             .lock()
+             .fill_dep_node(output, &picked_rule_info.pattern_rule, &n);
+ 
++        if let Some(found) = &picked_rule_info.implicit_match {
++            {
++                let mut n = n.lock();
++                n.stem = Some(intern(found.stem.clone()));
++                // Like GNU make, a file made by a pattern rule whose target pattern is
++                // listed in .PRECIOUS is precious, whether it was chained or named.
++                if self.precious.contains(&found.output_pattern) {
++                    n.is_precious = true;
++                }
++            }
++            for (sym, sub) in &found.intermediates {
++                self.pending_matches.insert(*sym, sub.clone());
++            }
++        }
++
+         let mut sv = Vec::new();
+         let frame = self.ev.enter(
+             FrameType::Dependency,
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 8179bca..de4d641 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -14,7 +14,13 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-use std::{collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, sync::Arc, time::SystemTime};
++use std::{
++    collections::{HashMap, HashSet},
++    ffi::OsStr,
++    os::unix::ffi::OsStrExt,
++    sync::{Arc, LazyLock},
++    time::SystemTime,
++};
+ 
+ use anyhow::Result;
+ use bytes::Bytes;
+@@ -56,9 +62,57 @@ impl PartialOrd for ExecStatus {
+     }
+ }
+ 
++// The targets of a failed recipe that .DELETE_ON_ERROR removes, each with the
++// target whose recipe failed when it is another target of the rule, and the
++// intermediates made before the failure. Like GNU make, which deletes them as
++// it exits, they are removed once the error has been reported.
++type FailedTargets = Vec<(Symbol, Option<Symbol>)>;
++static FAILED_RUN_TARGETS: LazyLock<Mutex<FailedTargets>> =
++    LazyLock::new(|| Mutex::new(Vec::new()));
++static FAILED_RUN_INTERMEDIATES: LazyLock<Mutex<Vec<Symbol>>> =
++    LazyLock::new(|| Mutex::new(Vec::new()));
++
++pub fn clean_up_failed_run() {
++    for (target, failed) in std::mem::take(&mut *FAILED_RUN_TARGETS.lock()) {
++        match failed {
++            Some(failed) => eprintln!("*** [{failed}] Deleting file '{target}'"),
++            None => eprintln!("*** Deleting file '{target}'"),
++        }
++        let _ = std::fs::remove_file(OsStr::from_bytes(&target.as_bytes()));
++    }
++    remove_files(std::mem::take(&mut *FAILED_RUN_INTERMEDIATES.lock()));
++}
++
++fn remove_files(files: Vec<Symbol>) {
++    let mut removed = Vec::new();
++    for f in files {
++        if !FLAGS.is_dry_run && std::fs::remove_file(OsStr::from_bytes(&f.as_bytes())).is_err() {
++            continue;
++        }
++        removed.push(f.to_string());
++    }
++    if !removed.is_empty() && !FLAGS.is_silent_mode {
++        println!("rm {}", removed.join(" "));
++    }
++}
++
++fn is_newer(ts: Option<SystemTime>, than: Option<SystemTime>) -> bool {
++    match (ts, than) {
++        (None, _) | (Some(_), None) => true,
++        (Some(ts), Some(than)) => ts > than,
++    }
++}
++
+ struct Executor<'a> {
+     ce: CommandEvaluator<'a>,
+     done: HashMap<Symbol, ExecStatus>,
++    intermediate: HashMap<Symbol, bool>,
++    checking: HashSet<Symbol>,
++    recorded: HashSet<Symbol>,
++    made_intermediates: Vec<Symbol>,
++    goals: HashSet<Symbol>,
++    also_made: HashSet<Symbol>,
++    checked: HashSet<Symbol>,
+     shell: Bytes,
+     shellflag: &'static [u8],
+     num_commands: u64,
+@@ -71,18 +125,306 @@ impl<'a> Executor<'a> {
+         Ok(Executor {
+             ce: CommandEvaluator::new(ev)?,
+             done: HashMap::new(),
++            intermediate: HashMap::new(),
++            checking: HashSet::new(),
++            recorded: HashSet::new(),
++            made_intermediates: Vec::new(),
++            goals: HashSet::new(),
++            also_made: HashSet::new(),
++            checked: HashSet::new(),
+             shell,
+             shellflag,
+             num_commands: 0,
+         })
+     }
+ 
+-    fn exec_node(
++    fn is_also_made((name, n): &NamedDepNode) -> bool {
++        let n = n.lock();
++        *name != n.output && n.also_made.contains(name)
++    }
++
++    fn target(d: &NamedDepNode) -> Symbol {
++        if Self::is_also_made(d) {
++            d.0
++        } else {
++            d.1.lock().output
++        }
++    }
++
++    fn is_intermediate_dep(&mut self, d: &NamedDepNode) -> Result<bool> {
++        if !Self::is_also_made(d) {
++            return self.is_intermediate(&d.1);
++        }
++        self.is_intermediate_also_made(d.0, &d.1)
++    }
++
++    fn is_intermediate_also_made(
++        &mut self,
++        output: Symbol,
++        n: &Arc<Mutex<DepNode>>,
++    ) -> Result<bool> {
++        if !n.lock().intermediate_also_made.contains(&output) {
++            return Ok(false);
++        }
++        if let Some(r) = self.intermediate.get(&output) {
++            return Ok(*r);
++        }
++        // A named one that another target's recipe made before it was looked at
++        // stays intermediate, as in GNU make, even if it existed before the run.
++        let r = self.also_made.contains(&output) || get_timestamp(&output.as_bytes())?.is_none();
++        self.intermediate.insert(output, r);
++        Ok(r)
++    }
++
++    fn exec_dep(&mut self, d: &NamedDepNode, needed_by: Option<&[u8]>) -> Result<ExecStatus> {
++        let output = Self::target(d);
++        self.update_file(output, &d.1, needed_by)
++    }
++
++    // GNU make marks every target of a rule that ran as updated, also when the
++    // recipe failed, and deletes the intermediates among them.
++    fn record_made_targets(
++        &mut self,
++        n: &Arc<Mutex<DepNode>>,
++        output: Symbol,
++        made_intermediate: bool,
++    ) -> Result<()> {
++        if made_intermediate {
++            let (primary, keep) = {
++                let n = n.lock();
++                (n.output, n.is_secondary || n.is_precious)
++            };
++            self.record_intermediate(primary, keep);
++        }
++        self.mark_also_made(n, output)
++    }
++
++    // GNU make marks the other targets of a rule that ran as updated, and
++    // deletes the ones a special target makes intermediate when it is done.
++    fn mark_also_made(&mut self, n: &Arc<Mutex<DepNode>>, output: Symbol) -> Result<()> {
++        let (mut targets, primary) = {
++            let n = n.lock();
++            (n.also_made.clone(), n.output)
++        };
++        targets.push(primary);
++        for t in targets {
++            if t == output {
++                continue;
++            }
++            match self.done.get(&t) {
++                None => {
++                    self.also_made.insert(t);
++                }
++                Some(ExecStatus::Processing) => continue,
++                Some(_) => {}
++            }
++            let ts = get_timestamp(&t.as_bytes())?;
++            self.done.insert(t, ExecStatus::Timestamp(ts));
++            if t != primary && self.is_intermediate_also_made(t, n)? {
++                let keep = {
++                    let n = n.lock();
++                    n.secondary_also_made.contains(&t) || n.precious_also_made.contains(&t)
++                };
++                self.record_intermediate(t, keep);
++            }
++        }
++        Ok(())
++    }
++
++    // What GNU make says for a goal that ran no commands. It doesn't know the
++    // commands of a file another target's rule made before it looked at it.
++    fn report_goal(&self, (sym, n): &NamedDepNode) {
++        let nothing_to_do = {
++            let n = n.lock();
++            n.is_phony
++                || n.cmds.is_empty()
++                || (self.also_made.contains(sym) && !self.checked.contains(sym))
++        };
++        if nothing_to_do {
++            println!("kati: Nothing to be done for `{sym}'.");
++        } else {
++            println!("kati: `{sym}' is up to date.");
++        }
++    }
++
++    fn is_intermediate(&mut self, n: &Arc<Mutex<DepNode>>) -> Result<bool> {
++        let (output, is_intermediate, is_phony, chained) = {
++            let n = n.lock();
++            (
++                n.output,
++                n.is_intermediate,
++                n.is_phony,
++                n.is_implicit_intermediate,
++            )
++        };
++        if !is_intermediate || is_phony {
++            return Ok(false);
++        }
++        if let Some(r) = self.intermediate.get(&output) {
++            return Ok(*r);
++        }
++        // Like GNU make, a named intermediate that exists when it is first looked
++        // at is taken to predate the run, even if an earlier goal made it: it is
++        // updated like any other prerequisite and never deleted.
++        let r = chained || get_timestamp(&output.as_bytes())?.is_none();
++        self.intermediate.insert(output, r);
++        Ok(r)
++    }
++
++    fn check_intermediate(
++        &mut self,
++        output: Symbol,
++        n: &Arc<Mutex<DepNode>>,
++        target_ts: Option<SystemTime>,
++    ) -> Result<bool> {
++        // GNU make looks at the rule of each intermediate it checks.
++        self.checked.insert(output);
++        if let Some(found) = self.done.get(&output)
++            && *found != ExecStatus::Processing
++        {
++            // Like GNU make, a missing intermediate is judged by what it depends
++            // on, even when this run already made it.
++            let ts = get_timestamp(&output.as_bytes())?;
++            if ts.is_some() {
++                return Ok(is_newer(ts, target_ts));
++            }
++        }
++        if !self.checking.insert(output) {
++            return Ok(false);
++        }
++        let mut must_make = false;
++        let ts = get_timestamp(&output.as_bytes())?;
++        if ts.is_some() && is_newer(ts, target_ts) {
++            must_make = true;
++        } else {
++            // Like GNU make's check_dep, update the non-intermediate files a missing
++            // intermediate depends on, order-only ones included, even if the target then
++            // turns out to be up to date.
++            let deps = n.lock().deps.clone();
++            for d in &deps {
++                if self.is_intermediate_dep(d)? {
++                    if self.check_intermediate(Self::target(d), &d.1, target_ts)? {
++                        must_make = true;
++                    }
++                    continue;
++                }
++                self.exec_dep(d, Some(&output.as_bytes()))?;
++                let dep_ts = get_timestamp(&Self::target(d).as_bytes())?;
++                if is_newer(dep_ts, target_ts) || d.1.lock().is_phony {
++                    must_make = true;
++                }
++            }
++            let order_onlys = n.lock().order_onlys.clone();
++            for d in &order_onlys {
++                if self.is_intermediate_dep(d)? {
++                    self.check_intermediate(Self::target(d), &d.1, target_ts)?;
++                } else {
++                    self.exec_dep(d, Some(&output.as_bytes()))?;
++                }
++            }
++        }
++        self.checking.remove(&output);
++        Ok(must_make)
++    }
++
++    fn record_intermediate_dep(&mut self, d: &NamedDepNode) {
++        let also_made = Self::is_also_made(d);
++        let (output, keep) = {
++            let n = d.1.lock();
++            if also_made {
++                let keep =
++                    n.secondary_also_made.contains(&d.0) || n.precious_also_made.contains(&d.0);
++                (d.0, keep)
++            } else {
++                (n.output, n.is_secondary || n.is_precious)
++            }
++        };
++        self.record_intermediate(output, keep);
++    }
++
++    fn record_intermediate(&mut self, output: Symbol, keep: bool) {
++        if keep || self.goals.contains(&output) {
++            return;
++        }
++        if self.recorded.insert(output) {
++            self.made_intermediates.push(output);
++        }
++    }
++
++    fn remove_intermediates(&mut self) {
++        remove_files(std::mem::take(&mut self.made_intermediates));
++    }
++
++    // Like GNU make under .DELETE_ON_ERROR, the target of a failed recipe is
++    // removed if the recipe changed it, unless it is precious or phony.
++    fn note_failed_targets(
++        &self,
++        n: &Arc<Mutex<DepNode>>,
++        output: Symbol,
++        old_ts: Option<SystemTime>,
++    ) -> Result<()> {
++        let n = n.lock();
++        if !n.delete_on_error {
++            return Ok(());
++        }
++        let mut failed = Vec::new();
++        if Self::changed_target(&n, output, Some(old_ts))? {
++            failed.push((output, None));
++        }
++        let mut others: Vec<Symbol> = n
++            .also_made
++            .iter()
++            .rev()
++            .copied()
++            .filter(|t| *t != output)
++            .collect();
++        if output != n.output {
++            others.push(n.output);
++        }
++        for t in others {
++            // A target that was never looked at counts as changed, as in GNU make.
++            let before = match self.done.get(&t) {
++                Some(ExecStatus::Timestamp(ts)) => Some(*ts),
++                _ => None,
++            };
++            if Self::changed_target(&n, t, before)? {
++                failed.push((t, Some(output)));
++            }
++        }
++        FAILED_RUN_TARGETS.lock().extend(failed);
++        Ok(())
++    }
++
++    fn changed_target(
++        n: &DepNode,
++        target: Symbol,
++        before: Option<Option<SystemTime>>,
++    ) -> Result<bool> {
++        let keep = if target == n.output {
++            n.is_precious || n.is_phony
++        } else {
++            n.precious_also_made.contains(&target) || n.phony_also_made.contains(&target)
++        };
++        let is_file =
++            std::fs::metadata(OsStr::from_bytes(&target.as_bytes())).is_ok_and(|m| m.is_file());
++        if keep || !is_file {
++            return Ok(false);
++        }
++        Ok(match before {
++            Some(ts) => get_timestamp(&target.as_bytes())? != ts,
++            None => true,
++        })
++    }
++
++    // Updates OUTPUT, which N makes. Like GNU make, another target of the
++    // pattern rule N uses is a file of its own, with its own timestamp and its
++    // own special targets.
++    fn update_file(
+         &mut self,
++        output: Symbol,
+         n: &Arc<Mutex<DepNode>>,
+         needed_by: Option<&[u8]>,
+     ) -> Result<ExecStatus> {
+-        let output = n.lock().output;
+         let output_str = output.as_bytes();
+         if let Some(found) = self.done.get(&output) {
+             if found == &ExecStatus::Processing {
+@@ -116,37 +458,69 @@ impl<'a> Executor<'a> {
+                     String::from_utf8_lossy(needed_by)
+                 );
+             } else {
+-                error!("*** No rule to make target '{output}'");
++                error!("*** No rule to make target '{output}'.");
+             }
+         }
+ 
+-        let mut latest = ExecStatus::Processing;
+         let order_onlys = n.lock().order_onlys.clone();
+-        for (_, d) in order_onlys {
+-            let dep_out = d.lock().output.as_bytes();
+-            if std::fs::exists(OsStr::from_bytes(&dep_out))? {
+-                continue;
+-            }
+-            let ts = self.exec_node(&d, Some(&output_str))?;
+-            if latest < ts {
+-                latest = ts;
++        for d in &order_onlys {
++            // Like GNU make, order-only prerequisites never make this target stale,
++            // and a missing intermediate one is made only below, when this target is
++            // remade; make leaves it unbuilt for an up-to-date target.
++            if self.is_intermediate_dep(d)? {
++                self.check_intermediate(Self::target(d), &d.1, output_timestamp)?;
++            } else {
++                self.exec_dep(d, Some(&output_str))?;
+             }
+         }
+ 
++        let mut latest = ExecStatus::Processing;
++
++        let mut must_make = false;
+         let deps = n.lock().deps.clone();
+-        for (_, d) in deps {
+-            let ts = self.exec_node(&d, Some(&output_str))?;
++        for d in &deps {
++            if self.is_intermediate_dep(d)? {
++                if self.check_intermediate(Self::target(d), &d.1, output_timestamp)? {
++                    must_make = true;
++                }
++                continue;
++            }
++            let ts = self.exec_dep(d, Some(&output_str))?;
++            // Like GNU make, a prerequisite that is phony or still missing after
++            // its update makes this target stale.
++            if ts == ExecStatus::Timestamp(None) || d.1.lock().is_phony {
++                must_make = true;
++            }
+             if latest < ts {
+                 latest = ts;
+             }
+         }
+ 
+-        if output_ts >= latest && !n.lock().is_phony {
++        if !must_make && output_ts >= latest && !n.lock().is_phony {
+             self.done.insert(output, output_ts);
+             return Ok(output_ts);
+         }
+ 
+-        let commands = self.ce.eval(n)?;
++        for d in deps.iter().chain(order_onlys.iter()) {
++            if !self.is_intermediate_dep(d)? {
++                continue;
++            }
++            self.record_intermediate_dep(d);
++            self.exec_dep(d, Some(&output_str))?;
++        }
++
++        let own_output = output == n.lock().output;
++        let made_intermediate = !own_output && self.is_intermediate(n)?;
++        let commands = if own_output {
++            self.ce.eval(n)?
++        } else {
++            let target = Arc::new(Mutex::new(DepNode {
++                output,
++                ..n.lock().clone()
++            }));
++            self.ce.eval(&target)?
++        };
++        let ran_commands = !commands.is_empty();
+         for command in commands {
+             self.num_commands += 1;
+             if command.echo {
+@@ -162,12 +536,16 @@ impl<'a> Executor<'a> {
+                 print!("{}", String::from_utf8_lossy(&output));
+                 if !status.success() {
+                     if command.ignore_error {
++                        // Like GNU make, an ignored error deletes nothing, even under
++                        // .DELETE_ON_ERROR.
+                         eprintln!(
+                             "[{}] Error {} (ignored)",
+                             command.output,
+                             status.code().unwrap_or(1)
+                         )
+                     } else {
++                        self.note_failed_targets(n, command.output, output_timestamp)?;
++                        self.record_made_targets(n, command.output, made_intermediate)?;
+                         error!(
+                             "*** [{}] Error {}",
+                             command.output,
+@@ -178,20 +556,34 @@ impl<'a> Executor<'a> {
+             }
+         }
+ 
++        let mut output_ts = output_ts;
++        if ran_commands
++            && !FLAGS.is_dry_run
++            && let Some(ts) = get_timestamp(&output_str)?
++        {
++            output_ts = ExecStatus::Timestamp(Some(ts));
++        }
+         self.done.insert(output, output_ts);
++        self.record_made_targets(n, output, made_intermediate)?;
+         Ok(output_ts)
+     }
+ }
+ 
+ pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
+     let mut executor = Executor::new(ev)?;
+-    for (_sym, root) in &roots {
+-        executor.exec_node(root, None)?;
++    for (sym, _) in &roots {
++        executor.goals.insert(*sym);
+     }
+-    if executor.num_commands == 0 {
+-        for (sym, _) in roots {
+-            println!("kati: Nothing to be done for `{sym}'.")
++    for root in &roots {
++        let num_commands = executor.num_commands;
++        if let Err(err) = executor.exec_dep(root, None) {
++            *FAILED_RUN_INTERMEDIATES.lock() = std::mem::take(&mut executor.made_intermediates);
++            return Err(err);
++        }
++        if executor.num_commands == num_commands && !FLAGS.is_silent_mode {
++            executor.report_goal(root);
+         }
+     }
++    executor.remove_intermediates();
+     Ok(())
+ }
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index 6703bef..3c0025a 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -383,6 +383,7 @@ fn main() {
+             for cause in err.chain() {
+                 eprintln!("{cause}");
+             }
++            kati::exec::clean_up_failed_run();
+             1
+         }
+     };
+diff --git a/src/command.cc b/src/command.cc
+index cc58616..4e3326b 100644
+--- a/src/command.cc
++++ b/src/command.cc
+@@ -121,6 +121,10 @@ void AutoPlusVar::Eval(Evaluator*, std::string* s) const {
+ 
+ void AutoStarVar::Eval(Evaluator*, std::string* s) const {
+   const DepNode* n = ce_->current_dep_node();
++  if (n->stem.IsValid()) {
++    s->append(n->stem.str());
++    return;
++  }
+   if (!n->output_pattern.IsValid())
+     return;
+   Pattern pat(n->output_pattern.str());
+diff --git a/src/dep.cc b/src/dep.cc
+index 5b6e5d0..1421d89 100644
+--- a/src/dep.cc
++++ b/src/dep.cc
+@@ -273,6 +273,11 @@ DepNode::DepNode(Symbol o, bool p, bool r)
+       is_default_target(false),
+       is_phony(p),
+       is_restat(r),
++      is_intermediate(false),
++      is_implicit_intermediate(false),
++      is_secondary(false),
++      is_precious(false),
++      delete_on_error(false),
+       rule_vars(NULL),
+       depfile_var(NULL),
+       ninja_pool_var(NULL),
+@@ -293,6 +298,8 @@ class DepBuilder {
+         tags_var_name_(Intern(".KATI_TAGS")) {
+     ScopedTimeReporter tr("make dep (populate)");
+     PopulateRules(rules);
++    for (const auto& p : rule_vars_)
++      mentioned_.insert(p.first);
+     // TODO?
+     // LOG_STAT("%zu variables", ev->mutable_vars()->size());
+     LOG_STAT("%zu explicit rules", rules_.size());
+@@ -321,12 +328,24 @@ class DepBuilder {
+         WARN_LOC(loc, "kati doesn't support .SUFFIXES with prerequisites");
+       }
+     }
++    if (GetSpecialTargetInputs(Intern(".PRECIOUS"), &targets, &loc)) {
++      for (Symbol t : targets)
++        precious_.insert(t);
++    }
++    if (GetSpecialTargetInputs(Intern(".INTERMEDIATE"), &targets, &loc)) {
++      for (Symbol t : targets)
++        intermediate_.insert(t);
++    }
++    if (GetSpecialTargetInputs(Intern(".SECONDARY"), &targets, &loc)) {
++      if (targets.empty())
++        all_secondary_ = true;
++      for (Symbol t : targets)
++        secondary_.insert(t);
++    }
+ 
+     // Note we can safely ignore .DELETE_ON_ERROR for --ninja mode.
++    delete_on_error_ = rules_.count(Intern(".DELETE_ON_ERROR")) > 0;
+     static const char* kUnsupportedBuiltinTargets[] = {".DEFAULT",
+-                                                       ".PRECIOUS",
+-                                                       ".INTERMEDIATE",
+-                                                       ".SECONDARY",
+                                                        ".SECONDEXPANSION",
+                                                        ".IGNORE",
+                                                        ".LOW_RESOLUTION_TIME",
+@@ -345,7 +364,9 @@ class DepBuilder {
+   ~DepBuilder() {}
+ 
+   void Build(std::vector<Symbol> targets, std::vector<NamedDepNode>* nodes) {
+-    if (!first_rule_.IsValid()) {
++    // Like GNU make, goals given on the command line need no default target.
++    if (!first_rule_.IsValid() &&
++        (targets.empty() || g_flags.gen_all_targets)) {
+       ERROR("*** No targets.");
+     }
+ 
+@@ -375,6 +396,11 @@ class DepBuilder {
+ 
+     // TODO: LogStats?
+ 
++    // GNU make enters the goals before reading the makefile, so a goal
++    // "ought to exist" when a pattern rule names it as a prerequisite.
++    for (Symbol target : targets)
++      mentioned_.insert(target);
++
+     for (Symbol target : targets) {
+       cur_rule_vars_.reset(new Vars);
+       ev_->set_current_scope(cur_rule_vars_.get());
+@@ -406,6 +432,17 @@ class DepBuilder {
+     return true;
+   }
+ 
++  // GNU make also counts the prerequisites after "|" of these special targets.
++  bool GetSpecialTargetInputs(Symbol s, std::vector<Symbol>* o, Loc* l) {
++    if (!GetRuleInputs(s, o, l))
++      return false;
++    for (const Rule* r : rules_.find(s)->second.rules) {
++      for (Symbol i : r->order_only_inputs)
++        o->push_back(i);
++    }
++    return true;
++  }
++
+   void PopulateRules(const std::vector<const Rule*>& rules) {
+     for (const Rule* rule : rules) {
+       if (rule->outputs.empty()) {
+@@ -478,6 +515,14 @@ class DepBuilder {
+       }
+       rules_[output].AddRule(output, rule);
+       PopulateSuffixRule(rule, output);
++
++      // Like GNU make, only explicit rules mention their prerequisites; make
++      // does not enter a pattern rule's prerequisites as files.
++      std::vector<Symbol> mentioned;
++      ApplyOutputPattern(*rule, output, rule->inputs, &mentioned);
++      ApplyOutputPattern(*rule, output, rule->order_only_inputs, &mentioned);
++      for (Symbol m : mentioned)
++        mentioned_.insert(m);
+     }
+   }
+ 
+@@ -495,7 +540,46 @@ class DepBuilder {
+             i == "SCCS/s.%");
+   }
+ 
++  // As in GNU make, an earlier rule with several target patterns is never the
++  // same rule: after "%.c %.h: %.src", a later "%.c: %.src" is a rule of its
++  // own, and the earlier one, tried first, still makes foo.c.
++  static bool IsSameImplicitRule(const Rule* old_rule, const Rule* rule) {
++    Symbol pattern = old_rule->output_patterns[0];
++    for (Symbol p : old_rule->output_patterns) {
++      if (!(p == pattern))
++        return false;
++    }
++    if (find(rule->output_patterns.begin(), rule->output_patterns.end(),
++             pattern) == rule->output_patterns.end()) {
++      return false;
++    }
++    std::vector<Symbol> old_inputs = old_rule->inputs;
++    old_inputs.insert(old_inputs.end(), old_rule->order_only_inputs.begin(),
++                      old_rule->order_only_inputs.end());
++    std::vector<Symbol> inputs = rule->inputs;
++    inputs.insert(inputs.end(), rule->order_only_inputs.begin(),
++                  rule->order_only_inputs.end());
++    return old_inputs == inputs;
++  }
++
+   void PopulateImplicitRule(const Rule* rule) {
++    // An empty static pattern rule has no target pattern and matches nothing.
++    if (rule->output_patterns.empty())
++      return;
++    // Like GNU make, a pattern rule replaces an earlier one only when the
++    // earlier rule has a single target pattern, which is one of its own, and
++    // the prerequisites have the same names in the same order, wherever "|"
++    // falls. It is then tried as if it were defined last.
++    for (const Rule* old_rule : implicit_rule_list_) {
++      if (!replaced_implicit_rules_.count(old_rule) &&
++          IsSameImplicitRule(old_rule, rule)) {
++        replaced_implicit_rules_.insert(old_rule);
++        break;
++      }
++    }
++    implicit_rule_order_[rule] = implicit_rule_list_.size();
++    implicit_rule_list_.push_back(rule);
++
+     for (Symbol output_pattern : rule->output_patterns) {
+       if (output_pattern.str() != "%" || !IsIgnorableImplicitRule(rule)) {
+         if (g_flags.werror_implicit_rules) {
+@@ -526,49 +610,232 @@ class DepBuilder {
+     return nullptr;
+   }
+ 
+-  bool CanPickImplicitRule(const Rule* rule,
+-                           Symbol output,
+-                           DepNode* n,
+-                           std::shared_ptr<Rule>* out_rule) {
+-    Symbol matched;
+-    for (Symbol output_pattern : rule->output_patterns) {
+-      Pattern pat(output_pattern.str());
+-      if (pat.Match(output.str())) {
+-        bool ok = true;
+-        for (Symbol input : rule->inputs) {
+-          std::string buf;
+-          pat.AppendSubst(output.str(), input.str(), &buf);
+-          if (!Exists(Intern(buf))) {
+-            ok = false;
+-            break;
+-          }
++  struct ImplicitMatch {
++    const Rule* rule;
++    Symbol output_pattern;
++    std::string stem;
++    std::shared_ptr<Rule> resolved;
++    std::vector<std::pair<Symbol, std::shared_ptr<ImplicitMatch>>>
++        intermediates;
++  };
++
++  struct ImplicitCandidate {
++    const Rule* rule;
++    Symbol output_pattern;
++    std::string_view dir;
++    std::string_view stem;
++    size_t stem_len;
++  };
++
++  bool IsMentioned(Symbol target) const {
++    return mentioned_.exists(target) || rules_.count(target) ||
++           phony_.exists(target);
++  }
++
++  std::vector<ImplicitCandidate> CollectImplicitCandidates(Symbol output,
++                                                           bool recursing) {
++    std::string_view name = output.str();
++    std::string_view dir;
++    std::string_view base = name;
++    size_t slash = name.rfind('/');
++    if (slash != std::string_view::npos && slash + 1 < name.size()) {
++      dir = name.substr(0, slash + 1);
++      base = name.substr(slash + 1);
++    }
++
++    std::vector<const Rule*> rules;
++    implicit_rules_->Get(name, &rules);
++    if (!dir.empty())
++      implicit_rules_->Get(base, &rules);
++    std::sort(rules.begin(), rules.end(), [this](const Rule* a, const Rule* b) {
++      return implicit_rule_order_[a] < implicit_rule_order_[b];
++    });
++    rules.erase(std::unique(rules.begin(), rules.end()), rules.end());
++
++    std::vector<ImplicitCandidate> candidates;
++    bool specific_rule_matched = false;
++    for (const Rule* rule : rules) {
++      if (replaced_implicit_rules_.count(rule) || in_use_rules_.count(rule))
++        continue;
++      bool has_inputs =
++          !rule->inputs.empty() || !rule->order_only_inputs.empty();
++      if (has_inputs && rule->cmds.empty())
++        continue;
++      for (Symbol output_pattern : rule->output_patterns) {
++        std::string_view pat = output_pattern.str();
++        if (recursing && pat == "%" && !rule->is_double_colon)
++          continue;
++        bool strip_dir = !dir.empty() && pat.find('/') == std::string::npos;
++        std::string_view target = strip_dir ? base : name;
++        size_t percent = pat.find('%');
++        if (percent == std::string::npos || pat.size() - 1 > target.size() ||
++            !HasPrefix(target, pat.substr(0, percent)) ||
++            !HasSuffix(target, pat.substr(percent + 1))) {
++          continue;
+         }
++        if (pat != "%")
++          specific_rule_matched = true;
++        if (!has_inputs && rule->cmds.empty())
++          continue;
++        std::string_view stem =
++            target.substr(percent, target.size() - (pat.size() - 1));
++        candidates.push_back({rule, output_pattern,
++                              strip_dir ? dir : std::string_view(), stem,
++                              stem.size() + (strip_dir ? dir.size() : 0)});
++      }
++    }
+ 
+-        if (ok) {
+-          matched = output_pattern;
+-          break;
++    std::stable_sort(
++        candidates.begin(), candidates.end(),
++        [](const ImplicitCandidate& a, const ImplicitCandidate& b) {
++          return a.stem_len < b.stem_len;
++        });
++    // Like GNU make, a non-terminal rule with a match-anything target is
++    // dropped as a whole, the arms of its other targets included.
++    if (specific_rule_matched) {
++      auto is_match_anything = [](const ImplicitCandidate& c) {
++        if (c.rule->is_double_colon)
++          return false;
++        for (Symbol p : c.rule->output_patterns) {
++          if (p.str() == "%")
++            return true;
++        }
++        return false;
++      };
++      candidates.erase(
++          remove_if(candidates.begin(), candidates.end(), is_match_anything),
++          candidates.end());
++    }
++    return candidates;
++  }
++
++  static Symbol SubstStem(Symbol input, const ImplicitCandidate& c) {
++    std::string_view s = input.str();
++    size_t percent = s.find('%');
++    if (percent == std::string::npos)
++      return input;
++    std::string buf(c.dir);
++    buf.append(s.substr(0, percent));
++    buf.append(c.stem);
++    buf.append(s.substr(percent + 1));
++    return Intern(buf);
++  }
++
++  std::shared_ptr<ImplicitMatch> TryImplicitCandidate(
++      const ImplicitCandidate& c,
++      bool intermediate_ok,
++      const std::vector<Symbol>& listed,
++      bool* rejected) {
++    auto resolved = std::make_shared<Rule>(*c.rule);
++    resolved->output_patterns.clear();
++    resolved->inputs.clear();
++    resolved->order_only_inputs.clear();
++    for (Symbol input : c.rule->inputs)
++      resolved->inputs.push_back(SubstStem(input, c));
++    for (Symbol input : c.rule->order_only_inputs)
++      resolved->order_only_inputs.push_back(SubstStem(input, c));
++
++    auto match = std::make_shared<ImplicitMatch>();
++    match->rule = c.rule;
++    match->output_pattern = c.output_pattern;
++    // As in GNU make, $* keeps the directory a slash-less pattern set aside.
++    match->stem = std::string(c.dir) + std::string(c.stem);
++    match->resolved = resolved;
++
++    std::vector<Symbol> prereqs = resolved->inputs;
++    prereqs.insert(prereqs.end(), resolved->order_only_inputs.begin(),
++                   resolved->order_only_inputs.end());
++
++    in_use_rules_.insert(c.rule);
++    bool ok = true;
++    for (Symbol prereq : prereqs) {
++      if (impossible_.exists(prereq)) {
++        *rejected = true;
++        ok = false;
++        break;
++      }
++      // A file the makefile mentions "ought to exist" for GNU make, even when
++      // nothing can make it. Like make, which reads a directory only once, this
++      // sees only files that exist before any recipe runs.
++      if (find(listed.begin(), listed.end(), prereq) != listed.end() ||
++          IsMentioned(prereq) || ::Exists(prereq.str())) {
++        continue;
++      }
++      if (intermediate_ok) {
++        std::shared_ptr<ImplicitMatch> sub = FindImplicitRule(prereq, true, {});
++        if (sub) {
++          match->intermediates.emplace_back(prereq, sub);
++          continue;
+         }
++        // Like GNU make, a name whose search failed stays impossible for the
++        // rest of the run, even when a rule in use caused the failure.
++        impossible_.insert(prereq);
+       }
++      ok = false;
++      break;
+     }
+-    if (!matched.IsValid())
+-      return false;
++    in_use_rules_.erase(c.rule);
++    return ok ? match : nullptr;
++  }
+ 
+-    *out_rule = std::make_shared<Rule>(*rule);
+-    if ((*out_rule)->output_patterns.size() > 1) {
+-      // We should mark all other output patterns as used.
+-      Pattern pat(matched.str());
+-      for (Symbol output_pattern : rule->output_patterns) {
+-        if (output_pattern == matched)
++  std::shared_ptr<ImplicitMatch> FindImplicitRule(
++      Symbol output,
++      bool recursing,
++      const std::vector<Symbol>& listed) {
++    std::vector<ImplicitCandidate> candidates =
++        CollectImplicitCandidates(output, recursing);
++    std::vector<bool> rejected(candidates.size(), false);
++    for (int pass = 0; pass < 2; pass++) {
++      for (size_t i = 0; i < candidates.size(); i++) {
++        if (rejected[i])
+           continue;
+-        std::string buf;
+-        pat.AppendSubst(output.str(), output_pattern.str(), &buf);
+-        done_[Intern(buf)] = n;
++        if (pass == 1 && candidates[i].rule->is_double_colon)
++          continue;
++        bool reject = false;
++        std::shared_ptr<ImplicitMatch> match =
++            TryImplicitCandidate(candidates[i], pass == 1, listed, &reject);
++        if (reject)
++          rejected[i] = true;
++        if (match)
++          return match;
+       }
+-      (*out_rule)->output_patterns.clear();
+-      (*out_rule)->output_patterns.push_back(matched);
+     }
++    return nullptr;
++  }
+ 
+-    return true;
++  void MarkAlsoMadeOutputs(Symbol output,
++                           const ImplicitMatch& match,
++                           DepNode* n) {
++    for (Symbol output_pattern : match.rule->output_patterns) {
++      if (output_pattern == match.output_pattern)
++        continue;
++      // Like GNU make, this names the other targets with the stem and its
++      // directory, so p%.h for lib/pfoo.out names plib/foo.h.
++      std::string_view pat = output_pattern.str();
++      size_t percent = pat.find('%');
++      std::string buf(pat.substr(0, percent));
++      buf.append(match.stem);
++      buf.append(pat.substr(percent + 1));
++      Symbol also_made = Intern(buf);
++      if (!(also_made == output)) {
++        // A phony name stays a target of its own, as GNU make never searches
++        // implicit rules for it.
++        if (!phony_.exists(also_made))
++          done_[also_made] = n;
++        n->also_made.push_back(also_made);
++        // GNU make keeps the special targets of each file the rule makes.
++        if (intermediate_.exists(also_made) || secondary_.exists(also_made) ||
++            (all_secondary_ && IsMentioned(also_made))) {
++          n->intermediate_also_made.insert(also_made);
++        }
++        if (all_secondary_ || secondary_.exists(also_made))
++          n->secondary_also_made.insert(also_made);
++        if (precious_.exists(also_made) || precious_.exists(output_pattern))
++          n->precious_also_made.insert(also_made);
++        if (phony_.exists(also_made))
++          n->phony_also_made.insert(also_made);
++      }
++    }
+   }
+ 
+   Vars* MergeImplicitRuleVars(Symbol output, Vars* vars) {
+@@ -589,6 +856,7 @@ class DepBuilder {
+                 DepNode* n,
+                 const RuleMerger** out_rule_merger,
+                 std::shared_ptr<Rule>* pattern_rule,
++                std::shared_ptr<ImplicitMatch>* out_match,
+                 Vars** out_var) {
+     const RuleMerger* rule_merger = LookupRuleMerger(output);
+     Vars* vars = LookupRuleVars(output);
+@@ -602,16 +870,39 @@ class DepBuilder {
+       return true;
+     }
+ 
+-    std::vector<const Rule*> irules;
+-    implicit_rules_->Get(output.str(), &irules);
+-    for (auto iter = irules.rbegin(); iter != irules.rend(); ++iter) {
+-      if (!CanPickImplicitRule(*iter, output, n, pattern_rule))
+-        continue;
++    std::shared_ptr<ImplicitMatch> match;
++    auto pending = pending_matches_.find(output);
++    if (pending != pending_matches_.end()) {
++      match = pending->second;
++      pending_matches_.erase(pending);
++    } else {
++      std::vector<Symbol> listed;
++      if (rule_merger) {
++        for (const Rule* r : rule_merger->rules) {
++          ApplyOutputPattern(*r, output, r->inputs, &listed);
++          ApplyOutputPattern(*r, output, r->order_only_inputs, &listed);
++        }
++      }
++      if (!phony_.exists(output) && !no_implicit_search_.exists(output))
++        match = FindImplicitRule(output, false, listed);
++    }
++    if (match) {
++      *pattern_rule = match->resolved;
++      *out_match = match;
++      MarkAlsoMadeOutputs(output, *match, n);
++      // GNU make chains no further past a terminal rule: it marks what the rule
++      // found as searched, so that file gets no implicit rule later, even as a
++      // goal.
++      if (match->rule->is_double_colon) {
++        for (Symbol input : match->resolved->inputs)
++          no_implicit_search_.insert(input);
++        for (Symbol input : match->resolved->order_only_inputs)
++          no_implicit_search_.insert(input);
++      }
+       if (rule_merger) {
+         return true;
+       }
+-      CHECK((*pattern_rule)->output_patterns.size() == 1);
+-      vars = MergeImplicitRuleVars((*pattern_rule)->output_patterns[0], vars);
++      vars = MergeImplicitRuleVars(match->output_pattern, vars);
+       *out_var = vars;
+       return true;
+     }
+@@ -660,17 +951,29 @@ class DepBuilder {
+ 
+     done_[output] = n;
+ 
++    bool chained = pending_matches_.count(output) > 0;
++    n->is_implicit_intermediate = chained;
++    n->is_intermediate = chained || intermediate_.exists(output) ||
++                         secondary_.exists(output) ||
++                         (all_secondary_ && IsMentioned(output));
++    n->is_secondary = all_secondary_ || secondary_.exists(output);
++    n->is_precious = precious_.exists(output);
++    n->delete_on_error = delete_on_error_;
++    if (chained)
++      mentioned_.insert(output);
++
+     const RuleMerger* rule_merger = nullptr;
+     std::shared_ptr<Rule> pattern_rule;
++    std::shared_ptr<ImplicitMatch> match;
+     Vars* vars;
+-    if (!PickRule(output, n, &rule_merger, &pattern_rule, &vars)) {
++    if (!PickRule(output, n, &rule_merger, &pattern_rule, &match, &vars)) {
+       return n;
+     }
+     if (rule_merger && rule_merger->parent) {
+       output = rule_merger->parent_sym;
+       done_[output] = n;
+       n->output = output;
+-      if (!PickRule(output, n, &rule_merger, &pattern_rule, &vars)) {
++      if (!PickRule(output, n, &rule_merger, &pattern_rule, &match, &vars)) {
+         return n;
+       }
+     }
+@@ -680,6 +983,16 @@ class DepBuilder {
+     else
+       RuleMerger().FillDepNode(output, pattern_rule.get(), n);
+ 
++    if (match) {
++      n->stem = Intern(match->stem);
++      // Like GNU make, a file made by a pattern rule whose target pattern is
++      // listed in .PRECIOUS is precious, whether it was chained or named.
++      if (precious_.exists(match->output_pattern))
++        n->is_precious = true;
++      for (auto& p : match->intermediates)
++        pending_matches_[p.first] = p.second;
++    }
++
+     std::vector<std::unique_ptr<ScopedVar>> sv;
+     ScopedFrame frame(ev_->Enter(FrameType::DEPENDENCY, output.str(), n->loc));
+ 
+@@ -907,6 +1220,20 @@ class DepBuilder {
+       SuffixRuleMap;
+   SuffixRuleMap suffix_rules_;
+ 
++  std::vector<const Rule*> implicit_rule_list_;
++  std::unordered_map<const Rule*, size_t> implicit_rule_order_;
++  std::unordered_set<const Rule*> replaced_implicit_rules_;
++  std::unordered_set<const Rule*> in_use_rules_;
++  std::unordered_map<Symbol, std::shared_ptr<ImplicitMatch>> pending_matches_;
++  SymbolSet mentioned_;
++  SymbolSet impossible_;
++  SymbolSet no_implicit_search_;
++  SymbolSet precious_;
++  SymbolSet intermediate_;
++  SymbolSet secondary_;
++  bool all_secondary_ = false;
++  bool delete_on_error_ = false;
++
+   Symbol first_rule_;
+   std::unordered_map<Symbol, DepNode*> done_;
+   SymbolSet phony_;
+diff --git a/src/dep.h b/src/dep.h
+index 594674c..2037019 100644
+--- a/src/dep.h
++++ b/src/dep.h
+@@ -45,7 +45,17 @@ struct DepNode {
+   bool is_default_target;
+   bool is_phony;
+   bool is_restat;
++  bool is_intermediate;
++  bool is_implicit_intermediate;
++  bool is_secondary;
++  bool is_precious;
++  bool delete_on_error;
+   std::vector<Symbol> implicit_outputs;
++  std::vector<Symbol> also_made;
++  SymbolSet intermediate_also_made;
++  SymbolSet secondary_also_made;
++  SymbolSet precious_also_made;
++  SymbolSet phony_also_made;
+   std::vector<Symbol> actual_inputs;
+   std::vector<Symbol> actual_order_only_inputs;
+   std::vector<Symbol> actual_validations;
+@@ -54,6 +64,7 @@ struct DepNode {
+   Var* ninja_pool_var;
+   Var* tags_var;
+   Symbol output_pattern;
++  Symbol stem;
+   Loc loc;
+ };
+ 
+diff --git a/src/exec.cc b/src/exec.cc
+index 1539369..c097274 100644
+--- a/src/exec.cc
++++ b/src/exec.cc
+@@ -18,11 +18,15 @@
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <sys/stat.h>
+ #include <sys/wait.h>
++#include <unistd.h>
+ 
++#include <algorithm>
+ #include <cstdint>
+ #include <string_view>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -49,55 +53,91 @@ class Executor {
+     shellflag_ = ev->GetShellFlag();
+   }
+ 
+-  double ExecNode(const DepNode& n, const char* needed_by) {
+-    auto found = done_.find(n.output);
++  double ExecDep(const NamedDepNode& d, const char* needed_by) {
++    return UpdateFile(Target(d), *d.second, needed_by);
++  }
++
++  // Updates OUTPUT, which N makes. Like GNU make, another target of the
++  // pattern rule N uses is a file of its own, with its own timestamp and its
++  // own special targets.
++  double UpdateFile(Symbol output, const DepNode& n, const char* needed_by) {
++    auto found = done_.find(output);
+     if (found != done_.end()) {
+       if (found->second == kProcessing) {
+         WARN("Circular %s <- %s dependency dropped.",
+-             needed_by ? needed_by : "(null)", n.output.c_str());
++             needed_by ? needed_by : "(null)", output.c_str());
+       }
+       return found->second;
+     }
+     ScopedFrame frame(
+-        ce_.evaluator()->Enter(FrameType::EXEC, n.output.c_str(), n.loc));
++        ce_.evaluator()->Enter(FrameType::EXEC, output.c_str(), n.loc));
+ 
+-    done_[n.output] = kProcessing;
+-    double output_ts = GetTimestamp(n.output.c_str());
++    done_[output] = kProcessing;
++    double output_ts = GetTimestamp(output.c_str());
+ 
+-    LOG("ExecNode: %s for %s", n.output.c_str(),
++    LOG("ExecNode: %s for %s", output.c_str(),
+         needed_by ? needed_by : "(null)");
+ 
+     if (!n.has_rule && output_ts == kNotExist && !n.is_phony) {
+       if (needed_by) {
+         ERROR("*** No rule to make target '%s', needed by '%s'.",
+-              n.output.c_str(), needed_by);
++              output.c_str(), needed_by);
+       } else {
+-        ERROR("*** No rule to make target '%s'.", n.output.c_str());
++        ERROR("*** No rule to make target '%s'.", output.c_str());
+       }
+     }
+ 
+-    double latest = kProcessing;
+     for (auto const& d : n.order_onlys) {
+-      if (Exists(d.second->output.str())) {
+-        continue;
+-      }
+-      double ts = ExecNode(*d.second, n.output.c_str());
+-      if (latest < ts)
+-        latest = ts;
++      // Like GNU make, order-only prerequisites never make this target stale,
++      // and a missing intermediate one is made only below, when this target is
++      // remade; make leaves it unbuilt for an up-to-date target.
++      if (IsIntermediate(d))
++        CheckIntermediate(Target(d), *d.second, output_ts);
++      else
++        ExecDep(d, output.c_str());
+     }
+ 
++    double latest = kProcessing;
++
++    bool must_make = false;
+     for (auto const& d : n.deps) {
+-      double ts = ExecNode(*d.second, n.output.c_str());
++      if (IsIntermediate(d)) {
++        if (CheckIntermediate(Target(d), *d.second, output_ts))
++          must_make = true;
++        continue;
++      }
++      double ts = ExecDep(d, output.c_str());
++      // Like GNU make, a prerequisite that is phony or still missing after
++      // its update makes this target stale.
++      if (ts == kNotExist || d.second->is_phony)
++        must_make = true;
+       if (latest < ts)
+         latest = ts;
+     }
+ 
+-    if (output_ts >= latest && !n.is_phony) {
+-      done_[n.output] = output_ts;
++    if (!must_make && output_ts >= latest && !n.is_phony) {
++      done_[output] = output_ts;
+       return output_ts;
+     }
+ 
+-    auto commands = ce_.Eval(n);
++    for (const auto* deps : {&n.deps, &n.order_onlys}) {
++      for (auto const& d : *deps) {
++        if (!IsIntermediate(d))
++          continue;
++        RecordIntermediate(d);
++        ExecDep(d, output.c_str());
++      }
++    }
++
++    bool made_intermediate = !(output == n.output) && IsIntermediate(n);
++    std::vector<Command> commands;
++    if (output == n.output) {
++      commands = ce_.Eval(n);
++    } else {
++      DepNode target = n;
++      target.output = output;
++      commands = ce_.Eval(target);
++    }
+     for (const Command& command : commands) {
+       num_commands_ += 1;
+       if (command.echo) {
+@@ -111,41 +151,278 @@ class Executor {
+         printf("%s", out.c_str());
+         if (result != 0) {
+           if (command.ignore_error) {
++            // Like GNU make, an ignored error deletes nothing, even under
++            // .DELETE_ON_ERROR.
+             fprintf(stderr, "[%s] Error %d (ignored)\n", command.output.c_str(),
+                     WEXITSTATUS(result));
+           } else {
+             fprintf(stderr, "*** [%s] Error %d\n", command.output.c_str(),
+                     WEXITSTATUS(result));
++            DeleteFailedTargets(n, output, output_ts);
++            RecordMadeTargets(n, output, made_intermediate);
+             exit(1);
+           }
+         }
+       }
+     }
+ 
+-    done_[n.output] = output_ts;
++    if (!commands.empty() && !g_flags.is_dry_run) {
++      double ts = GetTimestamp(output.c_str());
++      if (ts != kNotExist)
++        output_ts = ts;
++    }
++    done_[output] = output_ts;
++    RecordMadeTargets(n, output, made_intermediate);
+     return output_ts;
+   }
+ 
+   uint64_t Count() { return num_commands_; }
+ 
++  void AddGoal(Symbol goal) { goals_.insert(goal); }
++
++  // What GNU make says for a goal that ran no commands. It doesn't know the
++  // commands of a file another target's rule made before it looked at it.
++  void ReportGoal(const NamedDepNode& root) {
++    const DepNode& n = *root.second;
++    if (n.is_phony || n.cmds.empty() ||
++        (also_made_.exists(root.first) && !checked_.exists(root.first))) {
++      printf("kati: Nothing to be done for `%s'.\n", root.first.c_str());
++    } else {
++      printf("kati: `%s' is up to date.\n", root.first.c_str());
++    }
++    fflush(stdout);
++  }
++
++  void RemoveIntermediates() {
++    std::string removed;
++    for (Symbol f : made_intermediates_) {
++      if (!g_flags.is_dry_run && unlink(f.c_str()) != 0)
++        continue;
++      removed += removed.empty() ? "rm " : " ";
++      removed += f.str();
++    }
++    made_intermediates_.clear();
++    if (!removed.empty() && !g_flags.is_silent_mode) {
++      printf("%s\n", removed.c_str());
++      fflush(stdout);
++    }
++  }
++
+  private:
++  // Like GNU make under .DELETE_ON_ERROR, removes the targets of a failed
++  // recipe that the recipe changed, unless they are precious or phony. The
++  // other targets of the rule are deleted on behalf of OUTPUT.
++  void DeleteFailedTargets(const DepNode& n, Symbol output, double old_ts) {
++    if (!n.delete_on_error)
++      return;
++    DeleteChangedTarget(n, output, old_ts, nullptr);
++    std::vector<Symbol> others;
++    for (auto it = n.also_made.rbegin(); it != n.also_made.rend(); ++it) {
++      if (!(*it == output))
++        others.push_back(*it);
++    }
++    if (!(output == n.output))
++      others.push_back(n.output);
++    for (Symbol t : others) {
++      // A target that was never looked at counts as changed, as in GNU make.
++      auto found = done_.find(t);
++      double before = found == done_.end() ? kProcessing : found->second;
++      DeleteChangedTarget(n, t, before, output.c_str());
++    }
++  }
++
++  static void DeleteChangedTarget(const DepNode& n,
++                                  Symbol target,
++                                  double old_ts,
++                                  const char* on_behalf_of) {
++    bool keep = target == n.output ? n.is_precious || n.is_phony
++                                   : n.precious_also_made.exists(target) ||
++                                         n.phony_also_made.exists(target);
++    struct stat st;
++    if (keep || stat(target.c_str(), &st) != 0 || !S_ISREG(st.st_mode) ||
++        GetTimestamp(target.c_str()) == old_ts) {
++      return;
++    }
++    if (on_behalf_of) {
++      fprintf(stderr, "*** [%s] Deleting file '%s'\n", on_behalf_of,
++              target.c_str());
++    } else {
++      fprintf(stderr, "*** Deleting file '%s'\n", target.c_str());
++    }
++    unlink(target.c_str());
++  }
++
++  static bool IsAlsoMade(const NamedDepNode& d) {
++    const std::vector<Symbol>& also_made = d.second->also_made;
++    return !(d.first == d.second->output) &&
++           std::find(also_made.begin(), also_made.end(), d.first) !=
++               also_made.end();
++  }
++
++  static Symbol Target(const NamedDepNode& d) {
++    return IsAlsoMade(d) ? d.first : d.second->output;
++  }
++
++  bool IsIntermediate(const NamedDepNode& d) {
++    if (!IsAlsoMade(d))
++      return IsIntermediate(*d.second);
++    return IsIntermediateAlsoMade(d.first, *d.second);
++  }
++
++  bool IsIntermediateAlsoMade(Symbol output, const DepNode& n) {
++    if (!n.intermediate_also_made.exists(output))
++      return false;
++    auto found = intermediate_.find(output);
++    if (found != intermediate_.end())
++      return found->second;
++    // A named one that another target's recipe made before it was looked at
++    // stays intermediate, as in GNU make, even if it existed before the run.
++    bool r = also_made_.exists(output) || !Exists(output.str());
++    intermediate_.emplace(output, r);
++    return r;
++  }
++
++  // GNU make marks every target of a rule that ran as updated, also when the
++  // recipe failed, and deletes the intermediates among them.
++  void RecordMadeTargets(const DepNode& n,
++                         Symbol output,
++                         bool made_intermediate) {
++    if (made_intermediate)
++      RecordIntermediate(n.output, n.is_secondary || n.is_precious);
++    MarkAlsoMade(n, output);
++  }
++
++  // GNU make marks the other targets of a rule that ran as updated, and
++  // deletes the ones a special target makes intermediate when it is done.
++  void MarkAlsoMade(const DepNode& n, Symbol output) {
++    std::vector<Symbol> targets = n.also_made;
++    targets.push_back(n.output);
++    for (Symbol t : targets) {
++      if (t == output)
++        continue;
++      auto found = done_.find(t);
++      if (found == done_.end())
++        also_made_.insert(t);
++      else if (found->second == kProcessing)
++        continue;
++      done_[t] = GetTimestamp(t.c_str());
++      if (!(t == n.output) && IsIntermediateAlsoMade(t, n)) {
++        RecordIntermediate(t, n.secondary_also_made.exists(t) ||
++                                  n.precious_also_made.exists(t));
++      }
++    }
++  }
++
++  bool IsIntermediate(const DepNode& n) {
++    if (!n.is_intermediate || n.is_phony)
++      return false;
++    auto found = intermediate_.find(n.output);
++    if (found != intermediate_.end())
++      return found->second;
++    // Like GNU make, a named intermediate that exists when it is first looked
++    // at is taken to predate the run, even if an earlier goal made it: it is
++    // updated like any other prerequisite and never deleted.
++    bool r = n.is_implicit_intermediate || !Exists(n.output.str());
++    intermediate_.emplace(n.output, r);
++    return r;
++  }
++
++  bool CheckIntermediate(Symbol output, const DepNode& n, double target_ts) {
++    // GNU make looks at the rule of each intermediate it checks.
++    checked_.insert(output);
++    auto found = done_.find(output);
++    if (found != done_.end() && found->second != kProcessing) {
++      double ts = GetTimestamp(output.c_str());
++      // Like GNU make, a missing intermediate is judged by what it depends
++      // on, even when this run already made it.
++      if (ts != kNotExist)
++        return ts > target_ts;
++    }
++    if (!checking_.insert(output).second)
++      return false;
++    bool must_make = false;
++    double ts = GetTimestamp(output.c_str());
++    if (ts != kNotExist && ts > target_ts) {
++      must_make = true;
++    } else {
++      // Like GNU make's check_dep, update the non-intermediate files a missing
++      // intermediate depends on, order-only ones included, even if the target
++      // then turns out to be up to date.
++      for (auto const& d : n.deps) {
++        if (IsIntermediate(d)) {
++          if (CheckIntermediate(Target(d), *d.second, target_ts))
++            must_make = true;
++          continue;
++        }
++        ExecDep(d, output.c_str());
++        double dts = GetTimestamp(Target(d).c_str());
++        if (dts == kNotExist || dts > target_ts || d.second->is_phony)
++          must_make = true;
++      }
++      for (auto const& d : n.order_onlys) {
++        if (IsIntermediate(d))
++          CheckIntermediate(Target(d), *d.second, target_ts);
++        else
++          ExecDep(d, output.c_str());
++      }
++    }
++    checking_.erase(output);
++    return must_make;
++  }
++
++  void RecordIntermediate(const NamedDepNode& d) {
++    const DepNode& n = *d.second;
++    if (IsAlsoMade(d)) {
++      RecordIntermediate(d.first, n.secondary_also_made.exists(d.first) ||
++                                      n.precious_also_made.exists(d.first));
++    } else {
++      RecordIntermediate(n.output, n.is_secondary || n.is_precious);
++    }
++  }
++
++  void RecordIntermediate(Symbol output, bool keep) {
++    if (keep || goals_.exists(output))
++      return;
++    if (recorded_.insert(output).second)
++      made_intermediates_.push_back(output);
++  }
++
+   CommandEvaluator ce_;
+   std::unordered_map<Symbol, double> done_;
++  std::unordered_map<Symbol, bool> intermediate_;
++  std::unordered_set<Symbol> checking_;
++  std::unordered_set<Symbol> recorded_;
++  std::vector<Symbol> made_intermediates_;
++  SymbolSet goals_;
++  SymbolSet also_made_;
++  SymbolSet checked_;
+   std::string shell_;
+   std::string shellflag_;
+   uint64_t num_commands_;
+ };
+ 
++Executor* g_executor;
++
++void RemoveIntermediatesAtExit() {
++  if (g_executor)
++    g_executor->RemoveIntermediates();
++}
++
+ }  // namespace
+ 
+ void Exec(const std::vector<NamedDepNode>& roots, Evaluator* ev) {
+   Executor executor(ev);
+   for (auto const& root : roots) {
+-    executor.ExecNode(*root.second, nullptr);
++    executor.AddGoal(root.first);
+   }
+-  if (executor.Count() == 0) {
+-    for (auto const& root : roots) {
+-      printf("kati: Nothing to be done for `%s'.\n", root.first.c_str());
+-    }
++  g_executor = &executor;
++  atexit(RemoveIntermediatesAtExit);
++  for (auto const& root : roots) {
++    uint64_t count = executor.Count();
++    executor.ExecDep(root, nullptr);
++    if (executor.Count() == count && !g_flags.is_silent_mode)
++      executor.ReportGoal(root);
+   }
++  g_executor = nullptr;
++  executor.RemoveIntermediates();
+ }

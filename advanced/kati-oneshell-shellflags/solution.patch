@@ -1,0 +1,1589 @@
+diff --git a/src-rs/command.rs b/src-rs/command.rs
+index 270d8b6..81e5cd2 100644
+--- a/src-rs/command.rs
++++ b/src-rs/command.rs
+@@ -24,8 +24,8 @@ use crate::{
+     error_loc,
+     eval::Evaluator,
+     exec::ExecStatus,
+-    expr::Evaluable,
+-    fileutil::get_timestamp,
++    expr::{Evaluable, Value},
++    fileutil::{get_timestamp, has_shell_syntax},
+     flags::FLAGS,
+     strutil::{
+         Pattern, WordWriter, basename, dirname, find_end_of_line, trim_left_space, word_scanner,
+@@ -126,7 +126,17 @@ impl AutoCommandVar {
+                 if ev.avoid_io {
+                     // Check timestamps using the shell at the start of rule execution
+                     // instead.
+-                    out.put_slice(b"${KATI_NEW_INPUTS}");
++                    if ev.eval_depth == 0
++                        && needs_separate_shells(
++                            &ev.get_shell()?,
++                            &ev.get_shell_flag()?,
++                            ev.is_one_shell,
++                        )
++                    {
++                        kati_value_marker(b"KATI_NEW_INPUTS", out);
++                    } else {
++                        out.put_slice(b"${KATI_NEW_INPUTS}");
++                    }
+                     if !*found_new_inputs.lock() {
+                         let mut def = BytesMut::new();
+ 
+@@ -180,9 +190,115 @@ impl Debug for AutoCommandVar {
+ pub struct Command {
+     pub output: Symbol,
+     pub cmd: Bytes,
++    pub shell: Bytes,
++    pub shellflag: Bytes,
+     pub echo: bool,
+     pub ignore_error: bool,
+     pub force_no_subshell: bool,
++    pub one_shell: bool,
++}
++
++pub fn is_posix_shell(shell: &[u8]) -> bool {
++    matches!(
++        basename(shell),
++        b"sh" | b"bash" | b"ksh" | b"rksh" | b"zsh" | b"ash" | b"dash"
++    )
++}
++
++// Ninja commands are single lines, so text with newlines is rebuilt by
++// printf with one single-quoted argument per line.
++pub fn shell_quote(text: &[u8], r: &mut BytesMut) {
++    let multiline = text.contains(&b'\n');
++    r.put_slice(if multiline {
++        b"\"$(printf '%s\\n' '"
++    } else {
++        b"'"
++    });
++    for &ch in text {
++        match ch {
++            b'\n' => r.put_slice(b"' '"),
++            b'\'' => r.put_slice(b"'\\''"),
++            _ => r.put_u8(ch),
++        }
++    }
++    r.put_slice(if multiline { b"')\"" } else { b"'" });
++}
++
++// make splits a one-shell script's flags at blanks only, so quotes in them
++// reach the shell as they are.
++pub fn one_shell_flags(flags: &[u8]) -> Bytes {
++    let mut r = BytesMut::new();
++    for word in word_scanner(flags) {
++        if !r.is_empty() {
++            r.put_u8(b' ');
++        }
++        if has_shell_syntax(word) {
++            shell_quote(word, &mut r);
++        } else {
++            r.put_slice(word);
++        }
++    }
++    r.freeze()
++}
++
++// make drops the recipe tab that starts a continuation line.
++fn drop_continuation_tabs(script: &[u8]) -> BytesMut {
++    let mut r = BytesMut::with_capacity(script.len());
++    let mut escaped = false;
++    let mut i = 0;
++    while i < script.len() {
++        let c = script[i];
++        r.put_u8(c);
++        if c == b'\n' && escaped && script.get(i + 1) == Some(&b'\t') {
++            i += 1;
++        }
++        escaped = c == b'\\' && !escaped;
++        i += 1;
++    }
++    r
++}
++
++fn is_blank_or_prefix(c: u8) -> bool {
++    matches!(c, b' ' | b'\t' | b'@' | b'-' | b'+')
++}
++
++pub fn strip_one_shell_prefixes(script: &[u8]) -> Bytes {
++    let mut r = BytesMut::with_capacity(script.len());
++    let mut i = 0;
++    while i < script.len() {
++        while i < script.len() && is_blank_or_prefix(script[i]) {
++            i += 1;
++        }
++        let mut escaped = false;
++        while i < script.len() {
++            let c = script[i];
++            i += 1;
++            r.put_u8(c);
++            if c == b'\\' {
++                escaped = !escaped;
++            } else {
++                if c == b'\n' && !escaped {
++                    break;
++                }
++                escaped = false;
++            }
++        }
++    }
++    r.freeze()
++}
++
++// Recipes kati can't join into its usual POSIX -c ninja command: one-shell
++// scripts, and lines for other shells or with other flags.
++pub fn needs_separate_shells(shell: &[u8], shellflag: &[u8], one_shell: bool) -> bool {
++    one_shell || !is_posix_shell(shell) || shellflag.trim_ascii() != b"-c"
++}
++
++// Marks a value ninja's shell computes for such a recipe. The \x01 bytes keep
++// a recipe's own text, such as ${KATI_LOCAL}, from ever matching.
++pub fn kati_value_marker(name: &[u8], out: &mut dyn BufMut) {
++    out.put_u8(0x01);
++    out.put_slice(name);
++    out.put_u8(0x01);
+ }
+ 
+ fn parse_command_prefixes(cmds: Bytes, echo: &mut bool, ignore_error: &mut bool) -> Bytes {
+@@ -282,33 +398,50 @@ impl<'a> CommandEvaluator<'a> {
+         self.ev.is_evaluating_command = true;
+         *self.current_dep_node.lock() = Some(n.clone());
+         *self.found_new_inputs.lock() = false;
+-        for v in node_cmds {
+-            self.ev.loc = v.loc();
+-            let cmds_buf = v.eval_to_buf(self.ev)?;
+-            let mut cmds = cmds_buf.clone();
+-            let mut global_echo = !FLAGS.is_silent_mode;
+-            let mut global_ignore_error = false;
+-            cmds = parse_command_prefixes(cmds, &mut global_echo, &mut global_ignore_error);
+-            if cmds.is_empty() {
+-                continue;
++        let shell = self.ev.get_shell()?;
++        let shellflag = self.ev.get_shell_flag()?;
++        if self.ev.is_one_shell {
++            let breaks = n.lock().recipe_breaks.clone();
++            let mut starts = vec![0];
++            starts.extend(breaks);
++            starts.push(node_cmds.len());
++            for w in starts.windows(2) {
++                if let Some(command) = self.eval_one_shell(n, &node_cmds[w[0]..w[1]], &shell)? {
++                    result.push(command);
++                }
+             }
+-            while !cmds.is_empty() {
+-                let eol = find_end_of_line(&cmds);
+-                let mut cmd = eol.line.slice_ref(trim_left_space(&eol.line));
+-                cmds = eol.rest;
+-
+-                let mut echo = global_echo;
+-                let mut ignore_error = global_ignore_error;
+-                cmd = parse_command_prefixes(cmd, &mut echo, &mut ignore_error);
+-
+-                if !cmd.is_empty() {
+-                    result.push(Command {
+-                        output: n.lock().output,
+-                        cmd,
+-                        echo,
+-                        ignore_error,
+-                        force_no_subshell: false,
+-                    })
++        } else {
++            for v in node_cmds {
++                self.ev.loc = v.loc();
++                let cmds_buf = v.eval_to_buf(self.ev)?;
++                let mut cmds = cmds_buf.clone();
++                let mut global_echo = !FLAGS.is_silent_mode;
++                let mut global_ignore_error = false;
++                cmds = parse_command_prefixes(cmds, &mut global_echo, &mut global_ignore_error);
++                if cmds.is_empty() {
++                    continue;
++                }
++                while !cmds.is_empty() {
++                    let eol = find_end_of_line(&cmds);
++                    let mut cmd = eol.line.slice_ref(trim_left_space(&eol.line));
++                    cmds = eol.rest;
++
++                    let mut echo = global_echo;
++                    let mut ignore_error = global_ignore_error;
++                    cmd = parse_command_prefixes(cmd, &mut echo, &mut ignore_error);
++
++                    if !cmd.is_empty() {
++                        result.push(Command {
++                            output: n.lock().output,
++                            cmd,
++                            shell: Bytes::new(),
++                            shellflag: Bytes::new(),
++                            echo,
++                            ignore_error,
++                            force_no_subshell: false,
++                            one_shell: false,
++                        })
++                    }
+                 }
+             }
+         }
+@@ -320,9 +453,12 @@ impl<'a> CommandEvaluator<'a> {
+                 output_commands.push(Command {
+                     output: node.output,
+                     cmd: cmd.clone(),
++                    shell: Bytes::new(),
++                    shellflag: Bytes::new(),
+                     echo: false,
+                     ignore_error: false,
+                     force_no_subshell: true,
++                    one_shell: false,
+                 })
+             }
+             // Prepend |output_commands|.
+@@ -331,9 +467,69 @@ impl<'a> CommandEvaluator<'a> {
+             self.ev.delayed_output_commands.clear();
+         }
+ 
++        for command in &mut result {
++            command.shell = shell.clone();
++            command.shellflag = if command.one_shell {
++                one_shell_flags(&shellflag)
++            } else {
++                shellflag.clone()
++            };
++        }
++
+         self.ev.current_scope = None;
+         self.ev.is_evaluating_command = false;
+ 
+         Ok(result)
+     }
++
++    fn eval_one_shell(
++        &mut self,
++        n: &Arc<Mutex<DepNode>>,
++        node_cmds: &[Arc<Value>],
++        shell: &[u8],
++    ) -> Result<Option<Command>> {
++        let loc = n.lock().loc.clone();
++        let mut script = BytesMut::new();
++        for (i, v) in node_cmds.iter().enumerate() {
++            if i > 0 {
++                script.put_u8(b'\n');
++            }
++            self.ev.loc = loc.clone();
++            v.eval(self.ev, &mut script)?;
++        }
++        let script = drop_continuation_tabs(&script);
++
++        let mut echo = !FLAGS.is_silent_mode;
++        let mut ignore_error = false;
++        let mut start = 0;
++        while start < script.len() {
++            match script[start] {
++                b'@' => echo = false,
++                b'-' => ignore_error = true,
++                b'+' | b' ' | b'\t' => {}
++                _ => break,
++            }
++            start += 1;
++        }
++        let body = &script[start..];
++        if body.is_empty() {
++            return Ok(None);
++        }
++
++        let cmd = if is_posix_shell(shell) {
++            strip_one_shell_prefixes(body)
++        } else {
++            Bytes::copy_from_slice(body)
++        };
++        Ok(Some(Command {
++            output: n.lock().output,
++            cmd,
++            shell: Bytes::new(),
++            shellflag: Bytes::new(),
++            echo,
++            ignore_error,
++            force_no_subshell: false,
++            one_shell: true,
++        }))
++    }
+ }
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 3f32205..101d832 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -47,6 +47,7 @@ pub type NamedDepNode = (Symbol, Arc<Mutex<DepNode>>);
+ pub struct DepNode {
+     pub output: Symbol,
+     pub cmds: Vec<Arc<Value>>,
++    pub recipe_breaks: Vec<usize>,
+     pub deps: Vec<NamedDepNode>,
+     pub order_onlys: Vec<NamedDepNode>,
+     pub validations: Vec<NamedDepNode>,
+@@ -71,6 +72,7 @@ impl DepNode {
+         Arc::new(Mutex::new(Self {
+             output,
+             cmds: Vec::new(),
++            recipe_breaks: Vec::new(),
+             deps: Vec::new(),
+             order_onlys: Vec::new(),
+             validations: Vec::new(),
+@@ -315,6 +317,9 @@ impl RuleMerger {
+ 
+     fn fill_dep_node_from_rule(&self, output: Symbol, r: &Rule, n: &mut DepNode) {
+         if self.is_double_colon {
++            if !n.cmds.is_empty() && !r.cmds.is_empty() {
++                n.recipe_breaks.push(n.cmds.len());
++            }
+             n.cmds.extend(r.cmds.iter().cloned());
+         }
+ 
+@@ -483,7 +488,6 @@ impl<'a> DepBuilder<'a> {
+             ".SILENT",
+             ".EXPORT_ALL_VARIABLES",
+             ".NOTPARALLEL",
+-            ".ONESHELL",
+         ];
+         for p in unsupported_builtin_targets {
+             if let Some((_, loc)) = self.get_rule_inputs(intern(p)) {
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 6bb5651..afe0050 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -268,6 +268,10 @@ pub struct Evaluator {
+ 
+     posix_sym: Symbol,
+     is_posix: bool,
++    oneshell_sym: Symbol,
++    pub is_one_shell: bool,
++    shellflags_sym: Symbol,
++    is_shellflags_set: bool,
+ 
+     /// Whether `export`/`unexport` directives are allowed.
+     pub export_allowed: ExportAllowed,
+@@ -315,6 +319,10 @@ impl Evaluator {
+ 
+             posix_sym: crate::symtab::intern(".POSIX"),
+             is_posix: false,
++            oneshell_sym: crate::symtab::intern(".ONESHELL"),
++            is_one_shell: false,
++            shellflags_sym: crate::symtab::intern(".SHELLFLAGS"),
++            is_shellflags_set: false,
+ 
+             export_allowed: ExportAllowed::Allowed,
+ 
+@@ -497,6 +505,12 @@ impl Evaluator {
+             stmt.op,
+             is_override,
+         )?;
++        if lhs == self.shellflags_sym
++            && !self.is_bootstrap
++            && (needs_assign || stmt.op == AssignOp::PlusEq)
++        {
++            self.is_shellflags_set = true;
++        }
+         if needs_assign {
+             let mut readonly = false;
+             lhs.set_global_var(var.clone(), is_override, Some(&mut readonly))?;
+@@ -710,8 +724,28 @@ impl Evaluator {
+         }
+ 
+         for o in &rule.outputs {
+-            if o == &self.posix_sym {
++            if o == &self.posix_sym && !self.is_posix {
+                 self.is_posix = true;
++                let is_default = !self.is_shellflags_set
++                    && self
++                        .shellflags_sym
++                        .peek_global_var()
++                        .is_none_or(|v| v.read().origin() == VarOrigin::Default);
++                if is_default {
++                    self.shellflags_sym.set_global_var(
++                        Variable::with_simple_string(
++                            Bytes::from_static(b"-ec"),
++                            VarOrigin::Default,
++                            None,
++                            None,
++                        ),
++                        false,
++                        None,
++                    )?;
++                }
++            }
++            if o == &self.oneshell_sym {
++                self.is_one_shell = true;
+             }
+         }
+ 
+@@ -1101,8 +1135,8 @@ impl Evaluator {
+         self.eval_var(*SHELL_SYM)
+     }
+ 
+-    pub fn get_shell_flag(&self) -> &'static [u8] {
+-        if self.is_posix { b"-ec" } else { b"-c" }
++    pub fn get_shell_flag(&mut self) -> Result<Bytes> {
++        self.eval_var(self.shellflags_sym)
+     }
+ 
+     fn get_allow_rules(&mut self) -> Result<RulesAllowed> {
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 8179bca..ba7a360 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -17,7 +17,6 @@ limitations under the License.
+ use std::{collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, sync::Arc, time::SystemTime};
+ 
+ use anyhow::Result;
+-use bytes::Bytes;
+ use parking_lot::Mutex;
+ 
+ use crate::{
+@@ -59,20 +58,14 @@ impl PartialOrd for ExecStatus {
+ struct Executor<'a> {
+     ce: CommandEvaluator<'a>,
+     done: HashMap<Symbol, ExecStatus>,
+-    shell: Bytes,
+-    shellflag: &'static [u8],
+     num_commands: u64,
+ }
+ 
+ impl<'a> Executor<'a> {
+     fn new(ev: &'a mut Evaluator) -> Result<Self> {
+-        let shell = ev.get_shell()?;
+-        let shellflag = ev.get_shell_flag();
+         Ok(Executor {
+             ce: CommandEvaluator::new(ev)?,
+             done: HashMap::new(),
+-            shell,
+-            shellflag,
+             num_commands: 0,
+         })
+     }
+@@ -154,8 +147,8 @@ impl<'a> Executor<'a> {
+             }
+             if !FLAGS.is_dry_run {
+                 let (status, output) = run_command(
+-                    &self.shell,
+-                    self.shellflag,
++                    &command.shell,
++                    &command.shellflag,
+                     &command.cmd,
+                     RedirectStderr::Stdout,
+                 )?;
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index a52ce8f..613362e 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -48,6 +48,12 @@ pub fn get_timestamp(filename: &[u8]) -> Result<Option<SystemTime>> {
+     Ok(Some(metadata.modified()?))
+ }
+ 
++// Quotes and other shell syntax in .SHELLFLAGS need a shell to parse them, as
++// in make.
++pub fn has_shell_syntax(s: &[u8]) -> bool {
++    s.iter().any(|c| b"\"'\\$`*?[]~#;&|<>(){}!\n".contains(c))
++}
++
+ pub fn run_command(
+     shell: &[u8],
+     shellflag: &[u8],
+@@ -55,7 +61,11 @@ pub fn run_command(
+     redirect_stderr: RedirectStderr,
+ ) -> Result<(ExitStatus, Vec<u8>)> {
+     let mut cmd_with_shell;
+-    let args = if !shell.starts_with(b"/") || memchr2(b' ', b'$', shell).is_some() {
++    let direct_args;
++    let args: &[&OsStr] = if !shell.starts_with(b"/")
++        || memchr2(b' ', b'$', shell).is_some()
++        || has_shell_syntax(shellflag)
++    {
+         let cmd_escaped = crate::strutil::escape_shell(cmd);
+         cmd_with_shell = BytesMut::new();
+         cmd_with_shell.put_slice(shell);
+@@ -71,11 +81,12 @@ pub fn run_command(
+         ]
+     } else {
+         // If the shell isn't complicated, we don't need to wrap in /bin/sh
+-        &[
+-            <OsStr as OsStrExt>::from_bytes(shell),
+-            <OsStr as OsStrExt>::from_bytes(shellflag),
+-            <OsStr as OsStrExt>::from_bytes(cmd),
+-        ]
++        direct_args = std::iter::once(shell)
++            .chain(crate::strutil::word_scanner(shellflag))
++            .chain(std::iter::once(cmd.as_ref()))
++            .map(<OsStr as OsStrExt>::from_bytes)
++            .collect::<Vec<_>>();
++        &direct_args
+     };
+ 
+     log!("run_command({args:?})");
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 0ab7def..711145a 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -29,7 +29,12 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
+ use parking_lot::Mutex;
+ 
+ use crate::{
+-    collect_stats, collect_stats_with_slow_report, error_loc,
++    collect_stats, collect_stats_with_slow_report,
++    command::{
++        is_posix_shell, kati_value_marker, needs_separate_shells, one_shell_flags, shell_quote,
++        strip_one_shell_prefixes,
++    },
++    error_loc,
+     eval::{Evaluator, ExportAllowed, FrameType},
+     expr::{Evaluable, Value},
+     file_cache::add_extra_file_dep,
+@@ -648,7 +653,17 @@ pub struct CommandResult {
+ }
+ 
+ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) -> Result<()> {
+-    let cmd = args[0].eval_to_buf(ev)?;
++    let mut cmd = args[0].eval_to_buf(ev)?;
++    let shell = ev.get_shell()?;
++    let mut shellflag = ev.get_shell_flag()?;
++    // Once .ONESHELL is read, make runs $(shell ...) as it runs a one-shell
++    // script.
++    if ev.is_one_shell {
++        shellflag = one_shell_flags(&shellflag);
++        if is_posix_shell(&shell) && cmd.contains(&b'\n') {
++            cmd = strip_one_shell_prefixes(&cmd);
++        }
++    }
+     if ev.avoid_io && !has_no_io_in_shell_script(&cmd) {
+         if ev.eval_depth > 1 {
+             error_loc!(
+@@ -657,6 +672,24 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) ->
+                 String::from_utf8_lossy(&cmd)
+             );
+         }
++        // A one-shell script, or a line for another shell or other flags, gets the
++        // output as text: ninja's shell runs the call with the recipe's shell
++        // before the recipe starts. A POSIX line run with -c runs it itself.
++        if needs_separate_shells(&shell, &shellflag, ev.is_one_shell) {
++            let var = format!("KATI_SHELL_{}", ev.delayed_output_commands.len());
++            let mut def = BytesMut::new();
++            def.put_slice(var.as_bytes());
++            def.put_slice(b"=$(");
++            def.put_slice(&shell);
++            def.put_u8(b' ');
++            def.put_slice(&shellflag);
++            def.put_u8(b' ');
++            shell_quote(&cmd, &mut def);
++            def.put_slice(b" || true)");
++            ev.delayed_output_commands.push(def.freeze());
++            kati_value_marker(var.as_bytes(), out);
++            return Ok(());
++        }
+         let cmd = strip_shell_comment(cmd);
+         out.put_slice(b"$(");
+         out.put_slice(&cmd);
+@@ -665,10 +698,7 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) ->
+     }
+ 
+     let loc = ev.loc.clone().unwrap_or_default();
+-    let shell = ev.get_shell()?;
+-    let shellflag = ev.get_shell_flag();
+-
+-    let (exit_code, output, fc) = shell_func_impl(&shell, shellflag, &cmd, &loc)?;
++    let (exit_code, output, fc) = shell_func_impl(&shell, &shellflag, &cmd, &loc)?;
+     out.put_slice(&output);
+     if should_store_command_result(&cmd) {
+         COMMAND_RESULTS.lock().push(CommandResult {
+@@ -678,7 +708,7 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) ->
+                 CommandOp::Shell
+             },
+             shell,
+-            shellflag: Bytes::from_static(shellflag),
++            shellflag,
+             cmd,
+             find: fc,
+             result: output,
+@@ -708,9 +738,9 @@ fn shell_no_rerun_func(
+ 
+     let loc = ev.loc.clone().unwrap_or_default();
+     let shell = ev.get_shell()?;
+-    let shellflag = ev.get_shell_flag();
++    let shellflag = ev.get_shell_flag()?;
+ 
+-    let (exit_code, output, _) = shell_func_impl(&shell, shellflag, &cmd, &loc)?;
++    let (exit_code, output, _) = shell_func_impl(&shell, &shellflag, &cmd, &loc)?;
+     out.put_slice(&output);
+     set_shell_status_var(exit_code);
+     Ok(())
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index 6703bef..73777a5 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -75,6 +75,9 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>>
+     bootstrap.put_slice(b"KATI?=ckati\n");
+     // Overwrite $SHELL environment variable.
+     bootstrap.put_slice(b"SHELL=/bin/sh\n");
++    bootstrap.put_slice(b"ifeq ($(origin .SHELLFLAGS),undefined)\n");
++    bootstrap.put_slice(b".SHELLFLAGS:=-c\n");
++    bootstrap.put_slice(b"endif\n");
+     // TODO: Add more builtin vars.
+ 
+     if !FLAGS.no_builtin_rules {
+diff --git a/src-rs/ninja.rs b/src-rs/ninja.rs
+index 297b80f..06a86d9 100644
+--- a/src-rs/ninja.rs
++++ b/src-rs/ninja.rs
+@@ -34,7 +34,7 @@ use crate::func::CommandOp;
+ use crate::io::{dump_int, dump_string, dump_systemtime, dump_usize, dump_vec_string};
+ use crate::strutil::{basename, concat_dir, dirname, strip_ext, strip_ext_vec};
+ use crate::{
+-    command::{Command, CommandEvaluator},
++    command::{Command, CommandEvaluator, is_posix_shell, needs_separate_shells, shell_quote},
+     dep::{DepNode, NamedDepNode, is_special_target},
+     eval::Evaluator,
+     expr::Evaluable,
+@@ -151,7 +151,7 @@ struct NinjaGenerator<'a> {
+     done: HashSet<Symbol>,
+     rule_id: usize,
+     shell: Bytes,
+-    shell_flags: Bytes,
++    shellflag: Bytes,
+     used_envs: HashMap<Symbol, OsString>,
+     kati_binary: OsString,
+     start_time: SystemTime,
+@@ -161,15 +161,15 @@ struct NinjaGenerator<'a> {
+ 
+ impl<'a> NinjaGenerator<'a> {
+     fn new(ce: CommandEvaluator<'a>, start_time: SystemTime) -> Result<Self> {
+-        let shell = Self::escape_ninja(&ce.ev.get_shell()?);
+-        let shell_flags = Self::escape_ninja(&Bytes::from_static(ce.ev.get_shell_flag()));
++        let shell = ce.ev.get_shell()?;
++        let shellflag = ce.ev.get_shell_flag()?;
+         ce.ev.avoid_io = true;
+         Ok(Self {
+             ce,
+             done: HashSet::new(),
+             rule_id: 0,
+             shell,
+-            shell_flags,
++            shellflag,
+             used_envs: HashMap::new(),
+             kati_binary: OsString::from(std::env::current_exe().unwrap()),
+             start_time,
+@@ -379,6 +379,89 @@ impl<'a> NinjaGenerator<'a> {
+         true
+     }
+ 
++    fn join_commands(commands: &[Command], cmd_buf: &mut BytesMut) {
++        for c in commands {
++            if !cmd_buf.is_empty() {
++                cmd_buf.put_u8(b'\n');
++            }
++            cmd_buf.put_slice(&c.cmd);
++        }
++    }
++
++    // kati's ninja-time values, $(shell ...) and $?, are set by ninja's shell
++    // ahead of the recipe and reach its script as one line of text, as make
++    // expands them.
++    fn splice_kati_values(quoted: &[u8], r: &mut BytesMut) {
++        let mut rest = quoted;
++        while let Some(begin) = rest.iter().position(|&c| c == 0x01) {
++            let Some(len) = rest[begin + 1..].iter().position(|&c| c == 0x01) else {
++                break;
++            };
++            r.put_slice(&rest[..begin]);
++            r.put_slice(b"'\"$(printf %s \"${");
++            r.put_slice(&rest[begin + 1..begin + 1 + len]);
++            r.put_slice(b"}\" | tr '\\n' ' ')\"'");
++            rest = &rest[begin + len + 2..];
++        }
++        r.put_slice(rest);
++    }
++
++    fn escape_ninja_dollars(s: &[u8]) -> Bytes {
++        let mut escaped = BytesMut::with_capacity(s.len());
++        for &ch in s {
++            if ch == b'$' {
++                escaped.put_u8(b'$');
++            }
++            escaped.put_u8(ch);
++        }
++        escaped.freeze()
++    }
++
++    fn invocation(c: &Command, r: &mut BytesMut) {
++        if c.ignore_error {
++            r.put_slice(b"( ");
++        }
++        r.put_slice(&c.shell);
++        r.put_u8(b' ');
++        r.put_slice(&c.shellflag);
++        r.put_u8(b' ');
++        let mut quoted = BytesMut::new();
++        shell_quote(&c.cmd, &mut quoted);
++        Self::splice_kati_values(&quoted, r);
++        if c.ignore_error {
++            r.put_slice(b" || true )");
++        }
++    }
++
++    // One invocation per command: a whole recipe under .ONESHELL, a line
++    // otherwise, as make runs them. kati's own ninja-time commands run ahead of
++    // them, with the whole chain in the global SHELL.
++    fn separate_shells_command(&self, commands: &[Command]) -> Bytes {
++        let mut r = BytesMut::new();
++        let mut outer_commands = false;
++        for c in commands {
++            if !r.is_empty() {
++                r.put_slice(b" && ");
++            }
++            if c.force_no_subshell {
++                r.put_slice(&c.cmd);
++                outer_commands = true;
++            } else {
++                Self::invocation(c, &mut r);
++            }
++        }
++        if outer_commands && is_posix_shell(&self.shell) {
++            let mut wrapped = BytesMut::new();
++            wrapped.put_slice(&self.shell);
++            wrapped.put_u8(b' ');
++            wrapped.put_slice(&self.shellflag);
++            wrapped.put_u8(b' ');
++            shell_quote(&r, &mut wrapped);
++            r = wrapped;
++        }
++        Self::escape_ninja_dollars(&r)
++    }
++
+     fn gen_shell_script(
+         name: &Bytes,
+         commands: &Vec<Command>,
+@@ -473,14 +556,22 @@ impl<'a> NinjaGenerator<'a> {
+             rule_name = format!("rule{}", nn.rule_id.unwrap());
+             writeln!(out, "rule {rule_name}")?;
+ 
++            let head = commands.last().unwrap();
++            let shell = Self::escape_ninja(&head.shell);
+             let mut description = Bytes::from_static(b"build $out");
+             let mut cmd_buf = BytesMut::new();
+-            Self::gen_shell_script(
+-                &node.output.as_bytes(),
+-                commands,
+-                &mut cmd_buf,
+-                &mut description,
+-            );
++            let separate_shells =
++                needs_separate_shells(&head.shell, &head.shellflag, head.one_shell);
++            if separate_shells {
++                Self::join_commands(commands, &mut cmd_buf);
++            } else {
++                Self::gen_shell_script(
++                    &node.output.as_bytes(),
++                    commands,
++                    &mut cmd_buf,
++                    &mut description,
++                );
++            }
+             out.write_all(b" description = ")?;
+             out.write_all(&description)?;
+             out.write_all(b"\n")?;
+@@ -488,18 +579,30 @@ impl<'a> NinjaGenerator<'a> {
+ 
+             // It seems Linux is OK with ~130kB and Mac's limit is ~250kB.
+             // TODO: Find this number automatically.
+-            if cmd_buf.len() > 100 * 1000 {
++            if separate_shells {
++                let command = self.separate_shells_command(commands);
++                if command.len() > 100 * 1000 {
++                    writeln!(out, " rspfile = $out.rsp")?;
++                    write!(out, " rspfile_content = ")?;
++                    out.write_all(&command)?;
++                    writeln!(out, "\n command = /bin/sh $out.rsp")?;
++                } else {
++                    out.write_all(b" command = ")?;
++                    out.write_all(&command)?;
++                    writeln!(out)?;
++                }
++            } else if cmd_buf.len() > 100 * 1000 {
+                 writeln!(out, " rspfile = $out.rsp")?;
+                 write!(out, " rspfile_content = ")?;
+                 out.write_all(&cmd_buf)?;
+                 write!(out, "\n command = ")?;
+-                out.write_all(&self.shell)?;
++                out.write_all(&shell)?;
+                 writeln!(out, " $out.rsp")?;
+             } else {
+                 out.write_all(b" command = ")?;
+-                out.write_all(&self.shell)?;
++                out.write_all(&shell)?;
+                 out.write_all(b" ")?;
+-                out.write_all(&self.shell_flags)?;
++                out.write_all(&Self::escape_ninja(&head.shellflag))?;
+                 out.write_all(b" \"")?;
+                 out.write_all(&escape_shell(&cmd_buf.freeze()))?;
+                 writeln!(out, "\"")?;
+diff --git a/src/command.cc b/src/command.cc
+index cc58616..785cb27 100644
+--- a/src/command.cc
++++ b/src/command.cc
+@@ -133,7 +133,12 @@ void AutoQuestionVar::Eval(Evaluator* ev, std::string* s) const {
+   if (ev->avoid_io()) {
+     // Check timestamps using the shell at the start of rule execution
+     // instead.
+-    *s += "${KATI_NEW_INPUTS}";
++    if (ev->eval_depth() == 0 &&
++        NeedsSeparateShells(ev->GetShell(), ev->GetShellFlag(),
++                            ev->is_one_shell()))
++      *s += KatiValueMarker("KATI_NEW_INPUTS");
++    else
++      *s += "${KATI_NEW_INPUTS}";
+     if (!ce_->found_new_inputs()) {
+       std::string def;
+ 
+@@ -185,6 +190,24 @@ void AutoSuffixFVar::Eval(Evaluator* ev, std::string* s) const {
+   }
+ }
+ 
++// make drops the recipe tab that starts a continuation line.
++std::string DropContinuationTabs(std::string_view script) {
++  std::string r;
++  bool escaped = false;
++  for (size_t i = 0; i < script.size(); i++) {
++    const char c = script[i];
++    r += c;
++    if (c == '\n' && escaped && i + 1 < script.size() && script[i + 1] == '\t')
++      i++;
++    escaped = c == '\\' && !escaped;
++  }
++  return r;
++}
++
++bool IsBlankOrPrefix(char c) {
++  return c == ' ' || c == '\t' || c == '@' || c == '-' || c == '+';
++}
++
+ void ParseCommandPrefixes(std::string_view* s, bool* echo, bool* ignore_error) {
+   *s = TrimLeftSpace(*s);
+   while (true) {
+@@ -204,6 +227,85 @@ void ParseCommandPrefixes(std::string_view* s, bool* echo, bool* ignore_error) {
+ 
+ }  // namespace
+ 
++bool IsPosixShell(std::string_view shell) {
++  static const char* kPosixShells[] = {"sh",  "bash", "ksh",  "rksh",
++                                       "zsh", "ash",  "dash", NULL};
++  std::string_view name = Basename(shell);
++  for (const char** p = kPosixShells; *p; p++) {
++    if (name == *p)
++      return true;
++  }
++  return false;
++}
++
++// Ninja commands are single lines, so text with newlines is rebuilt by
++// printf with one single-quoted argument per line.
++std::string ShellQuote(std::string_view text) {
++  const bool multiline = text.find('\n') != std::string::npos;
++  std::string r = multiline ? "\"$(printf '%s\\n' '" : "'";
++  for (char ch : text) {
++    if (ch == '\n')
++      r += "' '";
++    else if (ch == '\'')
++      r += "'\\''";
++    else
++      r += ch;
++  }
++  r += multiline ? "')\"" : "'";
++  return r;
++}
++
++std::string StripOneShellPrefixes(std::string_view script) {
++  std::string r;
++  size_t i = 0;
++  while (i < script.size()) {
++    while (i < script.size() && IsBlankOrPrefix(script[i]))
++      i++;
++    bool escaped = false;
++    while (i < script.size()) {
++      char c = script[i++];
++      r += c;
++      if (c == '\\') {
++        escaped = !escaped;
++      } else {
++        if (c == '\n' && !escaped)
++          break;
++        escaped = false;
++      }
++    }
++  }
++  return r;
++}
++
++// make splits a one-shell script's flags at blanks only, so quotes in them
++// reach the shell as they are.
++std::string OneShellFlags(std::string_view flags) {
++  std::string r;
++  for (std::string_view word : WordScanner(flags)) {
++    if (!r.empty())
++      r += ' ';
++    r += HasShellSyntax(word) ? ShellQuote(word) : std::string(word);
++  }
++  return r;
++}
++
++// Recipes kati can't join into its usual POSIX -c ninja command: one-shell
++// scripts, and lines for other shells or with other flags.
++bool NeedsSeparateShells(std::string_view shell,
++                         std::string_view shellflag,
++                         bool one_shell) {
++  return one_shell || !IsPosixShell(shell) || TrimSpace(shellflag) != "-c";
++}
++
++// Marks a value ninja's shell computes for such a recipe. The \x01 bytes keep
++// a recipe's own text, such as ${KATI_LOCAL}, from ever matching.
++std::string KatiValueMarker(std::string_view name) {
++  std::string r(1, '\x01');
++  r += name;
++  r += '\x01';
++  return r;
++}
++
+ CommandEvaluator::CommandEvaluator(Evaluator* ev) : ev_(ev) {
+ #define INSERT_AUTO_VAR(name, sym)                                      \
+   do {                                                                  \
+@@ -230,37 +332,42 @@ std::vector<Command> CommandEvaluator::Eval(const DepNode& n) {
+   ev_->SetEvaluatingCommand(true);
+   current_dep_node_ = &n;
+   found_new_inputs_ = false;
+-  for (Value* v : n.cmds) {
+-    ev_->set_loc(v->Location());
+-    const std::string&& cmds_buf = v->Eval(ev_);
+-    std::string_view cmds = cmds_buf;
+-    bool global_echo = !g_flags.is_silent_mode;
+-    bool global_ignore_error = false;
+-    ParseCommandPrefixes(&cmds, &global_echo, &global_ignore_error);
+-    if (cmds == "")
+-      continue;
+-    while (true) {
+-      size_t lf_cnt;
+-      size_t index = FindEndOfLine(cmds, 0, &lf_cnt);
+-      if (index == cmds.size())
+-        index = std::string::npos;
+-      std::string_view cmd = TrimLeftSpace(cmds.substr(0, index));
+-      cmds = cmds.substr(index + 1);
+-
+-      bool echo = global_echo;
+-      bool ignore_error = global_ignore_error;
+-      ParseCommandPrefixes(&cmd, &echo, &ignore_error);
+-
+-      if (!cmd.empty()) {
+-        Command& command = result.emplace_back(n.output);
+-        command.cmd = std::string(cmd);
+-        command.echo = echo;
+-        command.ignore_error = ignore_error;
++  const std::string shell = ev_->GetShell();
++  const std::string shellflag = ev_->GetShellFlag();
++  if (ev_->is_one_shell()) {
++    EvalOneShell(n, shell, &result);
++  } else {
++    for (Value* v : n.cmds) {
++      ev_->set_loc(v->Location());
++      const std::string&& cmds_buf = v->Eval(ev_);
++      std::string_view cmds = cmds_buf;
++      bool global_echo = !g_flags.is_silent_mode;
++      bool global_ignore_error = false;
++      ParseCommandPrefixes(&cmds, &global_echo, &global_ignore_error);
++      if (cmds == "")
++        continue;
++      while (true) {
++        size_t lf_cnt;
++        size_t index = FindEndOfLine(cmds, 0, &lf_cnt);
++        if (index == cmds.size())
++          index = std::string::npos;
++        std::string_view cmd = TrimLeftSpace(cmds.substr(0, index));
++        cmds = cmds.substr(index + 1);
++
++        bool echo = global_echo;
++        bool ignore_error = global_ignore_error;
++        ParseCommandPrefixes(&cmd, &echo, &ignore_error);
++
++        if (!cmd.empty()) {
++          Command& command = result.emplace_back(n.output);
++          command.cmd = std::string(cmd);
++          command.echo = echo;
++          command.ignore_error = ignore_error;
++        }
++        if (index == std::string::npos)
++          break;
+       }
+-      if (index == std::string::npos)
+-        break;
+     }
+-    continue;
+   }
+ 
+   if (!ev_->delayed_output_commands().empty()) {
+@@ -278,8 +385,56 @@ std::vector<Command> CommandEvaluator::Eval(const DepNode& n) {
+     ev_->clear_delayed_output_commands();
+   }
+ 
++  for (Command& command : result) {
++    command.shell = shell;
++    command.shellflag =
++        command.one_shell ? OneShellFlags(shellflag) : shellflag;
++  }
++
+   ev_->set_current_scope(NULL);
+   ev_->SetEvaluatingCommand(false);
+ 
+   return result;
+ }
++
++void CommandEvaluator::EvalOneShell(const DepNode& n,
++                                    const std::string& shell,
++                                    std::vector<Command>* result) {
++  std::vector<size_t> starts = {0};
++  starts.insert(starts.end(), n.recipe_breaks.begin(), n.recipe_breaks.end());
++  starts.push_back(n.cmds.size());
++  for (size_t r = 0; r + 1 < starts.size(); r++) {
++    std::string script;
++    for (size_t i = starts[r]; i < starts[r + 1]; i++) {
++      if (i > starts[r])
++        script += '\n';
++      ev_->set_loc(n.loc);
++      n.cmds[i]->Eval(ev_, &script);
++    }
++    script = DropContinuationTabs(script);
++
++    bool echo = !g_flags.is_silent_mode;
++    bool ignore_error = false;
++    size_t start = 0;
++    for (; start < script.size(); start++) {
++      char c = script[start];
++      if (c == '@') {
++        echo = false;
++      } else if (c == '-') {
++        ignore_error = true;
++      } else if (c != '+' && c != ' ' && c != '\t') {
++        break;
++      }
++    }
++    std::string_view body = std::string_view(script).substr(start);
++    if (body.empty())
++      continue;
++
++    Command& command = result->emplace_back(n.output);
++    command.cmd =
++        IsPosixShell(shell) ? StripOneShellPrefixes(body) : std::string(body);
++    command.echo = echo;
++    command.ignore_error = ignore_error;
++    command.one_shell = true;
++  }
++}
+diff --git a/src/command.h b/src/command.h
+index 102c508..d0e3cbe 100644
+--- a/src/command.h
++++ b/src/command.h
+@@ -15,6 +15,8 @@
+ #ifndef COMMAND_H_
+ #define COMMAND_H_
+ 
++#include <string>
++#include <string_view>
+ #include <vector>
+ 
+ #include "symtab.h"
+@@ -24,14 +26,30 @@ class Evaluator;
+ 
+ struct Command {
+   explicit Command(Symbol o)
+-      : output(o), echo(true), ignore_error(false), force_no_subshell(false) {}
++      : output(o),
++        echo(true),
++        ignore_error(false),
++        force_no_subshell(false),
++        one_shell(false) {}
+   Symbol output;
+   std::string cmd;
++  std::string shell;
++  std::string shellflag;
+   bool echo;
+   bool ignore_error;
+   bool force_no_subshell;
++  bool one_shell;
+ };
+ 
++bool IsPosixShell(std::string_view shell);
++std::string ShellQuote(std::string_view text);
++std::string StripOneShellPrefixes(std::string_view script);
++std::string OneShellFlags(std::string_view flags);
++bool NeedsSeparateShells(std::string_view shell,
++                         std::string_view shellflag,
++                         bool one_shell);
++std::string KatiValueMarker(std::string_view name);
++
+ class CommandEvaluator {
+  public:
+   explicit CommandEvaluator(Evaluator* ev);
+@@ -42,6 +60,10 @@ class CommandEvaluator {
+   void set_found_new_inputs(bool val) { found_new_inputs_ = val; }
+ 
+  private:
++  void EvalOneShell(const DepNode& n,
++                    const std::string& shell,
++                    std::vector<Command>* result);
++
+   Evaluator* ev_;
+   const DepNode* current_dep_node_;
+   bool found_new_inputs_;
+diff --git a/src/dep.cc b/src/dep.cc
+index 5b6e5d0..6d3361c 100644
+--- a/src/dep.cc
++++ b/src/dep.cc
+@@ -209,8 +209,11 @@ struct RuleMerger {
+   }
+ 
+   void FillDepNodeFromRule(Symbol output, const Rule* r, DepNode* n) const {
+-    if (is_double_colon)
++    if (is_double_colon) {
++      if (!n->cmds.empty() && !r->cmds.empty())
++        n->recipe_breaks.push_back(n->cmds.size());
+       copy(r->cmds.begin(), r->cmds.end(), back_inserter(n->cmds));
++    }
+ 
+     ApplyOutputPattern(*r, output, r->inputs, &n->actual_inputs);
+     ApplyOutputPattern(*r, output, r->order_only_inputs,
+@@ -333,7 +336,6 @@ class DepBuilder {
+                                                        ".SILENT",
+                                                        ".EXPORT_ALL_VARIABLES",
+                                                        ".NOTPARALLEL",
+-                                                       ".ONESHELL",
+                                                        NULL};
+     for (const char** p = kUnsupportedBuiltinTargets; *p; p++) {
+       if (GetRuleInputs(Intern(*p), &targets, &loc)) {
+diff --git a/src/dep.h b/src/dep.h
+index 594674c..e1b365a 100644
+--- a/src/dep.h
++++ b/src/dep.h
+@@ -38,6 +38,7 @@ struct DepNode {
+ 
+   Symbol output;
+   std::vector<Value*> cmds;
++  std::vector<size_t> recipe_breaks;
+   std::vector<NamedDepNode> deps;
+   std::vector<NamedDepNode> order_onlys;
+   std::vector<NamedDepNode> validations;
+diff --git a/src/eval.cc b/src/eval.cc
+index 61a0588..2423765 100644
+--- a/src/eval.cc
++++ b/src/eval.cc
+@@ -160,6 +160,10 @@ Evaluator::Evaluator()
+       eval_depth_(0),
+       posix_sym_(Intern(".POSIX")),
+       is_posix_(false),
++      oneshell_sym_(Intern(".ONESHELL")),
++      is_one_shell_(false),
++      shellflags_sym_(Intern(".SHELLFLAGS")),
++      is_shellflags_set_(false),
+       export_error_(false) {
+ #if defined(__APPLE__)
+   stack_size_ = pthread_get_stacksize_np(pthread_self());
+@@ -333,6 +337,10 @@ void Evaluator::EvalAssign(const AssignStmt* stmt) {
+   Var* var =
+       EvalRHS(lhs, stmt->rhs, stmt->orig_rhs, stmt->op,
+               stmt->directive == AssignDirective::OVERRIDE, &needs_assign);
++  if (lhs == shellflags_sym_ && !is_bootstrap_ &&
++      (needs_assign || stmt->op == AssignOp::PLUS_EQ)) {
++    is_shellflags_set_ = true;
++  }
+   if (needs_assign) {
+     bool readonly;
+     lhs.SetGlobalVar(var, stmt->directive == AssignDirective::OVERRIDE,
+@@ -526,8 +534,17 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
+   }
+ 
+   for (Symbol o : rule->outputs) {
+-    if (o == posix_sym_)
++    if (o == posix_sym_ && !is_posix_) {
+       is_posix_ = true;
++      Var* flags = shellflags_sym_.PeekGlobalVar();
++      if (!is_shellflags_set_ &&
++          (!flags->IsDefined() || flags->Origin() == VarOrigin::DEFAULT)) {
++        shellflags_sym_.SetGlobalVar(
++            new SimpleVar("-ec", VarOrigin::DEFAULT, nullptr, Loc()));
++      }
++    }
++    if (o == oneshell_sym_)
++      is_one_shell_ = true;
+   }
+ 
+   LOG("Rule: %s", rule->DebugString().c_str());
+@@ -865,8 +882,7 @@ std::string Evaluator::GetShell() {
+ }
+ 
+ std::string Evaluator::GetShellFlag() {
+-  // TODO: Handle $(.SHELLFLAGS)
+-  return is_posix_ ? "-ec" : "-c";
++  return EvalVar(shellflags_sym_);
+ }
+ 
+ std::string Evaluator::GetShellAndFlag() {
+diff --git a/src/eval.h b/src/eval.h
+index 6c4199f..6e7e226 100644
+--- a/src/eval.h
++++ b/src/eval.h
+@@ -165,6 +165,8 @@ class Evaluator {
+   bool avoid_io() const { return avoid_io_; }
+   void set_avoid_io(bool a) { avoid_io_ = a; }
+ 
++  bool is_one_shell() const { return is_one_shell_; }
++
+   const std::vector<std::string>& delayed_output_commands() const {
+     return delayed_output_commands_;
+   }
+@@ -273,6 +275,10 @@ class Evaluator {
+ 
+   Symbol posix_sym_;
+   bool is_posix_;
++  Symbol oneshell_sym_;
++  bool is_one_shell_;
++  Symbol shellflags_sym_;
++  bool is_shellflags_set_;
+ 
+   void* stack_addr_;
+   size_t stack_size_;
+diff --git a/src/exec.cc b/src/exec.cc
+index 1539369..d10cffe 100644
+--- a/src/exec.cc
++++ b/src/exec.cc
+@@ -44,10 +44,7 @@ const double kProcessing = -1.0;
+ 
+ class Executor {
+  public:
+-  explicit Executor(Evaluator* ev) : ce_(ev), num_commands_(0) {
+-    shell_ = ev->GetShell();
+-    shellflag_ = ev->GetShellFlag();
+-  }
++  explicit Executor(Evaluator* ev) : ce_(ev), num_commands_(0) {}
+ 
+   double ExecNode(const DepNode& n, const char* needed_by) {
+     auto found = done_.find(n.output);
+@@ -106,9 +103,10 @@ class Executor {
+       }
+       if (!g_flags.is_dry_run) {
+         std::string out;
+-        int result = RunCommand(shell_, shellflag_, command.cmd.c_str(),
++        int result = RunCommand(command.shell, command.shellflag, command.cmd,
+                                 RedirectStderr::STDOUT, &out);
+         printf("%s", out.c_str());
++        fflush(stdout);
+         if (result != 0) {
+           if (command.ignore_error) {
+             fprintf(stderr, "[%s] Error %d (ignored)\n", command.output.c_str(),
+@@ -131,8 +129,6 @@ class Executor {
+  private:
+   CommandEvaluator ce_;
+   std::unordered_map<Symbol, double> done_;
+-  std::string shell_;
+-  std::string shellflag_;
+   uint64_t num_commands_;
+ };
+ 
+diff --git a/src/fileutil.cc b/src/fileutil.cc
+index e6518ef..6df62ea 100644
+--- a/src/fileutil.cc
++++ b/src/fileutil.cc
+@@ -30,7 +30,9 @@
+ #include <mach-o/dyld.h>
+ #endif
+ 
++#include <string>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include "log.h"
+ #include "strutil.h"
+@@ -63,26 +65,36 @@ double GetTimestamp(std::string_view filename) {
+   return GetTimestampFromStat(st);
+ }
+ 
++// Quotes and other shell syntax in .SHELLFLAGS need a shell to parse them, as
++// in make.
++bool HasShellSyntax(std::string_view s) {
++  return s.find_first_of("\"'\\$`*?[]~#;&|<>(){}!\n") != std::string_view::npos;
++}
++
+ int RunCommand(const std::string& shell,
+                const std::string& shellflag,
+                const std::string& cmd,
+                RedirectStderr redirect_stderr,
+                std::string* s) {
+-  const char* argv[] = {NULL, NULL, NULL, NULL};
++  std::vector<const char*> argv;
+   std::string cmd_with_shell;
+-  if (shell[0] != '/' || shell.find_first_of(" $") != std::string::npos) {
++  std::vector<std::string> flag_words;
++  if (shell[0] != '/' || shell.find_first_of(" $") != std::string::npos ||
++      HasShellSyntax(shellflag)) {
+     std::string cmd_escaped = cmd;
+     EscapeShell(&cmd_escaped);
+     cmd_with_shell = shell + " " + shellflag + " \"" + cmd_escaped + "\"";
+-    argv[0] = "/bin/sh";
+-    argv[1] = "-c";
+-    argv[2] = cmd_with_shell.c_str();
++    argv = {"/bin/sh", "-c", cmd_with_shell.c_str()};
+   } else {
+     // If the shell isn't complicated, we don't need to wrap in /bin/sh
+-    argv[0] = shell.c_str();
+-    argv[1] = shellflag.c_str();
+-    argv[2] = cmd.c_str();
++    for (std::string_view flag : WordScanner(shellflag))
++      flag_words.emplace_back(flag);
++    argv.push_back(shell.c_str());
++    for (const std::string& flag : flag_words)
++      argv.push_back(flag.c_str());
++    argv.push_back(cmd.c_str());
+   }
++  argv.push_back(NULL);
+ 
+   int pipefd[2];
+   if (pipe(pipefd) != 0)
+@@ -137,8 +149,8 @@ int RunCommand(const std::string& shell,
+   }
+ 
+   pid_t pid;
+-  err = posix_spawn(&pid, argv[0], &action, &attr, const_cast<char**>(argv),
+-                    environ);
++  err = posix_spawn(&pid, argv[0], &action, &attr,
++                    const_cast<char**>(argv.data()), environ);
+   if (err != 0) {
+     ERROR("posix_spawn: %s", strerror(err));
+   }
+diff --git a/src/fileutil.h b/src/fileutil.h
+index 6f4f067..1c54fe4 100644
+--- a/src/fileutil.h
++++ b/src/fileutil.h
+@@ -33,6 +33,8 @@ enum struct RedirectStderr {
+   DEV_NULL,
+ };
+ 
++bool HasShellSyntax(std::string_view s);
++
+ int RunCommand(const std::string& shell,
+                const std::string& shellflag,
+                const std::string& cmd,
+diff --git a/src/func.cc b/src/func.cc
+index b3e544c..9378dfe 100644
+--- a/src/func.cc
++++ b/src/func.cc
+@@ -30,6 +30,7 @@
+ #include <sstream>
+ #include <unordered_map>
+ 
++#include "command.h"
+ #include "eval.h"
+ #include "file_cache.h"
+ #include "fileutil.h"
+@@ -596,6 +597,15 @@ bool ShouldStoreCommandResult(std::string_view cmd) {
+ 
+ void ShellFunc(const std::vector<Value*>& args, Evaluator* ev, std::string* s) {
+   std::string cmd = args[0]->Eval(ev);
++  std::string shell = ev->GetShell();
++  std::string shellflag = ev->GetShellFlag();
++  // Once .ONESHELL is read, make runs $(shell ...) as it runs a one-shell
++  // script.
++  if (ev->is_one_shell()) {
++    shellflag = OneShellFlags(shellflag);
++    if (IsPosixShell(shell) && cmd.find('\n') != std::string::npos)
++      cmd = StripOneShellPrefixes(cmd);
++  }
+   if (ev->avoid_io() && !HasNoIoInShellScript(cmd)) {
+     if (ev->eval_depth() > 1) {
+       ERROR_LOC(ev->loc(),
+@@ -603,6 +613,17 @@ void ShellFunc(const std::vector<Value*>& args, Evaluator* ev, std::string* s) {
+                 "to other make constructs: %s",
+                 cmd.c_str());
+     }
++    // A one-shell script, or a line for another shell or other flags, gets the
++    // output as text: ninja's shell runs the call with the recipe's shell
++    // before the recipe starts. A POSIX line run with -c runs it itself.
++    if (NeedsSeparateShells(shell, shellflag, ev->is_one_shell())) {
++      const std::string var =
++          StringPrintf("KATI_SHELL_%zu", ev->delayed_output_commands().size());
++      ev->add_delayed_output_command(var + "=$(" + shell + ' ' + shellflag +
++                                     ' ' + ShellQuote(cmd) + " || true)");
++      *s += KatiValueMarker(var);
++      return;
++    }
+     StripShellComment(&cmd);
+     *s += "$(";
+     *s += cmd;
+@@ -610,9 +631,6 @@ void ShellFunc(const std::vector<Value*>& args, Evaluator* ev, std::string* s) {
+     return;
+   }
+ 
+-  std::string shell = ev->GetShell();
+-  std::string shellflag = ev->GetShellFlag();
+-
+   std::string out;
+   FindCommand* fc = NULL;
+   int returnCode = ShellFuncImpl(shell, shellflag, cmd, ev->loc(), &out, &fc);
+diff --git a/src/main.cc b/src/main.cc
+index f6dcc7c..086d87c 100644
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -66,6 +66,9 @@ static void ReadBootstrapMakefile(const std::vector<Symbol>& targets,
+        "KATI?=ckati\n"
+        // Overwrite $SHELL environment variable.
+        "SHELL=/bin/sh\n"
++       "ifeq ($(origin .SHELLFLAGS),undefined)\n"
++       ".SHELLFLAGS:=-c\n"
++       "endif\n"
+        // TODO: Add more builtin vars.
+       );
+ 
+diff --git a/src/ninja.cc b/src/ninja.cc
+index acfef40..02609e0 100644
+--- a/src/ninja.cc
++++ b/src/ninja.cc
+@@ -150,8 +150,8 @@ class NinjaGenerator {
+       : ce_(ev),
+         ev_(ev),
+         rule_id_(0),
+-        shell_(EscapeNinja(ev->GetShell())),
+-        shell_flags_(EscapeNinja(ev->GetShellFlag())),
++        shell_(ev->GetShell()),
++        shellflag_(ev->GetShellFlag()),
+         kati_binary_(GetExecutablePath()),
+         start_time_(start_time),
+         default_target_(NULL) {
+@@ -361,6 +361,75 @@ class NinjaGenerator {
+     return true;
+   }
+ 
++  static void JoinCommands(const std::vector<Command>& commands,
++                           std::string* cmd_buf) {
++    for (const Command& c : commands) {
++      if (!cmd_buf->empty())
++        *cmd_buf += '\n';
++      *cmd_buf += c.cmd;
++    }
++  }
++
++  // kati's ninja-time values, $(shell ...) and $?, are set by ninja's shell
++  // ahead of the recipe and reach its script as one line of text, as make
++  // expands them.
++  static std::string SpliceKatiValues(const std::string& quoted) {
++    std::string r;
++    size_t done = 0;
++    for (size_t begin = quoted.find('\x01'); begin != std::string::npos;
++         begin = quoted.find('\x01', done)) {
++      const size_t end = quoted.find('\x01', begin + 1);
++      if (end == std::string::npos)
++        break;
++      r.append(quoted, done, begin - done);
++      r += "'\"$(printf %s \"${" + quoted.substr(begin + 1, end - begin - 1) +
++           "}\" | tr '\\n' ' ')\"'";
++      done = end + 1;
++    }
++    r.append(quoted, done);
++    return r;
++  }
++
++  static std::string EscapeNinjaDollars(std::string_view s) {
++    std::string r;
++    for (char ch : s) {
++      if (ch == '$')
++        r += '$';
++      r += ch;
++    }
++    return r;
++  }
++
++  static std::string Invocation(const Command& c) {
++    std::string r =
++        c.shell + ' ' + c.shellflag + ' ' + SpliceKatiValues(ShellQuote(c.cmd));
++    if (c.ignore_error)
++      return "( " + r + " || true )";
++    return r;
++  }
++
++  // One invocation per command: a whole recipe under .ONESHELL, a line
++  // otherwise, as make runs them. kati's own ninja-time commands run ahead of
++  // them, with the whole chain in the global SHELL.
++  std::string SeparateShellsCommand(
++      const std::vector<Command>& commands) const {
++    std::string r;
++    bool outer_commands = false;
++    for (const Command& c : commands) {
++      if (!r.empty())
++        r += " && ";
++      if (c.force_no_subshell) {
++        r += c.cmd;
++        outer_commands = true;
++      } else {
++        r += Invocation(c);
++      }
++    }
++    if (outer_commands && IsPosixShell(shell_))
++      r = shell_ + ' ' + shellflag_ + ' ' + ShellQuote(r);
++    return EscapeNinjaDollars(r);
++  }
++
+   void GenShellScript(const char* name,
+                       const std::vector<Command>& commands,
+                       std::string* cmd_buf,
+@@ -451,22 +520,39 @@ class NinjaGenerator {
+       rule_name = StringPrintf("rule%d", nn.rule_id);
+       out << "rule " << rule_name << "\n";
+ 
++      const Command& head = commands.back();
++      const std::string shell = EscapeNinja(head.shell);
+       std::string description = "build $out";
+       std::string cmd_buf;
+-      GenShellScript(node->output.c_str(), commands, &cmd_buf, &description);
++      const bool separate_shells =
++          NeedsSeparateShells(head.shell, head.shellflag, head.one_shell);
++      if (separate_shells) {
++        JoinCommands(commands, &cmd_buf);
++      } else {
++        GenShellScript(node->output.c_str(), commands, &cmd_buf, &description);
++      }
+       out << " description = " << description << "\n";
+       EmitDepfile(nn, &cmd_buf, out);
+ 
+       // It seems Linux is OK with ~130kB and Mac's limit is ~250kB.
+       // TODO: Find this number automatically.
+-      if (cmd_buf.size() > 100 * 1000) {
++      if (separate_shells) {
++        const std::string command = SeparateShellsCommand(commands);
++        if (command.size() > 100 * 1000) {
++          out << " rspfile = $out.rsp\n";
++          out << " rspfile_content = " << command << "\n";
++          out << " command = /bin/sh $out.rsp\n";
++        } else {
++          out << " command = " << command << "\n";
++        }
++      } else if (cmd_buf.size() > 100 * 1000) {
+         out << " rspfile = $out.rsp\n";
+         out << " rspfile_content = " << cmd_buf << "\n";
+-        out << " command = " << shell_ << " $out.rsp\n";
++        out << " command = " << shell << " $out.rsp\n";
+       } else {
+         EscapeShell(&cmd_buf);
+-        out << " command = " << shell_ << ' ' << shell_flags_ << " \""
+-            << cmd_buf << "\"\n";
++        out << " command = " << shell << ' ' << EscapeNinja(head.shellflag)
++            << " \"" << cmd_buf << "\"\n";
+       }
+       if (node->is_restat) {
+         out << " restat = 1\n";
+@@ -762,7 +848,7 @@ class NinjaGenerator {
+   SymbolSet done_;
+   int rule_id_;
+   const std::string shell_;
+-  const std::string shell_flags_;
++  const std::string shellflag_;
+   std::map<std::string, std::string> used_envs_;
+   const std::string kati_binary_;
+   const double start_time_;

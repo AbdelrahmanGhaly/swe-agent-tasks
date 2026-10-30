@@ -1,0 +1,2890 @@
+diff --git a/src-rs/command.rs b/src-rs/command.rs
+index 270d8b6..9b439ee 100644
+--- a/src-rs/command.rs
++++ b/src-rs/command.rs
+@@ -207,6 +207,22 @@ fn parse_command_prefixes(cmds: Bytes, echo: &mut bool, ignore_error: &mut bool)
+     cmds.slice_ref(s)
+ }
+ 
++// Like make, which before it runs each line of a command removes the rule's
++// recipe prefix right after every newline of what is left, whether a
++// backslash continued a line or the expansion brought it.
++fn remove_prefix_after_newlines(prefix: u8, cmds: &[u8]) -> Bytes {
++    let mut r = Vec::with_capacity(cmds.len());
++    let mut i = 0;
++    while i < cmds.len() {
++        r.push(cmds[i]);
++        if cmds[i] == b'\n' && cmds.get(i + 1) == Some(&prefix) {
++            i += 1;
++        }
++        i += 1;
++    }
++    Bytes::from(r)
++}
++
+ pub struct CommandEvaluator<'a> {
+     pub ev: &'a mut Evaluator,
+     pub current_dep_node: Arc<Mutex<Option<Arc<Mutex<DepNode>>>>>,
+@@ -273,19 +289,25 @@ impl<'a> CommandEvaluator<'a> {
+     pub fn eval(&mut self, n: &Arc<Mutex<DepNode>>) -> Result<Vec<Command>> {
+         let mut result: Vec<Command> = Vec::new();
+         let node_cmds;
++        let recipe_prefixes;
+         {
+             let node = n.lock();
+             self.ev.loc = node.loc.clone();
+             self.ev.current_scope = node.rule_vars.clone();
+             node_cmds = node.cmds.clone();
++            recipe_prefixes = node.recipe_prefixes.clone();
+         }
+         self.ev.is_evaluating_command = true;
+         *self.current_dep_node.lock() = Some(n.clone());
+         *self.found_new_inputs.lock() = false;
+-        for v in node_cmds {
++        for (v, prefix) in node_cmds.into_iter().zip(recipe_prefixes) {
+             self.ev.loc = v.loc();
+             let cmds_buf = v.eval_to_buf(self.ev)?;
+-            let mut cmds = cmds_buf.clone();
++            let mut cmds = if prefix != 0 {
++                remove_prefix_after_newlines(prefix, &cmds_buf)
++            } else {
++                cmds_buf
++            };
+             let mut global_echo = !FLAGS.is_silent_mode;
+             let mut global_ignore_error = false;
+             cmds = parse_command_prefixes(cmds, &mut global_echo, &mut global_ignore_error);
+@@ -296,6 +318,9 @@ impl<'a> CommandEvaluator<'a> {
+                 let eol = find_end_of_line(&cmds);
+                 let mut cmd = eol.line.slice_ref(trim_left_space(&eol.line));
+                 cmds = eol.rest;
++                if prefix != 0 {
++                    cmds = remove_prefix_after_newlines(prefix, &cmds);
++                }
+ 
+                 let mut echo = global_echo;
+                 let mut ignore_error = global_ignore_error;
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 3f32205..1f4ad21 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -47,6 +47,8 @@ pub type NamedDepNode = (Symbol, Arc<Mutex<DepNode>>);
+ pub struct DepNode {
+     pub output: Symbol,
+     pub cmds: Vec<Arc<Value>>,
++    /// For each command, the .RECIPEPREFIX of the rule it comes from.
++    pub recipe_prefixes: Vec<u8>,
+     pub deps: Vec<NamedDepNode>,
+     pub order_onlys: Vec<NamedDepNode>,
+     pub validations: Vec<NamedDepNode>,
+@@ -71,6 +73,7 @@ impl DepNode {
+         Arc::new(Mutex::new(Self {
+             output,
+             cmds: Vec::new(),
++            recipe_prefixes: Vec::new(),
+             deps: Vec::new(),
+             order_onlys: Vec::new(),
+             validations: Vec::new(),
+@@ -316,6 +319,8 @@ impl RuleMerger {
+     fn fill_dep_node_from_rule(&self, output: Symbol, r: &Rule, n: &mut DepNode) {
+         if self.is_double_colon {
+             n.cmds.extend(r.cmds.iter().cloned());
++            n.recipe_prefixes
++                .extend(std::iter::repeat_n(r.recipe_prefix, r.cmds.len()));
+         }
+ 
+         n.actual_inputs
+@@ -350,10 +355,12 @@ impl RuleMerger {
+             self.fill_dep_node_from_rule(output, primary_rule, &mut n);
+             self.fill_dep_node_loc(primary_rule, &mut n);
+             n.cmds = primary_rule.cmds.clone();
++            n.recipe_prefixes = vec![primary_rule.recipe_prefix; n.cmds.len()];
+         } else if let Some(pattern_rule) = pattern_rule {
+             self.fill_dep_node_from_rule(output, pattern_rule, &mut n);
+             self.fill_dep_node_loc(pattern_rule, &mut n);
+             n.cmds = pattern_rule.cmds.clone();
++            n.recipe_prefixes = vec![pattern_rule.recipe_prefix; n.cmds.len()];
+         }
+ 
+         for r in &self.rules {
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 6bb5651..9724295 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -22,7 +22,7 @@ use std::os::unix::ffi::OsStringExt;
+ use std::sync::{Arc, LazyLock, Weak};
+ 
+ use anyhow::{Context, Result};
+-use bytes::{Buf, Bytes};
++use bytes::{Buf, Bytes, BytesMut};
+ use memchr::{memchr, memchr2};
+ use parking_lot::Mutex;
+ 
+@@ -30,14 +30,16 @@ use crate::expr::Evaluable;
+ use crate::expr::Value;
+ use crate::flags::FLAGS;
+ use crate::loc::Loc;
+-use crate::parser::{parse_assign_statement, parse_buf_no_stats};
++use crate::parser::{ReadFrame, parse_assign_statement, parse_buf_no_stats, parse_rest};
+ use crate::rule::{Rule, is_pattern_rule};
+ use crate::stmt::{
+     AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt, IncludeStmt, RuleSep, RuleStmt,
+-    Statement,
++    Statement, Stmt, StmtEnd,
+ };
+ use crate::strutil::{is_space_byte, trim_leading_curdir, trim_right_space, word_scanner};
+-use crate::symtab::{ALLOW_RULES_SYM, KATI_READONLY_SYM, MAKEFILE_LIST, SHELL_SYM, Symbol, intern};
++use crate::symtab::{
++    ALLOW_RULES_SYM, KATI_READONLY_SYM, MAKEFILE_LIST, RECIPEPREFIX_SYM, SHELL_SYM, Symbol, intern,
++};
+ use crate::var::{Var, VarOrigin, Variable, Vars};
+ use crate::{collect_stats_with_slow_report, error_loc, file_cache, log, warn_loc};
+ 
+@@ -239,6 +241,27 @@ impl IncludeGraph {
+ static USED_UNDEFINED_VARS: LazyLock<Mutex<HashSet<Symbol>>> =
+     LazyLock::new(|| Mutex::new(HashSet::new()));
+ 
++/// A text being evaluated, the .RECIPEPREFIX it was read with, and the
++/// conditionals open in it. After a change of .RECIPEPREFIX, the evaluation
++/// goes back to the text, which reads the rest again as |read_again| says.
++struct ReadContext {
++    buf: Bytes,
++    loc: Loc,
++    fixed_lineno: bool,
++    recipe_prefix: u8,
++    open_ifs: Vec<ReadFrame>,
++    read_again: Option<ReadAgain>,
++}
++
++/// Where the rest of a text is read again: after which statement, whether the
++/// change came from the innermost conditional itself, and the conditionals
++/// open there.
++struct ReadAgain {
++    after: StmtEnd,
++    at_true_part: bool,
++    frames: Vec<ReadFrame>,
++}
++
+ pub struct Evaluator {
+     pub rule_vars: HashMap<Symbol, Arc<Vars>>,
+     pub rules: Vec<Rule>,
+@@ -275,6 +298,10 @@ pub struct Evaluator {
+     pub profiled_files: Vec<OsString>,
+ 
+     pub is_evaluating_command: bool,
++
++    recipe_prefix: u8,
++    recipe_prefix_set: bool,
++    read_contexts: Vec<ReadContext>,
+ }
+ 
+ impl Default for Evaluator {
+@@ -321,6 +348,10 @@ impl Evaluator {
+             profiled_files: Vec::new(),
+ 
+             is_evaluating_command: false,
++
++            recipe_prefix: b'\t',
++            recipe_prefix_set: false,
++            read_contexts: Vec::new(),
+         }
+     }
+ 
+@@ -512,6 +543,126 @@ impl Evaluator {
+             var.write().readonly = true
+         }
+         self.trace_variable_assign(&lhs, &var)?;
++        if lhs == *RECIPEPREFIX_SYM {
++            self.update_recipe_prefix()?;
++        }
++        Ok(())
++    }
++
++    pub fn recipe_prefix(&self) -> u8 {
++        self.recipe_prefix
++    }
++
++    // The first character of the value, which for a recursive variable is its
++    // text before expansion, or a tab when it is empty. Like make,
++    // target-specific values do not change it.
++    fn update_recipe_prefix(&mut self) -> Result<()> {
++        self.recipe_prefix = match RECIPEPREFIX_SYM.get_global_var() {
++            Some(var) => var.read().first_char_as_written()?.unwrap_or(b'\t'),
++            None => b'\t',
++        };
++        self.recipe_prefix_set = true;
++        Ok(())
++    }
++
++    /// Evaluates |stmts|, read from |buf| with |recipe_prefix|. When a statement
++    /// changes .RECIPEPREFIX, the rest of |buf| is read again with the new one,
++    /// since make reads each line with the prefix in effect then.
++    pub fn eval_text(
++        &mut self,
++        buf: &Bytes,
++        loc: Loc,
++        fixed_lineno: bool,
++        recipe_prefix: u8,
++        stmts: &[Stmt],
++    ) -> Result<()> {
++        self.read_contexts.push(ReadContext {
++            buf: buf.clone(),
++            loc,
++            fixed_lineno,
++            recipe_prefix,
++            open_ifs: Vec::new(),
++            read_again: None,
++        });
++        let mut r = self.eval_stmts(stmts);
++        while r.is_ok() && self.read_contexts.last().unwrap().read_again.is_some() {
++            r = self.read_again();
++        }
++        self.read_contexts.pop();
++        r
++    }
++
++    fn eval_stmts(&mut self, stmts: &[Stmt]) -> Result<()> {
++        let idx = self.read_contexts.len() - 1;
++        for (i, stmt) in stmts.iter().enumerate() {
++            log!("{stmt:?}");
++            stmt.eval(self)?;
++            if self.read_contexts[idx].read_again.is_some() {
++                return Ok(());
++            }
++            // The rest of the text is read again from the end of the line, once
++            // the other statements read from that line are evaluated too.
++            if self.recipe_prefix != self.read_contexts[idx].recipe_prefix
++                && stmts
++                    .get(i + 1)
++                    .is_none_or(|next| next.end().offset != stmt.end().offset)
++            {
++                self.read_again_after(idx, stmt.end(), false);
++                return Ok(());
++            }
++        }
++        Ok(())
++    }
++
++    fn read_again_after(&mut self, idx: usize, after: StmtEnd, at_true_part: bool) {
++        let ctx = &mut self.read_contexts[idx];
++        ctx.read_again = Some(ReadAgain {
++            after,
++            at_true_part,
++            frames: ctx.open_ifs.clone(),
++        });
++    }
++
++    // Reads the rest of the innermost text again with the current
++    // .RECIPEPREFIX and evaluates it instead: what is left of the part each
++    // open conditional takes, innermost first, then the statements after them.
++    // When the change came from the innermost conditional itself, its true part
++    // is read too.
++    fn read_again(&mut self) -> Result<()> {
++        let idx = self.read_contexts.len() - 1;
++        let ctx = &mut self.read_contexts[idx];
++        let read_again = ctx.read_again.take().unwrap();
++        let buf = ctx.buf.clone();
++        let (stmts, frame_stmts) = parse_rest(
++            &buf,
++            ctx.loc.clone(),
++            ctx.fixed_lineno,
++            self.recipe_prefix,
++            read_again.after,
++            &read_again.frames,
++            read_again.at_true_part,
++        )?;
++
++        ctx.recipe_prefix = self.recipe_prefix;
++        let frames = read_again.frames;
++        for i in (0..frame_stmts.len()).rev() {
++            if self.read_contexts[idx].read_again.is_some() {
++                break;
++            }
++            self.read_contexts[idx].open_ifs = frames[..=i].to_vec();
++            let part = if frames[i].in_else {
++                &frame_stmts[i].false_stmts
++            } else {
++                &frame_stmts[i].true_stmts
++            };
++            let part = part.lock().clone();
++            self.eval_stmts(&part)?;
++        }
++        self.read_contexts[idx].open_ifs.clear();
++        if self.read_contexts[idx].read_again.is_none() {
++            let stmts = stmts.lock().clone();
++            self.eval_stmts(&stmts)?;
++        }
+         Ok(())
+     }
+ 
+@@ -652,7 +803,40 @@ impl Evaluator {
+         self.loc = Some(stmt.loc());
+         self.in_rule = false;
+ 
+-        let before_term = stmt.lhs.eval_to_buf(self)?;
++        // Like make, which takes the .RECIPEPREFIX for a rule's commands once the
++        // word of the line that gives the colon is expanded, the parts of the
++        // line are expanded in turn.
++        let parts = match &*stmt.lhs {
++            Value::List(_, parts) => parts.as_slice(),
++            _ => std::slice::from_ref(&stmt.lhs),
++        };
++        let mut before_term = BytesMut::new();
++        let mut i = 0;
++        while i < parts.len() && !before_term.contains(&b':') {
++            parts[i].eval(self, &mut before_term)?;
++            i += 1;
++        }
++        // When the colon came from a reference, the rest of its word comes first.
++        if i > 0 && !matches!(*parts[i - 1], Value::Literal(..)) {
++            while i < parts.len()
++                && !matches!(&*parts[i], Value::Literal(_, s) if s.iter().any(|c| b" \t:".contains(c)))
++            {
++                parts[i].eval(self, &mut before_term)?;
++                i += 1;
++            }
++        }
++        // Like make, this is the prefix the commands drop after newlines, even
++        // when the rest of the line sets another for the lines that follow.
++        let mut recipe_prefix = self.recipe_prefix;
++        for part in &parts[i..] {
++            part.eval(self, &mut before_term)?;
++        }
++        // Before .RECIPEPREFIX is first set, commands keep a tab after a
++        // newline, as kati always did.
++        if !self.recipe_prefix_set {
++            recipe_prefix = 0;
++        }
++        let before_term = before_term.freeze();
+         // See semicolon.mk.
+         if before_term.iter().all(|c| b" \t\n;".contains(c)) {
+             if stmt.sep == RuleSep::Semicolon {
+@@ -698,6 +882,7 @@ impl Evaluator {
+         }
+ 
+         let mut rule = Rule::new(self.loc.clone().unwrap(), is_double_colon);
++        rule.recipe_prefix = recipe_prefix;
+         if is_pattern_rule {
+             rule.output_patterns = targets;
+         } else {
+@@ -742,20 +927,18 @@ impl Evaluator {
+         self.loc = Some(stmt.loc());
+ 
+         if !self.in_rule {
+-            let stmts = parse_buf_no_stats(&stmt.orig(), stmt.loc())?;
++            let stmts = parse_buf_no_stats(&stmt.orig(), stmt.loc(), self.recipe_prefix)?;
+             let stmts = stmts.lock();
+-            for a in &*stmts {
+-                a.eval(self)?;
+-            }
+-            return Ok(());
++            return self.eval_text(&stmt.orig(), stmt.loc(), true, self.recipe_prefix, &stmts);
+         }
+ 
++        let expr = stmt.expr()?;
++        log!("Command: {:?}", expr);
+         let last_rule = self.rules.last_mut().unwrap();
+-        last_rule.cmds.push(stmt.expr.clone());
++        last_rule.cmds.push(expr);
+         if last_rule.cmd_loc.is_none() {
+             last_rule.cmd_loc = Some(stmt.loc());
+         }
+-        log!("Command: {:?}", stmt.expr);
+ 
+         Ok(())
+     }
+@@ -795,18 +978,27 @@ impl Evaluator {
+             false => &stmt.false_stmts,
+         };
+         let stmts = stmts.lock();
+-        for a in stmts.iter() {
+-            log!("{:?}", a);
+-            a.eval(self)?;
+-        }
+-        Ok(())
++        let idx = self.read_contexts.len() - 1;
++        self.read_contexts[idx].open_ifs.push(ReadFrame {
++            in_else: !is_true,
++            num_nest: stmt.num_nest,
++        });
++        // The condition may have changed .RECIPEPREFIX for the lines after it.
++        let r = if self.recipe_prefix != self.read_contexts[idx].recipe_prefix {
++            self.read_again_after(idx, stmt.end(), true);
++            Ok(())
++        } else {
++            self.eval_stmts(&stmts)
++        };
++        self.read_contexts[idx].open_ifs.pop();
++        r
+     }
+ 
+     pub fn do_include(&mut self, fname: &Bytes) -> Result<()> {
+         let filename = OsString::from_vec(fname.to_vec());
+         collect_stats_with_slow_report!("included makefiles", &filename);
+ 
+-        let Some(mk) = file_cache::get_makefile(&filename)? else {
++        let Some(mk) = file_cache::get_makefile(&filename, self.recipe_prefix)? else {
+             error_loc!(
+                 self.loc.as_ref(),
+                 "{} does not exist",
+@@ -829,10 +1021,12 @@ impl Evaluator {
+                 None,
+             )?;
+         }
+-        for stmt in mk.stmts.lock().iter() {
+-            log!("{stmt:?}");
+-            stmt.eval(self)?;
+-        }
++        let stmts = mk.stmts.lock();
++        let loc = Loc {
++            filename: mk.filename,
++            line: 0,
++        };
++        self.eval_text(&mk.buf, loc, false, mk.recipe_prefix, &stmts)?;
+ 
+         if !self.profiled_files.is_empty() {
+             for mk in std::mem::take(&mut self.profiled_files) {
+diff --git a/src-rs/file.rs b/src-rs/file.rs
+index 4c7f500..b891de3 100644
+--- a/src-rs/file.rs
++++ b/src-rs/file.rs
+@@ -30,10 +30,12 @@ pub struct Makefile {
+     pub filename: Symbol,
+     pub mtime: SystemTime,
+     pub stmts: Arc<Mutex<Vec<Stmt>>>,
++    pub buf: Bytes,
++    pub recipe_prefix: u8,
+ }
+ 
+ impl Makefile {
+-    pub fn from_file(filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
++    pub fn from_file(filename: &OsStr, recipe_prefix: u8) -> Result<Option<Arc<Makefile>>> {
+         let mut file = match std::fs::File::open(filename) {
+             Ok(f) => f,
+             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+@@ -45,12 +47,14 @@ impl Makefile {
+         let buf = Bytes::from(buf);
+ 
+         let filename = intern(filename.as_bytes().to_vec());
+-        let stmts = parse_file(&buf, filename)?;
++        let stmts = parse_file(&buf, filename, recipe_prefix)?;
+ 
+         Ok(Some(Arc::new(Makefile {
+             filename,
+             mtime,
+             stmts,
++            buf,
++            recipe_prefix,
+         })))
+     }
+ }
+diff --git a/src-rs/file_cache.rs b/src-rs/file_cache.rs
+index 70489db..a587167 100644
+--- a/src-rs/file_cache.rs
++++ b/src-rs/file_cache.rs
+@@ -34,24 +34,29 @@ static CACHE: LazyLock<Mutex<MakefileCacheManager>> = LazyLock::new(|| {
+ });
+ 
+ struct MakefileCacheManager {
+-    cache: HashMap<OsString, Option<Arc<Makefile>>>,
++    // A makefile is read again for each .RECIPEPREFIX it is included with.
++    cache: HashMap<(OsString, u8), Option<Arc<Makefile>>>,
+     extra_file_deps: HashMap<OsString, SystemTime>,
+ }
+ 
+ impl MakefileCacheManager {
+-    fn get_makefile(&mut self, filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
+-        if let Some(mk) = self.cache.get(filename) {
++    fn get_makefile(
++        &mut self,
++        filename: &OsStr,
++        recipe_prefix: u8,
++    ) -> Result<Option<Arc<Makefile>>> {
++        let key = (filename.to_os_string(), recipe_prefix);
++        if let Some(mk) = self.cache.get(&key) {
+             return Ok(mk.clone());
+         }
+-        let filename = filename.to_os_string();
+-        let mk = Makefile::from_file(&filename)?;
+-        self.cache.insert(filename, mk.clone());
++        let mk = Makefile::from_file(filename, recipe_prefix)?;
++        self.cache.insert(key, mk.clone());
+         Ok(mk)
+     }
+ }
+ 
+-pub fn get_makefile(filename: &OsStr) -> Result<Option<Arc<Makefile>>> {
+-    CACHE.lock().get_makefile(filename)
++pub fn get_makefile(filename: &OsStr, recipe_prefix: u8) -> Result<Option<Arc<Makefile>>> {
++    CACHE.lock().get_makefile(filename, recipe_prefix)
+ }
+ 
+ pub fn add_extra_file_dep(filename: OsString) {
+@@ -64,7 +69,7 @@ pub fn add_extra_file_dep(filename: OsString) {
+ pub fn get_all_filenames() -> HashMap<OsString, SystemTime> {
+     let manager = CACHE.lock();
+     let mut ret = HashMap::new();
+-    for (p, mk) in &manager.cache {
++    for ((p, _), mk) in &manager.cache {
+         let mtime = mk
+             .as_ref()
+             .map(|m| m.mtime)
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 0ab7def..d8f33a2 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -530,13 +530,10 @@ fn eval_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) ->
+             String::from_utf8_lossy(&text)
+         );
+     }
+-    let stmts = parse_buf(&text, ev.loc.clone().unwrap_or_default())?;
++    let loc = ev.loc.clone().unwrap_or_default();
++    let stmts = parse_buf(&text, loc.clone(), ev.recipe_prefix())?;
+     let stmts = stmts.lock();
+-    for stmt in stmts.iter() {
+-        log!("{:?}", stmt);
+-        stmt.eval(ev)?;
+-    }
+-    Ok(())
++    ev.eval_text(&text, loc, true, ev.recipe_prefix(), &stmts)
+ }
+ 
+ // A hack for Android build. We need to evaluate things like $((3+4))
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index 6703bef..f66e9a2 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -49,7 +49,7 @@ use kati::var::{VarOrigin, Variable};
+ 
+ use kati::eval::Evaluator;
+ use kati::flags::FLAGS;
+-use kati::symtab::{Symbol, intern, join_symbols};
++use kati::symtab::{RECIPEPREFIX_SYM, Symbol, intern, join_symbols};
+ use kati::timeutil::ScopedTimeReporter;
+ 
+ #[cfg(all(not(feature = "gperf"), target_os = "linux"))]
+@@ -108,6 +108,7 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>>
+             filename: intern("*bootstrap*"),
+             line: 0,
+         },
++        b'\t',
+     )
+ }
+ 
+@@ -142,6 +143,13 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+         false,
+         None,
+     )?;
++    // Like make, which defines it before reading the environment: a value from
++    // the environment does not change the recipe prefix.
++    RECIPEPREFIX_SYM.set_global_var(
++        Variable::with_simple_string(Bytes::new(), VarOrigin::Default, None, None),
++        false,
++        None,
++    )?;
+     for (k, v) in std::env::vars_os() {
+         let v = Bytes::from(v.as_bytes().to_vec());
+         let val = Arc::new(Value::Literal(None, v.clone()));
+@@ -181,16 +189,14 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+         );
+         ev.in_command_line();
+         for l in cl_vars {
+-            let asts = kati::parser::parse_buf(
+-                l,
+-                Loc {
+-                    filename: intern("*bootstrap*"),
+-                    line: 0,
+-                },
+-            )?;
++            let loc = Loc {
++                filename: intern("*bootstrap*"),
++                line: 0,
++            };
++            let asts = kati::parser::parse_buf(l, loc.clone(), ev.recipe_prefix())?;
+             let asts = asts.lock();
+             assert!(asts.len() == 1);
+-            asts[0].eval(&mut ev)?;
++            ev.eval_text(l, loc, true, ev.recipe_prefix(), &asts)?;
+         }
+     }
+     ev.in_toplevel_makefile();
+@@ -209,14 +215,15 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+             Bytes::from(makefile.as_bytes().to_vec()),
+             Loc::default(),
+         );
+-        let Some(mk) = kati::file_cache::get_makefile(&makefile)? else {
++        let Some(mk) = kati::file_cache::get_makefile(&makefile, ev.recipe_prefix())? else {
+             bail!("makefile not found")
+         };
+         let stmts = mk.stmts.lock();
+-        for stmt in stmts.iter() {
+-            log!("{stmt:?}");
+-            stmt.eval(&mut ev)?;
+-        }
++        let loc = Loc {
++            filename: mk.filename,
++            line: 0,
++        };
++        ev.eval_text(&mk.buf, loc, false, mk.recipe_prefix, &stmts)?;
+     }
+ 
+     if let Some(filename) = &FLAGS.dump_include_graph {
+diff --git a/src-rs/parser.rs b/src-rs/parser.rs
+index 6c3e20d..8c8ec36 100644
+--- a/src-rs/parser.rs
++++ b/src-rs/parser.rs
+@@ -22,18 +22,17 @@ use memchr::{memchr, memchr3};
+ use parking_lot::Mutex;
+ 
+ use crate::{
+-    collect_stats, error_loc,
++    collect_stats,
+     expr::{ParseExprOpt, Value, parse_expr, parse_expr_impl, parse_expr_impl_ext},
+     loc::Loc,
+     stmt::{
+         AssignDirective, AssignOp, AssignStmt, CommandStmt, CondOp, ExportStmt, IfStmt,
+-        IncludeStmt, RuleSep, RuleStmt, Stmt,
++        IncludeStmt, ParseErrorStmt, RuleSep, RuleStmt, Statement, Stmt, StmtEnd, WarnStmt,
+     },
+     strutil::{
+         find_end_of_line, find_outside_paren, trim_left_space, trim_right_space, trim_space,
+     },
+     symtab::Symbol,
+-    warn_loc,
+ };
+ 
+ struct IfState {
+@@ -42,9 +41,18 @@ struct IfState {
+     num_nest: i32,
+ }
+ 
++/// A conditional open where a text is read again: whether the part it takes is
++/// its else part, and how many enclosing conditionals its endif also closes.
++#[derive(Debug, Clone, Copy)]
++pub struct ReadFrame {
++    pub in_else: bool,
++    pub num_nest: i32,
++}
++
+ struct Parser {
+     buf: Bytes,
+     l: usize,
++    start: usize,
+     // Represents if we just parsed a rule or an expression.
+     // Expressions are included because they can expand into
+     // a rule, see testcase/rule_in_var.mk.
+@@ -66,13 +74,26 @@ struct Parser {
+ 
+     loc: Loc,
+     fixed_lineno: bool,
++
++    // The character that starts recipe lines, the statements read from the
++    // line being parsed, and whether an error stopped the reading.
++    recipe_prefix: u8,
++    line_stmts: Vec<Stmt>,
++    stopped: bool,
+ }
+ 
+ impl Parser {
+-    fn with_buf(buf: &Bytes, loc: Loc, stmts: Arc<Mutex<Vec<Stmt>>>, fixed_lineno: bool) -> Self {
++    fn with_buf(
++        buf: &Bytes,
++        loc: Loc,
++        stmts: Arc<Mutex<Vec<Stmt>>>,
++        fixed_lineno: bool,
++        recipe_prefix: u8,
++    ) -> Self {
+         Self {
+             buf: buf.clone(),
+             l: 0,
++            start: 0,
+             after_rule: false,
+ 
+             stmts: stmts.clone(),
+@@ -91,11 +112,15 @@ impl Parser {
+ 
+             loc,
+             fixed_lineno,
++
++            recipe_prefix,
++            line_stmts: Vec::new(),
++            stopped: false,
+         }
+     }
+ 
+     fn parse(&mut self) -> Result<()> {
+-        self.l = 0;
++        self.l = self.start;
+         let buf = self.buf.clone();
+ 
+         while self.l < buf.len() {
+@@ -113,26 +138,80 @@ impl Parser {
+             if !self.fixed_lineno {
+                 self.loc.line += eol.lf_cnt - 1;
+             }
+-            if new_l == buf.len() {
++            let end = StmtEnd {
++                offset: (new_l + 1).min(buf.len()),
++                line: self.loc.line,
++                after_rule: self.after_rule,
++            };
++            for stmt in std::mem::take(&mut self.line_stmts) {
++                stmt.set_end(end);
++            }
++            if new_l == buf.len() || self.stopped {
+                 break;
+             }
+             self.l = new_l + 1
+         }
++        if self.stopped {
++            return Ok(());
++        }
+ 
++        // Like make, these are reported when the evaluation gets to the end of
++        // the text, which another .RECIPEPREFIX may have read again without them.
+         if !self.if_stack.is_empty() {
+             let mut loc = self.loc.clone();
+             loc.line += 1;
+-            error_loc!(Some(&loc), "*** missing `endif'.");
++            self.end_error(loc, "*** missing `endif'.");
+         }
+         if self.define_name.is_some() {
+             let mut loc = self.loc.clone();
+             loc.line = self.define_start_line;
+-            error_loc!(Some(&loc), "*** missing `endef', unterminated `define'.",);
++            self.end_error(loc, "*** missing `endef', unterminated `define'.");
+         }
+ 
+         Ok(())
+     }
+ 
++    fn emit(&mut self, stmt: Stmt) {
++        self.out_stmts.lock().push(stmt.clone());
++        self.line_stmts.push(stmt);
++    }
++
++    // Emits |stmt| also in the other part of every open conditional: like an
++    // error or warning given while reading, it comes whichever parts the
++    // evaluation takes.
++    fn emit_on_every_path(&mut self, stmt: Stmt) {
++        for st in &self.if_stack {
++            let other = if st.is_in_else {
++                &st.stmt.true_stmts
++            } else {
++                &st.stmt.false_stmts
++            };
++            other.lock().push(stmt.clone());
++        }
++        self.emit(stmt);
++    }
++
++    // An error in the line being read, raised when the evaluation gets to it.
++    // The evaluation cannot go past it, so the reading stops there.
++    fn error(&mut self, msg: &str) {
++        self.emit_on_every_path(ParseErrorStmt::new(self.loc.clone(), msg.to_string()));
++        self.stopped = true;
++    }
++
++    fn warn(&mut self, msg: &str) {
++        self.emit_on_every_path(WarnStmt::new(self.loc.clone(), msg.to_string()));
++    }
++
++    fn end_error(&mut self, loc: Loc, msg: &str) {
++        let stmt = ParseErrorStmt::new(loc, msg.to_string());
++        stmt.set_end(StmtEnd {
++            offset: self.buf.len(),
++            line: self.loc.line,
++            after_rule: false,
++        });
++        self.emit_on_every_path(stmt);
++    }
++
+     fn parse_line(&mut self, line: Bytes) -> Result<()> {
+         if self.define_name.is_some() {
+             return self.parse_inside_define(line);
+@@ -144,13 +223,11 @@ impl Parser {
+ 
+         self.current_directive = None;
+ 
+-        if line.starts_with(b"\t") && self.after_rule {
+-            let loc = self.loc.clone();
+-            let mut mutable_loc = self.loc.clone();
+-            let expr = parse_expr(&mut mutable_loc, line.slice(1..), ParseExprOpt::Command)?;
+-            self.out_stmts
+-                .lock()
+-                .push(CommandStmt::new(loc, line, expr));
++        // Like make, a line that starts with the prefix is a recipe line only
++        // after a rule. Elsewhere comments, directives and assignments come
++        // first, so a # prefix starts a comment there.
++        if line.first() == Some(&self.recipe_prefix) && self.after_rule {
++            self.emit(CommandStmt::new(self.loc.clone(), line));
+             return Ok(());
+         }
+ 
+@@ -202,11 +279,9 @@ impl Parser {
+             return Ok(());
+         }
+ 
+-        if orig_line.starts_with(b"\t") {
+-            error_loc!(
+-                Some(&self.loc),
+-                "*** commands commence before first target."
+-            );
++        if orig_line.first() == Some(&self.recipe_prefix) {
++            self.error("*** commands commence before first target.");
++            return Ok(());
+         }
+ 
+         let rule_loc = self.loc.clone();
+@@ -247,15 +322,14 @@ impl Parser {
+             rule_rhs = None;
+         }
+         self.after_rule = true;
+-        self.out_stmts
+-            .lock()
+-            .push(RuleStmt::new(rule_loc, rule_lhs, rule_sep, rule_rhs));
++        self.emit(RuleStmt::new(rule_loc, rule_lhs, rule_sep, rule_rhs));
+         Ok(())
+     }
+ 
+     fn parse_assign(&mut self, line: Bytes, separator_pos: usize) -> Result<()> {
+         if separator_pos == 0 {
+-            error_loc!(Some(&self.loc), "*** empty variable name ***");
++            self.error("*** empty variable name ***");
++            return Ok(());
+         }
+         let mut assign = parse_assign_statement(&line, separator_pos);
+ 
+@@ -280,7 +354,7 @@ impl Parser {
+         let rhs = parse_expr(&mut mutable_loc, orig_rhs.clone(), ParseExprOpt::Normal)?;
+ 
+         self.after_rule = false;
+-        self.out_stmts.lock().push(AssignStmt::new(
++        self.emit(AssignStmt::new(
+             assign_loc,
+             lhs,
+             rhs,
+@@ -296,16 +370,15 @@ impl Parser {
+         let loc = self.loc.clone();
+         let mut mutable_loc = loc.clone();
+         let expr = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
+-        self.out_stmts
+-            .lock()
+-            .push(IncludeStmt::new(loc, expr, directive.starts_with(b"i")));
++        self.emit(IncludeStmt::new(loc, expr, directive.starts_with(b"i")));
+         self.after_rule = false;
+         Ok(())
+     }
+ 
+     fn parse_define(&mut self, line: Bytes) -> Result<()> {
+         if line.is_empty() {
+-            error_loc!(Some(&self.loc), "*** empty variable name.");
++            self.error("*** empty variable name.");
++            return Ok(());
+         }
+         self.define_name = Some(line);
+         self.num_define_nest = 1;
+@@ -316,8 +389,16 @@ impl Parser {
+     }
+ 
+     fn parse_inside_define(&mut self, line: Bytes) -> Result<()> {
++        // In make a line starting with the recipe prefix neither starts nor ends
++        // a define. Here that holds for prefixes other than a tab, since kati
++        // reads a tab-led endef as a directive.
++        let prefixed = self.recipe_prefix != b'\t' && line.first() == Some(&self.recipe_prefix);
+         let line = line.slice_ref(trim_left_space(&line));
+-        let directive = Parser::get_directive(&line);
++        let directive = if prefixed {
++            &b""[..]
++        } else {
++            Parser::get_directive(&line)
++        };
+         if directive == b"define" {
+             self.num_define_nest += 1;
+         } else if directive == b"endef" {
+@@ -334,7 +415,7 @@ impl Parser {
+             &line["endef".len()..],
+         )));
+         if !rest.is_empty() {
+-            warn_loc!(Some(&self.loc), "extraneous text after `endef' directive");
++            self.warn("extraneous text after `endef' directive");
+         }
+ 
+         let assign_loc = Loc {
+@@ -355,7 +436,7 @@ impl Parser {
+         };
+         let rhs = parse_expr(&mut mutable_loc, orig_rhs.clone(), ParseExprOpt::Define)?;
+ 
+-        self.out_stmts.lock().push(AssignStmt::new(
++        self.emit(AssignStmt::new(
+             assign_loc,
+             lhs,
+             rhs,
+@@ -386,8 +467,8 @@ impl Parser {
+         };
+         let mut mutable_loc = loc.clone();
+         let lhs = parse_expr(&mut mutable_loc, line, ParseExprOpt::Normal)?;
+-        let stmt = IfStmt::new(loc, op, lhs, None);
+-        self.out_stmts.lock().push(stmt.clone());
++        let stmt = IfStmt::new(loc, op, lhs, None, self.num_if_nest);
++        self.emit(stmt.clone());
+         self.enter_if(stmt);
+         Ok(())
+     }
+@@ -401,7 +482,8 @@ impl Parser {
+         };
+ 
+         if line.is_empty() {
+-            error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
++            self.error("*** invalid syntax in conditional.");
++            return Ok(());
+         }
+ 
+         let mut mutable_loc = loc.clone();
+@@ -420,7 +502,8 @@ impl Parser {
+             )?;
+             line.advance(n);
+             if line.first() != Some(&b',') {
+-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
++                self.error("*** invalid syntax in conditional.");
++                return Ok(());
+             }
+             line = line.slice_ref(trim_left_space(&line[1..]));
+             (n, rhs) = parse_expr_impl_ext(
+@@ -434,14 +517,17 @@ impl Parser {
+             line = line.slice_ref(trim_left_space(&line[n.min(line.len())..]));
+         } else {
+             if line.is_empty() {
+-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
++                self.error("*** invalid syntax in conditional.");
++                return Ok(());
+             }
+             let quote = line[0];
+             if quote != b'\'' && quote != b'"' {
+-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
++                self.error("*** invalid syntax in conditional.");
++                return Ok(());
+             }
+             let Some(end) = memchr(quote, &line[1..]) else {
+-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
++                self.error("*** invalid syntax in conditional.");
++                return Ok(());
+             };
+             lhs = parse_expr(
+                 &mut mutable_loc,
+@@ -452,14 +538,17 @@ impl Parser {
+             line = line.slice_ref(trim_left_space(&line[end + 2..]));
+ 
+             if line.is_empty() {
+-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
++                self.error("*** invalid syntax in conditional.");
++                return Ok(());
+             }
+             let quote = line[0];
+             if quote != b'\'' && quote != b'"' {
+-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
++                self.error("*** invalid syntax in conditional.");
++                return Ok(());
+             }
+             let Some(end) = memchr(quote, &line[1..]) else {
+-                error_loc!(Some(&self.loc), "*** invalid syntax in conditional.");
++                self.error("*** invalid syntax in conditional.");
++                return Ok(());
+             };
+             rhs = parse_expr(
+                 &mut mutable_loc,
+@@ -470,21 +559,24 @@ impl Parser {
+         }
+ 
+         if !line.is_empty() {
+-            warn_loc!(Some(&self.loc), "extraneous text after `ifeq' directive")
++            self.warn("extraneous text after `ifeq' directive")
+         }
+ 
+-        let stmt = IfStmt::new(loc, op, lhs, Some(rhs));
+-        self.out_stmts.lock().push(stmt.clone());
++        let stmt = IfStmt::new(loc, op, lhs, Some(rhs), self.num_if_nest);
++        self.emit(stmt.clone());
+         self.enter_if(stmt);
+         Ok(())
+     }
+ 
+     fn parse_else(&mut self, line: Bytes) -> Result<()> {
+-        self.check_if_stack("else")?;
+-        let st = self.if_stack.last_mut().unwrap();
+-        if st.is_in_else {
+-            error_loc!(Some(&self.loc), "*** only one `else' per conditional.");
++        if !self.check_if_stack("else") {
++            return Ok(());
++        }
++        if self.if_stack.last().unwrap().is_in_else {
++            self.error("*** only one `else' per conditional.");
++            return Ok(());
+         }
++        let st = self.if_stack.last_mut().unwrap();
+         st.is_in_else = true;
+         self.out_stmts = st.stmt.false_stmts.clone();
+ 
+@@ -495,16 +587,19 @@ impl Parser {
+ 
+         self.num_if_nest = st.num_nest + 1;
+         if !self.handle_else_if_directive(&line.slice_ref(next_if))? {
+-            warn_loc!(Some(&self.loc), "extraneous text after `else' directive");
++            self.warn("extraneous text after `else' directive");
+         }
+         self.num_if_nest = 0;
+         Ok(())
+     }
+ 
+     fn parse_endif(&mut self, line: Bytes) -> Result<()> {
+-        self.check_if_stack("endif")?;
++        if !self.check_if_stack("endif") {
++            return Ok(());
++        }
+         if !line.is_empty() {
+-            error_loc!(Some(&self.loc), "extraneous text after `endif` directive");
++            self.error("extraneous text after `endif` directive");
++            return Ok(());
+         }
+         let num_nest = self.if_stack.last().unwrap().num_nest;
+         for _ in 0..=num_nest {
+@@ -530,9 +625,7 @@ impl Parser {
+         let loc = self.loc.clone();
+         let mut mutable_loc = loc.clone();
+         let expr = parse_expr(&mut mutable_loc, line.clone(), ParseExprOpt::Normal)?;
+-        self.out_stmts
+-            .lock()
+-            .push(ExportStmt::new(loc, expr, is_export));
++        self.emit(ExportStmt::new(loc, expr, is_export));
+         Ok(())
+     }
+ 
+@@ -564,11 +657,12 @@ impl Parser {
+         self.create_export(line, false)
+     }
+ 
+-    fn check_if_stack(&self, keyword: &'static str) -> Result<()> {
++    fn check_if_stack(&mut self, keyword: &'static str) -> bool {
+         if self.if_stack.is_empty() {
+-            error_loc!(Some(&self.loc), "*** extraneous `{keyword}'.");
++            self.error(&format!("*** extraneous `{keyword}'."));
++            return false;
+         }
+-        Ok(())
++        true
+     }
+ 
+     fn remove_comment(line: &[u8]) -> &[u8] {
+@@ -637,32 +731,91 @@ impl Parser {
+     }
+ }
+ 
+-pub fn parse_file(buf: &Bytes, filename: Symbol) -> Result<Arc<Mutex<Vec<Stmt>>>> {
++pub fn parse_file(
++    buf: &Bytes,
++    filename: Symbol,
++    recipe_prefix: u8,
++) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+     collect_stats!("parse file time");
+     let loc = Loc { filename, line: 0 };
+-    parse_buf_no_stats_impl(buf, loc, false)
++    parse_buf_no_stats_impl(buf, loc, false, recipe_prefix)
+ }
+ 
+-pub fn parse_buf(buf: &Bytes, loc: Loc) -> Result<Arc<Mutex<Vec<Stmt>>>> {
++pub fn parse_buf(buf: &Bytes, loc: Loc, recipe_prefix: u8) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+     collect_stats!("parse eval time");
+-    parse_buf_no_stats_impl(buf, loc, true)
++    parse_buf_no_stats_impl(buf, loc, true, recipe_prefix)
+ }
+ 
+-pub fn parse_buf_no_stats(buf: &Bytes, loc: Loc) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+-    parse_buf_no_stats_impl(buf, loc, true)
++pub fn parse_buf_no_stats(
++    buf: &Bytes,
++    loc: Loc,
++    recipe_prefix: u8,
++) -> Result<Arc<Mutex<Vec<Stmt>>>> {
++    parse_buf_no_stats_impl(buf, loc, true, recipe_prefix)
+ }
+ 
+ fn parse_buf_no_stats_impl(
+     buf: &Bytes,
+     loc: Loc,
+     fixed_lineno: bool,
++    recipe_prefix: u8,
+ ) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+     let stmts = Arc::new(Mutex::new(Vec::new()));
+-    let mut p = Parser::with_buf(buf, loc, stmts.clone(), fixed_lineno);
++    let mut p = Parser::with_buf(buf, loc, stmts.clone(), fixed_lineno, recipe_prefix);
+     p.parse()?;
+     Ok(stmts)
+ }
+ 
++pub type StmtList = Arc<Mutex<Vec<Stmt>>>;
++
++/// The statements of |buf|, a text read from |loc|, read again after |after|
++/// inside the open conditionals |frames|, outermost first, each in the part it
++/// takes or, for the innermost one, in its true part if
++/// |innermost_at_true_part|: those after the last endif, and a conditional
++/// holding what was read inside each frame.
++pub fn parse_rest(
++    buf: &Bytes,
++    mut loc: Loc,
++    fixed_lineno: bool,
++    recipe_prefix: u8,
++    after: StmtEnd,
++    frames: &[ReadFrame],
++    innermost_at_true_part: bool,
++) -> Result<(StmtList, Vec<Arc<IfStmt>>)> {
++    collect_stats!("parse eval time");
++    if !fixed_lineno {
++        loc.line = after.line;
++    }
++    let stmts = Arc::new(Mutex::new(Vec::new()));
++    let mut p = Parser::with_buf(buf, loc, stmts.clone(), fixed_lineno, recipe_prefix);
++    p.start = after.offset;
++    p.after_rule = after.after_rule;
++    let mut frame_stmts = Vec::new();
++    for (i, frame) in frames.iter().enumerate() {
++        let stmt = IfStmt::new(
++            Loc::default(),
++            CondOp::Ifeq,
++            Arc::new(Value::Literal(None, Bytes::new())),
++            None,
++            frame.num_nest,
++        );
++        let in_else = frame.in_else && !(innermost_at_true_part && i + 1 == frames.len());
++        p.out_stmts = if in_else {
++            stmt.false_stmts.clone()
++        } else {
++            stmt.true_stmts.clone()
++        };
++        p.if_stack.push(IfState {
++            stmt: stmt.clone(),
++            is_in_else: in_else,
++            num_nest: frame.num_nest,
++        });
++        frame_stmts.push(stmt);
++    }
++    p.parse()?;
++    Ok((stmts, frame_stmts))
++}
++
+ pub struct ParsedAssign<'a> {
+     pub lhs: &'a [u8],
+     pub rhs: &'a [u8],
+diff --git a/src-rs/rule.rs b/src-rs/rule.rs
+index f6a3c03..4778de8 100644
+--- a/src-rs/rule.rs
++++ b/src-rs/rule.rs
+@@ -40,6 +40,10 @@ pub struct Rule {
+     pub cmds: Vec<Arc<Value>>,
+     pub loc: Loc,
+     pub cmd_loc: Option<Loc>,
++    /// Like make, the .RECIPEPREFIX in effect once the rule's targets were
++    /// expanded, which its commands drop after newlines. It is 0, so a tab
++    /// stays, for a rule read before .RECIPEPREFIX was set.
++    pub recipe_prefix: u8,
+ }
+ 
+ impl Rule {
+@@ -55,6 +59,7 @@ impl Rule {
+             cmds: Vec::new(),
+             loc,
+             cmd_loc: None,
++            recipe_prefix: 0,
+         }
+     }
+ 
+diff --git a/src-rs/stmt.rs b/src-rs/stmt.rs
+index 16a904f..e8b850a 100644
+--- a/src-rs/stmt.rs
++++ b/src-rs/stmt.rs
+@@ -22,17 +22,29 @@ use std::{fmt::Debug, sync::Arc};
+ use crate::{
+     error_loc,
+     eval::Evaluator,
+-    expr::{Evaluable, Value},
++    expr::{Evaluable, ParseExprOpt, Value, parse_expr},
+     loc::Loc,
+     strutil::no_line_break,
+     symtab::{Symbol, intern},
++    warn_loc,
+ };
+ 
+ pub type Stmt = Arc<dyn Statement + Send + Sync>;
+ 
++/// Where a statement's last line ends in its text, that line, and whether a
++/// rule is pending there, for reading the rest of the text again.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct StmtEnd {
++    pub offset: usize,
++    pub line: i32,
++    pub after_rule: bool,
++}
++
+ pub trait Statement: Debug {
+     fn loc(&self) -> Loc;
+     fn orig(&self) -> Bytes;
++    fn end(&self) -> StmtEnd;
++    fn set_end(&self, end: StmtEnd);
+ 
+     fn eval(&self, ev: &mut Evaluator) -> Result<()>;
+ }
+@@ -70,6 +82,7 @@ pub enum RuleSep {
+ pub struct RuleStmt {
+     loc: Loc,
+     orig: Bytes,
++    end: Mutex<StmtEnd>,
+ 
+     pub lhs: Arc<Value>,
+     pub sep: RuleSep,
+@@ -84,6 +97,12 @@ impl Statement for RuleStmt {
+     fn orig(&self) -> Bytes {
+         self.orig.clone()
+     }
++    fn end(&self) -> StmtEnd {
++        *self.end.lock()
++    }
++    fn set_end(&self, end: StmtEnd) {
++        *self.end.lock() = end;
++    }
+ 
+     fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+         ev.eval_rule(self)
+@@ -105,6 +124,7 @@ impl RuleStmt {
+         Arc::new(RuleStmt {
+             loc,
+             orig: Bytes::new(),
++            end: Mutex::new(StmtEnd::default()),
+             lhs,
+             sep,
+             rhs,
+@@ -115,6 +135,7 @@ impl RuleStmt {
+ pub struct AssignStmt {
+     loc: Loc,
+     orig: Bytes,
++    end: Mutex<StmtEnd>,
+ 
+     pub lhs: Arc<Value>,
+     pub rhs: Arc<Value>,
+@@ -134,6 +155,12 @@ impl Statement for AssignStmt {
+     fn orig(&self) -> Bytes {
+         self.orig.clone()
+     }
++    fn end(&self) -> StmtEnd {
++        *self.end.lock()
++    }
++    fn set_end(&self, end: StmtEnd) {
++        *self.end.lock() = end;
++    }
+ 
+     fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+         ev.eval_assign(self)
+@@ -168,6 +195,7 @@ impl AssignStmt {
+         Arc::new(AssignStmt {
+             loc,
+             orig: Bytes::new(),
++            end: Mutex::new(StmtEnd::default()),
+             lhs,
+             rhs,
+             orig_rhs,
+@@ -202,8 +230,9 @@ impl AssignStmt {
+ pub struct CommandStmt {
+     loc: Loc,
+     orig: Bytes,
++    end: Mutex<StmtEnd>,
+ 
+-    pub expr: Arc<Value>,
++    expr: Mutex<Option<Arc<Value>>>,
+ }
+ 
+ impl Statement for CommandStmt {
+@@ -213,6 +242,12 @@ impl Statement for CommandStmt {
+     fn orig(&self) -> Bytes {
+         self.orig.clone()
+     }
++    fn end(&self) -> StmtEnd {
++        *self.end.lock()
++    }
++    fn set_end(&self, end: StmtEnd) {
++        *self.end.lock() = end;
++    }
+     fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+         ev.eval_command(self)
+     }
+@@ -220,25 +255,47 @@ impl Statement for CommandStmt {
+ 
+ impl Debug for CommandStmt {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        write!(f, "CommandStmt({:?}, loc={})", self.expr, self.loc)
++        write!(f, "CommandStmt({:?}, loc={})", self.orig, self.loc)
+     }
+ }
+ 
+ impl CommandStmt {
+-    pub fn new(loc: Loc, orig: Bytes, expr: Arc<Value>) -> Arc<CommandStmt> {
+-        Arc::new(CommandStmt { loc, orig, expr })
++    pub fn new(loc: Loc, orig: Bytes) -> Arc<CommandStmt> {
++        Arc::new(CommandStmt {
++            loc,
++            orig,
++            end: Mutex::new(StmtEnd::default()),
++            expr: Mutex::new(None),
++        })
++    }
++
++    /// Parsed when the evaluation first gets to the line: until then, another
++    /// .RECIPEPREFIX may read it again as an ordinary line.
++    pub fn expr(&self) -> Result<Arc<Value>> {
++        let mut expr = self.expr.lock();
++        if let Some(expr) = &*expr {
++            return Ok(expr.clone());
++        }
++        let mut loc = self.loc.clone();
++        let parsed = parse_expr(&mut loc, self.orig.slice(1..), ParseExprOpt::Command)?;
++        *expr = Some(parsed.clone());
++        Ok(parsed)
+     }
+ }
+ 
+ pub struct IfStmt {
+     loc: Loc,
+     orig: Bytes,
++    end: Mutex<StmtEnd>,
+ 
+     pub op: CondOp,
+     pub lhs: Arc<Value>,
+     pub rhs: Option<Arc<Value>>,
+     pub true_stmts: Arc<Mutex<Vec<Stmt>>>,
+     pub false_stmts: Arc<Mutex<Vec<Stmt>>>,
++    /// How many enclosing conditionals its endif also closes, as in
++    /// "else ifeq ...".
++    pub num_nest: i32,
+ }
+ 
+ impl Statement for IfStmt {
+@@ -248,6 +305,12 @@ impl Statement for IfStmt {
+     fn orig(&self) -> Bytes {
+         self.orig.clone()
+     }
++    fn end(&self) -> StmtEnd {
++        *self.end.lock()
++    }
++    fn set_end(&self, end: StmtEnd) {
++        *self.end.lock() = end;
++    }
+     fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+         ev.eval_if(self)
+     }
+@@ -269,15 +332,23 @@ impl Debug for IfStmt {
+ }
+ 
+ impl IfStmt {
+-    pub fn new(loc: Loc, op: CondOp, lhs: Arc<Value>, rhs: Option<Arc<Value>>) -> Arc<IfStmt> {
++    pub fn new(
++        loc: Loc,
++        op: CondOp,
++        lhs: Arc<Value>,
++        rhs: Option<Arc<Value>>,
++        num_nest: i32,
++    ) -> Arc<IfStmt> {
+         Arc::new(IfStmt {
+             loc,
+             orig: Bytes::new(),
++            end: Mutex::new(StmtEnd::default()),
+             op,
+             lhs,
+             rhs,
+             true_stmts: Arc::new(Mutex::new(Vec::new())),
+             false_stmts: Arc::new(Mutex::new(Vec::new())),
++            num_nest,
+         })
+     }
+ }
+@@ -285,6 +356,7 @@ impl IfStmt {
+ pub struct IncludeStmt {
+     loc: Loc,
+     orig: Bytes,
++    end: Mutex<StmtEnd>,
+ 
+     pub expr: Arc<Value>,
+     pub should_exist: bool,
+@@ -297,6 +369,12 @@ impl Statement for IncludeStmt {
+     fn orig(&self) -> Bytes {
+         self.orig.clone()
+     }
++    fn end(&self) -> StmtEnd {
++        *self.end.lock()
++    }
++    fn set_end(&self, end: StmtEnd) {
++        *self.end.lock() = end;
++    }
+     fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+         ev.eval_include(self)
+     }
+@@ -313,6 +391,7 @@ impl IncludeStmt {
+         Arc::new(IncludeStmt {
+             loc,
+             orig: Bytes::new(),
++            end: Mutex::new(StmtEnd::default()),
+             expr,
+             should_exist,
+         })
+@@ -322,6 +401,7 @@ impl IncludeStmt {
+ pub struct ExportStmt {
+     loc: Loc,
+     orig: Bytes,
++    end: Mutex<StmtEnd>,
+ 
+     pub expr: Arc<Value>,
+     pub is_export: bool,
+@@ -334,6 +414,12 @@ impl Statement for ExportStmt {
+     fn orig(&self) -> Bytes {
+         self.orig.clone()
+     }
++    fn end(&self) -> StmtEnd {
++        *self.end.lock()
++    }
++    fn set_end(&self, end: StmtEnd) {
++        *self.end.lock() = end;
++    }
+     fn eval(&self, ev: &mut Evaluator) -> Result<()> {
+         ev.eval_export(self)
+     }
+@@ -354,8 +440,96 @@ impl ExportStmt {
+         Arc::new(ExportStmt {
+             loc,
+             orig: Bytes::new(),
++            end: Mutex::new(StmtEnd::default()),
+             expr,
+             is_export,
+         })
+     }
+ }
++
++/// An error the parser found, raised when the evaluation gets to it.
++pub struct ParseErrorStmt {
++    loc: Loc,
++    end: Mutex<StmtEnd>,
++
++    pub msg: String,
++}
++
++impl Statement for ParseErrorStmt {
++    fn loc(&self) -> Loc {
++        self.loc.clone()
++    }
++    fn orig(&self) -> Bytes {
++        Bytes::new()
++    }
++    fn end(&self) -> StmtEnd {
++        *self.end.lock()
++    }
++    fn set_end(&self, end: StmtEnd) {
++        *self.end.lock() = end;
++    }
++    fn eval(&self, ev: &mut Evaluator) -> Result<()> {
++        ev.loc = Some(self.loc.clone());
++        error_loc!(Some(&self.loc), "{}", self.msg);
++    }
++}
++
++impl Debug for ParseErrorStmt {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "ParseErrorStmt({}, loc={})", self.msg, self.loc)
++    }
++}
++
++impl ParseErrorStmt {
++    pub fn new(loc: Loc, msg: String) -> Arc<ParseErrorStmt> {
++        Arc::new(ParseErrorStmt {
++            loc,
++            end: Mutex::new(StmtEnd::default()),
++            msg,
++        })
++    }
++}
++
++/// A warning about a line, given when the evaluation gets to it, so that a part
++/// of the text read again with another .RECIPEPREFIX does not give it.
++pub struct WarnStmt {
++    loc: Loc,
++    end: Mutex<StmtEnd>,
++
++    pub msg: String,
++}
++
++impl Statement for WarnStmt {
++    fn loc(&self) -> Loc {
++        self.loc.clone()
++    }
++    fn orig(&self) -> Bytes {
++        Bytes::new()
++    }
++    fn end(&self) -> StmtEnd {
++        *self.end.lock()
++    }
++    fn set_end(&self, end: StmtEnd) {
++        *self.end.lock() = end;
++    }
++    fn eval(&self, _ev: &mut Evaluator) -> Result<()> {
++        warn_loc!(Some(&self.loc), "{}", self.msg);
++        Ok(())
++    }
++}
++
++impl Debug for WarnStmt {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "WarnStmt({}, loc={})", self.msg, self.loc)
++    }
++}
++
++impl WarnStmt {
++    pub fn new(loc: Loc, msg: String) -> Arc<WarnStmt> {
++        Arc::new(WarnStmt {
++            loc,
++            end: Mutex::new(StmtEnd::default()),
++            msg,
++        })
++    }
++}
+diff --git a/src-rs/symtab.rs b/src-rs/symtab.rs
+index 25ed0ee..6a786a9 100644
+--- a/src-rs/symtab.rs
++++ b/src-rs/symtab.rs
+@@ -35,6 +35,7 @@ static SYMTAB: LazyLock<Mutex<Symtab>> = LazyLock::new(|| Mutex::new(Symtab::new
+ pub static SHELL_SYM: LazyLock<Symbol> = LazyLock::new(|| intern("SHELL"));
+ pub static ALLOW_RULES_SYM: LazyLock<Symbol> = LazyLock::new(|| intern(".KATI_ALLOW_RULES"));
+ pub static KATI_READONLY_SYM: LazyLock<Symbol> = LazyLock::new(|| intern(".KATI_READONLY"));
++pub static RECIPEPREFIX_SYM: LazyLock<Symbol> = LazyLock::new(|| intern(".RECIPEPREFIX"));
+ pub static VARIABLES_SYM: LazyLock<Symbol> = LazyLock::new(|| intern(".VARIABLES"));
+ pub static KATI_SYMBOLS_SYM: LazyLock<Symbol> = LazyLock::new(|| intern(".KATI_SYMBOLS"));
+ pub static MAKEFILE_LIST: LazyLock<Symbol> = LazyLock::new(|| intern("MAKEFILE_LIST"));
+diff --git a/src-rs/var.rs b/src-rs/var.rs
+index 45fe249..5d5f438 100644
+--- a/src-rs/var.rs
++++ b/src-rs/var.rs
+@@ -140,6 +140,16 @@ impl Variable {
+     pub fn immediate_eval(&self) -> bool {
+         matches!(&self.value, InnerVar::Simple(_))
+     }
++    /// The first character of the value, which for a recursive variable is its
++    /// text before expansion.
++    pub fn first_char_as_written(&self) -> Result<Option<u8>> {
++        match &self.value {
++            // The parsed value drops a lone "$".
++            InnerVar::Recursive { orig, .. } if &orig[..] == b"$" => Ok(Some(b'$')),
++            InnerVar::Recursive { v, .. } => Ok(first_char_as_written(v)),
++            _ => Ok(self.string()?.first().copied()),
++        }
++    }
+     pub fn append_var(
+         &mut self,
+         v: Arc<Value>,
+@@ -362,6 +372,14 @@ impl Variable {
+     }
+ }
+ 
++fn first_char_as_written(v: &Value) -> Option<u8> {
++    match v {
++        Value::Literal(_, s) => s.first().copied(),
++        Value::List(_, parts) => parts.iter().find_map(|part| first_char_as_written(part)),
++        _ => Some(b'$'),
++    }
++}
++
+ impl Evaluable for Variable {
+     fn eval(&self, ev: &mut crate::eval::Evaluator, out: &mut dyn BufMut) -> Result<()> {
+         match &self.value {
+diff --git a/src/command.cc b/src/command.cc
+index 18e1fdd..7ad8dc5 100644
+--- a/src/command.cc
++++ b/src/command.cc
+@@ -224,6 +224,21 @@ CommandEvaluator::CommandEvaluator(Evaluator* ev) : ev_(ev) {
+   INSERT_AUTO_VAR(AutoNotImplementedVar, "|");
+ }
+ 
++// Like make, which before it runs each line of a command removes the rule's
++// recipe prefix right after every newline of what is left, whether a
++// backslash continued a line or the expansion brought it.
++static void RemovePrefixAfterNewlines(char prefix,
++                                      size_t start,
++                                      std::string* cmds) {
++  size_t w = start;
++  for (size_t r = start; r < cmds->size(); r++) {
++    (*cmds)[w++] = (*cmds)[r];
++    if ((*cmds)[r] == '\n' && r + 1 < cmds->size() && (*cmds)[r + 1] == prefix)
++      r++;
++  }
++  cmds->resize(w);
++}
++
+ std::vector<Command> CommandEvaluator::Eval(const DepNode& n) {
+   std::vector<Command> result;
+   ev_->set_loc(n.loc);
+@@ -231,9 +246,13 @@ std::vector<Command> CommandEvaluator::Eval(const DepNode& n) {
+   ev_->SetEvaluatingCommand(true);
+   current_dep_node_ = &n;
+   found_new_inputs_ = false;
+-  for (Value* v : n.cmds) {
++  for (size_t i = 0; i < n.cmds.size(); i++) {
++    Value* v = n.cmds[i];
+     ev_->set_loc(v->Location());
+-    const std::string&& cmds_buf = v->Eval(ev_);
++    std::string cmds_buf = v->Eval(ev_);
++    char prefix = n.recipe_prefixes[i];
++    if (prefix)
++      RemovePrefixAfterNewlines(prefix, 0, &cmds_buf);
+     std::string_view cmds = cmds_buf;
+     bool global_echo = !g_flags.is_silent_mode;
+     bool global_ignore_error = false;
+@@ -260,6 +279,11 @@ std::vector<Command> CommandEvaluator::Eval(const DepNode& n) {
+       }
+       if (index == std::string::npos)
+         break;
++      if (prefix) {
++        size_t start = cmds.data() - cmds_buf.data();
++        RemovePrefixAfterNewlines(prefix, start, &cmds_buf);
++        cmds = std::string_view(cmds_buf).substr(start);
++      }
+     }
+     continue;
+   }
+diff --git a/src/dep.cc b/src/dep.cc
+index 5b6e5d0..4c98c3d 100644
+--- a/src/dep.cc
++++ b/src/dep.cc
+@@ -209,8 +209,11 @@ struct RuleMerger {
+   }
+ 
+   void FillDepNodeFromRule(Symbol output, const Rule* r, DepNode* n) const {
+-    if (is_double_colon)
++    if (is_double_colon) {
+       copy(r->cmds.begin(), r->cmds.end(), back_inserter(n->cmds));
++      n->recipe_prefixes.insert(n->recipe_prefixes.end(), r->cmds.size(),
++                                r->recipe_prefix);
++    }
+ 
+     ApplyOutputPattern(*r, output, r->inputs, &n->actual_inputs);
+     ApplyOutputPattern(*r, output, r->order_only_inputs,
+@@ -234,10 +237,12 @@ struct RuleMerger {
+       FillDepNodeFromRule(output, primary_rule, n);
+       FillDepNodeLoc(primary_rule, n);
+       n->cmds = primary_rule->cmds;
++      n->recipe_prefixes.assign(n->cmds.size(), primary_rule->recipe_prefix);
+     } else if (pattern_rule) {
+       FillDepNodeFromRule(output, pattern_rule, n);
+       FillDepNodeLoc(pattern_rule, n);
+       n->cmds = pattern_rule->cmds;
++      n->recipe_prefixes.assign(n->cmds.size(), pattern_rule->recipe_prefix);
+     }
+ 
+     for (const Rule* r : rules) {
+diff --git a/src/dep.h b/src/dep.h
+index 594674c..52b19f3 100644
+--- a/src/dep.h
++++ b/src/dep.h
+@@ -38,6 +38,8 @@ struct DepNode {
+ 
+   Symbol output;
+   std::vector<Value*> cmds;
++  // For each command, the .RECIPEPREFIX of the rule it comes from.
++  std::vector<char> recipe_prefixes;
+   std::vector<NamedDepNode> deps;
+   std::vector<NamedDepNode> order_onlys;
+   std::vector<NamedDepNode> validations;
+diff --git a/src/eval.cc b/src/eval.cc
+index 49ff455..3776645 100644
+--- a/src/eval.cc
++++ b/src/eval.cc
+@@ -347,6 +347,87 @@ void Evaluator::EvalAssign(const AssignStmt* stmt) {
+     var->SetReadOnly();
+   }
+   TraceVariableAssign(lhs, var);
++  if (lhs == kRecipePrefixSym)
++    UpdateRecipePrefix();
++}
++
++// The first character of the value, or a tab when it is empty. Like make,
++// target-specific values do not change it.
++void Evaluator::UpdateRecipePrefix() {
++  char c = kRecipePrefixSym.GetGlobalVar()->FirstCharAsWritten();
++  recipe_prefix_ = c ? c : '\t';
++  recipe_prefix_set_ = true;
++}
++
++void Evaluator::EvalText(std::string_view buf,
++                         const Loc& loc,
++                         bool fixed_lineno,
++                         char recipe_prefix,
++                         const std::vector<Stmt*>& stmts) {
++  ReadContext ctx{buf, loc, fixed_lineno, recipe_prefix, {}};
++  read_contexts_.push_back(&ctx);
++  EvalStmts(stmts);
++  while (ctx.read_again_after)
++    ReadAgain(&ctx);
++  read_contexts_.pop_back();
++}
++
++void Evaluator::EvalStmts(const std::vector<Stmt*>& stmts) {
++  ReadContext* ctx = read_contexts_.back();
++  for (size_t i = 0; i < stmts.size(); i++) {
++    Stmt* stmt = stmts[i];
++    LOG("%s", stmt->DebugString().c_str());
++    stmt->Eval(this);
++    if (ctx->read_again_after)
++      return;
++    // The rest of the text is read again from the end of the line, once the
++    // other statements read from that line are evaluated too.
++    if (recipe_prefix_ != ctx->recipe_prefix &&
++        (i + 1 == stmts.size() ||
++         stmts[i + 1]->end_offset() != stmt->end_offset())) {
++      ReadAgainAfter(ctx, stmt, false);
++      return;
++    }
++  }
++}
++
++void Evaluator::ReadAgainAfter(ReadContext* ctx,
++                               const Stmt* stmt,
++                               bool at_true_part) {
++  ctx->read_again_after = stmt;
++  ctx->read_again_at_true_part = at_true_part;
++  ctx->read_again_frames = ctx->open_ifs;
++}
++
++// Reads the rest of the text of |ctx| again with the current .RECIPEPREFIX and
++// evaluates it instead: what is left of the part each open conditional takes,
++// innermost first, then the statements after them. When the change came from
++// the innermost conditional itself, its true part is read too.
++void Evaluator::ReadAgain(ReadContext* ctx) {
++  const Stmt* after = ctx->read_again_after;
++  std::vector<ReadFrame> frames;
++  frames.swap(ctx->read_again_frames);
++  ctx->read_again_after = nullptr;
++  SupersedeParseErrors(ctx->buf, after->end_offset());
++
++  Loc loc = ctx->loc;
++  if (!ctx->fixed_lineno)
++    loc.lineno = after->end_lineno();
++  std::vector<Stmt*> stmts;
++  std::vector<const IfStmt*> frame_stmts;
++  ParseRest(ctx->buf, after->end_offset(), loc, ctx->fixed_lineno,
++            recipe_prefix_, after->after_rule(), frames,
++            ctx->read_again_at_true_part, &stmts, &frame_stmts);
++
++  ctx->recipe_prefix = recipe_prefix_;
++  for (size_t i = frame_stmts.size(); i > 0 && !ctx->read_again_after; i--) {
++    ctx->open_ifs.assign(frames.begin(), frames.begin() + i);
++    const IfStmt* frame = frame_stmts[i - 1];
++    EvalStmts(frames[i - 1].in_else ? frame->false_stmts : frame->true_stmts);
++  }
++  ctx->open_ifs.clear();
++  if (!ctx->read_again_after)
++    EvalStmts(stmts);
+ }
+ 
+ // With rule broken into
+@@ -466,7 +547,33 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
+   loc_ = stmt->loc();
+   last_rule_ = NULL;
+ 
+-  const std::string&& before_term = stmt->lhs->Eval(this);
++  // Like make, which takes the .RECIPEPREFIX for a rule's commands once the
++  // word of the line that gives the colon is expanded, the parts of the line
++  // are expanded in turn.
++  const std::vector<Value*>* list = stmt->lhs->ListValues();
++  const std::vector<Value*> whole = {stmt->lhs};
++  const std::vector<Value*>& parts = list ? *list : whole;
++  std::string before_term;
++  size_t i = 0;
++  while (i < parts.size() && before_term.find(':') == std::string::npos)
++    parts[i++]->Eval(this, &before_term);
++  // When the colon came from a reference, the rest of its word comes first.
++  if (i > 0 && !parts[i - 1]->IsLiteral()) {
++    while (i < parts.size() &&
++           !(parts[i]->IsLiteral() &&
++             parts[i]->GetLiteralValueUnsafe().find_first_of(" \t:") !=
++                 std::string_view::npos))
++      parts[i++]->Eval(this, &before_term);
++  }
++  // Like make, this is the prefix the commands drop after newlines, even when
++  // the rest of the line sets another for the lines that follow.
++  char recipe_prefix = recipe_prefix_;
++  while (i < parts.size())
++    parts[i++]->Eval(this, &before_term);
++  // Before .RECIPEPREFIX is first set, commands keep a tab after a newline, as
++  // kati always did.
++  if (!recipe_prefix_set_)
++    recipe_prefix = 0;
+   // See semicolon.mk.
+   if (before_term.find_first_not_of(" \t\n;") == std::string::npos) {
+     if (stmt->sep == RuleStmt::SEP_SEMICOLON)
+@@ -514,6 +621,7 @@ void Evaluator::EvalRule(const RuleStmt* stmt) {
+   Rule* rule = new Rule();
+   rule->loc = loc_;
+   rule->is_double_colon = is_double_colon;
++  rule->recipe_prefix = recipe_prefix;
+   if (is_pattern_rule) {
+     rule->output_patterns.swap(targets);
+   } else {
+@@ -554,16 +662,15 @@ void Evaluator::EvalCommand(const CommandStmt* stmt) {
+ 
+   if (!last_rule_) {
+     std::vector<Stmt*> stmts;
+-    ParseNoStats(stmt->orig, stmt->loc(), &stmts);
+-    for (Stmt* a : stmts)
+-      a->Eval(this);
++    ParseNoStats(stmt->orig, stmt->loc(), &stmts, recipe_prefix_);
++    EvalText(stmt->orig, stmt->loc(), true, recipe_prefix_, stmts);
+     return;
+   }
+ 
+-  last_rule_->cmds.push_back(stmt->expr);
++  last_rule_->cmds.push_back(stmt->expr());
+   if (last_rule_->cmd_lineno == 0)
+     last_rule_->cmd_lineno = stmt->loc().lineno;
+-  LOG("Command: %s", Value::DebugString(stmt->expr).c_str());
++  LOG("Command: %s", Value::DebugString(stmt->expr()).c_str());
+ }
+ 
+ void Evaluator::EvalIf(const IfStmt* stmt) {
+@@ -603,17 +710,22 @@ void Evaluator::EvalIf(const IfStmt* stmt) {
+   } else {
+     stmts = &stmt->false_stmts;
+   }
+-  for (Stmt* a : *stmts) {
+-    LOG("%s", a->DebugString().c_str());
+-    a->Eval(this);
+-  }
++  ReadContext* ctx = read_contexts_.back();
++  ctx->open_ifs.push_back(ReadFrame{!is_true, stmt->num_nest});
++  // The condition may have changed .RECIPEPREFIX for the lines after it.
++  if (recipe_prefix_ != ctx->recipe_prefix)
++    ReadAgainAfter(ctx, stmt, /*at_true_part=*/true);
++  else
++    EvalStmts(*stmts);
++  ctx->open_ifs.pop_back();
+ }
+ 
+ void Evaluator::DoInclude(const std::string& fname) {
+   CheckStack();
+   COLLECT_STATS_WITH_SLOW_REPORT("included makefiles", fname.c_str());
+ 
+-  const Makefile& mk = MakefileCacheManager::Get().ReadMakefile(fname);
++  const Makefile& mk =
++      MakefileCacheManager::Get().ReadMakefile(fname, recipe_prefix_);
+   if (!mk.Exists()) {
+     Error(StringPrintf("%s does not exist", fname.c_str()));
+   }
+@@ -621,10 +733,8 @@ void Evaluator::DoInclude(const std::string& fname) {
+   Var* var_list = LookupVar(Intern("MAKEFILE_LIST"));
+   var_list->AppendVar(
+       this, Value::NewLiteral(Intern(TrimLeadingCurdir(fname)).str()));
+-  for (Stmt* stmt : mk.stmts()) {
+-    LOG("%s", stmt->DebugString().c_str());
+-    stmt->Eval(this);
+-  }
++  EvalText(mk.buf(), Loc(mk.filename().c_str(), 0), false, mk.recipe_prefix(),
++           mk.stmts());
+ 
+   for (auto& mk : profiled_files_) {
+     stats.MarkInteresting(mk);
+diff --git a/src/eval.h b/src/eval.h
+index 6c4199f..09ceb41 100644
+--- a/src/eval.h
++++ b/src/eval.h
+@@ -24,6 +24,7 @@
+ #include <vector>
+ 
+ #include "loc.h"
++#include "parser.h"
+ #include "stmt.h"
+ #include "symtab.h"
+ 
+@@ -133,6 +134,17 @@ class Evaluator {
+   void EvalInclude(const IncludeStmt* stmt);
+   void EvalExport(const ExportStmt* stmt);
+ 
++  // Evaluates |stmts|, read from |buf| with |recipe_prefix|. When a statement
++  // changes .RECIPEPREFIX, the rest of |buf| is read again with the new one,
++  // since make reads each line with the prefix in effect then.
++  void EvalText(std::string_view buf,
++                const Loc& loc,
++                bool fixed_lineno,
++                char recipe_prefix,
++                const std::vector<Stmt*>& stmts);
++
++  char recipe_prefix() const { return recipe_prefix_; }
++
+   Var* LookupVarForEval(Symbol name);
+   Var* LookupVar(Symbol name);
+   // For target specific variables.
+@@ -228,6 +240,26 @@ class Evaluator {
+                bool* needs_assign);
+   void DoInclude(const std::string& fname);
+ 
++  // A text being evaluated, the .RECIPEPREFIX it was read with, and the
++  // conditionals open in it. After a change of .RECIPEPREFIX, the evaluation
++  // goes back to the text, which reads the rest again from |read_again_after|
++  // inside |read_again_frames|.
++  struct ReadContext {
++    std::string_view buf;
++    Loc loc;
++    bool fixed_lineno;
++    char recipe_prefix;
++    std::vector<ReadFrame> open_ifs;
++    const Stmt* read_again_after = nullptr;
++    bool read_again_at_true_part = false;
++    std::vector<ReadFrame> read_again_frames = {};
++  };
++
++  void EvalStmts(const std::vector<Stmt*>& stmts);
++  void ReadAgainAfter(ReadContext* ctx, const Stmt* stmt, bool at_true_part);
++  void ReadAgain(ReadContext* ctx);
++  void UpdateRecipePrefix();
++
+   bool IsTraced(Symbol& name) const;
+   void TraceVariableLookup(const char* operation, Symbol& name, Var* var);
+   void TraceVariableAssign(Symbol& name, Var* var);
+@@ -251,6 +283,10 @@ class Evaluator {
+   Rule* last_rule_;
+   Vars* current_scope_;
+ 
++  char recipe_prefix_ = '\t';
++  bool recipe_prefix_set_ = false;
++  std::vector<ReadContext*> read_contexts_;
++
+   Loc loc_;
+   bool is_bootstrap_;
+   bool is_commandline_;
+diff --git a/src/expr.cc b/src/expr.cc
+index 0b08bca..814a111 100644
+--- a/src/expr.cc
++++ b/src/expr.cc
+@@ -109,6 +109,10 @@ class ValueList : public Value {
+     }
+   }
+ 
++  virtual const std::vector<Value*>* ListValues() const override {
++    return &vals_;
++  }
++
+   virtual std::string DebugString_() const override {
+     std::string r;
+     for (Value* v : vals_) {
+diff --git a/src/expr.h b/src/expr.h
+index b57018f..7664b75 100644
+--- a/src/expr.h
++++ b/src/expr.h
+@@ -60,6 +60,8 @@ class Value : public Evaluable {
+   virtual bool IsLiteral() const { return false; }
+   // Only safe after IsLiteral() returns true.
+   virtual std::string_view GetLiteralValueUnsafe() const { return ""; }
++  // The values a list is made of, in order, or null when this is not a list.
++  virtual const std::vector<Value*>* ListValues() const { return nullptr; }
+ 
+   static std::string DebugString(const Value*);
+ 
+diff --git a/src/file.cc b/src/file.cc
+index be51ff1..978e8dd 100644
+--- a/src/file.cc
++++ b/src/file.cc
+@@ -26,8 +26,11 @@
+ #include "parser.h"
+ #include "stmt.h"
+ 
+-Makefile::Makefile(const std::string& filename)
+-    : mtime_(0), filename_(filename), exists_(false) {
++Makefile::Makefile(const std::string& filename, char recipe_prefix)
++    : mtime_(0),
++      filename_(filename),
++      exists_(false),
++      recipe_prefix_(recipe_prefix) {
+   int fd = open(filename.c_str(), O_RDONLY);
+   if (fd < 0) {
+     return;
+diff --git a/src/file.h b/src/file.h
+index bfb6e08..580e712 100644
+--- a/src/file.h
++++ b/src/file.h
+@@ -24,11 +24,12 @@ struct Stmt;
+ 
+ class Makefile {
+  public:
+-  explicit Makefile(const std::string& filename);
++  Makefile(const std::string& filename, char recipe_prefix);
+   ~Makefile();
+ 
+   const std::string& buf() const { return buf_; }
+   const std::string& filename() const { return filename_; }
++  char recipe_prefix() const { return recipe_prefix_; }
+ 
+   const std::vector<Stmt*>& stmts() const { return stmts_; }
+   std::vector<Stmt*>* mutable_stmts() { return &stmts_; }
+@@ -42,6 +43,7 @@ class Makefile {
+   std::string filename_;
+   std::vector<Stmt*> stmts_;
+   bool exists_;
++  char recipe_prefix_;
+ };
+ 
+ #endif  // FILE_H_
+diff --git a/src/file_cache.cc b/src/file_cache.cc
+index 19cc876..407a27a 100644
+--- a/src/file_cache.cc
++++ b/src/file_cache.cc
+@@ -14,25 +14,33 @@
+ 
+ // +build ignore
+ 
++#include <tuple>
+ #include <unordered_map>
++#include <utility>
+ 
+ #include "file.h"
+ #include "file_cache.h"
+ #include "fileutil.h"
+ 
+-const Makefile& MakefileCacheManager::ReadMakefile(
+-    const std::string& filename) {
+-  auto iter = cache_.find(filename);
+-  if (iter != cache_.end()) {
++const Makefile& MakefileCacheManager::ReadMakefile(const std::string& filename,
++                                                   char recipe_prefix) {
++  auto& makefiles = cache_[filename];
++  auto iter = makefiles.find(recipe_prefix);
++  if (iter != makefiles.end()) {
+     return iter->second;
+   }
+-  return (cache_.emplace(filename, filename).first)->second;
++  return makefiles
++      .emplace(std::piecewise_construct, std::forward_as_tuple(recipe_prefix),
++               std::forward_as_tuple(filename, recipe_prefix))
++      .first->second;
+ }
+ 
+ void MakefileCacheManager::GetAllFilenames(
+     std::unordered_map<std::string, double>* out) const {
+-  for (const auto& p : cache_)
+-    (*out)[p.first] = p.second.mtime();
++  for (const auto& p : cache_) {
++    for (const auto& mk : p.second)
++      (*out)[p.first] = mk.second.mtime();
++  }
+   for (const auto& f : extra_file_deps_)
+     (*out)[f.first] = f.second;
+ }
+diff --git a/src/file_cache.h b/src/file_cache.h
+index ba176d8..eb563fe 100644
+--- a/src/file_cache.h
++++ b/src/file_cache.h
+@@ -23,7 +23,8 @@
+ 
+ class MakefileCacheManager {
+  public:
+-  const Makefile& ReadMakefile(const std::string& filename);
++  // A makefile is read again for each .RECIPEPREFIX it is included with.
++  const Makefile& ReadMakefile(const std::string& filename, char recipe_prefix);
+   void GetAllFilenames(std::unordered_map<std::string, double>* out) const;
+   void AddExtraFileDep(std::string_view dep);
+ 
+@@ -33,7 +34,7 @@ class MakefileCacheManager {
+   MakefileCacheManager() = default;
+   MakefileCacheManager(const MakefileCacheManager&) = delete;
+   MakefileCacheManager(MakefileCacheManager&&) = delete;
+-  std::unordered_map<std::string, Makefile> cache_;
++  std::unordered_map<std::string, std::unordered_map<char, Makefile>> cache_;
+   std::unordered_map<std::string, double> extra_file_deps_;
+ };
+ 
+diff --git a/src/func.cc b/src/func.cc
+index b3e544c..4b20d62 100644
+--- a/src/func.cc
++++ b/src/func.cc
+@@ -503,12 +503,8 @@ void EvalFunc(const std::vector<Value*>& args, Evaluator* ev, std::string*) {
+                   text->c_str());
+   }
+   std::vector<Stmt*> stmts;
+-  Parse(*text, ev->loc(), &stmts);
+-  for (Stmt* stmt : stmts) {
+-    LOG("%s", stmt->DebugString().c_str());
+-    stmt->Eval(ev);
+-    // delete stmt;
+-  }
++  Parse(*text, ev->loc(), &stmts, ev->recipe_prefix());
++  ev->EvalText(*text, ev->loc(), true, ev->recipe_prefix(), stmts);
+ }
+ 
+ // #define TEST_FIND_EMULATOR
+diff --git a/src/main.cc b/src/main.cc
+index f6dcc7c..c78e341 100644
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -233,6 +233,10 @@ static int Run(const std::vector<Symbol>& targets,
+       .SetGlobalVar(new SimpleVar(StringPrintf(" %s", g_flags.makefile),
+                                   VarOrigin::FILE, ev.CurrentFrame(),
+                                   ev.loc()));
++  // Like make, which defines it before reading the environment: a value from
++  // the environment does not change the recipe prefix.
++  kRecipePrefixSym.SetGlobalVar(
++      new SimpleVar(std::string(), VarOrigin::DEFAULT, nullptr, Loc()));
+   for (char** p = environ; *p; p++) {
+     SetVar(*p, VarOrigin::ENVIRONMENT, nullptr, Loc());
+   }
+@@ -254,10 +258,11 @@ static int Run(const std::vector<Symbol>& targets,
+     ScopedFrame frame(ev.Enter(FrameType::PHASE, "*command line*", Loc()));
+     ev.in_command_line();
+     for (std::string_view l : cl_vars) {
++      std::string_view text = Intern(l).str();
+       std::vector<Stmt*> asts;
+-      Parse(Intern(l).str(), Loc("*bootstrap*", 0), &asts);
++      Parse(text, Loc("*bootstrap*", 0), &asts, ev.recipe_prefix());
+       CHECK(asts.size() == 1);
+-      asts[0]->Eval(&ev);
++      ev.EvalText(text, Loc("*bootstrap*", 0), true, ev.recipe_prefix(), asts);
+     }
+   }
+   ev.in_toplevel_makefile();
+@@ -267,15 +272,15 @@ static int Run(const std::vector<Symbol>& targets,
+     ScopedTimeReporter tr("eval time");
+ 
+     ScopedFrame file_frame(ev.Enter(FrameType::PARSE, g_flags.makefile, Loc()));
+-    const Makefile& mk =
+-        MakefileCacheManager::Get().ReadMakefile(g_flags.makefile);
+-    for (Stmt* stmt : mk.stmts()) {
+-      LOG("%s", stmt->DebugString().c_str());
+-      stmt->Eval(&ev);
+-    }
++    const Makefile& mk = MakefileCacheManager::Get().ReadMakefile(
++        g_flags.makefile, ev.recipe_prefix());
++    ev.EvalText(mk.buf(), Loc(mk.filename().c_str(), 0), false,
++                mk.recipe_prefix(), mk.stmts());
+   }
+ 
+   for (ParseErrorStmt* err : GetParseErrors()) {
++    if (err->superseded)
++      continue;
+     WARN_LOC(err->loc(), "warning for parse error in an unevaluated line: %s",
+              err->msg.c_str());
+   }
+diff --git a/src/parser.cc b/src/parser.cc
+index ac9ef56..60a7a83 100644
+--- a/src/parser.cc
++++ b/src/parser.cc
+@@ -16,7 +16,7 @@
+ 
+ #include "parser.h"
+ 
+-#include <stack>
++#include <algorithm>
+ #include <string_view>
+ #include <unordered_map>
+ 
+@@ -40,24 +40,61 @@ class Parser {
+   typedef std::unordered_map<std::string_view, DirectiveHandler> DirectiveMap;
+ 
+  public:
+-  Parser(std::string_view buf, const char* filename, std::vector<Stmt*>* stmts)
++  Parser(std::string_view buf,
++         const char* filename,
++         std::vector<Stmt*>* stmts,
++         char recipe_prefix)
+       : buf_(buf),
+         stmts_(stmts),
+         out_stmts_(stmts),
+         loc_(filename, 0),
+-        fixed_lineno_(false) {}
++        fixed_lineno_(false),
++        recipe_prefix_(recipe_prefix) {}
+ 
+-  Parser(std::string_view buf, const Loc& loc, std::vector<Stmt*>* stmts)
++  Parser(std::string_view buf,
++         const Loc& loc,
++         std::vector<Stmt*>* stmts,
++         char recipe_prefix)
+       : buf_(buf),
+         stmts_(stmts),
+         out_stmts_(stmts),
+         loc_(loc),
+-        fixed_lineno_(true) {}
++        fixed_lineno_(true),
++        recipe_prefix_(recipe_prefix) {}
++
++  Parser(std::string_view buf,
++         size_t start,
++         const Loc& loc,
++         bool fixed_lineno,
++         char recipe_prefix,
++         bool after_rule,
++         const std::vector<ReadFrame>& frames,
++         bool innermost_at_true_part,
++         std::vector<Stmt*>* stmts,
++         std::vector<const IfStmt*>* frame_stmts)
++      : buf_(buf),
++        start_(start),
++        after_rule_(after_rule),
++        stmts_(stmts),
++        out_stmts_(stmts),
++        loc_(loc),
++        fixed_lineno_(fixed_lineno),
++        recipe_prefix_(recipe_prefix) {
++    for (size_t i = 0; i < frames.size(); i++) {
++      IfStmt* stmt = new IfStmt();
++      stmt->lhs = nullptr;
++      stmt->rhs = nullptr;
++      stmt->num_nest = frames[i].num_nest;
++      bool in_else = frames[i].in_else &&
++                     !(innermost_at_true_part && i + 1 == frames.size());
++      if_stack_.push_back(IfState{stmt, in_else, frames[i].num_nest});
++      out_stmts_ = in_else ? &stmt->false_stmts : &stmt->true_stmts;
++      frame_stmts->push_back(stmt);
++    }
++  }
+ 
+   void Parse() {
+-    l_ = 0;
+-
+-    for (l_ = 0; l_ < buf_.size();) {
++    for (l_ = start_; l_ < buf_.size();) {
+       size_t lf_cnt = 0;
+       size_t e = FindEndOfLine(&lf_cnt);
+       if (!fixed_lineno_)
+@@ -69,17 +106,22 @@ class Parser {
+       ParseLine(line);
+       if (!fixed_lineno_)
+         loc_.lineno += lf_cnt - 1;
++      for (Stmt* stmt : line_stmts_)
++        stmt->set_end(std::min(e + 1, buf_.size()), loc_.lineno, after_rule_);
++      line_stmts_.clear();
+       if (e == buf_.size())
+         break;
+ 
+       l_ = e + 1;
+     }
+ 
++    // Like make, these are reported when the evaluation gets to the end of the
++    // text, which another .RECIPEPREFIX may have read again without them.
+     if (!if_stack_.empty())
+-      ERROR_LOC(Loc(loc_.filename, loc_.lineno + 1), "*** missing `endif'.");
++      EndError(Loc(loc_.filename, loc_.lineno + 1), "*** missing `endif'.");
+     if (!define_name_.empty())
+-      ERROR_LOC(Loc(loc_.filename, define_start_line_),
+-                "*** missing `endef', unterminated `define'.");
++      EndError(Loc(loc_.filename, define_start_line_),
++               "*** missing `endef', unterminated `define'.");
+   }
+ 
+   static std::vector<ParseErrorStmt*> parse_errors;
+@@ -89,10 +131,43 @@ class Parser {
+     ParseErrorStmt* stmt = new ParseErrorStmt();
+     stmt->set_loc(loc_);
+     stmt->msg = msg;
+-    out_stmts_->push_back(stmt);
++    stmt->text = buf_.data();
++    Emit(stmt);
++    parse_errors.push_back(stmt);
++  }
++
++  void EndError(const Loc& loc, const char* msg) {
++    ParseErrorStmt* stmt = new ParseErrorStmt();
++    stmt->set_loc(loc);
++    stmt->msg = msg;
++    stmt->text = buf_.data();
++    stmt->at_end = true;
++    stmt->set_end(buf_.size(), loc_.lineno, false);
++    EmitOnEveryPath(stmt);
+     parse_errors.push_back(stmt);
+   }
+ 
++  void Emit(Stmt* stmt) {
++    out_stmts_->push_back(stmt);
++    line_stmts_.push_back(stmt);
++  }
++
++  // Emits |stmt| also in the other part of every open conditional: like a
++  // warning given while reading, it comes whichever parts the evaluation takes.
++  void EmitOnEveryPath(Stmt* stmt) {
++    for (IfState& st : if_stack_)
++      (st.is_in_else ? st.stmt->true_stmts : st.stmt->false_stmts)
++          .push_back(stmt);
++    Emit(stmt);
++  }
++
++  void Warn(const char* msg) {
++    WarnStmt* stmt = new WarnStmt();
++    stmt->set_loc(loc_);
++    stmt->msg = msg;
++    EmitOnEveryPath(stmt);
++  }
++
+   size_t FindEndOfLine(size_t* lf_cnt) {
+     return ::FindEndOfLine(buf_, l_, lf_cnt);
+   }
+@@ -114,14 +189,14 @@ class Parser {
+ 
+     current_directive_ = AssignDirective::NONE;
+ 
+-    if (line[0] == '\t' && after_rule_) {
++    // Like make, a line that starts with the prefix is a recipe line only after
++    // a rule. Elsewhere comments, directives and assignments come first, so a
++    // # prefix starts a comment there.
++    if (line[0] == recipe_prefix_ && after_rule_) {
+       CommandStmt* stmt = new CommandStmt();
+       stmt->set_loc(loc_);
+-      Loc mutable_loc(loc_);
+-      stmt->expr =
+-          ParseExpr(&mutable_loc, line.substr(1), ParseExprOpt::COMMAND);
+       stmt->orig = line;
+-      out_stmts_->push_back(stmt);
++      Emit(stmt);
+       return;
+     }
+ 
+@@ -169,7 +244,7 @@ class Parser {
+       return;
+ 
+     if (!orig_line_with_directives_.empty() &&
+-        orig_line_with_directives_[0] == '\t') {
++        orig_line_with_directives_[0] == recipe_prefix_) {
+       Error("*** commands commence before first target.");
+       return;
+     }
+@@ -204,7 +279,7 @@ class Parser {
+       rule_stmt->sep = RuleStmt::SEP_NULL;
+       rule_stmt->rhs = NULL;
+     }
+-    out_stmts_->push_back(rule_stmt);
++    Emit(rule_stmt);
+     after_rule_ = true;
+   }
+ 
+@@ -237,7 +312,7 @@ class Parser {
+     stmt->op = op;
+     stmt->directive = current_directive_;
+     stmt->is_final = is_final;
+-    out_stmts_->push_back(stmt);
++    Emit(stmt);
+     after_rule_ = false;
+   }
+ 
+@@ -247,7 +322,7 @@ class Parser {
+     Loc mutable_loc(loc_);
+     stmt->expr = ParseExpr(&mutable_loc, line);
+     stmt->should_exist = directive[0] == 'i';
+-    out_stmts_->push_back(stmt);
++    Emit(stmt);
+     after_rule_ = false;
+   }
+ 
+@@ -264,8 +339,13 @@ class Parser {
+   }
+ 
+   void ParseInsideDefine(std::string_view line) {
++    // In make a line starting with the recipe prefix neither starts nor ends a
++    // define. Here that holds for prefixes other than a tab, since kati reads a
++    // tab-led endef as a directive.
++    bool prefixed =
++        recipe_prefix_ != '\t' && !line.empty() && line[0] == recipe_prefix_;
+     line = TrimLeftSpace(line);
+-    std::string_view directive = GetDirective(line);
++    std::string_view directive = prefixed ? "" : GetDirective(line);
+     if (directive == "define")
+       num_define_nest_++;
+     else if (directive == "endef")
+@@ -279,7 +359,7 @@ class Parser {
+     std::string_view rest = TrimRightSpace(
+         RemoveComment(TrimLeftSpace(line.substr(sizeof("endef") - 1))));
+     if (!rest.empty()) {
+-      WARN_LOC(loc_, "extraneous text after `endef' directive");
++      Warn("extraneous text after `endef' directive");
+     }
+ 
+     AssignStmt* stmt = new AssignStmt();
+@@ -294,7 +374,7 @@ class Parser {
+     stmt->orig_rhs = rhs;
+     stmt->op = AssignOp::EQ;
+     stmt->directive = current_directive_;
+-    out_stmts_->push_back(stmt);
++    Emit(stmt);
+     define_name_ = std::string_view();
+   }
+ 
+@@ -303,7 +383,8 @@ class Parser {
+     st.stmt = stmt;
+     st.is_in_else = false;
+     st.num_nest = num_if_nest_;
+-    if_stack_.push(st);
++    stmt->num_nest = num_if_nest_;
++    if_stack_.push_back(st);
+     out_stmts_ = &stmt->true_stmts;
+   }
+ 
+@@ -314,7 +395,7 @@ class Parser {
+     Loc mutable_loc(loc_);
+     stmt->lhs = ParseExpr(&mutable_loc, line);
+     stmt->rhs = NULL;
+-    out_stmts_->push_back(stmt);
++    Emit(stmt);
+     EnterIf(stmt);
+   }
+ 
+@@ -356,7 +437,7 @@ class Parser {
+       }
+     }
+     if (!s.empty()) {
+-      WARN_LOC(loc_, "extraneous text after `ifeq' directive");
++      Warn("extraneous text after `ifeq' directive");
+       return true;
+     }
+     return true;
+@@ -372,14 +453,14 @@ class Parser {
+       return;
+     }
+ 
+-    out_stmts_->push_back(stmt);
++    Emit(stmt);
+     EnterIf(stmt);
+   }
+ 
+   void ParseElse(std::string_view line, std::string_view) {
+     if (!CheckIfStack("else"))
+       return;
+-    IfState& st = if_stack_.top();
++    IfState& st = if_stack_.back();
+     if (st.is_in_else) {
+       Error("*** only one `else' per conditional.");
+       return;
+@@ -393,7 +474,7 @@ class Parser {
+ 
+     num_if_nest_ = st.num_nest + 1;
+     if (!HandleDirective(next_if, else_if_directives_)) {
+-      WARN_LOC(loc_, "extraneous text after `else' directive");
++      Warn("extraneous text after `else' directive");
+     }
+     num_if_nest_ = 0;
+   }
+@@ -405,14 +486,14 @@ class Parser {
+       Error("extraneous text after `endif` directive");
+       return;
+     }
+-    int num_nest = if_stack_.top().num_nest;
++    int num_nest = if_stack_.back().num_nest;
+     for (int i = 0; i <= num_nest; i++) {
+-      if_stack_.pop();
++      if_stack_.pop_back();
+     }
+     if (if_stack_.empty()) {
+       out_stmts_ = stmts_;
+     } else {
+-      const IfState& st = if_stack_.top();
++      const IfState& st = if_stack_.back();
+       if (st.is_in_else)
+         out_stmts_ = &st.stmt->false_stmts;
+       else
+@@ -431,7 +512,7 @@ class Parser {
+     Loc mutable_loc(loc_);
+     stmt->expr = ParseExpr(&mutable_loc, line);
+     stmt->is_export = is_export;
+-    out_stmts_->push_back(stmt);
++    Emit(stmt);
+   }
+ 
+   void ParseOverride(std::string_view line, std::string_view) {
+@@ -497,6 +578,7 @@ class Parser {
+ 
+   std::string_view buf_;
+   size_t l_;
++  size_t start_ = 0;
+   // Represents if we just parsed a rule or an expression.
+   // Expressions are included because they can expand into
+   // a rule, see testcase/rule_in_var.mk.
+@@ -514,10 +596,14 @@ class Parser {
+   AssignDirective current_directive_;
+ 
+   int num_if_nest_ = 0;
+-  std::stack<IfState> if_stack_;
++  std::vector<IfState> if_stack_;
+ 
+   Loc loc_;
+   bool fixed_lineno_;
++  // The character that starts recipe lines, and the statements read from the
++  // line being parsed.
++  char recipe_prefix_;
++  std::vector<Stmt*> line_stmts_;
+ 
+   const static DirectiveMap make_directives_;
+   const static DirectiveMap else_if_directives_;
+@@ -528,24 +614,50 @@ class Parser {
+ 
+ void Parse(Makefile* mk) {
+   COLLECT_STATS("parse file time");
+-  Parser parser(mk->buf(), mk->filename().c_str(), mk->mutable_stmts());
++  Parser parser(mk->buf(), mk->filename().c_str(), mk->mutable_stmts(),
++                mk->recipe_prefix());
+   parser.Parse();
+ }
+ 
+ void Parse(std::string_view buf,
+            const Loc& loc,
+-           std::vector<Stmt*>* out_stmts) {
++           std::vector<Stmt*>* out_stmts,
++           char recipe_prefix) {
+   COLLECT_STATS("parse eval time");
+-  ParseNoStats(buf, loc, out_stmts);
++  ParseNoStats(buf, loc, out_stmts, recipe_prefix);
+ }
+ 
+ void ParseNoStats(std::string_view buf,
+                   const Loc& loc,
+-                  std::vector<Stmt*>* out_stmts) {
+-  Parser parser(buf, loc, out_stmts);
++                  std::vector<Stmt*>* out_stmts,
++                  char recipe_prefix) {
++  Parser parser(buf, loc, out_stmts, recipe_prefix);
+   parser.Parse();
+ }
+ 
++void ParseRest(std::string_view buf,
++               size_t start,
++               const Loc& loc,
++               bool fixed_lineno,
++               char recipe_prefix,
++               bool after_rule,
++               const std::vector<ReadFrame>& frames,
++               bool innermost_at_true_part,
++               std::vector<Stmt*>* out_stmts,
++               std::vector<const IfStmt*>* frame_stmts) {
++  COLLECT_STATS("parse eval time");
++  Parser parser(buf, start, loc, fixed_lineno, recipe_prefix, after_rule,
++                frames, innermost_at_true_part, out_stmts, frame_stmts);
++  parser.Parse();
++}
++
++void SupersedeParseErrors(std::string_view buf, size_t offset) {
++  for (ParseErrorStmt* err : Parser::parse_errors) {
++    if (err->text == buf.data() && err->end_offset() > offset)
++      err->superseded = true;
++  }
++}
++
+ const Parser::DirectiveMap Parser::make_directives_ = {
+     {"include", &Parser::ParseInclude},   {"-include", &Parser::ParseInclude},
+     {"sinclude", &Parser::ParseInclude},  {"define", &Parser::ParseDefine},
+diff --git a/src/parser.h b/src/parser.h
+index 21673b3..347d07f 100644
+--- a/src/parser.h
++++ b/src/parser.h
+@@ -24,10 +24,41 @@
+ class Makefile;
+ 
+ void Parse(Makefile* mk);
+-void Parse(std::string_view buf, const Loc& loc, std::vector<Stmt*>* out_asts);
++void Parse(std::string_view buf,
++           const Loc& loc,
++           std::vector<Stmt*>* out_asts,
++           char recipe_prefix = '\t');
+ void ParseNoStats(std::string_view buf,
+                   const Loc& loc,
+-                  std::vector<Stmt*>* out_asts);
++                  std::vector<Stmt*>* out_asts,
++                  char recipe_prefix = '\t');
++
++// A conditional open where a text is read again: whether the part it takes
++// is its else part, and how many enclosing conditionals its endif also closes.
++struct ReadFrame {
++  bool in_else;
++  int num_nest;
++};
++
++// Reads |buf| again from |start|, the end of line |loc|, inside the open
++// conditionals |frames|, outermost first, each in the part it takes or, for
++// the innermost one, in its true part if |innermost_at_true_part|. Each
++// frame's statements go to the conditional in |frame_stmts|, those after the
++// last endif to |out_asts|.
++void ParseRest(std::string_view buf,
++               size_t start,
++               const Loc& loc,
++               bool fixed_lineno,
++               char recipe_prefix,
++               bool after_rule,
++               const std::vector<ReadFrame>& frames,
++               bool innermost_at_true_part,
++               std::vector<Stmt*>* out_asts,
++               std::vector<const IfStmt*>* frame_stmts);
++
++// Drops the errors found in |buf| after |offset| from the errors reported for
++// lines that were never evaluated: that part was read again.
++void SupersedeParseErrors(std::string_view buf, size_t offset);
+ 
+ void ParseAssignStatement(std::string_view line,
+                           size_t sep,
+diff --git a/src/rule.h b/src/rule.h
+index 59f6de6..a332cbf 100644
+--- a/src/rule.h
++++ b/src/rule.h
+@@ -55,6 +55,10 @@ class Rule {
+   std::vector<Value*> cmds;
+   Loc loc;
+   int cmd_lineno;
++  // Like make, the .RECIPEPREFIX in effect once the rule's targets were
++  // expanded, which its commands drop after newlines. It is 0, so a tab stays,
++  // for a rule read before .RECIPEPREFIX was set.
++  char recipe_prefix = 0;
+ 
+  private:
+   void Error(const std::string& msg) { ERROR_LOC(loc, "%s", msg.c_str()); }
+diff --git a/src/stmt.cc b/src/stmt.cc
+index 7c7d4f4..04716e7 100644
+--- a/src/stmt.cc
++++ b/src/stmt.cc
+@@ -18,6 +18,7 @@
+ 
+ #include "eval.h"
+ #include "expr.h"
++#include "log.h"
+ #include "stringprintf.h"
+ #include "strutil.h"
+ 
+@@ -86,7 +87,7 @@ Symbol AssignStmt::GetLhsSymbol(Evaluator* ev) const {
+ 
+ std::string CommandStmt::DebugString() const {
+   return StringPrintf("CommandStmt(%s, loc=%s:%d)",
+-                      Value::DebugString(expr).c_str(), LOCF(loc()));
++                      Value::DebugString(expr()).c_str(), LOCF(loc()));
+ }
+ 
+ std::string IfStmt::DebugString() const {
+@@ -144,8 +145,16 @@ void AssignStmt::EvalStatement(Evaluator* ev) const {
+   ev->EvalAssign(this);
+ }
+ 
++Value* CommandStmt::expr() const {
++  if (!expr_) {
++    Loc loc(this->loc());
++    expr_ = ParseExpr(&loc, orig.substr(1), ParseExprOpt::COMMAND);
++  }
++  return expr_;
++}
++
+ CommandStmt::~CommandStmt() {
+-  delete expr;
++  delete expr_;
+ }
+ 
+ void CommandStmt::EvalStatement(Evaluator* ev) const {
+@@ -181,5 +190,18 @@ ParseErrorStmt::~ParseErrorStmt() {}
+ 
+ void ParseErrorStmt::EvalStatement(Evaluator* ev) const {
+   ev->set_loc(loc());
+-  ev->Error(msg);
++  if (at_end)
++    ERROR_LOC(loc(), "%s", msg.c_str());
++  else
++    ev->Error(msg);
++}
++
++WarnStmt::~WarnStmt() {}
++
++void WarnStmt::EvalStatement(Evaluator*) const {
++  WARN_LOC(loc(), "%s", msg.c_str());
++}
++
++std::string WarnStmt::DebugString() const {
++  return StringPrintf("WarnStmt(%s, loc=%s:%d)", msg.c_str(), LOCF(loc()));
+ }
+diff --git a/src/stmt.h b/src/stmt.h
+index 1173f1b..ac1f02f 100644
+--- a/src/stmt.h
++++ b/src/stmt.h
+@@ -58,12 +58,26 @@ struct Stmt {
+ 
+   virtual std::string DebugString() const = 0;
+ 
++  // Where the statement's last line ends in its text, that line, and whether
++  // a rule is pending there, for reading the rest of the text again.
++  size_t end_offset() const { return end_offset_; }
++  int end_lineno() const { return end_lineno_; }
++  bool after_rule() const { return after_rule_; }
++  void set_end(size_t offset, int lineno, bool after_rule) {
++    end_offset_ = offset;
++    end_lineno_ = lineno;
++    after_rule_ = after_rule;
++  }
++
+  protected:
+   Stmt();
+ 
+  private:
+   Loc loc_;
+   std::string_view orig_;
++  size_t end_offset_ = 0;
++  int end_lineno_ = 0;
++  bool after_rule_ = false;
+ };
+ 
+ /* Parsed "rule statement" before evaluation is kept as
+@@ -107,14 +121,20 @@ struct AssignStmt : public Stmt {
+ };
+ 
+ struct CommandStmt : public Stmt {
+-  Value* expr;
+   std::string_view orig;
+ 
++  // Parsed when the evaluation first gets to the line: until then, another
++  // .RECIPEPREFIX may read it again as an ordinary line.
++  Value* expr() const;
++
+   virtual ~CommandStmt();
+ 
+   virtual void EvalStatement(Evaluator* ev) const;
+ 
+   virtual std::string DebugString() const;
++
++ private:
++  mutable Value* expr_ = nullptr;
+ };
+ 
+ struct IfStmt : public Stmt {
+@@ -123,6 +143,9 @@ struct IfStmt : public Stmt {
+   Value* rhs;
+   std::vector<Stmt*> true_stmts;
+   std::vector<Stmt*> false_stmts;
++  // How many enclosing conditionals its endif also closes, as in
++  // "else ifeq ...".
++  int num_nest = 0;
+ 
+   virtual ~IfStmt();
+ 
+@@ -155,6 +178,13 @@ struct ExportStmt : public Stmt {
+ 
+ struct ParseErrorStmt : public Stmt {
+   std::string msg;
++  // The text the error was found in, and whether that part of the text was
++  // read again with another .RECIPEPREFIX.
++  const char* text = nullptr;
++  bool superseded = false;
++  // Whether it was found at the end of the text, which is reported without the
++  // include stack, as when the parser raised it.
++  bool at_end = false;
+ 
+   virtual ~ParseErrorStmt();
+ 
+@@ -163,4 +193,16 @@ struct ParseErrorStmt : public Stmt {
+   virtual std::string DebugString() const;
+ };
+ 
++// A warning about a line, given when the evaluation gets to it, so that a part
++// of the text read again with another .RECIPEPREFIX does not give it.
++struct WarnStmt : public Stmt {
++  std::string msg;
++
++  virtual ~WarnStmt();
++
++  virtual void EvalStatement(Evaluator* ev) const;
++
++  virtual std::string DebugString() const;
++};
++
+ #endif  // STMT_H_
+diff --git a/src/symtab.cc b/src/symtab.cc
+index 57c1417..12ee321 100644
+--- a/src/symtab.cc
++++ b/src/symtab.cc
+@@ -42,6 +42,7 @@ Symbol kEmptySym;
+ Symbol kShellSym;
+ Symbol kAllowRulesSym;
+ Symbol kKatiReadonlySym;
++Symbol kRecipePrefixSym;
+ Symbol kVariablesSym;
+ Symbol kKatiSymbolsSym;
+ 
+@@ -133,6 +134,7 @@ class Symtab {
+     shellStatusSym.SetGlobalVar(new ShellStatusVar(), false, nullptr);
+     kAllowRulesSym = Intern(".KATI_ALLOW_RULES");
+     kKatiReadonlySym = Intern(".KATI_READONLY");
++    kRecipePrefixSym = Intern(".RECIPEPREFIX");
+     kVariablesSym = Intern(".VARIABLES");
+     kVariablesSym.SetGlobalVar(new VariableNamesVar(".VARIABLES", true), false,
+                                nullptr);
+diff --git a/src/symtab.h b/src/symtab.h
+index 641f416..a73552f 100644
+--- a/src/symtab.h
++++ b/src/symtab.h
+@@ -217,6 +217,7 @@ extern Symbol kEmptySym;
+ extern Symbol kShellSym;
+ extern Symbol kAllowRulesSym;
+ extern Symbol kKatiReadonlySym;
++extern Symbol kRecipePrefixSym;
+ 
+ Symbol Intern(std::string_view s);
+ 
+diff --git a/src/var.cc b/src/var.cc
+index 9907409..3f72cda 100644
+--- a/src/var.cc
++++ b/src/var.cc
+@@ -61,6 +61,11 @@ Var::~Var() {
+   diagnostic_messages_.erase(this);
+ }
+ 
++char Var::FirstCharAsWritten() const {
++  std::string_view s = String();
++  return s.empty() ? 0 : s[0];
++}
++
+ void Var::AppendVar(Evaluator*, Value*) {
+   CHECK(false);
+ }
+@@ -221,6 +226,27 @@ std::string_view RecursiveVar::String() const {
+   return orig_;
+ }
+ 
++static char FirstCharAsWritten(const Value* v) {
++  if (const std::vector<Value*>* parts = v->ListValues()) {
++    for (const Value* part : *parts) {
++      if (char c = FirstCharAsWritten(part))
++        return c;
++    }
++    return 0;
++  }
++  if (!v->IsLiteral())
++    return '$';
++  std::string_view s = v->GetLiteralValueUnsafe();
++  return s.empty() ? 0 : s[0];
++}
++
++char RecursiveVar::FirstCharAsWritten() const {
++  // The parsed value drops a lone "$".
++  if (orig_ == "$")
++    return '$';
++  return ::FirstCharAsWritten(v_);
++}
++
+ std::string RecursiveVar::DebugString() const {
+   return Value::DebugString(v_);
+ }
+diff --git a/src/var.h b/src/var.h
+index a1c9096..8d0cfa4 100644
+--- a/src/var.h
++++ b/src/var.h
+@@ -59,6 +59,10 @@ class Var : public Evaluable {
+ 
+   virtual std::string_view String() const = 0;
+ 
++  // The first character of the value, which for a recursive variable is its
++  // text before expansion, or 0 when it is empty.
++  virtual char FirstCharAsWritten() const;
++
+   virtual std::string DebugString() const = 0;
+ 
+   bool ReadOnly() const { return readonly_; }
+@@ -155,6 +159,8 @@ class RecursiveVar : public Var {
+ 
+   virtual std::string_view String() const override;
+ 
++  virtual char FirstCharAsWritten() const override;
++
+   virtual std::string DebugString() const override;
+ 
+   virtual void Used(Evaluator* ev, const Symbol& sym) const override;
