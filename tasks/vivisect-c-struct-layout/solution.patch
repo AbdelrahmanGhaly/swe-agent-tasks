@@ -75,10 +75,10 @@ index 247a7c0b..ffd83211 100644
              return struct.pack(self._vs_fastfmt, *ffvals)
  
 diff --git a/vstruct/bitfield.py b/vstruct/bitfield.py
-index cce89151..3c6428ad 100644
+index cce89151..8473663d 100644
 --- a/vstruct/bitfield.py
 +++ b/vstruct/bitfield.py
-@@ -120,3 +120,61 @@ class VBitField(VStruct):
+@@ -120,3 +120,69 @@ class VBitField(VStruct):
              valu <<= (8 - bitrem)
  
          return binascii.unhexlify(('%.' + str(bytelen * 2) + 'x') % valu)
@@ -140,11 +140,19 @@ index cce89151..3c6428ad 100644
 +
 +    def vsSetValue(self, value):
 +        self._vs_store.vsSetBits(self._vs_bitoff, self._vs_bitwidth, value)
++
++
++class v_cboolfield(v_cbitfield):
++    '''
++    A named C _Bool bit-field.  Assigning any nonzero value stores 1.
++    '''
++    def vsSetValue(self, value):
++        v_cbitfield.vsSetValue(self, 1 if value else 0)
 diff --git a/vstruct/cparse.py b/vstruct/cparse.py
-index 8a4767ef..6f6b568a 100644
+index 8a4767ef..04d93a65 100644
 --- a/vstruct/cparse.py
 +++ b/vstruct/cparse.py
-@@ -1,128 +1,835 @@
+@@ -1,128 +1,856 @@
 +import struct
 +
  from pycparser import c_parser
@@ -287,6 +295,19 @@ index 8a4767ef..6f6b568a 100644
 +    _vs_length = 8
 +
 +
++class v_cbool(vs_prim.v_uint8):
++    '''
++    A C _Bool.  Assigning any nonzero value stores 1.  It emits the byte it
++    parsed until it is assigned, so it skips the struct.pack fast path.
++    '''
++    def __init__(self, bigend=False):
++        vs_prim.v_uint8.__init__(self, bigend=bigend)
++        self._vs_fmt = None
++
++    def vsSetValue(self, value):
++        vs_prim.v_uint8.vsSetValue(self, 1 if value else 0)
++
++
 +def _commit(vs):
 +    union = vs.__dict__.get('_vs_cunion')
 +    if union is not None and not union.__dict__.get('_vs_cbusy'):
@@ -400,7 +421,7 @@ index 8a4767ef..6f6b568a 100644
 +
 +class CType:
 +
-+    def __init__(self, size, align, ctor, signed=False, ischar=False, tclass='int', target=None):
++    def __init__(self, size, align, ctor, signed=False, ischar=False, tclass='int', target=None, isbool=False):
 +        self.size = size
 +        self.align = align
 +        self.ctor = ctor
@@ -408,6 +429,7 @@ index 8a4767ef..6f6b568a 100644
 +        self.ischar = ischar
 +        self.tclass = tclass
 +        self.target = target
++        self.isbool = isbool
 +
 +    def build(self, bigend):
 +        if self.ctor is None:
@@ -455,8 +477,9 @@ index 8a4767ef..6f6b568a 100644
 +                vs.vsAddField(item[1], item[2].build(bigend))
 +            else:
 +                store = _cprim(vs_bits.v_cbits)(size=item[2], bigend=bigend)
-+                for fname, bitoff, width, signed in item[3]:
-+                    vs.vsAddField(fname, _cprim(vs_bits.v_cbitfield)(store, bitoff, width, signed))
++                for fname, bitoff, width, ctype in item[3]:
++                    cls = vs_bits.v_cboolfield if ctype.isbool else vs_bits.v_cbitfield
++                    vs.vsAddField(fname, _cprim(cls)(store, bitoff, width, ctype.signed))
 +                vs.vsAddField(item[1], store)
 +
 +        if self.kind == 'union':
@@ -594,6 +617,10 @@ index 8a4767ef..6f6b568a 100644
 +        cls = _cprim(v_cfloat if size == 4 else v_cdouble)
 +        return CType(size, min(size, self.psize), lambda bigend: cls(bigend=bigend), tclass='float')
 +
++    def _boolType(self):
++        cls = _cprim(v_cbool)
++        return CType(1, 1, lambda bigend: cls(bigend=bigend), isbool=True)
++
 +    def _pointerTo(self, target):
 +        pclass = self.pclass
 +        return CType(self.psize, self.psize, lambda bigend: pclass(bigend=bigend), tclass='ptr', target=target)
@@ -616,7 +643,7 @@ index 8a4767ef..6f6b568a 100644
 +            return self._intType(2, 2, not unsigned)
 +
 +        if rest == ['_Bool'] and not (longs or signed or unsigned):
-+            return self._intType(1, 1, False)
++            return self._boolType()
 +
 +        if rest == ['float'] and not (longs or signed or unsigned):
 +            return self._floatType(4)
@@ -749,7 +776,7 @@ index 8a4767ef..6f6b568a 100644
 +
 +                if decl.name is not None and width:
 +                    align = max(align, ctype.align)
-+                    placed.append(('bits', decl.name, pos, width, ctype.signed))
++                    placed.append(('bits', decl.name, pos, width, ctype))
 +                    rec.members[decl.name] = ctype
 +                continue
 +
@@ -882,6 +909,8 @@ index 8a4767ef..6f6b568a 100644
 +        raise Exception('Unsupported constant expression: %r' % (node,))
 +
 +    def _convert(self, value, ctype):
++        if ctype.isbool:
++            return int(value != 0)
 +        if ctype.tclass == 'float':
 +            return float(value)
 +        bits = ctype.size * 8
@@ -1088,7 +1117,7 @@ index 8a4767ef..6f6b568a 100644
  
  def preProcessSource( src ):
      '''
-@@ -135,11 +842,11 @@ def preProcessSource( src ):
+@@ -135,11 +863,11 @@ def preProcessSource( src ):
  
  def ctorFromCSource(src, psize=4, bigend=False):
      '''

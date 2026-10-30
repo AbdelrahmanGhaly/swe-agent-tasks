@@ -1,0 +1,2468 @@
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..7c899d51
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,67 @@
++#!/usr/bin/env bash
++set -uo pipefail
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path=*) OUTPUT_PATH="${1#--output_path=}"; shift ;;
++    --output_path)   OUTPUT_PATH="$2"; shift 2 ;;
++    base|new)        MODE="$1"; shift ;;
++    *)               shift ;;
++  esac
++done
++MODE="${MODE:-base}"
++
++cd /app || exit 1
++
++export PICCOLO_CONF="tests.sqlite_conf"
++
++NEW_TESTS="tests/columns/test_generated_7f3a1c.py"
++ARGS=(-p no:cacheprovider -o addopts= -m "not integration")
++
++# Compares wall clock timings with timeit, so it fails under CPU contention
++# regardless of the code under test.
++FLAKY_TEST="tests/query/test_freeze.py::TestFreeze::test_frozen_performance"
++
++if [ -n "$OUTPUT_PATH" ]; then
++  mkdir -p "$(dirname "$OUTPUT_PATH")"
++  ARGS+=(--junitxml="$OUTPUT_PATH")
++fi
++
++LOG_FILE="$(mktemp)"
++
++if [ "$MODE" = "new" ]; then
++  python -m pytest "${ARGS[@]}" "$NEW_TESTS" 2>&1 | tee "$LOG_FILE"
++else
++  python -m pytest "${ARGS[@]}" --deselect "$FLAKY_TEST"     --ignore="$NEW_TESTS" tests 2>&1 | tee "$LOG_FILE"
++fi
++STATUS=${PIPESTATUS[0]}
++
++if [ -n "$OUTPUT_PATH" ] && ! grep -q "<testcase" "$OUTPUT_PATH" 2>/dev/null; then
++  python - "$OUTPUT_PATH" "$LOG_FILE" "$MODE" <<'PY'
++import html
++import sys
++
++output_path, log_file, mode = sys.argv[1:4]
++
++with open(log_file, encoding="utf-8", errors="replace") as f:
++    details = f.read()[-4000:]
++
++with open(output_path, "w", encoding="utf-8") as f:
++    f.write(
++        '<?xml version="1.0" encoding="utf-8"?>\n'
++        '<testsuites name="pytest tests">\n'
++        '<testsuite name="pytest" errors="1" failures="0" skipped="0" '
++        'tests="1" time="0">\n'
++        f'<testcase classname="pytest" name="{mode} test run" time="0">\n'
++        '<error message="pytest did not produce a report">'
++        f"{html.escape(details)}</error>\n"
++        "</testcase>\n</testsuite>\n</testsuites>\n"
++    )
++PY
++  if [ "$STATUS" -eq 0 ]; then STATUS=1; fi
++fi
++
++rm -f "$LOG_FILE"
++exit $STATUS
+diff --git a/tests/columns/test_generated_7f3a1c.py b/tests/columns/test_generated_7f3a1c.py
+new file mode 100644
+index 00000000..19fc8a45
+--- /dev/null
++++ b/tests/columns/test_generated_7f3a1c.py
+@@ -0,0 +1,2389 @@
++import datetime
++import json
++import uuid
++from enum import Enum
++from decimal import Decimal
++from types import SimpleNamespace
++from unittest import TestCase
++from unittest.mock import patch
++
++from piccolo import columns as piccolo_columns
++from piccolo.apps.fixtures.commands.load import load_json_string
++from piccolo.apps.migrations.auto.diffable_table import DiffableTable
++from piccolo.apps.migrations.auto.migration_manager import MigrationManager
++from piccolo.apps.migrations.auto.schema_differ import SchemaDiffer
++from piccolo.apps.migrations.auto.serialisation import (
++    deserialise_params,
++    serialise_params,
++)
++from piccolo.columns import (
++    UUID,
++    Array,
++    Boolean,
++    Date,
++    ForeignKey,
++    Integer,
++    Varchar,
++)
++from piccolo.query.functions.string import Lower, Upper
++from piccolo.querystring import QueryString
++from piccolo.conf.apps import Finder
++from piccolo.query.methods.insert import OnConflictAction
++from piccolo.table import Table, create_table_class
++from piccolo.testing.model_builder import ModelBuilder
++from piccolo.utils.sync import run_sync
++from tests.base import DBTestCase, TableTest, engines_only
++
++TABLES = SimpleNamespace()
++
++
++class Tone(str, Enum):
++    loud = "loud-ish"
++
++
++def generated(*args, **kwargs):
++    return piccolo_columns.Generated(*args, **kwargs)
++
++
++def get_tables() -> SimpleNamespace:
++    if not vars(TABLES):
++
++        class Product(Table):
++            name = Varchar()
++            price = Integer()
++            quantity = Integer()
++            name_upper = Varchar(generated=generated("UPPER({})", name))
++            total = Integer(generated=generated("{} * {}", price, quantity))
++
++        class Sensor(Table):
++            reading = Integer()
++            doubled = Integer(
++                generated=generated("{} * 2", reading, stored=False)
++            )
++
++        class Person(Table):
++            first_name = Varchar(db_column_name="fname")
++            shout = Varchar(generated=generated("UPPER({})", first_name))
++
++        class Ticket(Table):
++            price = Integer()
++            price_with_fee = Integer(generated=generated("price + 5"))
++            note = Varchar(null=True, generated=generated("'ok'"))
++            serial_code = Varchar(
++                unique=True, generated=generated("UPPER({})", note)
++            )
++
++        class Alias(Table):
++            source = Varchar()
++            label = Varchar(
++                db_column_name="label_db",
++                generated=generated("UPPER({})", source),
++            )
++
++        class Renamed(Table):
++            source = Varchar(db_column_name="source_db")
++            derived = Varchar(generated=generated("UPPER({})", source))
++            counter = Integer(db_column_name="counter_db")
++            positive = Boolean(generated=generated(counter > 0))
++
++        class Expression(Table):
++            text = Varchar()
++            number = Integer()
++            flag = Boolean()
++
++        class Stamped(Table):
++            source = Integer()
++            touched = Integer(auto_update=9)
++            derived = Integer(
++                generated=generated("{} + 1", source), auto_update=0
++            )
++
++        class Score(Table):
++            points = Integer()
++            cutoff = Integer()
++            ceiling = Integer()
++            passed = Boolean(generated=generated(points > 50))
++            banded = Boolean(
++                generated=generated((points > 10) & (ceiling < 90))
++            )
++            listed = Boolean(generated=generated(points.is_in([cutoff])))
++
++        TABLES.Product = Product
++        TABLES.Sensor = Sensor
++        TABLES.Person = Person
++        TABLES.Ticket = Ticket
++        TABLES.Score = Score
++        TABLES.Alias = Alias
++        TABLES.Renamed = Renamed
++        TABLES.Expression = Expression
++        TABLES.Stamped = Stamped
++
++    return TABLES
++
++
++def get_column_ddl(table_class: type[Table], column_name: str) -> str:
++    return table_class._meta.get_column_by_name(column_name).ddl
++
++
++def build_column_ddl(generated_value, column_name: str = "name_upper") -> str:
++    return bound_ddl(Varchar(generated=generated_value), column_name)
++
++
++def text_column():
++    return get_tables().Expression.text
++
++
++def number_column():
++    return get_tables().Expression.number
++
++
++def virtual(*args, **kwargs):
++    """
++    A generated value which isn't stored, which is the only kind SQLite adds
++    with ALTER TABLE.
++    """
++    return piccolo_columns.Generated(*args, stored=False, **kwargs)
++
++
++def added_ddl(column_class, expression, column_name: str) -> str:
++    """
++    The DDL for a generated column added to the table which owns the columns
++    its expression names.
++    """
++    return (
++        get_tables()
++        .Expression.alter()
++        .add_column(
++            name=column_name, column=column_class(generated=expression)
++        )
++        .ddl[0]
++    )
++
++
++def flag_column():
++    return get_tables().Expression.flag
++
++
++def bound_ddl(column, column_name: str = "name_upper", **extra_columns) -> str:
++    """
++    Read a column's DDL once the metaclass has bound it to a table, which is
++    how a table is always built.
++    """
++    members = {"name": Varchar(), **extra_columns, column_name: column}
++    table = create_table_class(class_name="Rendered", class_members=members)
++    return table._meta.get_column_by_name(column_name).ddl
++
++
++NAME_UPPER_CLAUSE = 'GENERATED ALWAYS AS (UPPER("name")) STORED'
++
++
++class TestGeneratedDDL(TestCase):
++    def test_stored_keyword(self):
++        ddl = get_column_ddl(get_tables().Product, "name_upper")
++        self.assertIn('"name_upper" VARCHAR(255)', ddl)
++        self.assertIn(NAME_UPPER_CLAUSE, ddl)
++
++    def test_virtual_keyword(self):
++        ddl = get_column_ddl(get_tables().Sensor, "doubled")
++        self.assertIn('"doubled" INTEGER', ddl)
++        self.assertIn('GENERATED ALWAYS AS ("reading" * 2) VIRTUAL', ddl)
++
++    def test_no_default_clause(self):
++        tables = get_tables()
++        self.assertNotIn(
++            "DEFAULT", get_column_ddl(tables.Product, "name_upper")
++        )
++        self.assertNotIn("DEFAULT", get_column_ddl(tables.Sensor, "doubled"))
++
++    def test_not_null_is_kept(self):
++        self.assertIn(
++            "NOT NULL", get_column_ddl(get_tables().Product, "total")
++        )
++
++    def test_nullable_generated_column(self):
++        ddl = get_column_ddl(get_tables().Ticket, "note")
++        self.assertNotIn("NOT NULL", ddl)
++        self.assertIn("GENERATED ALWAYS AS ('ok') STORED", ddl)
++
++    def test_placeholder_uses_column_name(self):
++        self.assertIn(
++            'UPPER("name")',
++            get_column_ddl(get_tables().Product, "name_upper"),
++        )
++
++    def test_name_settled_after_the_expression_was_built(self):
++        source = Varchar()
++        column = Varchar(generated=generated("UPPER({})", source))
++
++        self.assertIn(
++            'UPPER("renamed_later")',
++            bound_ddl(column, "shout", renamed_later=source),
++        )
++
++    def test_database_name_settled_after_the_expression_was_built(self):
++        source = Varchar(db_column_name="source_db")
++        column = Varchar(generated=generated("UPPER({})", source))
++
++        self.assertIn(
++            'UPPER("source_db")', bound_ddl(column, "shout", source=source)
++        )
++
++    def test_expression_uses_db_column_name(self):
++        self.assertIn(
++            '"counter_db" > 0',
++            get_column_ddl(get_tables().Renamed, "positive"),
++        )
++
++    def test_placeholder_uses_db_column_name(self):
++        self.assertIn(
++            'UPPER("fname")', get_column_ddl(get_tables().Person, "shout")
++        )
++
++    def test_several_placeholders_in_order(self):
++        self.assertIn(
++            '("price" * "quantity")',
++            get_column_ddl(get_tables().Product, "total"),
++        )
++
++    def test_sql_without_placeholders(self):
++        self.assertIn(
++            "GENERATED ALWAYS AS (price + 5) STORED",
++            get_column_ddl(get_tables().Ticket, "price_with_fee"),
++        )
++
++    def test_expression_is_not_table_qualified(self):
++        expression = get_column_ddl(get_tables().Product, "name_upper").split(
++            "ALWAYS AS"
++        )[1]
++        self.assertNotIn("product", expression)
++
++    def test_expression_has_no_bind_parameters(self):
++        expression = get_column_ddl(get_tables().Product, "total").split(
++            "ALWAYS AS"
++        )[1]
++        self.assertNotIn("?", expression)
++        self.assertNotIn("$1", expression)
++
++    def test_unique_is_kept(self):
++        ddl = get_column_ddl(get_tables().Ticket, "serial_code")
++        self.assertIn("UNIQUE", ddl)
++        self.assertIn("GENERATED ALWAYS AS", ddl)
++
++    def test_ordinary_columns_are_unchanged(self):
++        self.assertEqual(
++            get_column_ddl(get_tables().Product, "price"),
++            '"price" INTEGER NOT NULL DEFAULT 0',
++        )
++
++    def test_create_table_contains_generated_columns(self):
++        sql = get_tables().Product.create_table().ddl[0]
++        self.assertIn('GENERATED ALWAYS AS (UPPER("name")) STORED', sql)
++        self.assertIn('GENERATED ALWAYS AS ("price" * "quantity") STORED', sql)
++
++
++class TestGeneratedValidation(TestCase):
++    def test_too_few_columns(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError):
++            generated("{} + {}", product.price)
++
++    def test_too_many_columns(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError):
++            generated("{}", product.price, product.quantity)
++
++    def test_column_without_a_placeholder(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError):
++            generated("price + 5", product.price)
++
++    def test_no_columns_for_placeholder(self):
++        with self.assertRaises(ValueError):
++            generated("UPPER({})")
++
++    def test_primary_key_rejected(self):
++        with self.assertRaises(ValueError):
++            Integer(primary_key=True, generated=generated("1"))
++
++    def test_function_call_rejected(self):
++        with self.assertRaises(ValueError):
++            generated(Upper(text_column()))
++
++    def test_nested_function_call_rejected(self):
++        with self.assertRaises(ValueError):
++            generated(Upper(Lower(text_column())))
++
++    def test_number_as_the_expression_rejected(self):
++        with self.assertRaises(ValueError):
++            generated(123)
++
++    def test_object_as_the_expression_rejected(self):
++        with self.assertRaises(ValueError):
++            generated(object())
++
++    def test_none_as_the_expression_rejected(self):
++        with self.assertRaises(ValueError):
++            generated(None)
++
++    def test_function_as_a_comparison_operand_rejected(self):
++        with self.assertRaises(ValueError):
++            generated(text_column() == Upper(text_column()))
++
++    def test_querystring_as_a_comparison_operand_rejected(self):
++        with self.assertRaises(ValueError):
++            generated(number_column() == QueryString("1 + 1"))
++
++    def test_querystring_inside_a_list_operand_rejected(self):
++        with self.assertRaises(ValueError):
++            generated(number_column().is_in(QueryString("1, 2")))
++
++    def test_select_as_a_list_operand_rejected(self):
++        expression = get_tables().Expression
++        with self.assertRaises(ValueError):
++            generated(
++                expression.number.is_in(expression.select(expression.number))
++            )
++
++    def test_raw_querystring_rejected(self):
++        with self.assertRaises(ValueError):
++            generated(QueryString('UPPER("text")'))
++
++    def test_function_call_in_placeholder_form(self):
++        self.assertIn(
++            'UPPER("text")',
++            added_ddl(Varchar, virtual("UPPER({})", text_column()), "shout"),
++        )
++
++
++class GeneratedTableTest(TableTest):
++    table_names: list[str] = []
++
++    def setUp(self) -> None:
++        tables = get_tables()
++        self.tables = [getattr(tables, name) for name in self.table_names]
++        super().setUp()
++
++
++class TestGeneratedValues(GeneratedTableTest):
++    table_names = ["Product", "Sensor", "Person", "Ticket"]
++
++    def test_stored_value_is_calculated(self):
++        product = get_tables().Product
++        product(name="shirt", price=10, quantity=3).save().run_sync()
++
++        self.assertEqual(
++            product.select(product.name_upper, product.total).run_sync(),
++            [{"name_upper": "SHIRT", "total": 30}],
++        )
++
++    def test_virtual_value_is_calculated(self):
++        sensor = get_tables().Sensor
++        sensor(reading=21).save().run_sync()
++
++        self.assertEqual(
++            sensor.select(sensor.doubled).run_sync(), [{"doubled": 42}]
++        )
++
++    def test_db_column_name_expression(self):
++        person = get_tables().Person
++        person(first_name="ada").save().run_sync()
++
++        self.assertEqual(
++            person.select(person.shout).run_sync(), [{"shout": "ADA"}]
++        )
++
++    def test_literal_expression(self):
++        ticket = get_tables().Ticket
++        ticket(price=20).save().run_sync()
++
++        self.assertEqual(
++            ticket.select(ticket.price_with_fee, ticket.note).run_sync(),
++            [{"price_with_fee": 25, "note": "ok"}],
++        )
++
++    def test_select_all_columns(self):
++        product = get_tables().Product
++        product(name="hat", price=4, quantity=2).save().run_sync()
++
++        self.assertEqual(
++            product.select().run_sync(),
++            [
++                {
++                    "id": 1,
++                    "name": "hat",
++                    "price": 4,
++                    "quantity": 2,
++                    "name_upper": "HAT",
++                    "total": 8,
++                }
++            ],
++        )
++
++    def test_objects_are_populated(self):
++        product_class = get_tables().Product
++        product_class(name="hat", price=4, quantity=2).save().run_sync()
++
++        product = product_class.objects().first().run_sync()
++        assert product is not None
++        self.assertEqual(product.name_upper, "HAT")
++        self.assertEqual(product.total, 8)
++
++    def test_where_clause(self):
++        product = get_tables().Product
++        product(name="hat", price=4, quantity=2).save().run_sync()
++        product(name="mug", price=5, quantity=10).save().run_sync()
++
++        self.assertEqual(
++            product.select(product.name).where(product.total > 20).run_sync(),
++            [{"name": "mug"}],
++        )
++
++    def test_order_by(self):
++        product = get_tables().Product
++        product(name="hat", price=4, quantity=2).save().run_sync()
++        product(name="mug", price=5, quantity=10).save().run_sync()
++
++        self.assertEqual(
++            product.select(product.name)
++            .order_by(product.total, ascending=False)
++            .run_sync(),
++            [{"name": "mug"}, {"name": "hat"}],
++        )
++
++    def test_value_is_recalculated_after_update(self):
++        product = get_tables().Product
++        product(name="hat", price=4, quantity=2).save().run_sync()
++        product.update({product.quantity: 5}, force=True).run_sync()
++
++        self.assertEqual(
++            product.select(product.total).run_sync(), [{"total": 20}]
++        )
++
++    def test_value_is_recalculated_after_save(self):
++        product_class = get_tables().Product
++        product_class(name="hat", price=4, quantity=2).save().run_sync()
++
++        product = product_class.objects().first().run_sync()
++        assert product is not None
++        product.name = "cap"
++        product.save().run_sync()
++
++        self.assertEqual(
++            product_class.select(product_class.name_upper).run_sync(),
++            [{"name_upper": "CAP"}],
++        )
++
++    def test_insert_many_rows(self):
++        product = get_tables().Product
++        product.insert(
++            product(name="hat", price=4, quantity=2),
++            product(name="mug", price=5, quantity=10),
++        ).run_sync()
++
++        self.assertEqual(
++            product.select(product.total).order_by(product.total).run_sync(),
++            [{"total": 8}, {"total": 50}],
++        )
++
++    def test_save_with_named_columns(self):
++        product_class = get_tables().Product
++        product_class(name="hat", price=4, quantity=2).save().run_sync()
++
++        product = product_class.objects().first().run_sync()
++        assert product is not None
++        product.price = 9
++        product.save(columns=[product_class.price]).run_sync()
++
++        self.assertEqual(
++            product_class.select(product_class.total).run_sync(),
++            [{"total": 18}],
++        )
++
++    def test_refresh(self):
++        product_class = get_tables().Product
++        product_class(name="hat", price=4, quantity=2).save().run_sync()
++        product = product_class.objects().first().run_sync()
++        assert product is not None
++
++        product_class.update(
++            {product_class.quantity: 6}, force=True
++        ).run_sync()
++        product.refresh().run_sync()
++
++        self.assertEqual(product.total, 24)
++
++    def test_supplied_value_is_not_written(self):
++        product = get_tables().Product
++        product(
++            name="hat", price=4, quantity=2, name_upper="IGNORED"
++        ).save().run_sync()
++
++        self.assertEqual(
++            product.select(product.name_upper).run_sync(),
++            [{"name_upper": "HAT"}],
++        )
++
++    def test_delete(self):
++        product = get_tables().Product
++        product(name="hat", price=4, quantity=2).save().run_sync()
++        product.delete(force=True).run_sync()
++
++        self.assertEqual(product.count().run_sync(), 0)
++
++
++class TestGeneratedInstances(TestCase):
++    def test_value_starts_as_none(self):
++        product = get_tables().Product(name="hat", price=4, quantity=2)
++        self.assertIsNone(product.name_upper)
++        self.assertIsNone(product.total)
++
++    def test_column_default_is_not_used(self):
++        product = get_tables().Product(name="hat", price=4, quantity=2)
++        self.assertNotEqual(product.name_upper, "")
++
++    def test_ordinary_columns_still_get_defaults(self):
++        product = get_tables().Product(name="hat")
++        self.assertEqual(product.price, 0)
++        self.assertEqual(product.quantity, 0)
++
++    def test_constructor_value_is_kept_in_memory(self):
++        product = get_tables().Product(
++            name="hat", price=4, quantity=2, name_upper="MINE"
++        )
++        self.assertEqual(product.name_upper, "MINE")
++
++    def test_value_can_be_assigned_in_memory(self):
++        product = get_tables().Product(name="hat", price=4, quantity=2)
++        product.name_upper = "HAT"
++        self.assertEqual(product.name_upper, "HAT")
++
++
++class TestGeneratedWriteRejection(GeneratedTableTest):
++    table_names = ["Product", "Stamped"]
++
++    def test_update_with_column_key(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError):
++            product.update({product.name_upper: "X"}, force=True).run_sync()
++
++    def test_update_with_string_key(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError) as context:
++            product.update({"name_upper": "X"}, force=True).run_sync()
++
++        self.assertIn("name_upper", str(context.exception))
++
++    def test_update_error_message(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError) as context:
++            product.update({product.total: 1}, force=True).run_sync()
++
++        self.assertIn("total", str(context.exception))
++
++    def test_save_with_generated_column_named(self):
++        product_class = get_tables().Product
++        product_class(name="hat", price=4, quantity=2).save().run_sync()
++
++        product = product_class.objects().first().run_sync()
++        assert product is not None
++
++        with self.assertRaises(ValueError):
++            product.save(columns=[product_class.name_upper]).run_sync()
++
++    def test_save_rejection_message(self):
++        product_class = get_tables().Product
++        product_class(name="hat", price=4, quantity=2).save().run_sync()
++
++        product = product_class.objects().first().run_sync()
++        assert product is not None
++
++        with self.assertRaises(ValueError) as context:
++            product.save(columns=[product_class.name_upper]).run_sync()
++
++        self.assertIn("name_upper", str(context.exception))
++
++    def test_save_with_generated_column_named_as_a_string(self):
++        product_class = get_tables().Product
++        product_class(name="hat", price=4, quantity=2).save().run_sync()
++
++        product = product_class.objects().first().run_sync()
++        assert product is not None
++
++        with self.assertRaises(ValueError) as context:
++            product.save(columns=["name_upper"]).run_sync()
++
++        self.assertIn("name_upper", str(context.exception))
++
++    def test_on_conflict_rejects_a_generated_column(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError) as context:
++            product.insert(
++                product(name="hat", price=4, quantity=2)
++            ).on_conflict(
++                target=product._meta.primary_key,
++                action="DO UPDATE",
++                values=[product.name_upper],
++            )
++
++        self.assertIn("name_upper", str(context.exception))
++
++    def test_on_conflict_rejects_a_tuple_value(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError) as context:
++            product.insert(
++                product(name="hat", price=4, quantity=2)
++            ).on_conflict(
++                target=product._meta.primary_key,
++                action="DO UPDATE",
++                values=[(product.name_upper, "X")],
++            )
++
++        self.assertIn("name_upper", str(context.exception))
++
++    def test_on_conflict_rejects_a_string_value(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError) as context:
++            product.insert(
++                product(name="hat", price=4, quantity=2)
++            ).on_conflict(
++                target=product._meta.primary_key,
++                action="DO UPDATE",
++                values=["name_upper"],
++            )
++
++        self.assertIn("name_upper", str(context.exception))
++
++    def test_on_conflict_rejects_a_tuple_with_a_string(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError) as context:
++            product.insert(
++                product(name="hat", price=4, quantity=2)
++            ).on_conflict(
++                target=product._meta.primary_key,
++                action="DO UPDATE",
++                values=[("name_upper", "X")],
++            )
++
++        self.assertIn("name_upper", str(context.exception))
++
++    def test_on_conflict_with_an_ordinary_string_is_fine(self):
++        product = get_tables().Product
++        product.insert(product(name="hat", price=4, quantity=2)).on_conflict(
++            target=product._meta.primary_key,
++            action="DO UPDATE",
++            values=[product.name],
++        )
++
++    def test_on_conflict_with_ordinary_columns_is_fine(self):
++        product = get_tables().Product
++        product.insert(product(name="hat", price=4, quantity=2)).on_conflict(
++            target=product._meta.primary_key,
++            action="DO UPDATE",
++            values=[product.name],
++        ).run_sync()
++
++        self.assertEqual(
++            product.select(product.name_upper).run_sync(),
++            [{"name_upper": "HAT"}],
++        )
++
++    def test_new_row_save_with_generated_column_named(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++
++        with self.assertRaises(ValueError) as context:
++            row.save(columns=[product.total]).run_sync()
++
++        self.assertIn("total", str(context.exception))
++
++    def test_new_row_save_with_generated_column_as_a_string(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++
++        with self.assertRaises(ValueError):
++            row.save(columns=["name_upper"]).run_sync()
++
++    def test_new_row_save_with_ordinary_columns_is_fine(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save(columns=[product.name]).run_sync()
++
++        self.assertEqual(
++            product.select(product.name_upper).run_sync(),
++            [{"name_upper": "HAT"}],
++        )
++
++    def test_update_with_auto_update_present(self):
++        stamped = get_tables().Stamped
++        stamped(source=1).save().run_sync()
++        stamped.update({stamped.source: 2}, force=True).run_sync()
++
++        self.assertEqual(
++            stamped.select(stamped.source, stamped.derived).run_sync(),
++            [{"source": 2, "derived": 3}],
++        )
++
++    def test_update_of_ordinary_column_is_fine(self):
++        product = get_tables().Product
++        product(name="hat", price=4, quantity=2).save().run_sync()
++        product.update({product.name: "cap"}, force=True).run_sync()
++
++        self.assertEqual(
++            product.select(product.name_upper).run_sync(),
++            [{"name_upper": "CAP"}],
++        )
++
++
++class TestGeneratedModelBuilder(GeneratedTableTest):
++    table_names = ["Product"]
++
++    def test_build_persists(self):
++        product_class = get_tables().Product
++        ModelBuilder.build_sync(product_class)
++        self.assertEqual(product_class.count().run_sync(), 1)
++
++    def test_generated_column_not_populated(self):
++        product = ModelBuilder.build_sync(get_tables().Product, persist=False)
++        self.assertIsNone(product.name_upper)
++        self.assertIsNone(product.total)
++
++    def test_other_columns_are_populated(self):
++        product = ModelBuilder.build_sync(get_tables().Product, persist=False)
++        self.assertIsNotNone(product.name)
++        self.assertIsNotNone(product.price)
++
++
++class TestGeneratedAlter(GeneratedTableTest):
++    table_names = ["Sensor"]
++
++    def test_add_virtual_column(self):
++        sensor = get_tables().Sensor
++        sensor(reading=5).save().run_sync()
++
++        sensor.alter().add_column(
++            name="tripled",
++            column=Integer(
++                generated=generated("{} * 3", sensor.reading, stored=False)
++            ),
++        ).run_sync()
++
++        self.assertEqual(
++            sensor.raw("SELECT tripled FROM sensor").run_sync(),
++            [{"tripled": 15}],
++        )
++
++    @engines_only("sqlite")
++    def test_add_stored_column_rejected(self):
++        sensor = get_tables().Sensor
++        with self.assertRaises(ValueError):
++            sensor.alter().add_column(
++                name="tripled",
++                column=Integer(generated=generated("{} * 3", sensor.reading)),
++            ).run_sync()
++
++    @engines_only("sqlite")
++    def test_add_stored_column_error_message(self):
++        sensor = get_tables().Sensor
++        with self.assertRaises(ValueError) as context:
++            sensor.alter().add_column(
++                name="tripled",
++                column=Integer(generated=generated("{} * 3", sensor.reading)),
++            ).run_sync()
++
++        self.assertIn("tripled", str(context.exception))
++
++    def test_add_column_from_the_same_table(self):
++        sensor = get_tables().Sensor
++        sensor(reading=5).save().run_sync()
++
++        sensor.alter().add_column(
++            name="quadrupled",
++            column=Integer(
++                generated=generated("{} * 4", sensor.reading, stored=False)
++            ),
++        ).run_sync()
++
++        self.assertEqual(
++            sensor.raw("SELECT quadrupled FROM sensor").run_sync(),
++            [{"quadrupled": 20}],
++        )
++
++    def test_add_stored_column_is_fine_elsewhere(self):
++        expression = get_tables().Expression
++        with patch.object(
++            type(expression._meta.db), "engine_type", "postgres"
++        ):
++            ddl = (
++                expression.alter()
++                .add_column(
++                    name="shouted",
++                    column=Varchar(
++                        generated=generated("UPPER({})", expression.text)
++                    ),
++                )
++                .ddl[0]
++            )
++
++        self.assertIn('UPPER("text")', ddl)
++        self.assertIn("STORED", ddl)
++
++    def test_add_ordinary_column_is_fine(self):
++        sensor = get_tables().Sensor
++        sensor.alter().add_column(name="label", column=Varchar()).run_sync()
++
++        self.assertEqual(sensor.raw("SELECT label FROM sensor").run_sync(), [])
++
++    @engines_only("sqlite")
++    def test_drop_generated_column(self):
++        sensor = get_tables().Sensor
++        sensor.alter().drop_column(sensor.doubled).run_sync()
++
++        self.assertEqual(
++            [
++                i["name"]
++                for i in sensor.raw("PRAGMA table_xinfo(sensor)").run_sync()
++            ],
++            ["id", "reading"],
++        )
++
++
++class TestGeneratedSerialisation(TestCase):
++    def restore(self, rendered: str):
++        return eval(  # noqa: S307
++            rendered, {"Generated": piccolo_columns.Generated}
++        )
++
++    def test_rendered_expression_can_be_restored(self):
++        column = get_tables().Product._meta.get_column_by_name("name_upper")
++        serialised = serialise_params(column._meta.params)
++        restored = self.restore(repr(serialised.params["generated"]))
++
++        self.assertIn(NAME_UPPER_CLAUSE, build_column_ddl(restored))
++
++    def test_rendered_expression_keeps_virtual(self):
++        column = get_tables().Sensor._meta.get_column_by_name("doubled")
++        serialised = serialise_params(column._meta.params)
++        restored = self.restore(repr(serialised.params["generated"]))
++
++        self.assertIn("VIRTUAL", build_column_ddl(restored))
++
++    def test_rendered_comparison_can_be_restored(self):
++        column = get_tables().Score._meta.get_column_by_name("passed")
++        serialised = serialise_params(column._meta.params)
++        restored = self.restore(repr(serialised.params["generated"]))
++
++        self.assertIn('"points" > 50', build_column_ddl(restored, "passed"))
++
++    def test_rendered_combined_comparison_can_be_restored(self):
++        column = get_tables().Score._meta.get_column_by_name("banded")
++        serialised = serialise_params(column._meta.params)
++        restored = self.restore(repr(serialised.params["generated"]))
++        ddl = build_column_ddl(restored, "banded")
++
++        self.assertIn('"points" > 10', ddl)
++        self.assertIn('"ceiling" < 90', ddl)
++
++    def test_rendered_list_comparison_can_be_restored(self):
++        column = get_tables().Score._meta.get_column_by_name("listed")
++        serialised = serialise_params(column._meta.params)
++        restored = self.restore(repr(serialised.params["generated"]))
++
++        self.assertIn('"points" IN', build_column_ddl(restored, "listed"))
++
++    def test_rendered_expression_has_no_column_objects(self):
++        column = get_tables().Product._meta.get_column_by_name("total")
++        serialised = serialise_params(column._meta.params)
++        rendered = repr(serialised.params["generated"])
++
++        self.assertNotIn("Integer", rendered)
++        self.assertNotIn("object at", rendered)
++
++    def test_import_is_added(self):
++        column = get_tables().Product._meta.get_column_by_name("name_upper")
++        serialised = serialise_params(column._meta.params)
++
++        self.assertIn(
++            "Generated", "".join(str(i) for i in serialised.extra_imports)
++        )
++
++    def test_deserialise_round_trip(self):
++        column = get_tables().Product._meta.get_column_by_name("name_upper")
++        serialised = serialise_params(column._meta.params)
++        deserialised = deserialise_params(serialised.params)
++
++        self.assertIn(
++            NAME_UPPER_CLAUSE, build_column_ddl(deserialised["generated"])
++        )
++
++    def test_params_hold_a_generated_value(self):
++        column = get_tables().Product._meta.get_column_by_name("name_upper")
++        held = column._meta.params["generated"]
++
++        self.assertIsInstance(held, piccolo_columns.Generated)
++        self.assertTrue(held.stored)
++        self.assertIn(NAME_UPPER_CLAUSE, build_column_ddl(held))
++
++    def test_ordinary_columns_of_every_type_lack_the_key(self):
++        tables = get_tables()
++        columns = [
++            tables.Product._meta.get_column_by_name("name"),
++            tables.Product._meta.get_column_by_name("quantity"),
++            tables.Person._meta.get_column_by_name("first_name"),
++            tables.Score._meta.get_column_by_name("points"),
++            tables.Score._meta.get_column_by_name("id"),
++            Boolean(),
++            Date(),
++            UUID(),
++            Array(base_column=Integer()),
++            ForeignKey(references=tables.Product),
++        ]
++
++        for column in columns:
++            self.assertNotIn("generated", column._meta.params)
++
++    def test_ordinary_column_params_survive_serialisation(self):
++        tables = get_tables()
++
++        for column in [
++            tables.Product._meta.get_column_by_name("name"),
++            Boolean(),
++            Date(),
++            UUID(),
++            Array(base_column=Integer()),
++        ]:
++            column._meta._name = column._meta._name or "example"
++            before = dict(column._meta.params)
++
++            self.assertEqual(
++                serialise_params(column._meta.params).params.keys(),
++                before.keys(),
++            )
++            self.assertEqual(column._meta.params, before)
++
++    def test_generated_column_keeps_its_other_params(self):
++        column = get_tables().Ticket._meta.get_column_by_name("serial_code")
++        serialised = serialise_params(column._meta.params)
++
++        self.assertIn("generated", serialised.params)
++        self.assertEqual(serialised.params["length"], 255)
++        self.assertIs(serialised.params["unique"], True)
++        self.assertIs(serialised.params["null"], False)
++
++    def test_generated_column_keeps_a_nullable_flag(self):
++        column = get_tables().Ticket._meta.get_column_by_name("note")
++        serialised = serialise_params(column._meta.params)
++
++        self.assertIn("generated", serialised.params)
++        self.assertIs(serialised.params["null"], True)
++        self.assertIs(serialised.params["unique"], False)
++
++    def test_ordinary_column_params_are_unchanged(self):
++        column = get_tables().Product._meta.get_column_by_name("price")
++        serialised = serialise_params(column._meta.params)
++
++        self.assertNotIn("generated", serialised.params)
++
++
++class TestGeneratedDiff(TestCase):
++    def make_columns(self, sql: str):
++        name = Varchar()
++        name._meta._name = "name"
++
++        shout = Varchar(generated=generated(sql, name))
++        shout._meta._name = "shout"
++
++        return name, shout
++
++    def test_added_column_is_detected(self):
++        name, shout = self.make_columns("UPPER({})")
++
++        delta = DiffableTable(
++            class_name="Item", tablename="item", columns=[name, shout]
++        ) - DiffableTable(class_name="Item", tablename="item", columns=[name])
++
++        self.assertEqual(len(delta.add_columns), 1)
++        self.assertEqual(delta.add_columns[0].column_name, "shout")
++
++    def test_added_column_carries_the_expression(self):
++        name, shout = self.make_columns("UPPER({})")
++
++        delta = DiffableTable(
++            class_name="Item", tablename="item", columns=[name, shout]
++        ) - DiffableTable(class_name="Item", tablename="item", columns=[name])
++
++        params = serialise_params(delta.add_columns[0].params).params
++        restored = eval(  # noqa: S307
++            repr(params["generated"]),
++            {"Generated": piccolo_columns.Generated},
++        )
++        self.assertIn(NAME_UPPER_CLAUSE, build_column_ddl(restored, "shout"))
++
++    def dependent_columns(self):
++        name = Varchar()
++        name._meta._name = "name"
++
++        source = Varchar()
++        source._meta._name = "z_source"
++
++        derived = Varchar(
++            generated=generated("UPPER({})", source, stored=False)
++        )
++        derived._meta._name = "a_derived"
++
++        return name, source, derived
++
++    def test_added_columns_follow_the_columns_they_name(self):
++        name, source, derived = self.dependent_columns()
++
++        delta = DiffableTable(
++            class_name="Item",
++            tablename="item",
++            columns=[name, derived, source],
++        ) - DiffableTable(class_name="Item", tablename="item", columns=[name])
++
++        self.assertEqual(
++            [i.column_name for i in delta.add_columns],
++            ["z_source", "a_derived"],
++        )
++
++    def test_added_column_order_ignores_the_alphabet(self):
++        name, source, derived = self.dependent_columns()
++
++        delta = DiffableTable(
++            class_name="Item",
++            tablename="item",
++            columns=[name, source, derived],
++        ) - DiffableTable(class_name="Item", tablename="item", columns=[name])
++
++        names = [i.column_name for i in delta.add_columns]
++        self.assertLess(names.index("z_source"), names.index("a_derived"))
++
++    def test_added_columns_follow_a_chain(self):
++        name = Varchar()
++        name._meta._name = "name"
++
++        base = Integer()
++        base._meta._name = "c_base"
++
++        middle = Integer(generated=generated("{} * 2", base, stored=False))
++        middle._meta._name = "b_middle"
++
++        leaf = Integer(generated=generated("{} + 1", middle, stored=False))
++        leaf._meta._name = "a_leaf"
++
++        delta = DiffableTable(
++            class_name="Item",
++            tablename="item",
++            columns=[name, leaf, middle, base],
++        ) - DiffableTable(class_name="Item", tablename="item", columns=[name])
++
++        self.assertEqual(
++            [i.column_name for i in delta.add_columns],
++            ["c_base", "b_middle", "a_leaf"],
++        )
++
++    def test_added_columns_follow_a_comparison_operand(self):
++        name = Varchar()
++        name._meta._name = "name"
++
++        source = Integer()
++        source._meta._name = "z_source"
++
++        derived = Boolean(generated=generated(source > 10, stored=False))
++        derived._meta._name = "a_derived"
++
++        delta = DiffableTable(
++            class_name="Item",
++            tablename="item",
++            columns=[name, derived, source],
++        ) - DiffableTable(class_name="Item", tablename="item", columns=[name])
++
++        self.assertEqual(
++            [i.column_name for i in delta.add_columns],
++            ["z_source", "a_derived"],
++        )
++
++    def test_changed_storage_mode_is_detected(self):
++        name, old_shout = self.make_columns("UPPER({})")
++        new_shout = Varchar(
++            generated=generated("UPPER({})", name, stored=False)
++        )
++        new_shout._meta._name = "shout"
++
++        delta = DiffableTable(
++            class_name="Item", tablename="item", columns=[name, new_shout]
++        ) - DiffableTable(
++            class_name="Item", tablename="item", columns=[name, old_shout]
++        )
++
++        self.assertEqual(len(delta.alter_columns), 1)
++        self.assertEqual(delta.alter_columns[0].column_name, "shout")
++
++    def test_changed_expression_is_detected(self):
++        name, old_shout = self.make_columns("UPPER({})")
++        _, new_shout = self.make_columns("LOWER({})")
++
++        delta = DiffableTable(
++            class_name="Item", tablename="item", columns=[name, new_shout]
++        ) - DiffableTable(
++            class_name="Item", tablename="item", columns=[name, old_shout]
++        )
++
++        self.assertEqual(len(delta.alter_columns), 1)
++        self.assertEqual(delta.alter_columns[0].column_name, "shout")
++
++    def test_removed_expression_is_detected(self):
++        name, old_shout = self.make_columns("UPPER({})")
++
++        plain = Varchar()
++        plain._meta._name = "shout"
++
++        delta = DiffableTable(
++            class_name="Item", tablename="item", columns=[name, plain]
++        ) - DiffableTable(
++            class_name="Item", tablename="item", columns=[name, old_shout]
++        )
++
++        self.assertEqual(len(delta.alter_columns), 1)
++        self.assertEqual(delta.alter_columns[0].column_name, "shout")
++
++    def test_removed_expression_alongside_another_change(self):
++        name, old_shout = self.make_columns("UPPER({})")
++
++        plain = Varchar(null=True)
++        plain._meta._name = "shout"
++
++        delta = DiffableTable(
++            class_name="Item", tablename="item", columns=[name, plain]
++        ) - DiffableTable(
++            class_name="Item", tablename="item", columns=[name, old_shout]
++        )
++
++        alter_column = delta.alter_columns[0]
++        manager = MigrationManager()
++        manager.alter_column(
++            table_class_name=alter_column.table_class_name,
++            tablename=alter_column.tablename,
++            column_name=alter_column.column_name,
++            params=alter_column.params,
++            old_params=alter_column.old_params,
++        )
++
++        with self.assertRaises(ValueError) as context:
++            run_sync(manager.run())
++
++        self.assertIn("shout", str(context.exception))
++
++    def test_unchanged_expression_is_not_flagged(self):
++        name, old_shout = self.make_columns("UPPER({})")
++        _, new_shout = self.make_columns("UPPER({})")
++
++        delta = DiffableTable(
++            class_name="Item", tablename="item", columns=[name, new_shout]
++        ) - DiffableTable(
++            class_name="Item", tablename="item", columns=[name, old_shout]
++        )
++
++        self.assertEqual(delta.alter_columns, [])
++
++
++class TestGeneratedMigrations(DBTestCase):
++    @engines_only("sqlite")
++    def test_add_and_reverse(self):
++        manager = MigrationManager()
++        manager.add_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="name_upper",
++            column_class=Varchar,
++            column_class_name="Varchar",
++            params={
++                "length": 255,
++                "default": "",
++                "null": False,
++                "primary_key": False,
++                "unique": False,
++                "index": False,
++                "generated": generated('UPPER("name")', stored=False),
++            },
++        )
++        run_sync(manager.run())
++
++        self.run_sync("INSERT INTO manager (name) VALUES ('Dave');")
++        self.assertEqual(
++            self.run_sync("SELECT name_upper FROM manager;"),
++            [{"name_upper": "DAVE"}],
++        )
++
++        run_sync(manager.run(backwards=True))
++        self.assertEqual(
++            [i["name"] for i in self.run_sync("PRAGMA table_xinfo(manager);")],
++            ["id", "name"],
++        )
++
++    def dependent_pair(self):
++        manager = MigrationManager()
++        base = {
++            "length": 255,
++            "default": "",
++            "null": False,
++            "primary_key": False,
++            "unique": False,
++            "index": False,
++        }
++        manager.add_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="z_source",
++            column_class=Varchar,
++            column_class_name="Varchar",
++            params=dict(base),
++        )
++        manager.add_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="a_derived",
++            column_class=Varchar,
++            column_class_name="Varchar",
++            params=dict(
++                base,
++                generated=generated('UPPER("z_source")', stored=False),
++            ),
++        )
++        return manager
++
++    @engines_only("sqlite")
++    def test_add_a_generated_column_beside_its_source(self):
++        manager = self.dependent_pair()
++        run_sync(manager.run())
++
++        self.run_sync(
++            "INSERT INTO manager (name, z_source) VALUES ('Dave', 'ada');"
++        )
++        self.assertEqual(
++            self.run_sync("SELECT a_derived FROM manager;"),
++            [{"a_derived": "ADA"}],
++        )
++
++    @engines_only("sqlite")
++    def test_reverse_a_generated_column_beside_its_source(self):
++        manager = self.dependent_pair()
++        run_sync(manager.run())
++        run_sync(manager.run(backwards=True))
++
++        self.assertEqual(
++            [i["name"] for i in self.run_sync("PRAGMA table_xinfo(manager);")],
++            ["id", "name"],
++        )
++
++    def comparison_pair(self):
++        manager = MigrationManager()
++        source = Integer()
++        source._meta._name = "z_source"
++
++        manager.add_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="z_source",
++            column_class=Integer,
++            column_class_name="Integer",
++            params={
++                "default": 0,
++                "null": False,
++                "primary_key": False,
++                "unique": False,
++                "index": False,
++            },
++        )
++        manager.add_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="a_derived",
++            column_class=Boolean,
++            column_class_name="Boolean",
++            params={
++                "default": False,
++                "null": False,
++                "primary_key": False,
++                "unique": False,
++                "index": False,
++                "generated": generated(source > 10, stored=False),
++            },
++        )
++        return manager
++
++    def chain(self):
++        manager = MigrationManager()
++        base = {
++            "default": 0,
++            "null": False,
++            "primary_key": False,
++            "unique": False,
++            "index": False,
++        }
++        manager.add_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="c_base",
++            column_class=Integer,
++            column_class_name="Integer",
++            params=dict(base),
++        )
++        manager.add_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="b_middle",
++            column_class=Integer,
++            column_class_name="Integer",
++            params=dict(
++                base, generated=generated('"c_base" * 2', stored=False)
++            ),
++        )
++        manager.add_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="a_leaf",
++            column_class=Integer,
++            column_class_name="Integer",
++            params=dict(
++                base, generated=generated('"b_middle" + 1', stored=False)
++            ),
++        )
++        return manager
++
++    @engines_only("sqlite")
++    def test_add_a_chain_of_generated_columns(self):
++        run_sync(self.chain().run())
++
++        self.run_sync("INSERT INTO manager (name, c_base) VALUES ('Dave', 5);")
++        self.assertEqual(
++            self.run_sync("SELECT b_middle, a_leaf FROM manager;"),
++            [{"b_middle": 10, "a_leaf": 11}],
++        )
++
++    @engines_only("sqlite")
++    def test_reverse_a_chain_of_generated_columns(self):
++        manager = self.chain()
++        run_sync(manager.run())
++        run_sync(manager.run(backwards=True))
++
++        self.assertEqual(
++            [i["name"] for i in self.run_sync("PRAGMA table_xinfo(manager);")],
++            ["id", "name"],
++        )
++
++    @engines_only("sqlite")
++    def test_add_a_comparison_column_beside_its_source(self):
++        run_sync(self.comparison_pair().run())
++
++        self.run_sync(
++            "INSERT INTO manager (name, z_source) VALUES ('Dave', 20);"
++        )
++        self.assertEqual(
++            self.run_sync("SELECT a_derived FROM manager;"),
++            [{"a_derived": 1}],
++        )
++
++    @engines_only("sqlite")
++    def test_reverse_a_comparison_column_beside_its_source(self):
++        manager = self.comparison_pair()
++        run_sync(manager.run())
++        run_sync(manager.run(backwards=True))
++
++        self.assertEqual(
++            [i["name"] for i in self.run_sync("PRAGMA table_xinfo(manager);")],
++            ["id", "name"],
++        )
++
++    def test_storage_mode_change_is_rejected(self):
++        manager = MigrationManager()
++        manager.alter_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="shout",
++            params={"generated": generated('UPPER("name")', stored=False)},
++            old_params={"generated": generated('UPPER("name")')},
++        )
++
++        with self.assertRaises(ValueError) as context:
++            run_sync(manager.run())
++
++        self.assertIn("shout", str(context.exception))
++
++    @engines_only("sqlite")
++    def test_add_alongside_a_custom_database_name(self):
++        manager = MigrationManager()
++        manager.add_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="nickname",
++            db_column_name="nickname_db",
++            column_class=Varchar,
++            column_class_name="Varchar",
++            params={
++                "length": 255,
++                "default": "",
++                "null": False,
++                "primary_key": False,
++                "unique": False,
++                "index": False,
++                "db_column_name": "nickname_db",
++            },
++        )
++        manager.add_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="shout",
++            db_column_name="shout_db",
++            column_class=Varchar,
++            column_class_name="Varchar",
++            params={
++                "length": 255,
++                "default": "",
++                "null": False,
++                "primary_key": False,
++                "unique": False,
++                "index": False,
++                "db_column_name": "shout_db",
++                "generated": generated('UPPER("nickname_db")', stored=False),
++            },
++        )
++        run_sync(manager.run())
++
++        self.run_sync(
++            "INSERT INTO manager (name, nickname_db) VALUES ('Dave', 'ada');"
++        )
++        self.assertEqual(
++            self.run_sync("SELECT shout_db FROM manager;"),
++            [{"shout_db": "ADA"}],
++        )
++
++    def test_alter_is_rejected(self):
++        manager = MigrationManager()
++        manager.alter_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="name",
++            params={"generated": generated("'x'")},
++            old_params={"generated": generated("'y'")},
++        )
++
++        with self.assertRaises(ValueError):
++            run_sync(manager.run())
++
++    def test_removed_expression_is_rejected(self):
++        manager = MigrationManager()
++        manager.alter_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="name",
++            params={"generated": None},
++            old_params={"generated": generated("'x'")},
++        )
++
++        with self.assertRaises(ValueError) as context:
++            run_sync(manager.run())
++
++        self.assertIn("name", str(context.exception))
++
++    def test_alter_rejection_message(self):
++        manager = MigrationManager()
++        manager.alter_column(
++            table_class_name="Manager",
++            tablename="manager",
++            column_name="name",
++            params={"generated": generated("'x'")},
++            old_params={"generated": generated("'y'")},
++        )
++
++        with self.assertRaises(ValueError) as context:
++            run_sync(manager.run())
++
++        self.assertIn("name", str(context.exception))
++
++
++class TestGeneratedExpressions(TestCase):
++    def test_comparison_expression(self):
++        self.assertIn(
++            'GENERATED ALWAYS AS ("points" > 50) STORED',
++            get_column_ddl(get_tables().Score, "passed"),
++        )
++
++    def test_combined_expression(self):
++        ddl = get_column_ddl(get_tables().Score, "banded")
++        self.assertIn('"points" > 10', ddl)
++        self.assertIn('"ceiling" < 90', ddl)
++        self.assertIn("AND", ddl)
++
++    def test_either_side_expression(self):
++        ddl = added_ddl(
++            Boolean,
++            virtual((number_column() > 10) | (number_column() < 5)),
++            "either",
++        )
++
++        self.assertIn('"number" > 10', ddl)
++        self.assertIn('"number" < 5', ddl)
++        self.assertIn("OR", ddl)
++        self.assertNotIn("AND", ddl)
++
++    def test_expression_is_not_table_qualified(self):
++        self.assertNotIn("score", get_column_ddl(get_tables().Score, "passed"))
++
++    def test_columns_alongside_an_expression(self):
++        score = get_tables().Score
++        with self.assertRaises(ValueError):
++            generated(score.points > 50, score.points)
++
++    def test_enum_operand_is_inlined_as_its_value(self):
++        ddl = added_ddl(Boolean, virtual(text_column() == Tone.loud), "toned")
++
++        self.assertIn("'loud-ish'", ddl)
++        self.assertNotIn("Tone", ddl)
++
++    def test_enum_inside_a_list_is_inlined_as_its_value(self):
++        ddl = added_ddl(
++            Boolean, virtual(text_column().is_in([Tone.loud])), "toned"
++        )
++
++        self.assertIn("IN ('loud-ish')", ddl)
++        self.assertNotIn("Tone", ddl)
++
++    def test_literal_which_looks_like_a_qualified_column(self):
++        ddl = added_ddl(
++            Boolean,
++            virtual(text_column() == '"expression"."text"'),
++            "matches",
++        )
++
++        self.assertIn('"text" = \'"expression"."text"\'', ddl)
++
++    def test_not_equal_expression(self):
++        ddl = added_ddl(Boolean, virtual(number_column() != 5), "other")
++
++        self.assertIn('"number" != 5', ddl)
++
++    def test_at_least_expression(self):
++        ddl = added_ddl(Boolean, virtual(number_column() >= 5), "enough")
++
++        self.assertIn('"number" >= 5', ddl)
++
++    def test_is_not_null_expression(self):
++        ddl = added_ddl(Boolean, virtual(text_column().is_not_null()), "set")
++
++        self.assertIn('"text" IS NOT NULL', ddl)
++        self.assertNotIn("?", ddl)
++
++    def test_is_in_expression(self):
++        ddl = added_ddl(
++            Boolean, virtual(number_column().is_in([10, 20])), "listed"
++        )
++
++        self.assertIn('"number" IN (10, 20)', ddl)
++        self.assertNotIn("?", ddl)
++
++    def test_not_in_expression(self):
++        ddl = added_ddl(
++            Boolean, virtual(number_column().not_in([10, 20])), "unlisted"
++        )
++
++        self.assertIn('"number" NOT IN (10, 20)', ddl)
++        self.assertNotIn("?", ddl)
++
++    def test_placeholder_arithmetic(self):
++        ddl = added_ddl(Integer, virtual("{} * 3", number_column()), "tripled")
++
++        self.assertIn('GENERATED ALWAYS AS ("number" * 3)', ddl)
++
++    def test_quotes_inside_a_value(self):
++        ddl = added_ddl(Boolean, virtual(text_column() == " it's"), "excited")
++
++        self.assertIn("' it''s'", ddl)
++
++    def test_adjacent_quotes_in_a_value(self):
++        ddl = added_ddl(Boolean, virtual(text_column() == "a''b'c"), "messy")
++
++        self.assertIn("'a''''b''c'", ddl)
++
++    def test_none_operator(self):
++        expression = virtual(text_column() == None)  # noqa: E711
++        ddl = added_ddl(Boolean, expression, "safe")
++
++        self.assertIn('"text" IS NULL', ddl)
++
++    def test_none_value(self):
++        ddl = added_ddl(
++            Boolean, virtual(number_column().is_in([None])), "safe"
++        )
++
++        self.assertIn("IN (null)", ddl.replace("NULL", "null"))
++        self.assertNotIn("?", ddl)
++
++    def test_none_among_other_values(self):
++        ddl = added_ddl(
++            Boolean, virtual(number_column().is_in([1, None])), "safe"
++        )
++
++        self.assertIn("1", ddl)
++        self.assertIn("null", ddl.replace("NULL", "null"))
++        self.assertNotIn("?", ddl)
++
++    def test_number_value(self):
++        ddl = added_ddl(Integer, virtual("{} + 7", number_column()), "bumped")
++
++        self.assertIn('"number" + 7', ddl)
++
++    def test_date_and_time_values(self):
++        for value in (
++            datetime.date(2026, 9, 5),
++            datetime.datetime(2026, 9, 5, 13, 30),
++            datetime.time(13, 30),
++        ):
++            ddl = added_ddl(
++                Boolean, virtual(text_column() == value), "stamped"
++            )
++
++            self.assertIn("'%s" % str(value)[:10], ddl)
++            self.assertNotIn("?", ddl)
++
++    def test_datetime_keeps_its_time(self):
++        value = datetime.datetime(2026, 9, 5, 13, 30)
++        ddl = added_ddl(Boolean, virtual(text_column() == value), "stamped")
++
++        self.assertIn("2026-09-05", ddl)
++        self.assertIn("13:30", ddl)
++        self.assertNotIn("?", ddl)
++
++    def test_time_keeps_its_minutes(self):
++        ddl = added_ddl(
++            Boolean,
++            virtual(text_column() == datetime.time(13, 30)),
++            "stamped",
++        )
++
++        self.assertIn("13:30", ddl)
++
++    def test_uuid_value(self):
++        value = uuid.UUID("8d4d0e4a-6d4e-4f5a-9f0a-3a5e5a6b7c8d")
++        ddl = added_ddl(Boolean, virtual(text_column() == value), "tagged")
++
++        self.assertIn("'%s'" % value, ddl)
++
++    def test_float_value(self):
++        ddl = added_ddl(Boolean, virtual(number_column() > 1.5), "over")
++
++        self.assertIn('"number" > 1.5', ddl)
++        self.assertNotIn("?", ddl)
++
++    def test_decimal_value(self):
++        ddl = added_ddl(
++            Boolean, virtual(number_column() == Decimal("1.25")), "adjusted"
++        )
++
++        self.assertIn('"number" = 1.25', ddl)
++        self.assertNotIn("?", ddl)
++
++    def test_boolean_value(self):
++        ddl = added_ddl(
++            Boolean, virtual(flag_column() == True), "flagged"  # noqa: E712
++        )
++
++        expression = ddl.split("ALWAYS AS")[1].lower()
++        self.assertIn('"flag" =', expression)
++        self.assertIn("true", expression)
++        self.assertNotIn("'true'", expression)
++
++    def test_false_value(self):
++        ddl = added_ddl(
++            Boolean, virtual(flag_column() == False), "flagged"  # noqa: E712
++        )
++
++        expression = ddl.split("ALWAYS AS")[1].lower()
++        self.assertIn('"flag" =', expression)
++        self.assertIn("false", expression)
++        self.assertNotIn("'false'", expression)
++
++    def test_unsupported_value(self):
++        with self.assertRaises(ValueError):
++            added_ddl(Boolean, virtual(number_column() == {"a": 1}), "odd")
++
++    def test_arbitrary_object_value(self):
++        with self.assertRaises(ValueError):
++            added_ddl(Boolean, virtual(number_column() == object()), "odd")
++
++    def test_callable_value(self):
++        with self.assertRaises(ValueError):
++            added_ddl(Boolean, virtual(text_column() == str.upper), "odd")
++
++    def test_container_value(self):
++        with self.assertRaises(ValueError):
++            added_ddl(Boolean, virtual(number_column() == {1, 2}), "odd")
++
++    def test_decimal_nan_value(self):
++        with self.assertRaises(ValueError):
++            added_ddl(
++                Boolean,
++                virtual(number_column() == Decimal("NaN")),
++                "bumped",
++            )
++
++    def test_infinite_value(self):
++        for value in (float("inf"), float("-inf")):
++            with self.assertRaises(ValueError):
++                added_ddl(Boolean, virtual(number_column() == value), "bumped")
++
++    def test_decimal_infinite_value(self):
++        for value in (Decimal("Infinity"), Decimal("-Infinity")):
++            with self.assertRaises(ValueError):
++                added_ddl(Boolean, virtual(number_column() == value), "bumped")
++
++    def test_non_finite_value(self):
++        for value in (float("nan"),):
++            with self.assertRaises(ValueError):
++                added_ddl(Boolean, virtual(number_column() == value), "bumped")
++
++    def test_expression_inlines_values(self):
++        ddl = added_ddl(Boolean, virtual(text_column() == "!"), "excited")
++
++        self.assertIn("'!'", ddl)
++        for marker in ("?", "$1", "%s"):
++            self.assertNotIn(marker, ddl)
++
++
++class TestGeneratedExpressionValues(GeneratedTableTest):
++    table_names = ["Score"]
++
++    def test_comparison_value(self):
++        score = get_tables().Score
++        score(points=80, ceiling=50).save().run_sync()
++
++        self.assertEqual(
++            score.select(score.passed, score.banded).run_sync(),
++            [{"passed": True, "banded": True}],
++        )
++
++    def test_comparison_value_when_false(self):
++        score = get_tables().Score
++        score(points=95, ceiling=99).save().run_sync()
++
++        self.assertEqual(
++            score.select(score.passed, score.banded).run_sync(),
++            [{"passed": True, "banded": False}],
++        )
++
++
++class TestGeneratedQuotedLiteral(GeneratedTableTest):
++    table_names = ["Person"]
++
++    def test_value_with_a_quote_is_usable(self):
++        person = get_tables().Person
++        person.alter().add_column(
++            name="excited",
++            column=Boolean(generated=virtual(person.first_name == "it's")),
++        ).run_sync()
++        person(first_name="it's").save().run_sync()
++        person(first_name="ada").save().run_sync()
++
++        self.assertEqual(
++            person.raw("SELECT excited FROM person ORDER BY id").run_sync(),
++            [{"excited": 1}, {"excited": 0}],
++        )
++
++
++class TestGeneratedRefresh(GeneratedTableTest):
++    table_names = ["Product", "Score", "Alias"]
++
++    def test_values_after_insert(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        self.assertEqual(row.name_upper, "HAT")
++        self.assertEqual(row.total, 8)
++
++    def test_constructor_value_is_replaced_after_save(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2, name_upper="WRONG")
++        row.save().run_sync()
++
++        self.assertEqual(row.name_upper, "HAT")
++
++    def test_values_after_update(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        row.quantity = 10
++        row.save().run_sync()
++
++        self.assertEqual(row.total, 40)
++
++    def test_bogus_value_is_replaced_on_an_ordinary_save(self):
++        product = get_tables().Product
++        product(name="hat", price=4, quantity=2).save().run_sync()
++
++        row = product.objects().first().run_sync()
++        assert row is not None
++        row.name_upper = "WRONG"
++        row.name = "cap"
++        row.save().run_sync()
++
++        self.assertEqual(row.name_upper, "CAP")
++        self.assertEqual(
++            product.select(product.name_upper).run_sync(),
++            [{"name_upper": "CAP"}],
++        )
++
++    def test_values_after_update_of_named_columns(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        row.name = "cap"
++        row.save(columns=[product.name]).run_sync()
++
++        self.assertEqual(row.name_upper, "CAP")
++
++    def test_expression_column_after_insert(self):
++        score = get_tables().Score
++        row = score(points=80)
++        row.save().run_sync()
++
++        self.assertEqual(row.passed, True)
++
++    def test_custom_db_column_name_after_insert(self):
++        alias = get_tables().Alias
++        row = alias(source="ada")
++        row.save().run_sync()
++
++        self.assertEqual(row.label, "ADA")
++
++    def test_custom_db_column_name_after_update(self):
++        alias = get_tables().Alias
++        row = alias(source="ada")
++        row.save().run_sync()
++
++        row.source = "grace"
++        row.save().run_sync()
++
++        self.assertEqual(row.label, "GRACE")
++
++    def test_ordinary_columns_are_untouched(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        self.assertEqual(row.name, "hat")
++        self.assertEqual(row.quantity, 2)
++
++
++class TestGeneratedFixtures(GeneratedTableTest):
++    table_names = ["Product"]
++
++    def fixture(self, product, row_id: int, name: str) -> str:
++        return json.dumps(
++            {
++                "app": {
++                    "Product": [
++                        {
++                            "id": row_id,
++                            "name": name,
++                            "price": 4,
++                            "quantity": 2,
++                            "name_upper": "STALE",
++                            "total": 999,
++                        }
++                    ]
++                }
++            }
++        )
++
++    def load(self, payload: str, action=None):
++        product = get_tables().Product
++        with patch.object(Finder, "get_table_with_name", return_value=product):
++            run_sync(
++                load_json_string(payload, on_conflict_action=action)
++                if action
++                else load_json_string(payload)
++            )
++
++    def test_load_inserts_a_row(self):
++        product = get_tables().Product
++        self.load(self.fixture(product, 1, "hat"))
++
++        self.assertEqual(
++            product.select(product.name, product.name_upper).run_sync(),
++            [{"name": "hat", "name_upper": "HAT"}],
++        )
++
++    def test_load_with_a_conflict_update(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        self.load(
++            self.fixture(product, row.id, "cap"),
++            action=OnConflictAction.do_update,
++        )
++
++        self.assertEqual(
++            product.select(product.name, product.name_upper).run_sync(),
++            [{"name": "cap", "name_upper": "CAP"}],
++        )
++
++    def test_load_with_a_conflict_update_recalculates(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        self.load(
++            self.fixture(product, row.id, "cap"),
++            action=OnConflictAction.do_update,
++        )
++
++        self.assertEqual(
++            product.select(product.total).run_sync(), [{"total": 8}]
++        )
++
++
++class TestGeneratedLegacySQLite(GeneratedTableTest):
++    table_names = ["Product"]
++
++    def old_sqlite(self):
++        return patch.object(
++            type(get_tables().Product._meta.db),
++            "get_version_sync",
++            return_value=3.34,
++        )
++
++    @engines_only("sqlite")
++    def test_values_after_insert(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++
++        with self.old_sqlite():
++            row.save().run_sync()
++
++        self.assertEqual(row.name_upper, "HAT")
++        self.assertEqual(row.total, 8)
++
++    @engines_only("sqlite")
++    def test_values_after_update(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        row.quantity = 10
++        with self.old_sqlite():
++            row.save().run_sync()
++
++        self.assertEqual(row.total, 40)
++
++    @engines_only("sqlite")
++    def test_values_after_update_self(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        with self.old_sqlite():
++            row.update_self({product.quantity: 5}).run_sync()
++
++        self.assertEqual(row.total, 20)
++
++    @engines_only("sqlite")
++    def test_ordinary_columns_are_untouched(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++
++        with self.old_sqlite():
++            row.save().run_sync()
++
++        self.assertIsNotNone(row.id)
++        self.assertEqual(row.name, "hat")
++
++
++class TestGeneratedDropGuard(GeneratedTableTest):
++    table_names = ["Product", "Score", "Expression"]
++
++    def test_placeholder_column_is_protected(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError):
++            product.alter().drop_column(product.name).run_sync()
++
++    def test_expression_column_is_protected(self):
++        score = get_tables().Score
++        with self.assertRaises(ValueError):
++            score.alter().drop_column(score.points).run_sync()
++
++    def test_error_message_names_both_columns(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError) as context:
++            product.alter().drop_column(product.quantity).run_sync()
++
++        message = str(context.exception)
++        self.assertIn("quantity", message)
++        self.assertIn("total", message)
++
++    def test_column_name_as_a_string(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError):
++            product.alter().drop_column("name").run_sync()
++
++    def test_database_name_as_a_string(self):
++        renamed = get_tables().Renamed
++        with self.assertRaises(ValueError) as context:
++            renamed.alter().drop_column("source_db").run_sync()
++
++        message = str(context.exception)
++        self.assertIn("source", message)
++        self.assertIn("derived", message)
++
++    def test_column_object_with_a_database_name(self):
++        renamed = get_tables().Renamed
++        with self.assertRaises(ValueError):
++            renamed.alter().drop_column(renamed.source).run_sync()
++
++    def test_column_inside_a_list_operand_is_protected(self):
++        score = get_tables().Score
++        with self.assertRaises(ValueError) as context:
++            score.alter().drop_column(score.cutoff).run_sync()
++
++        message = str(context.exception)
++        self.assertIn("cutoff", message)
++        self.assertIn("listed", message)
++
++    def test_column_named_only_by_the_second_operand(self):
++        score = get_tables().Score
++        with self.assertRaises(ValueError) as context:
++            score.alter().drop_column(score.ceiling).run_sync()
++
++        message = str(context.exception)
++        self.assertIn("ceiling", message)
++        self.assertIn("banded", message)
++
++    def test_generated_column_named_by_another_is_protected(self):
++        ticket = get_tables().Ticket
++        ticket.create_table().run_sync()
++        try:
++            with self.assertRaises(ValueError) as context:
++                ticket.alter().drop_column(ticket.note).run_sync()
++        finally:
++            ticket.alter().drop_table(if_exists=True).run_sync()
++
++        message = str(context.exception)
++        self.assertIn("note", message)
++        self.assertIn("serial_code", message)
++
++    def test_generated_column_named_by_another_as_a_string(self):
++        ticket = get_tables().Ticket
++        ticket.create_table().run_sync()
++        try:
++            with self.assertRaises(ValueError):
++                ticket.alter().drop_column("note").run_sync()
++        finally:
++            ticket.alter().drop_table(if_exists=True).run_sync()
++
++    def test_column_added_in_the_same_query_is_protected(self):
++        expression = get_tables().Expression
++        with self.assertRaises(ValueError) as context:
++            expression.alter().add_column(
++                name="doubled",
++                column=Integer(generated=virtual("{} * 2", expression.number)),
++            ).drop_column(expression.number).run_sync()
++
++        message = str(context.exception)
++        self.assertIn("number", message)
++        self.assertIn("doubled", message)
++
++    def test_comparison_added_in_the_same_query_is_protected(self):
++        expression = get_tables().Expression
++        with self.assertRaises(ValueError):
++            expression.alter().add_column(
++                name="big",
++                column=Boolean(generated=virtual(expression.number > 10)),
++            ).drop_column(expression.number).run_sync()
++
++    def test_column_dropped_before_the_generated_one_is_protected(self):
++        expression = get_tables().Expression
++        with self.assertRaises(ValueError) as context:
++            expression.alter().drop_column(expression.number).add_column(
++                name="doubled",
++                column=Integer(generated=virtual("{} * 2", expression.number)),
++            ).run_sync()
++
++        message = str(context.exception)
++        self.assertIn("number", message)
++        self.assertIn("doubled", message)
++
++    def test_dropped_name_before_the_generated_one_is_protected(self):
++        expression = get_tables().Expression
++        with self.assertRaises(ValueError):
++            expression.alter().drop_column("number").add_column(
++                name="doubled",
++                column=Integer(generated=virtual("{} * 2", expression.number)),
++            ).run_sync()
++
++    def test_comparison_dropped_before_the_generated_one_is_protected(self):
++        expression = get_tables().Expression
++        with self.assertRaises(ValueError) as context:
++            expression.alter().drop_column(expression.number).add_column(
++                name="big",
++                column=Boolean(generated=virtual(expression.number > 10)),
++            ).run_sync()
++
++        message = str(context.exception)
++        self.assertIn("number", message)
++        self.assertIn("big", message)
++
++    def test_unrelated_drop_before_a_generated_one_is_fine(self):
++        expression = get_tables().Expression
++        expression.alter().drop_column(expression.flag).add_column(
++            name="doubled",
++            column=Integer(generated=virtual("{} * 2", expression.number)),
++        ).run_sync()
++
++    def test_ordinary_column_added_in_the_same_query_is_fine(self):
++        expression = get_tables().Expression
++        expression.alter().add_column(
++            name="spare", column=Integer(null=True)
++        ).drop_column(expression.flag).run_sync()
++
++    def test_unrelated_column_can_be_dropped(self):
++        ticket = get_tables().Ticket
++        ticket.create_table().run_sync()
++        try:
++            ticket.alter().drop_column(ticket.price_with_fee).run_sync()
++        finally:
++            ticket.alter().drop_table(if_exists=True).run_sync()
++
++
++class TestGeneratedReferences(TestCase):
++    def test_column_from_the_same_table(self):
++        class Fine(Table):
++            title = Varchar()
++            shout = Varchar(generated=generated("UPPER({})", title))
++
++        self.assertIn('UPPER("title")', get_column_ddl(Fine, "shout"))
++
++
++class TestGeneratedModelBuilderDefaults(GeneratedTableTest):
++    table_names = ["Product"]
++
++    def test_default_for_generated_column(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError):
++            ModelBuilder.build_sync(
++                product, defaults={product.name_upper: "X"}, persist=False
++            )
++
++    def test_default_by_name(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError):
++            ModelBuilder.build_sync(
++                product, defaults={"total": 5}, persist=False
++            )
++
++    def test_default_rejection_message(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError) as context:
++            ModelBuilder.build_sync(
++                product, defaults={product.name_upper: "X"}, persist=False
++            )
++
++        self.assertIn("name_upper", str(context.exception))
++
++    def test_default_by_name_rejection_message(self):
++        product = get_tables().Product
++        with self.assertRaises(ValueError) as context:
++            ModelBuilder.build_sync(
++                product, defaults={"total": 5}, persist=False
++            )
++
++        self.assertIn("total", str(context.exception))
++
++    def test_default_for_ordinary_column(self):
++        product = get_tables().Product
++        built = ModelBuilder.build_sync(
++            product, defaults={product.name: "hat"}, persist=False
++        )
++        self.assertEqual(built.name, "hat")
++
++
++class TestGeneratedUpdateSelf(GeneratedTableTest):
++    table_names = ["Product", "Alias"]
++
++    def test_update_self_refreshes(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        row.update_self({product.quantity: 5}).run_sync()
++
++        self.assertEqual(row.total, 20)
++
++    def test_update_self_with_custom_db_column_name(self):
++        alias = get_tables().Alias
++        row = alias(source="ada")
++        row.save().run_sync()
++
++        row.update_self({alias.source: "grace"}).run_sync()
++
++        self.assertEqual(row.label, "GRACE")
++
++    def test_update_self_rejects_a_generated_column(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        with self.assertRaises(ValueError) as context:
++            row.update_self({product.total: 5}).run_sync()
++
++        self.assertIn("total", str(context.exception))
++
++    def test_update_self_rejects_a_generated_column_by_name(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        with self.assertRaises(ValueError) as context:
++            row.update_self({"total": 5}).run_sync()
++
++        self.assertIn("total", str(context.exception))
++
++    def test_update_self_keeps_updating_ordinary_columns(self):
++        product = get_tables().Product
++        row = product(name="hat", price=4, quantity=2)
++        row.save().run_sync()
++
++        row.update_self({product.quantity: 5}).run_sync()
++
++        self.assertEqual(row.quantity, 5)
++
++
++class TestGeneratedMigrationFile(TestCase):
++    def build_schema(self, sql: str, stored: bool = True):
++        name = Varchar()
++        name._meta._name = "name"
++
++        shout = Varchar(generated=generated(sql, name, stored=stored))
++        shout._meta._name = "shout"
++
++        return DiffableTable(
++            class_name="Item", tablename="item", columns=[name, shout]
++        ), DiffableTable(class_name="Item", tablename="item", columns=[name])
++
++    def get_statements(self, sql: str = "UPPER({})", stored: bool = True):
++        schema, snapshot = self.build_schema(sql, stored=stored)
++        differ = SchemaDiffer(
++            schema=[schema], schema_snapshot=[snapshot], auto_input="n"
++        )
++        return differ.get_alter_statements()
++
++    def rendered(self, **kwargs) -> str:
++        return " ".join(
++            statement
++            for group in self.get_statements(**kwargs)
++            for statement in group.statements
++        )
++
++    def restore(self, rendered: str):
++        start = rendered.index("Generated(")
++        end = start
++        depth = 0
++        for character in rendered[start:]:
++            end += 1
++            if character == "(":
++                depth += 1
++            elif character == ")":
++                depth -= 1
++                if depth == 0:
++                    break
++        return eval(  # noqa: S307
++            rendered[start:end], {"Generated": piccolo_columns.Generated}
++        )
++
++    def test_file_contains_a_generated_call(self):
++        rendered = " ".join(
++            statement
++            for group in self.get_statements()
++            for statement in group.statements
++        )
++
++        self.assertIn("Generated(", rendered)
++
++    def test_file_contains_the_rendered_column_name(self):
++        rendered = " ".join(
++            statement
++            for group in self.get_statements()
++            for statement in group.statements
++        )
++
++        self.assertIn('UPPER("name")', rendered)
++        self.assertNotIn("object at", rendered)
++
++    def test_file_keeps_a_stored_expression(self):
++        self.assertIn(
++            'GENERATED ALWAYS AS (UPPER("name")) STORED',
++            build_column_ddl(self.restore(self.rendered()), "shout"),
++        )
++
++    def test_file_keeps_a_virtual_expression(self):
++        self.assertIn(
++            'GENERATED ALWAYS AS (UPPER("name")) VIRTUAL',
++            build_column_ddl(
++                self.restore(self.rendered(stored=False)), "shout"
++            ),
++        )
++
++    def test_file_imports_generated(self):
++        imports = [
++            str(i)
++            for group in self.get_statements()
++            for i in group.extra_imports
++        ]
++
++        self.assertTrue(
++            any("Generated" in i for i in imports), msg=str(imports)
++        )
++
++
++class TestGeneratedChangedExpressionEndToEnd(DBTestCase):
++    def build_delta(self):
++        name = Varchar()
++        name._meta._name = "name"
++
++        old_column = Varchar(generated=generated("UPPER({})", name))
++        old_column._meta._name = "name_upper"
++
++        new_column = Varchar(generated=generated("LOWER({})", name))
++        new_column._meta._name = "name_upper"
++
++        return DiffableTable(
++            class_name="Manager",
++            tablename="manager",
++            columns=[name, new_column],
++        ) - DiffableTable(
++            class_name="Manager",
++            tablename="manager",
++            columns=[name, old_column],
++        )
++
++    def test_diff_output_is_rejected_when_run(self):
++        delta = self.build_delta()
++        self.assertEqual(len(delta.alter_columns), 1)
++
++        alter_column = delta.alter_columns[0]
++
++        manager = MigrationManager()
++        manager.alter_column(
++            table_class_name=alter_column.table_class_name,
++            tablename=alter_column.tablename,
++            column_name=alter_column.column_name,
++            params=alter_column.params,
++            old_params=alter_column.old_params,
++        )
++
++        with self.assertRaises(ValueError) as context:
++            run_sync(manager.run())
++
++        self.assertIn("name_upper", str(context.exception))

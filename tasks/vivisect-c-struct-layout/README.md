@@ -5,8 +5,8 @@
 | **Project** | [vivisect/vivisect](https://github.com/vivisect/vivisect) (Apache-2.0) |
 | **Base commit** | [`66c93f0c1c`](https://github.com/vivisect/vivisect/tree/66c93f0c1caa949434b9b1ba8bb64c8bad0eb3d9) |
 | **Language** | Python |
-| **Reference solution** | +887 / -119 lines across 5 files |
-| **New tests** | 183 test functions, +3,380 lines in 2 test files |
+| **Reference solution** | +916 / -119 lines across 5 files |
+| **New tests** | 191 test functions, +3,606 lines in 2 test files |
 
 ## Problem
 

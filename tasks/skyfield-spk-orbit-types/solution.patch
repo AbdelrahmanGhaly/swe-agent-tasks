@@ -1,8 +1,8 @@
 diff --git a/skyfield/jpllib.py b/skyfield/jpllib.py
-index 13ff0aa..a3a7151 100644
+index 13ff0aa..af8ee9b 100644
 --- a/skyfield/jpllib.py
 +++ b/skyfield/jpllib.py
-@@ -8,8 +8,12 @@ from jplephem.exceptions import OutOfRangeError
+@@ -8,8 +8,10 @@ from jplephem.exceptions import OutOfRangeError
  from jplephem.spk import SPK
  from jplephem.names import target_name_pairs
  
@@ -10,13 +10,11 @@ index 13ff0aa..a3a7151 100644
 +from .constants import AU_KM, DAY_S, T0
 +from .descriptorlib import reify
  from .errors import EphemerisRangeError
-+from .keplerlib import (
-+    discrete_states_at, equinoctial_elements_at, precessing_conic_at,
-+)
++from .keplerlib import discrete_states_at, precessing_conic_at
  from .timelib import compute_calendar_date
  from .vectorlib import VectorFunction, VectorSum, _jpl_code_name_dict
  
-@@ -198,12 +202,11 @@ class SpiceKernel(object):
+@@ -198,12 +200,11 @@ class SpiceKernel(object):
  class SPICESegment(VectorFunction):
  
      def __new__(cls, ephemeris, spk_segment):
@@ -34,7 +32,7 @@ index 13ff0aa..a3a7151 100644
  
      def __init__(self, ephemeris, spk_segment):
          self.ephemeris = ephemeris
-@@ -219,6 +222,16 @@ class SPICESegment(VectorFunction):
+@@ -219,6 +220,16 @@ class SPICESegment(VectorFunction):
          s = self.spk_segment
          return ts.tdb_jd(s.start_jd), ts.tdb_jd(s.end_jd)
  
@@ -51,7 +49,7 @@ index 13ff0aa..a3a7151 100644
  class ChebyshevPosition(SPICESegment):
      def _at(self, t):
          segment = self.spk_segment
-@@ -226,15 +239,7 @@ class ChebyshevPosition(SPICESegment):
+@@ -226,15 +237,7 @@ class ChebyshevPosition(SPICESegment):
              position, velocity = segment.compute_and_differentiate(
                  t.whole, t.tdb_fraction)
          except OutOfRangeError as e:
@@ -68,7 +66,7 @@ index 13ff0aa..a3a7151 100644
  
          return position / AU_KM, velocity / AU_KM, None, None
  
-@@ -243,6 +248,60 @@ class ChebyshevPositionVelocity(SPICESegment):
+@@ -243,6 +246,46 @@ class ChebyshevPositionVelocity(SPICESegment):
          pv = self.spk_segment.compute(t.whole, t.tdb_fraction)
          return pv[:3] / AU_KM, pv[3:] * DAY_S / AU_KM, None, None
  
@@ -81,6 +79,8 @@ index 13ff0aa..a3a7151 100644
 +        if outside.any():
 +            raise self._range_error(t.ts, np.atleast_1d(outside))
 +        shape = (3,) + np.shape(seconds)
++        if not np.size(seconds):
++            return np.empty(shape), np.empty(shape), None, None
 +        position, velocity = self._compute(np.ravel(seconds))
 +        position = position.reshape(shape) / AU_KM
 +        velocity = velocity.reshape(shape) * DAY_S / AU_KM
@@ -101,36 +101,20 @@ index 13ff0aa..a3a7151 100644
 +
 +class PrecessingConic(_OrbitSegment):
 +    def _compute(self, seconds):
-+        record = self._record
-+        if record[7] <= 0.0 or record[8] < 0.0:
-+            raise ValueError('SPK type 15 needs a positive semi-latus rectum'
-+                             ' and a non-negative eccentricity, not {0} and'
-+                             ' {1}'.format(record[7], record[8]))
-+        return precessing_conic_at(seconds, record)
-+
-+class EquinoctialElements(_OrbitSegment):
-+    def _compute(self, seconds):
-+        record = self._record
-+        e = np.hypot(record[2], record[3])
-+        if record[1] <= 0.0 or e >= 0.9:
-+            raise ValueError('SPK type 17 needs a positive semi-major axis'
-+                             ' and an eccentricity below 0.9, not {0}'
-+                             ' and {1}'.format(record[1], e))
-+        return equinoctial_elements_at(seconds, record)
++        return precessing_conic_at(seconds, self._record)
 +
 +_segment_classes = {
 +    2: ChebyshevPosition,
 +    3: ChebyshevPositionVelocity,
 +    5: DiscreteStates,
 +    15: PrecessingConic,
-+    17: EquinoctialElements,
 +}
 +
  class Stack(VectorFunction):
      """Several segments for one target, that might cover different dates."""
      def __init__(self, segments):
 diff --git a/skyfield/keplerlib.py b/skyfield/keplerlib.py
-index 01fef36..3ded37d 100644
+index 01fef36..cf99f4e 100644
 --- a/skyfield/keplerlib.py
 +++ b/skyfield/keplerlib.py
 @@ -4,11 +4,12 @@ import sys
@@ -150,7 +134,37 @@ index 01fef36..3ded37d 100644
  from skyfield.descriptorlib import reify
  from skyfield.elementslib import OsculatingElements, normpi
  from skyfield.units import Distance, Velocity
-@@ -613,3 +614,128 @@ def propagate(position, velocity, t0, t1, gm):
+@@ -543,7 +544,8 @@ def propagate(position, velocity, t0, t1, gm):
+     copyto(lower, x, where=past)
+     copyto(upper, x, where=future)
+ 
+-    while (kfun[past] > dt[past]).any():
++    past &= kfun > dt
++    while past.any():
+         copyto(upper, lower, where=past)
+         lower[past] *= 2
+         copyto(oldx, x, where=past)
+@@ -556,8 +558,10 @@ def propagate(position, velocity, t0, t1, gm):
+                              'this GM and initial state are from {1}'
+                              'to {2}.'.format(dt, kepler(-bound), kepler(bound)))
+         kfun[past] = kepler_1d(x[past], orb_ind)
++        past &= kfun > dt
+ 
+-    while (kfun[future] < dt[future]).any():
++    future &= kfun < dt
++    while future.any():
+         copyto(lower, upper, where=future)
+         upper[future] *= 2
+         copyto(oldx, x, where=future)
+@@ -570,6 +574,7 @@ def propagate(position, velocity, t0, t1, gm):
+                              'this GM and initial state are from {1} '
+                              'to {2}.'.format(dt, kepler(-bound), kepler(bound)))
+         kfun[future] = kepler_1d(x[future], orb_ind)
++        future &= kfun < dt
+ 
+     x = copy(upper)
+     copyto(x, (upper+lower)/2, where=(lower<=upper))
+@@ -613,3 +618,82 @@ def propagate(position, velocity, t0, t1, gm):
      position_prop.shape = output_shape
      velocity_prop.shape = output_shape
      return position_prop, velocity_prop
@@ -233,147 +247,3 @@ index 01fef36..3ded37d 100644
 +    c = cos(angle)
 +    return (vectors * c + _cross(axis, vectors) * sin(angle)
 +            + axis * dots(axis, vectors) * (1.0 - c))
-+
-+def equinoctial_elements_at(seconds, record):
-+    """Compute states from an SPK type 17 equinoctial elements record."""
-+    epoch, a, h, k, mean_longitude, p, q = record[:7]
-+    periapsis_rate, longitude_rate, node_rate, ra, dec = record[7:12]
-+    dt = seconds - epoch
-+
-+    turn = periapsis_rate * dt
-+    h, k = h * cos(turn) + k * sin(turn), k * cos(turn) - h * sin(turn)
-+    turn = node_rate * dt
-+    p, q = p * cos(turn) + q * sin(turn), q * cos(turn) - p * sin(turn)
-+    L = mean_longitude + fmod(longitude_rate * dt, tau)
-+
-+    F = L
-+    for _ in range(30):
-+        cos_F = cos(F)
-+        sin_F = sin(F)
-+        step = (F + h * cos_F - k * sin_F - L) / (1.0 - h * sin_F - k * cos_F)
-+        F = F - step
-+        if abs(step).max() < 1e-15:
-+            break
-+    cos_F = cos(F)
-+    sin_F = sin(F)
-+
-+    b = 1.0 / (1.0 + sqrt(1.0 - h * h - k * k))
-+    x = a * ((1.0 - b * h * h) * cos_F + h * k * b * sin_F - k)
-+    y = a * ((1.0 - b * k * k) * sin_F + h * k * b * cos_F - h)
-+    rb = h * sin_F + k * cos_F
-+    rate = (longitude_rate - periapsis_rate) * a / (1.0 - rb)
-+    apsis_rate = periapsis_rate - node_rate
-+    dx = rate * (h * b * rb - sin_F) - apsis_rate * y
-+    dy = rate * (cos_F - k * b * rb) + apsis_rate * x
-+
-+    d = 1.0 / (1.0 + p * p + q * q)
-+    f = array((1.0 - p * p + q * q, 2.0 * p * q, -2.0 * p)) * d
-+    g = array((2.0 * p * q, 1.0 + p * p - q * q, 2.0 * q)) * d
-+    position = x * f + y * g
-+    velocity = dx * f + dy * g
-+    velocity[0] -= node_rate * position[1]
-+    velocity[1] += node_rate * position[0]
-+
-+    sa, ca, sd, cd = sin(ra), cos(ra), sin(dec), cos(dec)
-+    to_inertial = array(((-sa, -ca * sd, ca * cd),
-+                         (ca, -sa * sd, sa * cd),
-+                         (0.0, cd, sd)))
-+    return mxv(to_inertial, position), mxv(to_inertial, velocity)
-diff --git a/skyfield/planetarylib.py b/skyfield/planetarylib.py
-index c2bccf9..eebf774 100644
---- a/skyfield/planetarylib.py
-+++ b/skyfield/planetarylib.py
-@@ -1,7 +1,7 @@
- # -*- coding: utf-8 -*-
- """Open a BPC file, read its angles, and produce rotation matrices."""
- 
--from numpy import array, cos, nan, sin
-+from numpy import array, cos, empty, nan, sin
- from jplephem.pck import DAF, PCK
- from .constants import ASEC2RAD, AU_KM, DAY_S, tau
- from .data import text_pck
-@@ -80,7 +80,7 @@ class PlanetaryConstants(object):
-         self._binary_files.append(pck)
-         for segment in pck.segments:
-             self._segment_list.append(segment)
--            self._segment_map[segment.body] = segment
-+            self._segment_map.setdefault(segment.body, []).append(segment)
- 
-     def _get_assignment(self, key):
-         """Do .variables[key] but with a pretty exception on failure."""
-@@ -124,15 +124,16 @@ class PlanetaryConstants(object):
-             integer = self.variables['FRAME_{0}'.format(relative)]
- 
-         if _segment is None:
--            segment = self._segment_map.get(integer)
-+            segments = self._segment_map.get(integer)
-         else:
--            segment = _segment
-+            segments = [_segment]
- 
--        if segment is None:
-+        if not segments:
-             raise LookupError('you have not yet loaded a binary PCK file that'
-                               ' has a segment for frame {0}'.format(integer))
--        assert segment.frame == 1  # base frame should be ITRF/J2000
--        return Frame(center, segment, matrix)
-+        for segment in segments:
-+            assert segment.frame == 1  # base frame should be ITRF/J2000
-+        return Frame(center, segments, matrix)
- 
-     def build_latlon_degrees(self, frame, latitude_degrees, longitude_degrees,
-                              elevation_m=0.0):
-@@ -159,14 +160,41 @@ object's `.variables` dictionary."""
- class Frame(object):
-     """Planetary constants frame, for building rotation matrices."""
- 
--    def __init__(self, center, segment, matrix):
-+    def __init__(self, center, segments, matrix):
-         self.center = center
--        self._segment = segment
-+        self._segments = segments
-         self._matrix = matrix
- 
-+    def _compute(self, tdb, tdb2, derivative):
-+        segments = self._segments
-+        if len(segments) == 1:
-+            return segments[0].compute(tdb, tdb2, derivative)
-+
-+        jd = tdb + tdb2
-+        if not getattr(jd, 'shape', ()):
-+            for segment in reversed(segments):
-+                if segment.initial_jd <= jd <= segment.final_jd:
-+                    return segment.compute(tdb, tdb2, derivative)
-+            return segments[-1].compute(tdb, tdb2, derivative)
-+
-+        tdb = tdb + 0.0 * jd
-+        tdb2 = tdb2 + 0.0 * jd
-+        results = empty((2 if derivative else 1, 3) + jd.shape)
-+        unclaimed = jd == jd
-+        for segment in reversed(segments):
-+            mine = unclaimed & (segment.initial_jd <= jd)
-+            mine &= jd <= segment.final_jd
-+            if mine.any():
-+                values = segment.compute(tdb[mine], tdb2[mine], derivative)
-+                results[:,:,mine] = values if derivative else [values]
-+                unclaimed &= ~mine
-+        if unclaimed.any():
-+            segments[-1].compute(tdb[unclaimed], tdb2[unclaimed], derivative)
-+        return results if derivative else results[0]
-+
-     def rotation_at(self, t):
-         """Return the rotation matrix for this frame at time ``t``."""
--        ra, dec, w = self._segment.compute(t.tdb, 0.0, False)
-+        ra, dec, w = self._compute(t.tdb, 0.0, False)
-         R = mxm(rot_z(-w), mxm(rot_x(-dec), rot_z(-ra)))
-         if self._matrix is not None:
-             R = mxm(self._matrix, R)
-@@ -178,7 +206,7 @@ class Frame(object):
-         The rate matrix returned is in units of angular motion per day.
- 
-         """
--        components, rates = self._segment.compute(t.whole, t.tdb_fraction, True)
-+        components, rates = self._compute(t.whole, t.tdb_fraction, True)
-         ra, dec, w = components
-         radot, decdot, wdot = rates
- 

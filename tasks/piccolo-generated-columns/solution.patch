@@ -1,0 +1,1310 @@
+diff --git a/piccolo/apps/fixtures/commands/load.py b/piccolo/apps/fixtures/commands/load.py
+index 835f814a..3154ec46 100644
+--- a/piccolo/apps/fixtures/commands/load.py
++++ b/piccolo/apps/fixtures/commands/load.py
+@@ -86,7 +86,7 @@ async def load_json_string(
+                     query = query.on_conflict(
+                         target=table_class._meta.primary_key,
+                         action=on_conflict_action,
+-                        values=table_class._meta.columns,
++                        values=table_class._meta.writable_columns,
+                     )
+                 await query.run()
+ 
+diff --git a/piccolo/apps/migrations/auto/diffable_table.py b/piccolo/apps/migrations/auto/diffable_table.py
+index 55d88cb6..3e5d79b3 100644
+--- a/piccolo/apps/migrations/auto/diffable_table.py
++++ b/piccolo/apps/migrations/auto/diffable_table.py
+@@ -110,6 +110,34 @@ class ConstraintComparison:
+         return False
+ 
+ 
++def order_by_dependency(columns: list[Column]) -> list[Column]:
++    """
++    A generated column has to be added after the columns its expression
++    names, otherwise the database rejects it. Dropping runs in reverse.
++    """
++    ordered: list[Column] = []
++    remaining = list(columns)
++
++    while remaining:
++        for index, column in enumerate(remaining):
++            generated = column._meta.generated
++            required = (
++                {i._meta._name for i in generated.get_columns()}
++                if generated is not None
++                else set()
++            )
++            pending = {i._meta._name for i in remaining if i is not column}
++
++            if not required & pending:
++                ordered.append(remaining.pop(index))
++                break
++        else:
++            ordered.extend(remaining)
++            break
++
++    return ordered
++
++
+ @dataclass
+ class DiffableTable:
+     """
+@@ -149,19 +177,28 @@ class DiffableTable:
+         add_columns = [
+             AddColumn(
+                 table_class_name=self.class_name,
+-                column_name=i.column._meta.name,
+-                db_column_name=i.column._meta.db_column_name,
+-                column_class_name=i.column.__class__.__name__,
+-                column_class=i.column.__class__,
+-                params=i.column._meta.params,
++                column_name=column._meta.name,
++                db_column_name=column._meta.db_column_name,
++                column_class_name=column.__class__.__name__,
++                column_class=column.__class__,
++                params=column._meta.params,
+                 schema=self.schema,
+             )
+-            for i in sorted(
+-                {ColumnComparison(column=column) for column in self.columns}
+-                - {
+-                    ColumnComparison(column=column) for column in value.columns
+-                },
+-                key=lambda x: x.column._meta.name,
++            for column in order_by_dependency(
++                [
++                    i.column
++                    for i in sorted(
++                        {
++                            ColumnComparison(column=column)
++                            for column in self.columns
++                        }
++                        - {
++                            ColumnComparison(column=column)
++                            for column in value.columns
++                        },
++                        key=lambda x: x.column._meta.name,
++                    )
++                ]
+             )
+         ]
+ 
+@@ -195,6 +232,18 @@ class DiffableTable:
+                 serialise_params(existing_column._meta.params).params,
+             )
+ 
++            # `compare_dicts` only walks the new params, so a param which
++            # was removed has to be spotted here instead.
++            if "generated" in existing_column._meta.params and (
++                "generated" not in column._meta.params
++            ):
++                delta["generated"] = None
++
++            # A generated column has no default, so a changed one would turn
++            # into DDL the database refuses.
++            if column._meta.generated is not None:
++                delta.pop("default", None)
++
+             old_params = {
+                 key: existing_column._meta.params.get(key)
+                 for key, _ in delta.items()
+diff --git a/piccolo/apps/migrations/auto/migration_manager.py b/piccolo/apps/migrations/auto/migration_manager.py
+index 8d8732c4..529de501 100644
+--- a/piccolo/apps/migrations/auto/migration_manager.py
++++ b/piccolo/apps/migrations/auto/migration_manager.py
+@@ -562,6 +562,18 @@ class MigrationManager:
+ 
+                 ###############################################################
+ 
++                # A database can't rewrite the expression of an existing
++                # generated column, so the column has to be dropped and added
++                # again instead.
++                if "generated" in alter_column.params:
++                    raise ValueError(
++                        f"{alter_column.column_name} is a generated column - "
++                        "drop it and add it again to change how it's "
++                        "calculated."
++                    )
++
++                ###############################################################
++
+                 # Change the column type if possible
+                 column_class = (
+                     alter_column.old_column_class
+@@ -935,7 +947,9 @@ class MigrationManager:
+         Add columns, which belong to existing tables
+         """
+         if backwards:
+-            for add_column in self.add_columns.add_columns:
++            # Additions are ordered so a generated column follows the columns
++            # it names, so the drops have to run the other way round.
++            for add_column in reversed(self.add_columns.add_columns):
+                 if add_column.table_class_name in [
+                     i.class_name for i in self.add_tables
+                 ]:
+diff --git a/piccolo/apps/migrations/auto/serialisation.py b/piccolo/apps/migrations/auto/serialisation.py
+index e3d16635..447e5793 100644
+--- a/piccolo/apps/migrations/auto/serialisation.py
++++ b/piccolo/apps/migrations/auto/serialisation.py
+@@ -15,6 +15,7 @@ from typing import Any, Optional
+ 
+ from piccolo.columns import Column
+ from piccolo.columns.defaults.base import Default
++from piccolo.columns.generated import Generated
+ from piccolo.columns.reference import LazyTableReference
+ from piccolo.table import Table
+ from piccolo.utils.repr import repr_class_instance
+@@ -519,6 +520,26 @@ class SerialisedDecimal:
+         ).replace("'", '"')
+ 
+ 
++@dataclass
++class SerialisedGenerated:
++    """
++    A migration file can't refer to the columns which filled the placeholders,
++    so we store the SQL with the column names already substituted in.
++    """
++
++    instance: Generated
++
++    def __hash__(self):
++        return hash(repr(self))
++
++    def __eq__(self, other):
++        return check_equality(self, other)
++
++    def __repr__(self):
++        sql = self.instance.get_sql()
++        return f"Generated({sql!r}, stored={self.instance.stored})"
++
++
+ ###############################################################################
+ 
+ 
+@@ -592,6 +613,17 @@ def serialise_params(
+             )
+             continue
+ 
++        # Generated column expressions
++        if isinstance(value, Generated):
++            params[key] = SerialisedGenerated(instance=value)
++            extra_imports.append(
++                Import(
++                    module=value.__class__.__module__,
++                    target=value.__class__.__name__,
++                )
++            )
++            continue
++
+         # Class instances
+         if isinstance(value, Default):
+             params[key] = SerialisedClassInstance(instance=value)
+@@ -817,6 +849,8 @@ def deserialise_params(params: dict[str, Any]) -> dict[str, Any]:
+             params[key] = value.instance
+         elif isinstance(value, SerialisedDecimal):
+             params[key] = value.instance
++        elif isinstance(value, SerialisedGenerated):
++            params[key] = value.instance
+         elif isinstance(value, SerialisedCallable):
+             params[key] = value.callable_
+         elif isinstance(value, SerialisedTableType):
+diff --git a/piccolo/columns/__init__.py b/piccolo/columns/__init__.py
+index 8758493c..f140cbe4 100644
+--- a/piccolo/columns/__init__.py
++++ b/piccolo/columns/__init__.py
+@@ -30,12 +30,14 @@ from .column_types import (
+     Varchar,
+ )
+ from .combination import And, Or, Where
++from .generated import Generated
+ from .m2m import M2M
+ from .reference import LazyTableReference
+ 
+ __all__ = [
+     "Column",
+     "ForeignKeyMeta",
++    "Generated",
+     "OnDelete",
+     "OnUpdate",
+     "Selectable",
+diff --git a/piccolo/columns/base.py b/piccolo/columns/base.py
+index 48ca4eb8..c9bea07c 100644
+--- a/piccolo/columns/base.py
++++ b/piccolo/columns/base.py
+@@ -23,6 +23,7 @@ from piccolo.columns.choices import Choice
+ from piccolo.columns.combination import Where
+ from piccolo.columns.defaults.base import Default
+ from piccolo.columns.defaults.interval import IntervalCustom
++from piccolo.columns.generated import Generated
+ from piccolo.columns.indexes import IndexMethod
+ from piccolo.columns.operators.comparison import (
+     ComparisonOperator,
+@@ -170,6 +171,7 @@ class ColumnMeta:
+     choices: Optional[type[Enum]] = None
+     secret: bool = False
+     auto_update: Any = ...
++    generated: Optional[Generated] = None
+ 
+     # Used for representing the table in migrations and the playground.
+     params: dict[str, Any] = field(default_factory=dict)
+@@ -378,6 +380,7 @@ class ColumnKwargs(TypedDict, total=False):
+     db_column_name: Optional[str]
+     secret: bool
+     auto_update: Any
++    generated: Optional[Generated]
+ 
+ 
+ class Column(Selectable):
+@@ -495,6 +498,7 @@ class Column(Selectable):
+         db_column_name: Optional[str] = None,
+         secret: bool = False,
+         auto_update: Any = ...,
++        generated: Optional[Generated] = None,
+         **kwargs,
+     ) -> None:
+         # This is for backwards compatibility - originally the `primary_key`
+@@ -520,6 +524,16 @@ class Column(Selectable):
+             }
+         )
+ 
++        if generated is not None:
++            if primary_key:
++                raise ValueError(
++                    "A generated column can't be used as a primary key."
++                )
++
++            # Only added when used, so the params of every other column are
++            # left as they were.
++            kwargs["generated"] = generated
++
+         if choices is not None:
+             self._validate_choices(choices, allowed_type=self.value_type)
+ 
+@@ -536,6 +550,7 @@ class Column(Selectable):
+             _db_column_name=db_column_name,
+             secret=secret,
+             auto_update=auto_update,
++            generated=generated,
+         )
+ 
+         self._alias: Optional[str] = None
+@@ -1007,6 +1022,12 @@ class Column(Selectable):
+                 f" ON UPDATE {on_update}"
+             )
+ 
++        generated = self._meta.generated
++        if generated is not None:
++            # The database calculates the value, so a default is both
++            # meaningless and rejected by the database.
++            return f"{query} {generated.ddl}"
++
+         # Always ran for Cockroach because unique_rowid() is directly
+         # defined for Cockroach Serial and BigSerial.
+         # Postgres and SQLite will not run this for Serial and BigSerial.
+diff --git a/piccolo/columns/combination.py b/piccolo/columns/combination.py
+index 113baa52..98776c8a 100644
+--- a/piccolo/columns/combination.py
++++ b/piccolo/columns/combination.py
+@@ -274,21 +274,23 @@ class Where(CombinableMixin):
+             return f'"{column._meta.db_column_name}"'
+ 
+         args: list[Any] = []
+-        if self.value != UNDEFINED:
++        if not isinstance(self.value, Undefined):
+             args.append(
+                 QueryString(stringify_column(self.value))
+                 if isinstance(self.value, Column)
+                 else self.value
+             )
+ 
+-        if not isinstance(self.values, Undefined):
++        if isinstance(self.values, QueryString):
++            args.append(self.values)
++        elif not isinstance(self.values, Undefined):
+             args.append(
+                 self.get_values_querystring(
+                     values=[
+                         (
+                             QueryString(stringify_column(value))
+-                            if isinstance(self.value, Column)
+-                            else self.value
++                            if isinstance(value, Column)
++                            else value
+                         )
+                         for value in self.values  # type: ignore
+                     ]
+diff --git a/piccolo/columns/generated.py b/piccolo/columns/generated.py
+new file mode 100644
+index 00000000..e0d3743c
+--- /dev/null
++++ b/piccolo/columns/generated.py
+@@ -0,0 +1,316 @@
++from __future__ import annotations
++
++import datetime
++import decimal
++import math
++import uuid
++from collections.abc import Sequence
++from typing import TYPE_CHECKING, Any, Union
++
++from piccolo.columns.combination import Combination, Where
++from piccolo.custom_types import Combinable
++from piccolo.querystring import QueryString
++
++if TYPE_CHECKING:  # pragma: no cover
++    from piccolo.columns.base import Column
++
++
++def _is_sql(operand: Any) -> bool:
++    """
++    SQL a caller assembled elsewhere, such as a function call or a sub
++    select. It reaches a generated column through the placeholder form.
++    """
++    from piccolo.query.base import Query
++
++    return isinstance(operand, (QueryString, Query))
++
++
++def _is_comparison(expression: Any) -> bool:
++    """
++    A comparison, or comparisons combined with ``&`` and ``|``. Neither a raw
++    SQL where clause nor a comparison carrying SQL of its own is one, so both
++    have to use the placeholder form.
++    """
++    if isinstance(expression, Combination):
++        return _is_comparison(expression.first) and _is_comparison(
++            expression.second
++        )
++
++    if not isinstance(expression, Where):
++        return False
++
++    operands = [expression.value]
++    values = expression.values
++    if isinstance(values, (list, tuple)):
++        operands.extend(values)
++    else:
++        operands.append(values)
++
++    return not any(_is_sql(i) for i in operands)
++
++
++class Generated:
++    """
++    Describes a value which the database calculates for us. For example::
++
++        from piccolo.columns import (
++            Boolean,
++            Generated,
++            Integer,
++            Varchar,
++        )
++
++        class Band(Table):
++            name = Varchar()
++            popularity = Integer()
++
++            upper_name = Varchar(generated=Generated("UPPER({})", name))
++            is_popular = Boolean(generated=Generated(popularity > 1000))
++
++    :param expression:
++        Either the SQL for the expression, with curly brackets as placeholders
++        for any columns, or a Piccolo expression such as ``popularity > 1000``.
++    :param columns:
++        The columns which fill the placeholders (one column is needed for each
++        set of curly brackets). Only allowed when the expression is SQL.
++    :param stored:
++        If ``True``, the value is calculated when the row is written, and is
++        stored on disk. If ``False``, it's calculated each time the row is
++        read.
++
++    """
++
++    __slots__ = ("expression", "columns", "stored")
++
++    def __init__(
++        self,
++        expression: Union[str, Combinable],
++        *columns: Column,
++        stored: bool = True,
++    ):
++        if isinstance(expression, str):
++            placeholder_count = expression.count("{}")
++
++            if placeholder_count != len(columns):
++                raise ValueError(
++                    f"{placeholder_count} placeholders were given, but "
++                    f"{len(columns)} columns."
++                )
++        elif not _is_comparison(expression):
++            raise ValueError(
++                "Only SQL with placeholders, or a comparison such as "
++                "`popularity > 100`, can be used here. Anything else, "
++                "including a function call, needs the placeholder form."
++            )
++        elif columns:
++            raise ValueError(
++                "Columns can only be passed in alongside SQL which has "
++                "placeholders for them."
++            )
++
++        self.expression = expression
++        self.columns = columns
++        self.stored = stored
++
++    def get_columns(self) -> list[Column]:
++        """
++        Every column the expression names, wherever it appears in it.
++        """
++        if self.columns:
++            return list(self.columns)
++
++        return self._walk(self.expression)
++
++    @classmethod
++    def _walk(cls, expression: Any) -> list[Column]:
++        from piccolo.columns.base import Column
++
++        if isinstance(expression, Column):
++            return [expression]
++
++        if isinstance(expression, QueryString):
++            columns = list(expression.columns)
++            for arg in expression.args:
++                columns.extend(cls._walk(arg))
++            return columns
++
++        if isinstance(expression, Combination):
++            return cls._walk(expression.first) + cls._walk(expression.second)
++
++        if isinstance(expression, Where):
++            columns = cls._walk(expression.column)
++
++            for side in (expression.value, expression.values):
++                if isinstance(side, (list, tuple)):
++                    for item in side:
++                        columns.extend(cls._walk(item))
++                else:
++                    columns.extend(cls._walk(side))
++
++            return columns
++
++        return []
++
++    def get_sql(self) -> str:
++        """
++        The SQL expression, ready for a table definition.
++
++        The column names are only known once the ``Table`` metaclass has
++        assigned them, which is why this is deferred until the SQL is needed.
++        """
++        expression = self.expression
++
++        if isinstance(expression, str):
++            if not self.columns:
++                return expression
++
++            return expression.format(
++                *[
++                    f'"{column._meta.db_column_name}"'
++                    for column in self.columns
++                ]
++            )
++
++        if isinstance(expression, QueryString):
++            querystring = expression
++        else:
++            querystring = expression.querystring_for_constraint
++
++        return self._render(querystring)
++
++    @classmethod
++    def _render(cls, querystring: QueryString) -> str:
++        """
++        A database rejects both bind parameters and table names inside a
++        generated column's expression, so the values are written into the SQL,
++        and each column is left with just its own name.
++
++        Column names only ever reach the SQL through a fragment's prefix, and
++        values only ever arrive as arguments, so the two are unqualified and
++        written separately. Rewriting the finished SQL instead would change a
++        value which happens to look like a column name.
++        """
++        unqualified = {
++            column._meta.get_full_name(
++                with_alias=False
++            ): f'"{column._meta.db_column_name}"'
++            for column in querystring.columns
++            if column._meta._table is not None
++        }
++
++        _, fragments, args = querystring.bundle(
++            start_index=1, bundled=[], combined_args=[]
++        )
++
++        parts: list[str] = []
++        index = 0
++
++        for fragment in fragments:
++            prefix = fragment.prefix
++            for full_name, name in unqualified.items():
++                prefix = prefix.replace(full_name, name)
++
++            parts.append(prefix)
++
++            if not fragment.no_arg:
++                parts.append(cls._render_value(args[index]))
++                index += 1
++
++        return "".join(parts)
++
++    @staticmethod
++    def _render_value(value: Any) -> str:
++        """
++        Write a value into the SQL, as the expression can't carry it
++        separately.
++        """
++        if value is None:
++            return "null"
++
++        if isinstance(value, bool):
++            return "true" if value else "false"
++
++        if isinstance(value, (int, float, decimal.Decimal)):
++            unusable = isinstance(
++                value, (float, decimal.Decimal)
++            ) and not math.isfinite(value)
++            if unusable:
++                raise ValueError(
++                    f"{value} has no SQL form which works everywhere."
++                )
++
++            return str(value)
++
++        if isinstance(
++            value,
++            (
++                datetime.datetime,
++                datetime.date,
++                datetime.time,
++                uuid.UUID,
++            ),
++        ):
++            value = str(value)
++
++        if isinstance(value, str):
++            escaped = value.replace("'", "''")
++            return f"'{escaped}'"
++
++        raise ValueError(
++            f"A {type(value).__name__} can't be written into a generated "
++            "column's expression."
++        )
++
++    @property
++    def ddl(self) -> str:
++        storage = "STORED" if self.stored else "VIRTUAL"
++        return f"GENERATED ALWAYS AS ({self.get_sql()}) {storage}"
++
++    def __hash__(self) -> int:
++        return hash((self.get_sql(), self.stored))
++
++    def __eq__(self, other: Any) -> bool:
++        if not isinstance(other, Generated):
++            return False
++        return (
++            self.get_sql() == other.get_sql() and self.stored == other.stored
++        )
++
++    def __repr__(self) -> str:
++        return f"Generated({self.get_sql()!r}, stored={self.stored})"
++
++
++def read_generated_values(
++    row: dict[str, Any], columns: Sequence[Column]
++) -> dict[str, Any]:
++    """
++    Pick the calculated values out of a row which the database handed back,
++    keyed by the name of the attribute they belong to.
++    """
++    return {
++        column._meta.name: row[column._meta.db_column_name]
++        for column in columns
++        if column._meta.db_column_name in row
++    }
++
++
++def reject_generated_write(column: Column) -> None:
++    """
++    The database works out a generated column's value, so it can't be given
++    one deliberately.
++    """
++    if column._meta.generated is not None:
++        raise ValueError(
++            f"{column._meta.name} is a generated column - the database "
++            "works out its value."
++        )
++
++
++def reject_named_generated_write(table: Any, name: Any) -> None:
++    """
++    The same guard, for the write APIs which take a column's name instead of
++    the column itself. Either name reaches the same column.
++    """
++    for column in table._meta.columns:
++        if name in (column._meta.name, column._meta.db_column_name):
++            reject_generated_write(column)
+diff --git a/piccolo/engine/sqlite.py b/piccolo/engine/sqlite.py
+index 2b1840c5..7a0c73f8 100644
+--- a/piccolo/engine/sqlite.py
++++ b/piccolo/engine/sqlite.py
+@@ -713,6 +713,32 @@ class SQLiteEngine(Engine[SQLiteTransaction]):
+         response = await cursor.fetchone()
+         return response[table._meta.primary_key._meta.db_column_name]
+ 
++    async def _get_inserted_row(self, cursor, table: type[Table]) -> dict:
++        """
++        What an insert hands back when the RETURNING clause isn't available.
++        Generated columns are fetched too, as the database is the only place
++        their values exist.
++        """
++        primary_key_name = table._meta.primary_key._meta.db_column_name
++        pk = await self._get_inserted_pk(cursor, table)
++        row = {primary_key_name: pk}
++
++        generated_columns = table._meta.generated_columns
++        if generated_columns:
++            column_names = ", ".join(
++                f'"{i._meta.db_column_name}"' for i in generated_columns
++            )
++            await cursor.execute(
++                f"SELECT {column_names} FROM {table._meta.tablename} "
++                f'WHERE "{primary_key_name}" = ?',
++                [pk],
++            )
++            generated_values = await cursor.fetchone()
++            if generated_values:
++                row.update(generated_values)
++
++        return row
++
+     async def _run_in_new_connection(
+         self,
+         query: str,
+@@ -733,8 +759,7 @@ class SQLiteEngine(Engine[SQLiteTransaction]):
+                     # We can't use the RETURNING clause on older versions
+                     # of SQLite.
+                     assert table is not None
+-                    pk = await self._get_inserted_pk(cursor, table)
+-                    return [{table._meta.primary_key._meta.db_column_name: pk}]
++                    return [await self._get_inserted_row(cursor, table)]
+                 else:
+                     return await cursor.fetchall()
+ 
+@@ -761,8 +786,7 @@ class SQLiteEngine(Engine[SQLiteTransaction]):
+                 # We can't use the RETURNING clause on older versions
+                 # of SQLite.
+                 assert table is not None
+-                pk = await self._get_inserted_pk(cursor, table)
+-                return [{table._meta.primary_key._meta.db_column_name: pk}]
++                return [await self._get_inserted_row(cursor, table)]
+             else:
+                 return response
+ 
+diff --git a/piccolo/query/methods/alter.py b/piccolo/query/methods/alter.py
+index 3fe3a815..8097723c 100644
+--- a/piccolo/query/methods/alter.py
++++ b/piccolo/query/methods/alter.py
+@@ -347,7 +347,27 @@ class Alter(DDL):
+         """
+         column._meta._table = self.table
+         column._meta._name = name
+-        column._meta.db_column_name = name
++        if column._meta._db_column_name is None:
++            # A column which was given its own database name keeps it, so a
++            # generated expression naming it still resolves.
++            column._meta.db_column_name = name
++
++        generated = column._meta.generated
++        if (
++            generated is not None
++            and generated.stored
++            and self.engine_type == "sqlite"
++        ):
++            raise ValueError(
++                f"{name} is a stored generated column, and SQLite can only "
++                "add generated columns which aren't stored."
++            )
++
++        if generated is not None:
++            self._reject_generated_dependency(
++                dropped=[i.column for i in self._drop],
++                generated_columns=[column],
++            )
+ 
+         if isinstance(column, ForeignKey):
+             column._setup(table_class=self.table)
+@@ -362,9 +382,69 @@ class Alter(DDL):
+             >>> await Band.alter().drop_column(Band.popularity)
+ 
+         """
++        self._reject_generated_dependency(
++            dropped=[column],
++            generated_columns=[
++                *self.table._meta.generated_columns,
++                # A generated column queued by this same query isn't on the
++                # table yet, and it depends on its columns just as much.
++                *(i.column for i in self._add if i.column._meta.generated),
++            ],
++        )
++
+         self._drop.append(DropColumn(column))
+         return self
+ 
++    def _column_names(self, column: Union[str, Column]) -> set[str]:
++        """
++        A column can be named either way round, so gather both names before
++        looking for anything which depends on it.
++        """
++        if isinstance(column, Column):
++            return {column._meta.name, column._meta.db_column_name}
++
++        names = {column}
++        for existing_column in self.table._meta.columns:
++            if column in (
++                existing_column._meta.name,
++                existing_column._meta.db_column_name,
++            ):
++                names.update(
++                    {
++                        existing_column._meta.name,
++                        existing_column._meta.db_column_name,
++                    }
++                )
++        return names
++
++    def _reject_generated_dependency(
++        self,
++        dropped: Sequence[Union[str, Column]],
++        generated_columns: Sequence[Column],
++    ) -> None:
++        """
++        A generated column keeps the columns its expression names alive,
++        whichever order the two operations were asked for in.
++        """
++        dropped_names: set[str] = set()
++        for column in dropped:
++            dropped_names |= self._column_names(column)
++
++        for generated_column in generated_columns:
++            generated = generated_column._meta.generated
++            assert generated is not None
++
++            for referenced_column in generated.get_columns():
++                if dropped_names & {
++                    referenced_column._meta.name,
++                    referenced_column._meta.db_column_name,
++                }:
++                    raise ValueError(
++                        f"{referenced_column._meta.name} is used by "
++                        f"{generated_column._meta.name}, which is a generated "
++                        "column."
++                    )
++
+     def drop_default(self, column: Union[str, Column]) -> Alter:
+         """
+         Drop the default from a column::
+diff --git a/piccolo/query/methods/insert.py b/piccolo/query/methods/insert.py
+index f9bce951..f9831e12 100644
+--- a/piccolo/query/methods/insert.py
++++ b/piccolo/query/methods/insert.py
+@@ -11,6 +11,7 @@ from typing import (
+     Union,
+ )
+ 
++from piccolo.columns.generated import read_generated_values
+ from piccolo.custom_types import Combinable, TableInstance
+ from piccolo.query.base import Query
+ from piccolo.query.mixins import (
+@@ -83,6 +84,7 @@ class Insert(
+             action=action,
+             values=values,
+             where=where,
++            table=self.table,
+         )
+         return self
+ 
+@@ -90,8 +92,11 @@ class Insert(
+ 
+     def _raw_response_callback(self, results: list):
+         """
+-        Assign the ids of the created rows to the model instances.
++        Assign the ids of the created rows to the model instances, along with
++        any values the database calculated for us.
+         """
++        generated_columns = self.table._meta.generated_columns
++
+         for index, row in enumerate(results):
+             table_instance: Table = self.add_delegate._add[index]
+             setattr(
+@@ -101,13 +106,20 @@ class Insert(
+                     self.table._meta.primary_key._meta.db_column_name, None
+                 ),
+             )
++
++            for name, value in read_generated_values(
++                row, generated_columns
++            ).items():
++                setattr(table_instance, name, value)
++
+             table_instance._exists_in_db = True
+ 
+     @property
+     def default_querystrings(self) -> Sequence[QueryString]:
+         base = f"INSERT INTO {self.table._meta.get_formatted_tablename()}"
+         columns = ",".join(
+-            f'"{i._meta.db_column_name}"' for i in self.table._meta.columns
++            f'"{i._meta.db_column_name}"'
++            for i in self.table._meta.writable_columns
+         )
+         values = ",".join("{}" for _ in self.add_delegate._add)
+         query = f"{base} ({columns}) VALUES {values}"
+diff --git a/piccolo/query/methods/objects.py b/piccolo/query/methods/objects.py
+index 2379ff22..8434dcc7 100644
+--- a/piccolo/query/methods/objects.py
++++ b/piccolo/query/methods/objects.py
+@@ -18,6 +18,7 @@ from piccolo.custom_types import Combinable, TableInstance
+ from piccolo.engine.base import BaseBatch
+ from piccolo.query.base import Query
+ from piccolo.query.methods.select import Select
++from piccolo.query.methods.update import supports_returning
+ from piccolo.query.mixins import (
+     AsOfDelegate,
+     CallbackDelegate,
+@@ -214,17 +215,39 @@ class UpdateSelf:
+             for i in self.values.keys()
+         ]
+ 
+-        response = (
+-            await TableClass.update(self.values)
+-            .where(primary_key == primary_key_value)
+-            .returning(*columns)
+-            .run(
+-                node=node,
+-                in_pool=in_pool,
+-            )
++        read_back = [*columns, *TableClass._meta.generated_columns]
++
++        query = TableClass.update(self.values).where(
++            primary_key == primary_key_value
+         )
+ 
++        if supports_returning(TableClass):
++            response = await query.returning(*read_back).run(
++                node=node, in_pool=in_pool
++            )
++        else:
++            # The database can't hand the values back from the update, so
++            # they're read afterwards instead.
++            await query.run(node=node, in_pool=in_pool)
++            response = [
++                await TableClass.select(*read_back)
++                .where(primary_key == primary_key_value)
++                .first()
++                .run(node=node, in_pool=in_pool)
++            ]
++
++        if not response[0]:
++            return
++
+         for key, value in response[0].items():
++            try:
++                key = TableClass._meta.get_column_by_name(
++                    key, match_db_column_name=True
++                )._meta.name
++            except ValueError:
++                # An aliased column comes back under its alias, which is
++                # what the attribute was always set from.
++                pass
+             setattr(self.row, key, value)
+ 
+     def __await__(self) -> Generator[None, None, None]:
+diff --git a/piccolo/query/methods/update.py b/piccolo/query/methods/update.py
+index 97715b7d..a7807f9a 100644
+--- a/piccolo/query/methods/update.py
++++ b/piccolo/query/methods/update.py
+@@ -1,8 +1,9 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Sequence
+-from typing import TYPE_CHECKING, Any, Optional, Union
++from typing import TYPE_CHECKING, Any, Optional, TypeVar, Union
+ 
++from piccolo.columns.generated import read_generated_values
+ from piccolo.custom_types import Combinable, TableInstance
+ from piccolo.query.base import Query
+ from piccolo.query.mixins import (
+@@ -14,18 +15,33 @@ from piccolo.querystring import QueryString
+ 
+ if TYPE_CHECKING:  # pragma: no cover
+     from piccolo.columns import Column
++    from piccolo.table import Table
+ 
+ 
+ class UpdateError(Exception):
+     pass
+ 
+ 
++def supports_returning(table: type[Table]) -> bool:
++    """
++    SQLite only gained the RETURNING clause in 3.35, and Piccolo supports
++    older versions than that.
++    """
++    engine = table._meta.db
++
++    if engine is None or engine.engine_type != "sqlite":
++        return True
++
++    return engine.get_version_sync() >= 3.35
++
++
+ class Update(Query[TableInstance, list[Any]]):
+     __slots__ = (
+         "force",
+         "returning_delegate",
+         "values_delegate",
+         "where_delegate",
++        "_refresh_row",
+     )
+ 
+     def __init__(
+@@ -36,6 +52,68 @@ class Update(Query[TableInstance, list[Any]]):
+         self.returning_delegate = ReturningDelegate()
+         self.values_delegate = ValuesDelegate(table=table)
+         self.where_delegate = WhereDelegate()
++        self._refresh_row: Optional[TableInstance] = None
++
++    def refresh_generated(self: Self, row: TableInstance) -> Self:
++        """
++        Bring the row's generated values up to date once the update has run.
++        """
++        generated_columns = self.table._meta.generated_columns
++
++        if generated_columns:
++            self._refresh_row = row
++
++            if supports_returning(self.table):
++                self.returning(*generated_columns)
++
++        return self
++
++    async def run(
++        self, node: Optional[str] = None, in_pool: bool = True
++    ) -> list[Any]:
++        response = await super().run(node=node, in_pool=in_pool)
++
++        row = self._refresh_row
++        if row is not None and not supports_returning(self.table):
++            await self._select_generated(row, node=node, in_pool=in_pool)
++
++        return response
++
++    async def _select_generated(
++        self, row: TableInstance, node: Optional[str], in_pool: bool
++    ) -> None:
++        """
++        Read the calculated values back when the database can't return them
++        from the update itself.
++        """
++        table = self.table
++        primary_key = table._meta.primary_key
++
++        values = (
++            await table.select(*table._meta.generated_columns)
++            .where(primary_key == getattr(row, primary_key._meta.name, None))
++            .first()
++            .run(node=node, in_pool=in_pool)
++        )
++
++        if values:
++            for name, value in read_generated_values(
++                values, table._meta.generated_columns
++            ).items():
++                setattr(row, name, value)
++
++    def _raw_response_callback(self, results: list):
++        row = self._refresh_row
++
++        if row is None or not results:
++            return
++
++        values = read_generated_values(
++            results[0], self.table._meta.generated_columns
++        )
++
++        for name, value in values.items():
++            setattr(row, name, value)
+ 
+     ###########################################################################
+     # Clauses
+@@ -116,3 +194,6 @@ class Update(Query[TableInstance, list[Any]]):
+             )
+ 
+         return [querystring]
++
++
++Self = TypeVar("Self", bound=Update)
+diff --git a/piccolo/query/mixins.py b/piccolo/query/mixins.py
+index 6d973d60..f4d6f4bf 100644
+--- a/piccolo/query/mixins.py
++++ b/piccolo/query/mixins.py
+@@ -11,6 +11,10 @@ from typing import TYPE_CHECKING, Any, Literal, Optional, Union
+ from piccolo.columns import And, Column, Or, Where
+ from piccolo.columns.column_types import ForeignKey
+ from piccolo.columns.combination import WhereRaw
++from piccolo.columns.generated import (
++    reject_generated_write,
++    reject_named_generated_write,
++)
+ from piccolo.custom_types import Combinable
+ from piccolo.querystring import QueryString
+ from piccolo.utils.list import flatten
+@@ -566,6 +570,9 @@ class ValuesDelegate:
+                     f"Unrecognised key - {key} is neither a Column or the "
+                     "name of a Column."
+                 )
++
++            reject_generated_write(column)
++
+             cleaned_values[column] = value
+ 
+         self._values.update(cleaned_values)
+@@ -779,6 +786,7 @@ class OnConflictDelegate:
+         ] = OnConflictAction.do_nothing,
+         values: Optional[Sequence[Union[Column, tuple[Column, Any]]]] = None,
+         where: Optional[Combinable] = None,
++        table: Optional[type[Table]] = None,
+     ):
+         action_: OnConflictAction
+         if isinstance(action, OnConflictAction):
+@@ -798,6 +806,13 @@ class OnConflictDelegate:
+                 "The `where` option can only be used with DO NOTHING."
+             )
+ 
++        for value in values or []:
++            column = value[0] if isinstance(value, tuple) else value
++            if isinstance(column, Column):
++                reject_generated_write(column)
++            elif table is not None:
++                reject_named_generated_write(table, column)
++
+         self._on_conflict.on_conflict_items.append(
+             OnConflictItem(
+                 target=target, action=action_, values=values, where=where
+diff --git a/piccolo/table.py b/piccolo/table.py
+index 4f72022a..4ca0438e 100644
+--- a/piccolo/table.py
++++ b/piccolo/table.py
+@@ -20,6 +20,7 @@ from piccolo.columns.column_types import (
+     Serial,
+ )
+ from piccolo.columns.defaults.base import Default
++from piccolo.columns.generated import reject_generated_write
+ from piccolo.columns.indexes import IndexMethod
+ from piccolo.columns.m2m import (
+     M2M,
+@@ -85,6 +86,7 @@ class TableMeta:
+     primary_key: Column = field(default_factory=Column)
+     json_columns: list[Union[JSON, JSONB]] = field(default_factory=list)
+     secret_columns: list[Column] = field(default_factory=list)
++    generated_columns: list[Column] = field(default_factory=list)
+     constraints: list[Constraint] = field(default_factory=list)
+     auto_update_columns: list[Column] = field(default_factory=list)
+     tags: list[str] = field(default_factory=list)
+@@ -204,6 +206,16 @@ class TableMeta:
+                 return constraint
+         raise ValueError(f"No matching constraint found with name == {name}")
+ 
++    @property
++    def writable_columns(self) -> list[Column]:
++        """
++        The columns which we send values for when writing a row. The database
++        calculates the value of a generated column, so we leave it out.
++        """
++        if not self.generated_columns:
++            return self.columns
++        return [i for i in self.columns if i._meta.generated is None]
++
+     def get_auto_update_values(self) -> dict[Column, Any]:
+         """
+         If columns have ``auto_update`` defined, then we retrieve these values.
+@@ -305,6 +317,7 @@ class Table(metaclass=TableMetaclass):
+         array_columns: list[Array] = []
+         foreign_key_columns: list[ForeignKey] = []
+         secret_columns: list[Column] = []
++        generated_columns: list[Column] = []
+         json_columns: list[Union[JSON, JSONB]] = []
+         email_columns: list[Email] = []
+         auto_update_columns: list[Column] = []
+@@ -357,9 +370,15 @@ class Table(metaclass=TableMetaclass):
+                 if column._meta.secret:
+                     secret_columns.append(column)
+ 
+-                if column._meta.auto_update is not ...:
++                if (
++                    column._meta.auto_update is not ...
++                    and column._meta.generated is None
++                ):
+                     auto_update_columns.append(column)
+ 
++                if column._meta.generated is not None:
++                    generated_columns.append(column)
++
+             if isinstance(attribute, M2M):
+                 attribute._meta._name = attribute_name
+                 attribute._meta._table = cls
+@@ -387,6 +406,7 @@ class Table(metaclass=TableMetaclass):
+             foreign_key_columns=foreign_key_columns,
+             json_columns=json_columns,
+             secret_columns=secret_columns,
++            generated_columns=generated_columns,
+             auto_update_columns=auto_update_columns,
+             tags=tags,
+             help_text=help_text,
+@@ -470,17 +490,24 @@ class Table(metaclass=TableMetaclass):
+                     )
+ 
+             if value is ...:
+-                value = column.get_default_value()
+-
+-                if isinstance(value, Default):
+-                    value = value.python()
+-
+-                if (
+-                    (value is None)
+-                    and (not column._meta.null)
+-                    and not _ignore_missing
+-                ):
+-                    raise ValueError(f"{column._meta.name} wasn't provided")
++                if column._meta.generated is not None:
++                    # The database works the value out for us, so there's
++                    # nothing to provide.
++                    value = None
++                else:
++                    value = column.get_default_value()
++
++                    if isinstance(value, Default):
++                        value = value.python()
++
++                    if (
++                        (value is None)
++                        and (not column._meta.null)
++                        and not _ignore_missing
++                    ):
++                        raise ValueError(
++                            f"{column._meta.name} wasn't provided"
++                        )
+ 
+             self[column._meta.name] = value
+ 
+@@ -532,19 +559,28 @@ class Table(metaclass=TableMetaclass):
+         """
+         cls = self.__class__
+ 
++        # Whichever way the row is written, a generated column can't be
++        # named here.
++        if columns is not None:
++            column_instances = [
++                self._meta.get_column_by_name(i) if isinstance(i, str) else i
++                for i in columns
++            ]
++            for column in column_instances:
++                reject_generated_write(column)
++
+         # New row - insert
+         if not self._exists_in_db:
+-            return cls.insert(self).returning(cls._meta.primary_key)
++            return cls.insert(self).returning(
++                cls._meta.primary_key, *cls._meta.generated_columns
++            )
+ 
+         # Pre-existing row - update
+         if columns is None:
+             column_instances = [
+-                i for i in cls._meta.columns if not i._meta.primary_key
+-            ]
+-        else:
+-            column_instances = [
+-                self._meta.get_column_by_name(i) if isinstance(i, str) else i
+-                for i in columns
++                i
++                for i in cls._meta.writable_columns
++                if not i._meta.primary_key
+             ]
+ 
+         values: dict[Column, Any] = {
+@@ -558,14 +594,18 @@ class Table(metaclass=TableMetaclass):
+             for column, value in auto_update_values.items():
+                 setattr(self, column._meta.name, value)
+ 
+-        return cls.update(
+-            values,  # type: ignore
+-            # We've already included the `auto_update` columns, so no need
+-            # to do it again:
+-            use_auto_update=False,
+-        ).where(
+-            cls._meta.primary_key
+-            == getattr(self, self._meta.primary_key._meta.name)
++        return (
++            cls.update(
++                values,  # type: ignore
++                # We've already included the `auto_update` columns, so no need
++                # to do it again:
++                use_auto_update=False,
++            )
++            .where(
++                cls._meta.primary_key
++                == getattr(self, self._meta.primary_key._meta.name)
++            )
++            .refresh_generated(self)
+         )
+ 
+     def update_self(self, values: dict[Union[Column, str], Any]) -> UpdateSelf:
+@@ -876,7 +916,7 @@ class Table(metaclass=TableMetaclass):
+         """
+         args = [
+             convert_to_sql_value(value=self[column._meta.name], column=column)
+-            for column in self._meta.columns
++            for column in self._meta.writable_columns
+         ]
+ 
+         # If unquoted, dump it straight into the query.
+diff --git a/piccolo/testing/model_builder.py b/piccolo/testing/model_builder.py
+index f94bd059..22573e29 100644
+--- a/piccolo/testing/model_builder.py
++++ b/piccolo/testing/model_builder.py
+@@ -9,6 +9,7 @@ from typing import Any, Optional, Union, cast
+ from uuid import UUID
+ 
+ from piccolo.columns import JSON, JSONB, Array, Column, Email, ForeignKey
++from piccolo.columns.generated import reject_generated_write
+ from piccolo.custom_types import TableInstance
+ from piccolo.testing.random_builder import RandomBuilder
+ from piccolo.utils.sync import run_sync
+@@ -115,9 +116,14 @@ class ModelBuilder:
+             if isinstance(column, str):
+                 column = model._meta.get_column_by_name(column)
+ 
++            reject_generated_write(column)
++
+             setattr(model, column._meta.name, value)
+ 
+         for column in model._meta.columns:
++            if column._meta.generated is not None:
++                continue
++
+             if column._meta.null and minimal:
+                 continue
+ 

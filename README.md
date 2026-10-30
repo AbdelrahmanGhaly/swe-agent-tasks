@@ -6,12 +6,12 @@ The tasks come in two parts, both tested against the same frontier AI coding age
 
 | Part | Folder | Tasks | What it tests |
 |---|---|---|---|
-| [Part 1: Core](#part-1-core) | [`tasks/`](tasks) | 36 tasks on 29 projects | New features and cross-module fixes, mostly in Python libraries |
+| [Part 1: Core](#part-1-core) | [`tasks/`](tasks) | 39 tasks on 32 projects | New features and cross-module fixes, mostly in Python libraries |
 | [Part 2: Advanced](#part-2-advanced) | [`advanced/`](advanced) | 30 tasks on 16 projects | Matching real tools, two implementations at once, binary formats, protocols, several tasks per codebase |
 
-- **66 tasks** on **42 open-source projects**
-- **Languages:** Python (28), Go (9), C++ (7), C++ and Rust (5), Rust (5), TypeScript (5), Java (4), JavaScript (3)
-- **107,324 lines** of new tests and **52,313 lines** of reference solution in total
+- **69 tasks** on **45 open-source projects**
+- **Languages:** Python (29), Go (9), C++ (8), Rust (6), C++ and Rust (5), TypeScript (5), Java (4), JavaScript (3)
+- **112,052 lines** of new tests and **54,486 lines** of reference solution in total
 
 Each task asks for a real change to a real codebase: a new feature, or a fix that cuts across several modules. It is graded only by tests the solver never sees, so a solution passes only if it actually works. Every task was designed and tested against frontier AI coding agents to be hard for them to solve.
 
@@ -42,9 +42,9 @@ docker run --rm task ./test.sh --output_path /tmp/r.xml base   # existing tests 
 
 ## Part 1: Core
 
-36 tasks on 29 projects in [`tasks/`](tasks), with 3,230 new test functions and 20,387 lines of reference solution. Most of them ask for a new feature in a library, described in prose.
+39 tasks on 32 projects in [`tasks/`](tasks), with 3,658 new test functions and 22,560 lines of reference solution. Most of them ask for a new feature in a library, described in prose.
 
-### Python (22)
+### Python (23)
 
 | Task | Project | What it asks for | Reference solution |
 |---|---|---|---|
@@ -58,20 +58,21 @@ docker run --rm task ./test.sh --output_path /tmp/r.xml base   # existing tests 
 | [nibabel-cifti-parcellation](tasks/nibabel-cifti-parcellation) | [nipy/nibabel](https://github.com/nipy/nibabel) | Add greyordinate operations for CIFTI-2 images | +546 lines, 3 files |
 | [optiland-constraint-resolution](tasks/optiland-constraint-resolution) | [optiland/optiland](https://github.com/optiland/optiland) | Resolve pickups and solves in dependency order | +1,239 lines, 9 files |
 | [pgmpy-network-templates](tasks/pgmpy-network-templates) | [pgmpy/pgmpy](https://github.com/pgmpy/pgmpy) | Add reusable templates for composing discrete Bayesian networks | +547 lines, 5 files |
+| [piccolo-generated-columns](tasks/piccolo-generated-columns) | [piccolo-orm/piccolo](https://github.com/piccolo-orm/piccolo) | Add database-generated columns to Piccolo tables | +780 lines, 16 files |
 | [pony-collection-iteration](tasks/pony-collection-iteration) | [ponyorm/pony](https://github.com/ponyorm/pony) | Iterate over array and JSON values in Pony queries | +425 lines, 7 files |
 | [pony-python-numeric-semantics](tasks/pony-python-numeric-semantics) | [ponyorm/pony](https://github.com/ponyorm/pony) | Give query arithmetic Python's numeric semantics | +536 lines, 7 files |
 | [rdflib-query-provenance](tasks/rdflib-query-provenance) | [RDFLib/rdflib](https://github.com/RDFLib/rdflib) | Report what a SPARQL update changed and why | +1,004 lines, 7 files |
 | [scons-cachedir-directory-targets](tasks/scons-cachedir-directory-targets) | [SCons/scons](https://github.com/SCons/scons) | Make directory targets rebuild and cache like file targets | +410 lines, 3 files |
 | [pythran-range-analysis](tasks/pythran-range-analysis) | [serge-sans-paille/pythran](https://github.com/serge-sans-paille/pythran) | Sharpen integer range analysis in the pythran optimizer | +733 lines, 4 files |
 | [skyfield-planetodetic-surfaces](tasks/skyfield-planetodetic-surfaces) | [skyfielders/python-skyfield](https://github.com/skyfielders/python-skyfield) | Support planetodetic sites and local skies on other bodies | +313 lines, 5 files |
-| [skyfield-spk-orbit-types](tasks/skyfield-spk-orbit-types) | [skyfielders/python-skyfield](https://github.com/skyfielders/python-skyfield) | Load SPK orbit segments and multi-segment PCK files | +244 lines, 3 files |
+| [skyfield-spk-orbit-types](tasks/skyfield-spk-orbit-types) | [skyfielders/python-skyfield](https://github.com/skyfielders/python-skyfield) | Load SPK type 5 and type 15 orbit segments | +149 lines, 2 files |
 | [sunpy-carried-quality](tasks/sunpy-carried-quality) | [sunpy/sunpy](https://github.com/sunpy/sunpy) | Carry a map's mask and uncertainty through its operations | +776 lines, 4 files |
 | [textx-assigned-actions](tasks/textx-assigned-actions) | [textX/textX](https://github.com/textX/textX) | Add Xtext-style actions to textX grammar rules | +702 lines, 7 files |
-| [vivisect-c-struct-layout](tasks/vivisect-c-struct-layout) | [vivisect/vivisect](https://github.com/vivisect/vivisect) | Lay out vstruct C structures the way GCC does | +887 lines, 5 files |
+| [vivisect-c-struct-layout](tasks/vivisect-c-struct-layout) | [vivisect/vivisect](https://github.com/vivisect/vivisect) | Lay out vstruct C structures the way GCC does | +916 lines, 5 files |
 | [vivisect-elf-symbol-versioning](tasks/vivisect-elf-symbol-versioning) | [vivisect/vivisect](https://github.com/vivisect/vivisect) | Resolve ELF GNU symbol versions in the loader and linker | +354 lines, 5 files |
 | [vivisect-symbolik-byte-memory](tasks/vivisect-symbolik-byte-memory) | [vivisect/vivisect](https://github.com/vivisect/vivisect) | Make symbolik memory and register writes byte-accurate | +403 lines, 8 files |
 
-### Rust (5)
+### Rust (6)
 
 | Task | Project | What it asks for | Reference solution |
 |---|---|---|---|
@@ -80,6 +81,15 @@ docker run --rm task ./test.sh --output_path /tmp/r.xml base   # existing tests 
 | [fundsp-oversampling-units](tasks/fundsp-oversampling-units) | [SamiPerttu/fundsp](https://github.com/SamiPerttu/fundsp) | Fix block processing in oversample and add dynamic oversampling | +494 lines, 6 files |
 | [fundsp-sequencer-automation](tasks/fundsp-sequencer-automation) | [SamiPerttu/fundsp](https://github.com/SamiPerttu/fundsp) | Add sample-accurate setting automation to Sequencer events | +501 lines, 6 files |
 | [fundsp-time-stretch](tasks/fundsp-time-stretch) | [SamiPerttu/fundsp](https://github.com/SamiPerttu/fundsp) | Add time stretching to Wave and a variable-speed player | +470 lines, 7 files |
+| [numbat-logarithmic-units](tasks/numbat-logarithmic-units) | [sharkdp/numbat](https://github.com/sharkdp/numbat) | Add logarithmic level units to the unit engine | +593 lines, 19 files |
+
+### C++ (3)
+
+| Task | Project | What it asks for | Reference solution |
+|---|---|---|---|
+| [highs-model-roundtrip](tasks/highs-model-roundtrip) | [ERGO-Code/HiGHS](https://github.com/ERGO-Code/HiGHS) | Preserve model structure through the HiGHS file handlers | +415 lines, 8 files |
+| [ispc-designated-initializers](tasks/ispc-designated-initializers) | [ispc/ispc](https://github.com/ispc/ispc) | Add C99 designated initializers to ispc initializer lists | +538 lines, 7 files |
+| [stim-logical-error-spectrum](tasks/stim-logical-error-spectrum) | [quantumlib/Stim](https://github.com/quantumlib/Stim) | Add a command reporting the graphlike logical error spectrum | +866 lines, 9 files |
 
 ### Java (3)
 
@@ -88,13 +98,6 @@ docker run --rm task ./test.sh --output_path /tmp/r.xml base   # existing tests 
 | [brouter-via-way-restrictions](tasks/brouter-via-way-restrictions) | [abrensch/brouter](https://github.com/abrensch/brouter) | Honor via-way turn restrictions in map creation and routing | +580 lines, 17 files |
 | [timefold-solver-value-range-algebra](tasks/timefold-solver-value-range-algebra) | [TimefoldAI/timefold-solver](https://github.com/TimefoldAI/timefold-solver) | Add union, intersection and difference value ranges | +1,320 lines, 19 files |
 | [archunit-static-initialization-cycles](tasks/archunit-static-initialization-cycles) | [TNG/ArchUnit](https://github.com/TNG/ArchUnit) | Add static initialization cycle analysis to ArchUnit | +414 lines, 14 files |
-
-### C++ (2)
-
-| Task | Project | What it asks for | Reference solution |
-|---|---|---|---|
-| [highs-model-roundtrip](tasks/highs-model-roundtrip) | [ERGO-Code/HiGHS](https://github.com/ERGO-Code/HiGHS) | Preserve model structure through the HiGHS file handlers | +415 lines, 8 files |
-| [ispc-designated-initializers](tasks/ispc-designated-initializers) | [ispc/ispc](https://github.com/ispc/ispc) | Add C99 designated initializers to ispc initializer lists | +538 lines, 7 files |
 
 ### JavaScript (2)
 
@@ -117,14 +120,14 @@ docker run --rm task ./test.sh --output_path /tmp/r.xml base   # existing tests 
 
 ## Part 2: Advanced
 
-30 tasks on 16 projects in [`advanced/`](advanced), with 54,554 lines of new tests and 31,926 lines of reference solution. They test the same agents as Part 1 from other angles, and the changes are bigger: the average reference solution is about 1,060 lines, against about 570 in Part 1.
+30 tasks on 16 projects in [`advanced/`](advanced), with 54,554 lines of new tests and 31,926 lines of reference solution. They test the same agents as Part 1 from other angles, and the changes are bigger: the average reference solution is about 1,060 lines, against about 580 in Part 1.
 
 - **Matching a real tool.** In 23 of the 30 tasks, the problem statement names a real tool and the change has to do what that tool does: GNU make 4.2.1, GNU ed 1.19, flex 2.6.4, rsync 3.2.7, OpenSSH 9.2, apt 2.6, dpkg, dose-distcheck, gcc 12, gfortran, glibc 2.36, GDB 13, ffmpeg 5.1, WavPack and FLAC. The tool is installed in the task's environment, and where it disagrees with its own manual, the tool is what counts. An agent has to run the tool to find out what it really does.
 - **Two implementations at once.** Each of the five kati tasks changes both ckati (C++) and rkati (Rust), and both have to match GNU make.
 - **Binary formats and low-level code.** ELF dependencies, rpaths and split debug symbols (linuxdeploy); MP4 edit lists, exact MPEG and FLAC sample counts, stored checksums, and the original file's chunks kept inside WavPack and FLAC files (music-metadata, tinytag); flex's C interface in generated scanners (RE-flex); and faults on an emulated ARMv6-M core (rp2040js).
 - **Protocols and shared state.** Weighted quorums, bounded appends and leadership handoff in etcd's raft; new rsync options in every client, server and daemon role (gokr-rsync); and pruning a workflow database without deleting records that other runs still use (redun).
 - **One codebase from several sides.** Seven projects have more than one task: kati (5), aptly (3), linuxdeploy (3), music-metadata (3), raft (3), RE-flex (2) and SCons (2). Each task on a project works on a different part of it. DigitalJS, Skyfield and SCons also appear in Part 1, with different tasks.
-- **More languages.** Python is 6 of the 30 tasks here, against 22 of 36 in Part 1. Go, C++ and Rust make up most of the rest.
+- **More languages.** Python is 6 of the 30 tasks here, against 23 of 39 in Part 1. Go, C++ and Rust make up most of the rest.
 
 ### Go (8)
 
